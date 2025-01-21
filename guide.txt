@@ -1,0 +1,2 @@
+helpful tutorial to connect your vscode with blender:
+https://www.youtube.com/watch?v=YUytEtaVrrc
