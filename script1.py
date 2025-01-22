@@ -1,5 +1,7 @@
+import random
 import bpy
 import os  
+import math
 
 def forward(colors):
     # Get the active object (knitting object)
@@ -29,6 +31,22 @@ def forward(colors):
 
     # Render images from different angles
     render_from_angles(knitting_obj)
+
+    update_materials(knitting_obj, materials, colors)
+
+
+def update_materials(knitting_obj, materials, colors):
+    # new collab
+    num_colors = len(colors)-1
+    for i in range(num_colors):
+        random.shuffle(colors)
+        for i, material in enumerate(materials):
+            material.use_nodes = True
+            bsdf = material.node_tree.nodes["Principled BSDF"]
+            bsdf.inputs["Base Color"].default_value = colors[i]  
+            print(f"Updated material {material.name} with color {colors[i]}.")
+        render_from_angles(knitting_obj)
+    
 
 # Function to set the materials in the Geometry Nodes tree
 def set_geometry_node_materials(knitting_obj, materials):
@@ -137,8 +155,10 @@ def set_geometry_node_materials(knitting_obj, materials):
     #     print(f"Node name: {node.name}, Node type: {node.type}")
 
 
-
+index = 0
 def render_from_angles(obj):
+    global index
+
     # Ensure the output folder exists in the project directory
     script_dir = os.path.dirname(bpy.data.filepath)  # Get the directory of the current Blender file
     output_folder = os.path.join(script_dir, "renders")  # Create a "renders" folder in the project directory
@@ -148,7 +168,8 @@ def render_from_angles(obj):
         os.makedirs(output_folder)
 
     # Set the Blender render filepath
-    bpy.context.scene.render.filepath = os.path.join(output_folder, "render_1.png")
+    bpy.context.scene.render.filepath = os.path.join(output_folder, f"render_{index+1}.png")
+    index += 1
     
     # Get the camera in the scene
     camera = bpy.data.objects.get("Camera")
