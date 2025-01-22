@@ -2,6 +2,7 @@ import random
 import bpy
 import os  
 import math
+import mathutils
 
 def forward(colors):
     # Get the active object (knitting object)
@@ -155,31 +156,60 @@ def set_geometry_node_materials(knitting_obj, materials):
     #     print(f"Node name: {node.name}, Node type: {node.type}")
 
 
-index = 0
-def render_from_angles(obj):
-    global index
+collab = 0
 
+# render multiple images from different angles
+def render_from_angles(obj):
+    global collab
+
+    collab += 1
+    index = 0
     # Ensure the output folder exists in the project directory
     script_dir = os.path.dirname(bpy.data.filepath)  # Get the directory of the current Blender file
     output_folder = os.path.join(script_dir, "renders")  # Create a "renders" folder in the project directory
-    
+
     # Create the folder if it doesn't exist
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    # Set the Blender render filepath
-    bpy.context.scene.render.filepath = os.path.join(output_folder, f"render_{index+1}.png")
-    index += 1
-    
+    if collab == 1:
+        # delete the content of renders folder
+        for file in os.listdir(output_folder):
+            os.remove(os.path.join(output_folder, file))
+
     # Get the camera in the scene
     camera = bpy.data.objects.get("Camera")
     if not camera:
         print("No camera found in the scene. Please add a camera.")
         return
 
+    # Save the original camera location and rotation
+    original_location = camera.location.copy()
+    original_rotation = camera.rotation_euler.copy()
+
+    # Define camera locations and rotations
+    camera_locations = [(-2, 0.5, 6), (-3, 0.5, 8.1)]
+    camera_rotations = [
+        (math.radians(18), math.radians(-5), math.radians(270)),
+        (math.radians(18), math.radians(6), math.radians(230))
+    ]
+
     # Render and save the image
-    bpy.ops.render.render(write_still=True)
-    print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
+    for i, location in enumerate(camera_locations):
+        for j, rotation in enumerate(camera_rotations):
+            camera.location = location
+            camera.rotation_euler = mathutils.Euler(rotation, 'XYZ')
+            
+            # Set the Blender render filepath
+            bpy.context.scene.render.filepath = os.path.join(output_folder, f"collab{collab}_render_{index+1}.png")
+            index += 1
+            bpy.ops.render.render(write_still=True)
+            print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
+
+    # Restore the original camera location and rotation
+    camera.location = original_location
+    camera.rotation_euler = original_rotation
+
 
 
 def main():
