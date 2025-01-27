@@ -1,8 +1,45 @@
+import os
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.*=false"
+
 import bpy
-import os  
 import math
 import mathutils
 import itertools
+from PyQt6.QtWidgets import QApplication, QColorDialog, QPushButton, QVBoxLayout, QWidget
+
+def pick_colors():
+    """Open a PyQt window to let the user pick colors."""
+    app = QApplication([])
+    selected_colors = []
+
+    def pick_color():
+        color = QColorDialog.getColor()
+        if color.isValid():
+            rgba = (
+                color.redF(),
+                color.greenF(),
+                color.blueF(),
+                1.0,  
+            )
+            selected_colors.append(rgba)
+            print(f"Selected color: {rgba}")
+
+    # Create a simple GUI for picking colors
+    window = QWidget()
+    layout = QVBoxLayout()
+    pick_button = QPushButton("Pick a Color")
+    pick_button.clicked.connect(pick_color)
+    done_button = QPushButton("Done")
+    done_button.clicked.connect(lambda: window.close())
+    layout.addWidget(pick_button)
+    layout.addWidget(done_button)
+    window.setLayout(layout)
+    window.setWindowTitle("Color Picker")
+    window.show()
+    app.exec()
+
+    return selected_colors
+
 
 def forward(colors):
     # Get the active object (knitting object)
@@ -215,23 +252,12 @@ def render_from_angles(obj):
 
 
 def main():
-    colors = []
-    print("Enter the colors you want to add to the knitting simulation.")
-    print("Enter colors as tuples (R, G, B, A) with values between 0 and 1.")
-    print("Enter 'done' when you are finished.")
+    # Launch the PyQt-based color picker to get colors
+    colors = pick_colors()
 
-    while True:
-        color = input("Enter a color (e.g., (1, 0, 0, 1) for red): ")
-        if color.lower() == "done":
-            break
-        try:
-            parsed_color = tuple(map(float, color.strip("()").split(",")))
-            if len(parsed_color) == 4 and all(0 <= c <= 1 for c in parsed_color):
-                colors.append(parsed_color)
-            else:
-                print("Invalid color format. Please enter (R, G, B, A) with values between 0 and 1.")
-        except ValueError:
-            print("Invalid input. Please enter a tuple like (1, 0, 0, 1).")
+    if not colors:
+        print("No colors selected. Exiting.")
+        return
 
     forward(colors)
 
