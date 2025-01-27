@@ -1,8 +1,8 @@
-import random
 import bpy
 import os  
 import math
 import mathutils
+import itertools
 
 def forward(colors):
     # Get the active object (knitting object)
@@ -30,24 +30,26 @@ def forward(colors):
     # Update the Geometry Nodes modifier
     set_geometry_node_materials(knitting_obj, materials)
 
-    # Render images from different angles
-    render_from_angles(knitting_obj)
-
     update_materials(knitting_obj, materials, colors)
 
 
+# function to update the materials for more colors collaborations  
 def update_materials(knitting_obj, materials, colors):
-    # new collab
-    num_colors = len(colors)-1
-    for i in range(num_colors):
-        random.shuffle(colors)
+    # Generate all unique permutations of colors
+    unique_combinations = list(itertools.permutations(colors, len(materials)))
+
+    # Iterate through each unique combination and update materials
+    for combination_index, combination in enumerate(unique_combinations):
         for i, material in enumerate(materials):
             material.use_nodes = True
             bsdf = material.node_tree.nodes["Principled BSDF"]
-            bsdf.inputs["Base Color"].default_value = colors[i]  
-            print(f"Updated material {material.name} with color {colors[i]}.")
+            bsdf.inputs["Base Color"].default_value = combination[i]
+            print(f"Updated material {material.name} with color {combination[i]}.")
+
+        # Render the scene for this color combination
+        print(f"Rendering for combination {combination_index + 1}/{len(unique_combinations)}: {combination}")
         render_from_angles(knitting_obj)
-    
+
 
 # Function to set the materials in the Geometry Nodes tree
 def set_geometry_node_materials(knitting_obj, materials):
@@ -188,7 +190,7 @@ def render_from_angles(obj):
     original_rotation = camera.rotation_euler.copy()
 
     # Define camera locations and rotations
-    camera_locations = [(-2, 0.5, 6), (-3, 0.5, 8.1)]
+    camera_locations = [(-3, -1, 8), (-3.5, -2, 9.5)]
     camera_rotations = [
         (math.radians(18), math.radians(-5), math.radians(270)),
         (math.radians(18), math.radians(6), math.radians(230))
