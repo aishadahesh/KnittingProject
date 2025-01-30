@@ -6,6 +6,7 @@ import math
 import mathutils
 import itertools
 from PyQt6.QtWidgets import QApplication, QColorDialog, QPushButton, QVBoxLayout, QWidget
+from PIL import Image
 
 def pick_colors():
     """Open a PyQt window to let the user pick colors."""
@@ -69,6 +70,8 @@ def forward(colors):
 
     update_materials(knitting_obj, materials, colors)
 
+    render_model(knitting_obj)
+
 
 # function to update the materials for more colors collaborations  
 def update_materials(knitting_obj, materials, colors):
@@ -84,8 +87,8 @@ def update_materials(knitting_obj, materials, colors):
             print(f"Updated material {material.name} with color {combination[i]}.")
 
         # Render the scene for this color combination
-        print(f"Rendering for combination {combination_index + 1}/{len(unique_combinations)}: {combination}")
-        render_from_angles(knitting_obj)
+        # print(f"Rendering for combination {combination_index + 1}/{len(unique_combinations)}: {combination}")
+        # render_from_angles(knitting_obj)
 
 
 # Function to set the materials in the Geometry Nodes tree
@@ -248,6 +251,61 @@ def render_from_angles(obj):
     # Restore the original camera location and rotation
     camera.location = original_location
     camera.rotation_euler = original_rotation
+
+
+def duplicate_image_grid():
+    global result
+    script_dir = os.path.dirname(bpy.data.filepath)  # Get the directory of the current Blender file
+    output_folder = os.path.join(script_dir, "results")  # Output folder for images
+
+    # Define the original image path (latest render)
+    original_image_path = os.path.join(output_folder, f"result{result}_render.png")
+    
+    # Ensure the original image exists before proceeding
+    if not os.path.exists(original_image_path):
+        print(f"Error: Image {original_image_path} not found!")
+        return
+
+    # Open the original image
+    original_image = Image.open(original_image_path)
+
+    # Get dimensions of the original image
+    width, height = original_image.size
+
+    # Create a new blank image (3x3 grid)
+    grid_image = Image.new('RGB', (width * 3, height * 3))
+
+    # Paste the original image 9 times in a 3x3 grid
+    for row in range(3):
+        for col in range(3):
+            grid_image.paste(original_image, (col * width, row * height))
+            # Rotate the image by 180 degrees if row is even
+            # img_to_paste = original_image.rotate(180) if row % 2 == 0 else original_image
+            # grid_image.paste(img_to_paste, (col * width, row * height))
+
+    # Save the new grid image
+    grid_image_path = os.path.join(output_folder, f"result{result}_grid.png")
+    grid_image.save(grid_image_path)
+    print(f"Grid image saved to {grid_image_path}")
+
+
+result = 0
+def render_model(obj):
+    global result
+    # Ensure the output folder exists in the project directory
+    script_dir = os.path.dirname(bpy.data.filepath)  # Get the directory of the current Blender file
+    output_folder = os.path.join(script_dir, "results")  # Create a "results" folder in the project directory
+
+    # Create the folder if it doesn't exist
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    bpy.context.scene.render.filepath = os.path.join(output_folder, f"result{result+1}_render.png")
+    result += 1
+    bpy.ops.render.render(write_still=True)
+    print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
+    duplicate_image_grid()
+
+
 
 
 
