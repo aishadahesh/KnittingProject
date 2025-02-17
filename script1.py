@@ -5,65 +5,141 @@ import bpy
 import math
 import mathutils
 import itertools
-from PyQt6.QtWidgets import QApplication, QColorDialog, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QApplication, QColorDialog, QPushButton, QVBoxLayout, QWidget, QLabel, QHBoxLayout
+)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt
 from PIL import Image
 
-def pick_colors():
-    """Open a PyQt window to let the user pick colors."""
-    app = QApplication([])
-    selected_colors = []
 
-    def pick_color():
+class ColorPickerApp(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Knitting Color Picker")
+        self.setGeometry(100, 100, 500, 450)  
+        
+        self.selected_colors = [(1.0, 1.0, 1.0, 1.0)] * 3  # Default colors (White)
+        self.render_path = os.path.join(os.path.dirname(bpy.data.filepath), "results", "live_result.png")
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        # Title Label
+        title_label = QLabel("Select 3 Colors for Knitting")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(title_label)
+
+        # Color selection buttons
+        self.color_labels = []
+        self.color_buttons = []
+
+        for i in range(3):
+            color_layout = QHBoxLayout()
+
+            color_label = QLabel(f"Color {i+1}: #FFFFFF")  # Default to white
+            color_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            color_label.setStyleSheet("background-color: white; padding: 5px; border: 1px solid black;")
+
+            self.color_labels.append(color_label)
+
+            color_button = QPushButton("Pick Color")
+            color_button.clicked.connect(lambda checked, index=i: self.pick_color(index))
+            self.color_buttons.append(color_button)
+
+            color_layout.addWidget(color_label)
+            color_layout.addWidget(color_button)
+            layout.addLayout(color_layout)
+
+        # Render button
+        self.render_button = QPushButton("Render")
+        self.render_button.clicked.connect(self.update_render)
+        self.render_button.setStyleSheet("font-size: 12px; font-weight: bold; background-color: #4CAF50; color: white; padding: 5px; border-radius: 5px;")
+        layout.addWidget(self.render_button)
+
+        # Image Preview
+        self.image_label = QLabel("Rendered Image Will Appear Here")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setStyleSheet("border: 2px dashed gray; padding: 5px;")
+        layout.addWidget(self.image_label)
+
+        self.setLayout(layout)
+
+        # Timer to check for image updates
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_for_render)
+
+    def pick_color(self, index):
         color = QColorDialog.getColor()
         if color.isValid():
-            rgba = (
-                color.redF(),
-                color.greenF(),
-                color.blueF(),
-                1.0,  
-            )
-            selected_colors.append(rgba)
-            print(f"Selected color: {rgba}")
+            rgba = (color.redF(), color.greenF(), color.blueF(), 1.0)
+            self.selected_colors[index] = rgba
+            hex_color = f"#{color.red():02X}{color.green():02X}{color.blue():02X}"
+            self.color_labels[index].setText(f"Color {index+1}: {hex_color}")
+            self.color_labels[index].setStyleSheet(f"background-color: {hex_color}; padding: 5px; border: 1px solid black;")
 
-    # Create a simple GUI for picking colors
-    window = QWidget()
-    layout = QVBoxLayout()
-    pick_button = QPushButton("Pick a Color")
-    pick_button.clicked.connect(pick_color)
-    done_button = QPushButton("Done")
-    done_button.clicked.connect(lambda: window.close())
-    layout.addWidget(pick_button)
-    layout.addWidget(done_button)
-    window.setLayout(layout)
-    window.setWindowTitle("Color Picker")
-    window.show()
-    app.exec()
+    def update_render(self):
+        """Triggers the rendering process and starts checking for the image."""
+        print("Updating render with colors:", self.selected_colors)
+        forward(self.selected_colors)
 
-    return selected_colors
+        # Start the timer to check if the render is done
+        self.timer.start(500)  # Check every 0.5 seconds
+
+    def check_for_render(self):
+        """Checks if the rendered image is ready, then displays it."""
+        if os.path.exists(self.render_path):
+            print("Render complete. Displaying image...")
+            self.display_rendered_image()
+            self.timer.stop()  # Stop checking once the image is found
+
+    def display_rendered_image(self):
+        """Loads and displays the rendered image inside the PyQt window."""
+        if not os.path.exists(self.render_path):
+            print("Error: Rendered image not found!")
+            self.image_label.setText("Error: Rendered image not found!")
+            return
+
+        # Load and set the image
+        pixmap = QPixmap(self.render_path)
+        self.image_label.setPixmap(pixmap.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio))
+
 
 
 def forward(colors):
-    # Get the active object (knitting object)
+    """Assigns colors to materials and updates Geometry Nodes."""
     knitting_obj = bpy.context.active_object
     if not knitting_obj:
         print("No active object found. Please select the knitting object.")
         return
 
-    # Add materials for each color
     materials = []
-    for color in colors:
-        name = f"Material_{color}"
-        material = bpy.data.materials.new(name=name)
-        material.use_nodes = True
-        bsdf = material.node_tree.nodes["Principled BSDF"]
-        bsdf.inputs["Base Color"].default_value = color  # Set color (RGBA)
+    for i, color in enumerate(colors):
+        mat_name = f"Material_{i}"
+
+        # Check if the material already exists
+        if mat_name in bpy.data.materials:
+            material = bpy.data.materials[mat_name]
+        else:
+            material = bpy.data.materials.new(name=mat_name)
+            material.use_nodes = True
+
+        # Update the material's base color
+        bsdf = material.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = color
         materials.append(material)
 
-    # Assign materials to the knitting object
+    # Clear old materials before adding new ones
+    knitting_obj.data.materials.clear()
+
+    # Assign updated materials
     for material in materials:
-        if material.name not in [mat.name for mat in knitting_obj.data.materials]:
-            knitting_obj.data.materials.append(material)
-        print(f"Added material to {knitting_obj.name}: {material.name}")
+        knitting_obj.data.materials.append(material)
 
     # Update the Geometry Nodes modifier
     set_geometry_node_materials(knitting_obj, materials)
@@ -305,18 +381,17 @@ def render_model(obj):
     print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
     duplicate_image_grid()
 
-
+    bpy.context.scene.render.filepath = os.path.join(output_folder, "live_result.png")
+    bpy.ops.render.render(write_still=True)
+    print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
 
 
 
 def main():
-    # Launch the PyQt-based color picker to get colors
-    colors = pick_colors()
-
-    if not colors:
-        print("No colors selected. Exiting.")
-        return
-
-    forward(colors)
+    """Launches the PyQt UI for color selection."""
+    app = QApplication([])
+    window = ColorPickerApp()
+    window.show()
+    app.exec()
 
 main()
