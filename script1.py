@@ -61,11 +61,22 @@ class ColorPickerApp(QWidget):
         self.render_button.setStyleSheet("font-size: 12px; font-weight: bold; background-color: #4CAF50; color: white; padding: 5px; border-radius: 5px;")
         layout.addWidget(self.render_button)
 
+
+        # more combinations button
+        self.comb_button = QPushButton("see more combinations")
+        self.comb_button.clicked.connect(self.more_combinations)
+        self.comb_button.setStyleSheet("font-size: 12px; font-weight: bold; background-color: #FF1C91; color: white; padding: 5px; border-radius: 5px;")
+        layout.addWidget(self.comb_button)
+
         # Image Preview
         self.image_label = QLabel("Rendered Image Will Appear Here")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setStyleSheet("border: 2px dashed gray; padding: 5px;")
         layout.addWidget(self.image_label)
+
+        # Additional images container
+        self.extra_images_container = QVBoxLayout()
+        layout.addLayout(self.extra_images_container)
 
         self.setLayout(layout)
 
@@ -85,10 +96,15 @@ class ColorPickerApp(QWidget):
     def update_render(self):
         """Triggers the rendering process and starts checking for the image."""
         print("Updating render with colors:", self.selected_colors)
+        # Delete previous render image if it exists
+        if os.path.exists(self.render_path):
+            os.remove(self.render_path)
+        self.image_label.clear()
         forward(self.selected_colors)
 
         # Start the timer to check if the render is done
-        self.timer.start(500)  # Check every 0.5 seconds
+        QTimer.singleShot(1000, self.check_for_render)  
+
 
     def check_for_render(self):
         """Checks if the rendered image is ready, then displays it."""
@@ -102,21 +118,81 @@ class ColorPickerApp(QWidget):
         if not os.path.exists(self.render_path):
             print("Error: Rendered image not found!")
             self.image_label.setText("Error: Rendered image not found!")
+            self.image_label.repaint()
+            QApplication.processEvents()
             return
 
         # Load and set the image
+        self.image_label.clear()
         pixmap = QPixmap(self.render_path)
         self.image_label.setPixmap(pixmap.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio))
 
+    
+    def more_combinations(self):
+        """Generates and displays three different color combinations."""
+        
+        permutations = list(itertools.permutations(self.selected_colors))
+        selected_combinations = permutations[1:4]  
+
+        # Clear previous additional images
+        while self.extra_images_container.count():
+            item = self.extra_images_container.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Store the paths for the new renders
+        self.extra_render_paths = []
+        self.image_labels = []
+
+        for i, combo in enumerate(selected_combinations):
+            render_path = os.path.join(os.path.dirname(bpy.data.filepath), "results", f"combo_{i}.png")
+            self.extra_render_paths.append(render_path)
+
+            print(f"Rendering combination {i+1}: {combo}")
+            forward(combo, render_path)  # Pass a unique render path
+
+            # Create QLabel for each rendered image
+            image_label = QLabel(f"Rendering Combination {i+1}...")
+            image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            image_label.setStyleSheet("border: 2px dashed gray; padding: 5px;")
+
+            self.extra_images_container.addWidget(image_label)
+            self.image_labels.append((image_label, render_path))  # Store labels for updating later
+
+        # Use a timer to wait and update images after rendering
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_combination_images)
+        self.timer.start(1000)  # Check every second for updates
+
+    def update_combination_images(self):
+        """Checks if the additional renders are ready and updates the UI."""
+        all_rendered = True  # Flag to check if all images are rendered
+
+        for image_label, render_path in self.image_labels:
+            if os.path.exists(render_path):
+                pixmap = QPixmap(render_path)
+                image_label.setPixmap(pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio))
+                image_label.setText("")  # Remove the placeholder text
+            else:
+                all_rendered = False  # If even one image is missing, keep checking
+
+        if all_rendered:
+            self.timer.stop()  # Stop checking once all images are available
 
 
-def forward(colors):
+
+
+
+
+first = 0
+def forward(colors, render_path=None):
     """Assigns colors to materials and updates Geometry Nodes."""
     knitting_obj = bpy.context.active_object
     if not knitting_obj:
         print("No active object found. Please select the knitting object.")
         return
-
+    global first
+    first +=1
     materials = []
     for i, color in enumerate(colors):
         mat_name = f"Material_{i}"
@@ -141,12 +217,16 @@ def forward(colors):
     for material in materials:
         knitting_obj.data.materials.append(material)
 
-    # Update the Geometry Nodes modifier
-    set_geometry_node_materials(knitting_obj, materials)
 
-    update_materials(knitting_obj, materials, colors)
+    # Set the materials in the Geometry Nodes tree
+    if first == 1:
+        set_geometry_node_materials(knitting_obj, materials)
 
-    render_model(knitting_obj)
+    # If no render path is provided, use the default
+    if render_path is None:
+        render_path = os.path.join(os.path.dirname(bpy.data.filepath), "results", "live_result.png")
+
+    render_model(knitting_obj, render_path)
 
 
 # function to update the materials for more colors collaborations  
@@ -190,7 +270,7 @@ def set_geometry_node_materials(knitting_obj, materials):
     # Add a new Set Material node for each color
     for i, material in enumerate(materials):
         set_material_node = node_tree.nodes.new(type="GeometryNodeSetMaterial")
-        set_material_node.location = (5800, 199 + 200 * i)  # Position the node
+        set_material_node.location = (6500, 199 + 200 * i)  # Position the node
         print(f"Added a Set Material node at location {set_material_node.location}.")
 
 
@@ -211,12 +291,12 @@ def set_geometry_node_materials(knitting_obj, materials):
 
     # Add a Join Geometry node to combine all outputs
     join_geometry_node = node_tree.nodes.new(type="GeometryNodeJoinGeometry")
-    join_geometry_node.location = (6000, 0)  # Position the node
+    join_geometry_node.location = (6800, 400)  # Position the node
     print("Added a Join Geometry node.")
 
     floored_modulo_node = node_tree.nodes.new(type="ShaderNodeMath")
     floored_modulo_node.operation = "FLOORED_MODULO"
-    floored_modulo_node.location = (5600, 0)  # Position the node
+    floored_modulo_node.location = (5900, 200)  # Position the node
     print("Added a FLOORED MODULO node.")
 
     # Link each Set Material node to the Join Geometry node
@@ -241,14 +321,14 @@ def set_geometry_node_materials(knitting_obj, materials):
 
     
     named_attribute_node = node_tree.nodes.new(type="GeometryNodeInputNamedAttribute")
-    named_attribute_node.location = (5600, 50)  # Position the node
+    named_attribute_node.location = (5600, 0)  # Position the node
     named_attribute_node.data_type = "INT"
     named_attribute_node.inputs[0].default_value = "duplicate_index"
     print("Added a Geometry Input Named Attribute node.")
 
     int_node = node_tree.nodes.new(type="FunctionNodeInputInt")
     int_node.integer = j
-    floored_modulo_node.location = (5600, 50)  # Position the node
+    int_node.location = (5600, 90)  # Position the node
     print("Added a int node.")
 
     node_tree.links.new(named_attribute_node.outputs[0], floored_modulo_node.inputs[0])  # Link Geometry Input Named Attribute to FLOORED MODULO
@@ -366,25 +446,30 @@ def duplicate_image_grid():
 
 
 result = 0
-def render_model(obj):
+def render_model(obj, render_path=None):
     global result
     # Ensure the output folder exists in the project directory
     script_dir = os.path.dirname(bpy.data.filepath)  # Get the directory of the current Blender file
     output_folder = os.path.join(script_dir, "results")  # Create a "results" folder in the project directory
 
-    # Create the folder if it doesn't exist
+    # # Create the folder if it doesn't exist
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
-    bpy.context.scene.render.filepath = os.path.join(output_folder, f"result{result+1}_render.png")
-    result += 1
-    bpy.ops.render.render(write_still=True)
-    print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
-    duplicate_image_grid()
+    
+    # bpy.context.scene.render.filepath = os.path.join(output_folder, f"result{result+1}_render.png")
+    # result += 1
+    # bpy.ops.render.render(write_still=True)
+    # print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
+    # duplicate_image_grid()
 
     bpy.context.scene.render.filepath = os.path.join(output_folder, "live_result.png")
     bpy.ops.render.render(write_still=True)
     print(f"Rendered image saved to {bpy.context.scene.render.filepath}")
 
+    if render_path is not None:
+        bpy.context.scene.render.filepath = render_path
+        bpy.ops.render.render(write_still=True)
+        print(f"Rendered image saved to {render_path}")
 
 
 def main():
