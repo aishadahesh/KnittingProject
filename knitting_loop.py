@@ -57,7 +57,7 @@ map = [[0,0,0,1],
        [0,1,1,1],
        [1,1,1,1]]
 input = convert_map_to_input(map)
-def create_loop(x_transform = 0.0, y_transform=0.0, dup_index=0):
+def create_loop(x_transform = 0.0, dup_index=0):
     verts = []
     edges = []
 
@@ -78,7 +78,7 @@ def create_loop(x_transform = 0.0, y_transform=0.0, dup_index=0):
         else:
             dx, dy, dz = 0, 0, 0
 
-        pos = (x + dx + x_transform, y + dy + y_transform, z + dz)
+        pos = (x + dx + x_transform, y + dy , z + dz)
         verts.append(pos)
 
         if i > 0:
@@ -117,7 +117,6 @@ def add_duplicate_index(obj, value):
     for i in range(len(attr)):
         attr[i].value = value
 
-y_transform = -0.960143     # transform loop by y and merge 2 loops in the same row
 x_transform = -0.120    # distance on x between loops
 dup = 4
 
@@ -125,13 +124,11 @@ dup = 4
 named_attr_dup = 0
 created_objects = []
 for i in range(dup):
-    obj1 = create_loop(i * x_transform, 0,i)
-    obj2 = create_loop(i * x_transform, y_transform,i)
-    created_objects.extend([obj1, obj2])
+    obj1 = create_loop(i * x_transform,i)
+    created_objects.extend([obj1])
     named_attr_dup = i
     # named attribute duplicate
     add_duplicate_index(obj1, i)
-    add_duplicate_index(obj2, i)
 
     
 # Now merge all created objects into one mesh
