@@ -1,6 +1,9 @@
 import bpy
 import numpy as np
 import sys
+sys.path.append(r"C:\Users\Aisha\KnittingProject")     
+import pick_colors
+
 
 def count_consecutive_zeros_after(A):
     A = np.asarray(A)
@@ -67,15 +70,11 @@ def join_objects(objects, new_name="MergedLoops"):
 
 dy = 0.55
 
-# map = np.array([[0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1],
-#                 [0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1],
-#                 [0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1],
-#                 [0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1]])
-
-map = np.array([[1,1,1,1],
-                [0,1,0,1],
-                [0,0,1,1],
-                [1,1,0,1]])
+pick_colors.run_app()
+map = np.load("bitmap.npy")
+map=map[::-1]
+colors = np.load("colors.npy")
+colors = colors[::-1]
 
 scale_factor = convert_bitmap_to_scales_factors(map)
 scale_factor = np.where((scale_factor <= 1), scale_factor, 1 + dy * (scale_factor - 1))
@@ -164,14 +163,6 @@ else:
 
 
 ############################ COLORING ############################
-
-# Define RGB colors with alpha
-colors = [
-    (0.0, 0.0, 1.0, 1.0),  # Blue
-    (1.0, 0.0, 0.0, 1.0),  # Red
-    (0.0, 1.0, 0.0, 1.0),  # Green
-    (0.5, 0.5, 0.0, 0.0)    # Yellow
-]
 
 materials = []
 for i, rgba in enumerate(colors):
