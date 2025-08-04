@@ -1,9 +1,11 @@
+import os
 import bpy
 import numpy as np
 import sys
 sys.path.append(r"C:\Users\Aisha\KnittingProject")     
 import pick_colors
-
+import render_images
+import itertools
 
 def count_consecutive_zeros_after(A):
     A = np.asarray(A)
@@ -70,7 +72,7 @@ def join_objects(objects, new_name="MergedLoops"):
 
 dy = 0.55
 
-pick_colors.run_app()
+pick_colors.run_color_app()
 map = np.load("bitmap.npy")
 map=map[::-1]
 colors = np.load("colors.npy")
@@ -85,6 +87,10 @@ n_rows = map.shape[0]
 print(f"Number of rows: {n_rows}")
 loop_res = 32    # loop resolution
 num_points = loop_res * n_loops
+
+del_obj = bpy.context.active_object
+if del_obj:
+    bpy.data.objects.remove(del_obj, do_unlink=True)
 
 created_objects = []
 for i in range(len(scale_factor)):
@@ -106,7 +112,6 @@ for i in range(len(scale_factor)):
 
 # Select all created objects and join them
 merged_obj = join_objects(created_objects)
-
 
 ########################  CONVERT OBJECT TO MESH ########################
 
@@ -242,3 +247,65 @@ for node in node_tree.nodes:
 
 if group_output_node:
     node_tree.links.new(join_geometry_node.outputs[0], group_output_node.inputs[0])
+
+
+########################################## RENDER IMAGES ################################################
+def render_model(obj, render_path=None):
+    script_dir = os.path.dirname(__file__)
+    output_folder = os.path.join(script_dir, "images")
+    os.makedirs(output_folder, exist_ok=True)
+
+    if render_path is None:
+        render_path = os.path.join(output_folder, "result.png")
+
+    bpy.context.scene.render.filepath = render_path
+    bpy.ops.render.render(write_still=True)
+    print(f"Rendered image saved to {render_path}")
+
+
+def update_materials(obj, color_combo):
+    if not obj:
+        print("No object passed to update_materials.")
+        return
+
+    obj.data.materials.clear()
+    for i, color in enumerate(color_combo):
+        mat_name = f"Material_{i}"
+        material = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
+        material.use_nodes = True
+        bsdf = material.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = color
+        obj.data.materials.append(material)
+
+
+def render_more_combinations(obj):
+    script_dir = os.path.dirname(__file__)
+    output_folder = os.path.join(script_dir, "images")
+    os.makedirs(output_folder, exist_ok=True)
+    
+    for file in os.listdir(output_folder):
+                os.remove(os.path.join(output_folder, file))
+
+    permutations = list(itertools.permutations(colors, len(colors)))
+    selected_combos = permutations[1:4]  # Pick 3 combos for demo
+
+    for i, combo in enumerate(selected_combos):
+        update_materials(obj, combo)
+        render_path = os.path.join(output_folder, f"combo_{i+1}.png")
+        render_model(obj, render_path)
+
+
+# Blender active object
+obj = bpy.context.active_object
+if obj:
+    camera = bpy.data.objects.get("Camera")
+    if not camera:
+        print("No camera found in the scene. Please add a camera.")
+    camera.location = (8, -4, 4)
+
+    render_model(obj)
+    render_images.run_rendering_app(obj, render_more_combinations)
+else:
+    print("No active object to render.")
+    

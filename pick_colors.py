@@ -51,7 +51,7 @@ class ColorPickerApp(QWidget):
         main_layout.addLayout(self.content_layout)
 
         # Save button
-        save_btn = QPushButton("Continue")
+        save_btn = QPushButton("CLOSE")
         save_btn.clicked.connect(self.save_array)
         main_layout.addWidget(save_btn)
 
@@ -127,7 +127,7 @@ class ColorPickerApp(QWidget):
         self.close() 
 
 
-def run_app():
+def run_color_app():
     app = QApplication(sys.argv)
     window = ColorPickerApp()
     window.show()
