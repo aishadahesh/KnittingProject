@@ -6,6 +6,10 @@ sys.path.append(r"C:\Users\Aisha\KnittingProject")
 import pick_colors
 import render_images
 import itertools
+import obj_to_mesh
+import coloring
+import rendering
+
 
 def count_consecutive_zeros_after(A):
     A = np.asarray(A)
@@ -70,233 +74,60 @@ def join_objects(objects, new_name="MergedLoops"):
 
     return merged_obj
 
-dy = 0.55
+
+def main(map):
+    dy = 0.55
+
+    scale_factor = convert_bitmap_to_scales_factors(map)
+    scale_factor = np.where((scale_factor <= 1), scale_factor, 1 + dy * (scale_factor - 1))
+
+    n_loops = map.shape[1]
+    print(f"Number of loops: {n_loops}")
+    n_rows = map.shape[0]
+    print(f"Number of rows: {n_rows}")
+    loop_res = 32    # loop resolution
+    num_points = loop_res * n_loops
+
+    del_obj = bpy.context.active_object
+    if del_obj:
+        bpy.data.objects.remove(del_obj, do_unlink=True)
+
+    created_objects = []
+    for i in range(len(scale_factor)):
+        scale = scale_factor[i]
+        points = create_curve(loop_res, n_loops, scale, i * dy)
+        
+        edges = [(i - 1, i) for i in range(1, len(points))]
+
+        mesh_data = bpy.data.meshes.new("knittingMesh")
+        mesh_data.from_pydata(points, edges, [])
+        mesh_data.update()
+
+        obj = bpy.data.objects.new("knittingObject", mesh_data)
+        bpy.context.collection.objects.link(obj)
+
+        created_objects.append(obj)
+        add_duplicate_index(obj, i)
+
+    # Select all created objects and join them
+    join_objects(created_objects)
+
+
 
 pick_colors.run_color_app()
 map = np.load("bitmap.npy")
 map=map[::-1]
 colors = np.load("colors.npy")
 colors = colors[::-1]
+main(map)
 
-scale_factor = convert_bitmap_to_scales_factors(map)
-scale_factor = np.where((scale_factor <= 1), scale_factor, 1 + dy * (scale_factor - 1))
+# convert object to mesh
+obj_to_mesh.convert_obj_to_mesh()
 
-n_loops = map.shape[1]
-print(f"Number of loops: {n_loops}")
-n_rows = map.shape[0]
-print(f"Number of rows: {n_rows}")
-loop_res = 32    # loop resolution
-num_points = loop_res * n_loops
+# add colors to mesh
+coloring.set_colors(colors)
 
-del_obj = bpy.context.active_object
-if del_obj:
-    bpy.data.objects.remove(del_obj, do_unlink=True)
-
-created_objects = []
-for i in range(len(scale_factor)):
-    scale = scale_factor[i]
-    points = create_curve(loop_res, n_loops, scale, i * dy)
-    
-    edges = [(i - 1, i) for i in range(1, len(points))]
-
-    mesh_data = bpy.data.meshes.new("knittingMesh")
-    mesh_data.from_pydata(points, edges, [])
-    mesh_data.update()
-
-    obj = bpy.data.objects.new("knittingObject", mesh_data)
-    bpy.context.collection.objects.link(obj)
-
-    created_objects.append(obj)
-    add_duplicate_index(obj, i)
-
-
-# Select all created objects and join them
-merged_obj = join_objects(created_objects)
-
-########################  CONVERT OBJECT TO MESH ########################
-
-group_name = "AutoMeshToCurve"
-if group_name in bpy.data.node_groups:
-    node_group = bpy.data.node_groups[group_name]
-else:
-    node_group = bpy.data.node_groups.new(name=group_name, type='GeometryNodeTree')
-
-    node_group.interface.clear()
-    node_group.nodes.clear()
-
-    node_group.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
-    node_group.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
-
-    nodes = node_group.nodes
-    links = node_group.links
-
-    input_node = nodes.new("NodeGroupInput")
-    output_node = nodes.new("NodeGroupOutput")
-    mesh_to_curve = nodes.new("GeometryNodeMeshToCurve")
-    curve_to_mesh = nodes.new("GeometryNodeCurveToMesh")
-    curve_circle = nodes.new("GeometryNodeCurvePrimitiveCircle")
-
-    curve_to_mesh.label= "CurveToMesh_"
-
-    input_node.location = (-600, 0)
-    mesh_to_curve.location = (-300, 0)
-    curve_circle.location = (-300, -200)
-    curve_to_mesh.location = (0, 0)
-    output_node.location = (900, 0)
-
-    links.new(mesh_to_curve.inputs["Mesh"], input_node.outputs["Geometry"])
-    links.new(curve_to_mesh.inputs["Curve"], mesh_to_curve.outputs["Curve"])
-    links.new(curve_to_mesh.inputs["Profile Curve"], curve_circle.outputs["Curve"])
-    links.new(output_node.inputs["Geometry"], curve_to_mesh.outputs["Mesh"])
-
-    curve_circle.inputs["Radius"].default_value = 0.13  # controls thickness
-    curve_circle.inputs["Resolution"].default_value = 16
-
-
-obj_name = "MergedLoops"
-obj = bpy.data.objects.get(obj_name)
-
-if obj:
-    for mod in obj.modifiers:
-        if mod.type == 'NODES' and mod.node_group and mod.node_group.name == group_name:
-            obj.modifiers.remove(mod)
-    mod = obj.modifiers.new(name="AutoCurveMod", type='NODES')
-    mod.node_group = node_group
-else:
-    print(f"Object '{obj_name}' not found.")
-
-
-
-############################ COLORING ############################
-
-materials = []
-for i, rgba in enumerate(colors):
-    mat_name = f"Material_{i}"
-    if mat_name in bpy.data.materials:
-        material = bpy.data.materials[mat_name]
-    else:
-        material = bpy.data.materials.new(name=mat_name)
-        material.use_nodes = True
-    bsdf = material.node_tree.nodes.get("Principled BSDF")
-    if bsdf:
-        bsdf.inputs["Base Color"].default_value = rgba
-    materials.append(material)
-
-obj = bpy.context.active_object 
-obj.data.materials.clear()
-for material in materials:
-    obj.data.materials.append(material)
-
-geo_nodes_mod = None
-for mod in obj.modifiers:
-    if mod.type == 'NODES':
-        geo_nodes_mod = mod
-        break
-
-node_tree = geo_nodes_mod.node_group
-for i, material in enumerate(materials):
-        set_material_node = node_tree.nodes.new(type="GeometryNodeSetMaterial")
-        set_material_node.location = (500, 100 * i)  
-        set_material_node.inputs[2].default_value = material
-
-curve_to_mesh_node = None
-for node in node_tree.nodes:
-    if node.label == "CurveToMesh_":
-        curve_to_mesh_node = node
-        break
-
-join_geometry_node = node_tree.nodes.new(type="GeometryNodeJoinGeometry")
-join_geometry_node.location = (680, 100)  
-
-floored_modulo_node = node_tree.nodes.new(type="ShaderNodeMath")
-floored_modulo_node.operation = "FLOORED_MODULO"
-floored_modulo_node.location = (20, 200)  
-
-j = 0
-for i, node in enumerate(node_tree.nodes):
-    if node.type == "SET_MATERIAL":
-        compare_node = node_tree.nodes.new(type="ShaderNodeMath") 
-        compare_node.operation = "COMPARE"  
-        compare_node.location = (node.location.x-300 , node.location.y-300) 
-        compare_node.inputs[1].default_value = j  
-        j += 1
-        compare_node.inputs[2].default_value = 0  
-
-        node_tree.links.new(curve_to_mesh_node.outputs[0], node.inputs[0])  
-        node_tree.links.new(node.outputs[0], join_geometry_node.inputs[0])  
-        node_tree.links.new(compare_node.outputs[0], node.inputs[1]) 
-        node_tree.links.new(floored_modulo_node.outputs[0], compare_node.inputs[0]) 
-
-named_attribute_node = node_tree.nodes.new(type="GeometryNodeInputNamedAttribute")
-named_attribute_node.location = (-200, 250)  
-named_attribute_node.data_type = "INT"
-named_attribute_node.inputs[0].default_value = "duplicate_index"
-
-int_node = node_tree.nodes.new(type="FunctionNodeInputInt")
-int_node.integer = j
-int_node.location = (-250, 100)  
-
-node_tree.links.new(named_attribute_node.outputs[0], floored_modulo_node.inputs[0])  
-node_tree.links.new(int_node.outputs[0], floored_modulo_node.inputs[1]) 
-
-group_output_node = None
-for node in node_tree.nodes:
-    if node.type == "GROUP_OUTPUT":
-        group_output_node = node
-        break
-
-if group_output_node:
-    node_tree.links.new(join_geometry_node.outputs[0], group_output_node.inputs[0])
-
-
-########################################## RENDER IMAGES ################################################
-def render_model(obj, render_path=None):
-    script_dir = os.path.dirname(__file__)
-    output_folder = os.path.join(script_dir, "images")
-    os.makedirs(output_folder, exist_ok=True)
-
-    if render_path is None:
-        render_path = os.path.join(output_folder, "result.png")
-
-    bpy.context.scene.render.filepath = render_path
-    bpy.ops.render.render(write_still=True)
-    print(f"Rendered image saved to {render_path}")
-
-
-def update_materials(obj, color_combo):
-    if not obj:
-        print("No object passed to update_materials.")
-        return
-
-    obj.data.materials.clear()
-    for i, color in enumerate(color_combo):
-        mat_name = f"Material_{i}"
-        material = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
-        material.use_nodes = True
-        bsdf = material.node_tree.nodes.get("Principled BSDF")
-        if bsdf:
-            bsdf.inputs["Base Color"].default_value = color
-        obj.data.materials.append(material)
-
-
-def render_more_combinations(obj):
-    script_dir = os.path.dirname(__file__)
-    output_folder = os.path.join(script_dir, "images")
-    os.makedirs(output_folder, exist_ok=True)
-    
-    for file in os.listdir(output_folder):
-                os.remove(os.path.join(output_folder, file))
-
-    permutations = list(itertools.permutations(colors, len(colors)))
-    selected_combos = permutations[1:4]  # Pick 3 combos for demo
-
-    for i, combo in enumerate(selected_combos):
-        update_materials(obj, combo)
-        render_path = os.path.join(output_folder, f"combo_{i+1}.png")
-        render_model(obj, render_path)
-
-
-# Blender active object
+# render images
 obj = bpy.context.active_object
 if obj:
     camera = bpy.data.objects.get("Camera")
@@ -304,8 +135,8 @@ if obj:
         print("No camera found in the scene. Please add a camera.")
     camera.location = (8, -4, 4)
 
-    render_model(obj)
-    render_images.run_rendering_app(obj, render_more_combinations)
+    rendering.render_model(obj)
+    render_images.run_rendering_app(obj, lambda o: rendering.render_more_combinations(o, colors))
 else:
     print("No active object to render.")
     
