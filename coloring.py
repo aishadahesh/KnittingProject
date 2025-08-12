@@ -1,6 +1,6 @@
 import bpy
 
-def set_colors(colors):
+def set_colors(colors, connect_node_label = "CurveToMesh_"):
     materials = []
     for i, rgba in enumerate(colors):
         mat_name = f"Material_{i}"
@@ -31,10 +31,10 @@ def set_colors(colors):
             set_material_node.location = (500, 100 * i)  
             set_material_node.inputs[2].default_value = material
 
-    curve_to_mesh_node = None
+    connect_node = None
     for node in node_tree.nodes:
-        if node.label == "CurveToMesh_":
-            curve_to_mesh_node = node
+        if node.label == connect_node_label:
+            connect_node = node
             break
 
     join_geometry_node = node_tree.nodes.new(type="GeometryNodeJoinGeometry")
@@ -54,7 +54,7 @@ def set_colors(colors):
             j += 1
             compare_node.inputs[2].default_value = 0  
 
-            node_tree.links.new(curve_to_mesh_node.outputs[0], node.inputs[0])  
+            node_tree.links.new(connect_node.outputs[0], node.inputs[0])  
             node_tree.links.new(node.outputs[0], join_geometry_node.inputs[0])  
             node_tree.links.new(compare_node.outputs[0], node.inputs[1]) 
             node_tree.links.new(floored_modulo_node.outputs[0], compare_node.inputs[0]) 

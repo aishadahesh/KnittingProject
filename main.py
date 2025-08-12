@@ -16,11 +16,14 @@ colors = np.load("colors.npy")
 colors = colors[::-1]
 knitting_loop.main(map)
 
-# convert object to mesh
-obj_to_mesh.convert_obj_to_mesh()
+# # convert object to mesh
+# obj_to_mesh.convert_obj_to_mesh()
 
-# add colors to mesh
-coloring.set_colors(colors)
+# # add colors to mesh
+# coloring.set_colors(colors)
+
+obj_to_mesh.add_geo()
+coloring.set_colors(colors, "input_")
 
 # render images
 obj = bpy.context.active_object

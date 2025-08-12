@@ -1,6 +1,6 @@
 import bpy
 import numpy as np
-
+import frame_functions
 
 def count_consecutive_zeros_after(A):
     A = np.asarray(A)
@@ -38,9 +38,10 @@ def create_curve(loop_res, n_loops, x_scale, tx = 0.0):
     x_scale = np.repeat(x_scale, loop_res)
     x_scale = np.append(x_scale, 1)  # Add 1 to the end of the vector
     x, y, z = eval_curve(t_values, x_scale)
+    dx, dy, dz = frame_functions.eval_curve_derivative(t_values, x_scale)
     points = [(x[i], y[i] + tx, z[i]) for i in range(num_points)]
     
-    return points
+    return points, dx, dy, dz
 
 def add_duplicate_index(obj, value):
     mesh = obj.data
@@ -86,16 +87,27 @@ def main(map):
     created_objects = []
     for i in range(len(scale_factor)):
         scale = scale_factor[i]
-        points = create_curve(loop_res, n_loops, scale, i * dy)
+        points, dx_, dy_, dz_ = create_curve(loop_res, n_loops, scale, i * dy)
         
-        edges = [(i - 1, i) for i in range(1, len(points))]
+        # Convert points to np.array for calculation
+        points_np = np.array([
+            (p[0], p[1], p[2]) for p in points
+        ])
+        T = np.column_stack((dx_, dy_, dz_))
+        T, U, V = frame_functions.compute_orthonormal_frame(T)
+        # frame_functions.visualize_in_blender(points_np, T, U, V, scale=0.3, step=5)
+        # all_circles = frame_functions.create_circles_along_curve(points_np, U, V, radius=0.05)
+        # frame_functions.plot_circles_in_blender(all_circles)
+        obj = frame_functions.build_mesh(points, U, V)
 
-        mesh_data = bpy.data.meshes.new("knittingMesh")
-        mesh_data.from_pydata(points, edges, [])
-        mesh_data.update()
+        # edges = [(i - 1, i) for i in range(1, len(points))]
 
-        obj = bpy.data.objects.new("knittingObject", mesh_data)
-        bpy.context.collection.objects.link(obj)
+        # mesh_data = bpy.data.meshes.new("knittingMesh")
+        # mesh_data.from_pydata(points, edges, [])
+        # mesh_data.update()
+
+        # obj = bpy.data.objects.new("knittingObject", mesh_data)
+        # bpy.context.collection.objects.link(obj)
 
         created_objects.append(obj)
         add_duplicate_index(obj, i)

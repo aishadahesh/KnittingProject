@@ -3,7 +3,7 @@ import os
 import bpy
 import coloring
 
-def render_model(obj, render_path=None):
+def render_model(obj=None, render_path=None):
     script_dir = os.path.dirname(__file__)
     output_folder = os.path.join(script_dir, "images")
     os.makedirs(output_folder, exist_ok=True)
