@@ -20,9 +20,6 @@ def render_more_combinations(obj, colors):
     script_dir = os.path.dirname(__file__)
     output_folder = os.path.join(script_dir, "images")
     os.makedirs(output_folder, exist_ok=True)
-    
-    for file in os.listdir(output_folder):
-                os.remove(os.path.join(output_folder, file))
 
     permutations = list(itertools.permutations(colors, len(colors)))
     selected_combos = permutations[1:4]  # Pick 3 combos for demo

@@ -1,5 +1,6 @@
 import bpy
 import numpy as np
+from PyQt6.QtWidgets import QApplication
 import sys
 sys.path.append(r"C:\Users\Aisha\KnittingProject")     
 import pick_colors_gui
@@ -9,31 +10,43 @@ import coloring
 import rendering
 import knitting_loop
 
-pick_colors_gui.run_color_app()
-map = np.load("bitmap.npy")
-map=map[::-1]
-colors = np.load("colors.npy")
-colors = colors[::-1]
-knitting_loop.main(map)
 
-# # convert object to mesh
-# obj_to_mesh.convert_obj_to_mesh()
+def main():
+    app = QApplication(sys.argv)
+    color_window = pick_colors_gui.ColorPickerApp(on_see_result=None)
+    render_window = render_images_gui.RenderImagesApp(None, None, other_window=color_window)
+    color_window.move(100, 100)
+    render_window.move(1100, 100)
 
-# # add colors to mesh
-# coloring.set_colors(colors)
+    color_window.show()
+    render_window.show()
 
-obj_to_mesh.add_geo()
-coloring.set_colors(colors, "input_")
+    # Define callback after windows created
+    def on_colors_updated(bitmap, colors):
+        bitmap = bitmap[::-1]
+        colors = colors[::-1]
 
-# render images
-obj = bpy.context.active_object
-if obj:
-    camera = bpy.data.objects.get("Camera")
-    if not camera:
-        print("No camera found in the scene. Please add a camera.")
-    camera.location = (8, -4, 4)
+        knitting_loop.main(bitmap)
+        obj_to_mesh.add_geo()
+        coloring.set_colors(colors, "input_")
 
-    rendering.render_model(obj)
-    render_images_gui.run_rendering_app(obj, lambda o: rendering.render_more_combinations(o, colors))
-else:
-    print("No active object to render.")
+        obj = bpy.context.active_object
+        if obj:
+            cam = bpy.data.objects.get("Camera")
+            if cam:
+                cam.location = (8, -4, 4)
+
+            rendering.render_model(obj)
+            render_window.obj = obj
+            render_window.render_callback = lambda o: rendering.render_more_combinations(o, colors)
+            render_window.refresh_render()
+        else:
+            print("No object to render")
+
+    # Assign the real callback to the color picker window
+    color_window.on_see_result = on_colors_updated
+
+    app.exec()
+
+
+main()

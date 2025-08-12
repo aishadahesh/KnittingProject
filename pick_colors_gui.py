@@ -12,10 +12,11 @@ from PyQt6.QtCore import Qt
 
 
 class ColorPickerApp(QWidget):
-    def __init__(self):
+    def __init__(self, on_see_result=None):
         super().__init__()
         self.setWindowTitle("Knitting Color Mapper")
         self.setGeometry(100, 100, 900, 600)
+        self.on_see_result = on_see_result
 
         self.selected_colors = [
             (1.0, 1.0, 0.0, 1.0),  # yellow
@@ -172,20 +173,12 @@ class ColorPickerApp(QWidget):
 
     def save_array(self):
         array = np.array(self.grid_data)
-        print("Grid:\n", array)
-        print("Colors:\n", np.array(self.selected_colors))
+        colors = np.array(self.selected_colors)
         np.save("bitmap.npy", array)
-        np.save("colors.npy", np.array(self.selected_colors))
-        print("Saved to 'bitmap.npy' and 'colors.npy'")
-        self.close()
+        np.save("colors.npy", colors)
+        if self.on_see_result:
+            self.on_see_result(array, colors)
 
 
-def run_color_app():
-    app = QApplication(sys.argv)
-    window = ColorPickerApp()
-    window.show()
-    app.exec()
-
-
-# if __name__ == "__main__":
-#     run_color_app()
+def run_color_app(on_see_result):
+    return ColorPickerApp(on_see_result)
