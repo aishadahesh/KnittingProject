@@ -1,6 +1,6 @@
 import bpy
 
-def set_colors(colors, connect_node_label = "CurveToMesh_"):
+def set_colors(colors, connect_node_label = "CurveToMesh_", obj_name = "MergedLoops"):
     materials = []
     for i, rgba in enumerate(colors):
         mat_name = f"Material_{i}"
@@ -14,8 +14,9 @@ def set_colors(colors, connect_node_label = "CurveToMesh_"):
             bsdf.inputs["Base Color"].default_value = rgba
         materials.append(material)
 
-    obj = bpy.context.active_object 
-    obj.data.materials.clear()
+    obj = bpy.data.objects.get(obj_name)
+    if obj.data.materials:
+        obj.data.materials.clear()
     for material in materials:
         obj.data.materials.append(material)
 

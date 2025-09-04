@@ -51,7 +51,7 @@ def convert_obj_to_mesh():
     else:
         print(f"Object '{obj_name}' not found.")
 
-def add_geo():
+def add_geo(obj_name = "MergedLoops"):
     group_name = "AutoMeshToCurve"
     if group_name in bpy.data.node_groups:
         node_group = bpy.data.node_groups[group_name]
@@ -74,7 +74,6 @@ def add_geo():
         input_node.label = "input_"
         output_node.location = (900, 0)
 
-    obj_name = "MergedLoops"
     obj = bpy.data.objects.get(obj_name)
 
     if obj:

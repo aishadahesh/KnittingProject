@@ -1,6 +1,7 @@
 import bpy
 import numpy as np
 import frame_functions
+import mathutils
 
 def count_consecutive_zeros_after(A):
     A = np.asarray(A)
@@ -66,6 +67,47 @@ def join_objects(objects, new_name="MergedLoops"):
 
     return merged_obj
 
+offsets = [[0.05, 0, 0], [0, 0.05, 0], [0, 0, 0.05], [-0.05, 0, 0], [0, -0.05, 0], [0, 0, -0.05], 
+           [0.025, 0, 0], [0, 0.025, 0], [0, 0, 0.025], [-0.025, 0, 0], [0, -0.025, 0], [0, 0, -0.025],
+           [0.075, 0, 0], [0, 0.075, 0], [0, 0, 0.075], [-0.075, 0, 0], [0, -0.075, 0], [0, 0, -0.075],
+           [0.01, 0, 0], [0, 0.01, 0], [0, 0, 0.01], [-0.01, 0, 0], [0, -0.01, 0], [0, 0, -0.01],
+           [0.015, 0, 0], [0, 0.015, 0], [0, 0, 0.015], [-0.015, 0, 0], [0, -0.015, 0], [0, 0, -0.015],
+           [0.09, 0, 0], [0, 0.09, 0], [0, 0, 0.09], [-0.09, 0, 0], [0, -0.09, 0], [0, 0, -0.09],
+           [0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1], [-0.1, 0, 0], [0, -0.1, 0], [0, 0, -0.1],
+           [0.03, 0, 0], [0, 0.03, 0], [0, 0, 0.03], [-0.03, 0, 0], [0, -0.03, 0], [0, 0, -0.03],
+           [0.08, 0, 0], [0, 0.08, 0], [0, 0, 0.08], [-0.08, 0, 0], [0, -0.08, 0], [0, 0, -0.08]]
+
+def duplicate_loop(obj, objs_list=None):
+    global offsets
+    duplicates = []
+    base_loc = obj.location.copy()
+
+    for i in range(len(offsets)):
+        # Create a new object sharing the same mesh data
+        dup = obj.copy()
+        dup.data = obj.data.copy()  
+        dup.location = base_loc + mathutils.Vector((
+            offsets[i][0],
+            offsets[i][1],
+            offsets[i][2]
+        ))
+        dup.name = f"{obj.name}_dup_{i}"  
+        bpy.context.collection.objects.link(dup)
+        duplicates.append(dup)
+        if objs_list is not None:
+            objs_list.append(dup)
+
+    return duplicates
+
+def join_loop(objects, new_name="MergedLoops"):
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in objects:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = objects[0]
+    bpy.ops.object.join()
+    merged_obj = bpy.context.view_layer.objects.active
+    merged_obj.name = new_name
+    return merged_obj
 
 def main(map):
     dy = 0.55
@@ -98,7 +140,7 @@ def main(map):
         # frame_functions.visualize_in_blender(points_np, T, U, V, scale=0.3, step=5)
         # all_circles = frame_functions.create_circles_along_curve(points_np, U, V, radius=0.05)
         # frame_functions.plot_circles_in_blender(all_circles)
-        obj = frame_functions.build_mesh(points, U, V)
+        obj = frame_functions.build_mesh(points, U, V, radius=0.01)
 
         # edges = [(i - 1, i) for i in range(1, len(points))]
 
@@ -112,7 +154,14 @@ def main(map):
         created_objects.append(obj)
         add_duplicate_index(obj, i)
 
-    # Select all created objects and join them
-    join_objects(created_objects)
+    global offsets
+    merged_loops = []  # store each loop's merged object
+
+    for i in range(n_loops):
+        duplicates = duplicate_loop(created_objects[i])
+        merged = join_loop([created_objects[i]] + duplicates, f"MergedLoop{i}")
+        merged_loops.append(merged)
+        
+    join_objects(merged_loops)
 
     
