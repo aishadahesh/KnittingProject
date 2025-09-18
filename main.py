@@ -1,13 +1,12 @@
 #%% imports
 import bpy
 import numpy as np
-from PyQt6.QtWidgets import QApplication
 import sys
-sys.path.append(r"C:\Users\Aisha\KnittingProject")     
-import pick_colors_gui
-import render_images_gui
+sys.path.append(r"C:\projects\KnittingProject")     
+# import pick_colors_gui
+# import render_images_gui
 import obj_to_mesh
-import coloring
+# import coloring
 import rendering
 # import knitting_loop
 
@@ -21,41 +20,56 @@ import bpy
 
 
 def eval_curve(t, scale, ax=0.25, az=-0.2):
-    x = ax * np.sin(2 * t) +  t / (2 * np.pi)
-    y = - (np.cos(t) - 1)/2
-    z = az * (np.cos(2 * t) - 1)/2
-    x = np.where(scale==0, t / (2 * np.pi), x) # when scale is zero, use a linear function, otherwise the line will overlap itself
-    return (x, y*scale, z*scale)
+    t = np.asarray(t, dtype=float)
+    scale = np.asarray(scale, dtype=float)
+    x = ax * np.sin(2*t) + t/(2*np.pi)
+    y = -(np.cos(t) - 1)/2
+    z = az * (np.cos(2*t) - 1)/2
+    x = np.where(scale == 0, t/(2*np.pi), x)
+    return np.column_stack((x, y*scale, z*scale))
 
 def eval_curve_derivative(t, scale, ax=0.25, az=-0.2):
-    dx = 2 * ax * np.cos(2 * t) + 1 / (2 * np.pi)
-    dy = 0.5 * np.sin(t) * scale
-    dz = -az * np.sin(2 * t) * scale
-    dx = np.where(scale == 0, 1 / (2 * np.pi), dx)
-    return dx, dy, dz
-
+    t = np.asarray(t, dtype=float)
+    scale = np.asarray(scale, dtype=float)
+    dx = 2*ax*np.cos(2*t) + 1/(2*np.pi)
+    dy = 0.5*np.sin(t)*scale
+    dz = -az*np.sin(2*t)*scale
+    dx = np.where(scale == 0, 1/(2*np.pi), dx)
+    return np.column_stack((dx, dy, dz))
 
 def eval_curve_second_derivative(t, scale, ax=0.25, az=-0.2):
-    d2x = -4 * ax * np.sin(2 * t)
-    d2y = 0.5 * np.cos(t) * scale
-    d2z = -2 * az * np.cos(2 * t) * scale
-    d2x = np.where(scale == 0, 0, d2x)
-    return d2x, d2y, d2z
+    t = np.asarray(t, dtype=float)
+    scale = np.asarray(scale, dtype=float)
+    d2x = -4*ax*np.sin(2*t)
+    d2y = 0.5*np.cos(t)*scale
+    d2z = -2*az*np.cos(2*t)*scale
+    d2x = np.where(scale == 0, 0.0, d2x)
+    return np.column_stack((d2x, d2y, d2z))
 
 
-# Compute the Frenet frame (T, N, B) for a parametric curve
-def compute_frenet_frame(points, dpoints, ddpoints):
-    d1 = np.array(dpoints)  # First derivative (tangent)
-    d2 = np.array(ddpoints)  # Second derivative (curvature)
-    # Tangent vector (normalized first derivative)
-    T = d1 / (np.linalg.norm(d1, axis=-1, keepdims=True) + 1e-8)
-    # Normal vector (normalized derivative of T)
-    dT = d2 - (np.sum(d2 * T, axis=-1, keepdims=True)) * T
-    N = dT / (np.linalg.norm(dT, axis=-1, keepdims=True) + 1e-8)
-    # Binormal vector (cross product of T and N)
+def compute_frenet_frame(t, p, dp, ddp):
+    dp = np.asarray(dp, dtype=float)
+    ddp = np.asarray(ddp, dtype=float)
+
+    # Tangent: normalize dp
+    dp_norm = np.linalg.norm(dp, axis=1, keepdims=True)
+    T = dp / dp_norm
+
+    dp_dot_ddp = np.sum(dp * ddp, axis=1, keepdims=True)
+    numerator = ddp * (dp_norm**2) - dp * dp_dot_ddp
+    denom = dp_norm**3
+    dT_ds = numerator / denom
+
+    dT_norm = np.linalg.norm(dT_ds, axis=1, keepdims=True)
+    N = np.zeros_like(dT_ds)
+    mask = dT_norm[:, 0] > 1e-14
+    N[mask] = dT_ds[mask] / dT_norm[mask]
+
+    # Binormal: cross product
     B = np.cross(T, N)
-    B = B / (np.linalg.norm(B, axis=-1, keepdims=True) + 1e-8)
+
     return T, N, B
+
 
 def compute_orthonormal_frame(T):
     # Normalize T
@@ -180,7 +194,7 @@ def plot_circles_in_blender(all_circles):
         mesh.from_pydata(verts, edges, [])
         mesh.update()
 
-def build_mesh(points, U, V, radius=0.115, segments=16):
+def build_mesh(points, U, V, radius, segments=16):
     verts = []
     faces = []
 
@@ -188,7 +202,7 @@ def build_mesh(points, U, V, radius=0.115, segments=16):
     for i in range(len(points)):
         for j in range(segments):
             angle = 2 * np.pi * j / segments
-            offset = np.cos(angle) * U[i] * radius + np.sin(angle) * V[i] * radius
+            offset = (np.cos(angle) * U[i]  + np.sin(angle) * V[i]) * radius  # * (1 + 0.5 * np.sin(2 * angle))
             verts.append(points[i] + offset)
 
     # Connect vertices between circles
@@ -201,7 +215,7 @@ def build_mesh(points, U, V, radius=0.115, segments=16):
             faces.append([v0, v1, v2, v3])
             
     # Create mesh in Blender
-    edges = [(i - 1, i) for i in range(1, len(points))]
+    edges = [] # [(i - 1,   i) for i in range(1, len(points))]
     mesh_data = bpy.data.meshes.new("knittingMesh")
     mesh_data.from_pydata(verts, edges, faces)
     mesh_data.update()
@@ -242,18 +256,16 @@ def convert_bitmap_to_scales_factors(matrix):
 
 def create_curve(loop_res, n_loops, x_scale, tx = 0.0):
     # t_values = 2 * np.pi * np.arange(loop_res * n_loops) / loop_res
-    t_values = np.linspace(0, 2 * np.pi * n_loops, loop_res * n_loops + 1, endpoint=True)
-    num_points = len(t_values)
+    t = np.linspace(0, 2 * np.pi * n_loops, loop_res * n_loops + 1, endpoint=True)
+    n = len(t)
     x_scale = np.repeat(x_scale, loop_res)
     x_scale = np.append(x_scale, 1)  # Add 1 to the end of the vector
-    x, y, z = eval_curve(t_values, x_scale)
-    dx, dy, dz = eval_curve_derivative(t_values, x_scale)
-    ddx, ddy, ddz = eval_curve_derivative(t_values, x_scale)
-    points = [(x[i], y[i] + tx, z[i]) for i in range(num_points)]
-    dpoints = [(dx[i], dy[i], dz[i]) for i in range(num_points)]
-    ddpoints = [(ddx[i], ddy[i], ddz[i]) for i in range(num_points)]
-    
-    return t_values,points, dpoints, ddpoints
+    p = eval_curve(t, x_scale)
+    p[:,1] += tx
+    dp = eval_curve_derivative(t, x_scale)
+    ddp = eval_curve_second_derivative(t, x_scale)
+
+    return t,p, dp, ddp
 
 def add_duplicate_index(obj, value):
     mesh = obj.data
@@ -289,50 +301,36 @@ def join_loop(objects, new_name="MergedLoops"):
     return merged_obj
 
 
-def create_twisted(points, U, V, t_values, radius=0.01, omega=6.0, n_fibers=4, phi0=0.0):
-    """
-    Returns list of fibers: each fiber is (points_list, U_list, V_list)
-    - points: list of 3D positions (same length as points)
-    - U,V: rotated local frames for that fiber
-    t_values: array of parameter t per sample - used for theta = omega * t + phi
-    """
-    # convert U,V to numpy arrays shape (n,3)
-    U = np.asarray(U)
-    V = np.asarray(V)
-    pts_np = np.asarray(points)  # shape (n,3)
-    n = pts_np.shape[0]
+def generate_fibres(p, U, V, n_fibers, scale, angle):
+    # generate n_fibers around the main curve
+    # p: points along the main curve
+    # U, V: orthonormal frame along the curve
+    # n_fibers: number of fibers to generate
+    # scale: vector of scale factors along the curve
+    # angle: twist angle along the curve
+    # returns: list of fiber_points
+    n = p.shape[0]
 
-    # if U/V are shape (3,n) transpose if needed
-    if U.shape[0] == 3 and U.shape[1] == n:
-        U = U.T
-    if V.shape[0] == 3 and V.shape[1] == n:
-        V = V.T
-
-    # normalize 
-    U = U / np.linalg.norm(U, axis=1)[:, None]
-    V = V / np.linalg.norm(V, axis=1)[:, None]
+    # create a template
+    # points on a circle in the UV plane
+    a = 2 * np.pi * np.arange(n_fibers) / n_fibers
+    pattern = np.stack((np.cos(a), np.sin(a)), axis=1)
 
     fibers = []
-    dphi = 2.0 * np.pi / float(n_fibers)
-    for k in range(n_fibers):
-        phi = phi0 + k * dphi
-        fiber_pts = []
-        fiber_U = []
-        fiber_V = []
-        for i in range(n):
-            t = t_values[i]
-            theta = omega * t + phi  # use real param t
-            cu = np.cos(theta)
-            su = np.sin(theta)
-            u = U[i]
-            v = V[i]
-            offset = radius[i] * (cu * u + su * v)
-            p = pts_np[i] + offset
-
-            fiber_pts.append((float(p[0]), float(p[1]), float(p[2])))
-            fiber_U.append(u)
-            fiber_V.append(v)
-        fibers.append((fiber_pts, fiber_U, fiber_V))
+    for i in range(n_fibers):
+        fiber_points = []
+        for j in range(n):
+            r = scale[j]
+            a = angle[j]
+            cp = r * pattern[i,:]
+            cp_rotated = (cp[0] * math.cos(a) - cp[1] * math.sin(a),
+                          cp[0] * math.sin(a) + cp[1] * math.cos(a))
+            offset = cp_rotated[0] * U[j] + cp_rotated[1] * V[j]
+            fiber_point = p[j] + offset
+            fiber_points.append(fiber_point)
+        fiber_points = np.array(fiber_points)
+        fibers.append(fiber_points)
+    
     return fibers
 
 def knitting_loop_main(map):
@@ -355,47 +353,27 @@ def knitting_loop_main(map):
     created_objects = []
     for i in range(len(scale_factor)):
         scale = scale_factor[i]
-        t_values, points, dpoints, ddpoints = create_curve(loop_res, n_loops, scale, i * dy)
-        
-        # Convert points to np.array for calculation
-        T, U, V = compute_frenet_frame(points, dpoints, ddpoints)
+        t, p, dp, ddp = create_curve(loop_res, n_loops, scale, i * dy)
+        T, U, V = compute_frenet_frame(t, p, dp, ddp)
+        # T, U, V = compute_orthonormal_frame(dpoints)
+        # obj_fiber = build_mesh(p, U, V, radius=0.05)
+        # created_objects.append(obj_fiber)
 
-        # Ensure U and V are shape (n,3) numpy arrays
-        U = np.asarray(U)
-        V = np.asarray(V)
-        if U.shape[0] == 3 and U.shape[1] == len(points):
-            U = U.T
-        if V.shape[0] == 3 and V.shape[1] == len(points):
-            V = V.T
+        yarn_radius = 0.08 + 0.05*np.sin(np.linspace(0, 8 * np.pi * n_loops, num_points + 1, endpoint=True))
+        angle = np.linspace(0, 1 * np.pi * n_loops, num_points + 1, endpoint=True)  # twist angle along the yarn
+        fiber_radius = 0.01
+        n_fibers = 32
 
-        # --- Main core yarn: build a core mesh (optional) ---
-        core_radius = 0.1  # try larger core if you want a thicker yarn
-        # obj_core = frame_functions.build_mesh(points, U, V, radius=core_radius)
-        # created_objects.append(obj_core)
-        # add_duplicate_index(obj_core, i)
-
-        # --- Twisted fibers around core ---
-        fiber_radius = 0.0  # much smaller than core
-        n_fibers = 1
-        omega = 6.0  # try 4..8
-
-        pts_np = np.asarray(points)  # shape (n,3)
-        n = pts_np.shape[0]
-        # Make radius a sine function along the fiber
-        t = np.linspace(0, 0, n)
-        base_radius = core_radius
-        radius = base_radius + t
-        print(f"Fiber radius range: {radius.min()} to {radius.max()}")
-        fibers = create_twisted(points, U, V, t_values, radius=radius, omega=omega, n_fibers=n_fibers)
-        for f_points, f_U, f_V in fibers:
+        fibers = generate_fibres(p, U, V, n_fibers=n_fibers, scale=yarn_radius, angle=angle)
+        for p in fibers:
             # build mesh for each fiber with smaller tube radius
-            obj_fiber = build_mesh(f_points, f_U, f_V, radius=fiber_radius)
+            obj_fiber = build_mesh(p, U, V, radius=fiber_radius)
             created_objects.append(obj_fiber)
             add_duplicate_index(obj_fiber, i)
 
 
 
-    #join_objects(created_objects)
+    join_objects(created_objects)
 
     ### smooth object
     bpy.ops.object.shade_smooth()
@@ -443,6 +421,7 @@ def main():
 
 Gui = False
 if Gui:
+    from PyQt6.QtWidgets import QApplication
     main()
 else:
     # Run with default bitmap and colors, no GUI
@@ -463,7 +442,7 @@ else:
     bitmap = bitmap[::-1]
     colors = colors[::-1]
     knitting_loop_main(bitmap)
-    #obj_to_mesh.add_geo()
-    #coloring.set_colors(colors, "input_")
+    # obj_to_mesh.add_geo()
+    # coloring.set_colors(colors, "input_")
     
     
