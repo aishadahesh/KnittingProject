@@ -12,6 +12,7 @@ import rendering
 import bmesh
 import math
 import mathutils
+import random
 
 #%% frame functions
 
@@ -333,7 +334,7 @@ def join_loop(objects, new_name="MergedLoops"):
     return merged_obj
 
 
-def generate_fibres(p, U, V, n_fibers, scale, angle):
+def generate_fibres(p, U, V, n_fibers, scale, angle, n_random = 0):
     # generate n_fibers around the main curve
     # p: points along the main curve
     # U, V: orthonormal frame along the curve
@@ -359,6 +360,28 @@ def generate_fibres(p, U, V, n_fibers, scale, angle):
                           cp[0] * math.sin(a) + cp[1] * math.cos(a))
             offset = cp_rotated[0] * U[j] + cp_rotated[1] * V[j]
             fiber_point = p[j] + offset
+            fiber_points.append(fiber_point)
+        fiber_points = np.array(fiber_points)
+        fibers.append(fiber_points)
+    
+    # add some random fibers
+    for _ in range(n_random):
+        fiber_points = []
+        offset_strength = 0.08 * random.uniform(0.8, 1.2) 
+        offset_angle = random.uniform(0, 2 * np.pi)
+        twist_phase = random.uniform(0, 2 * np.pi)
+        twist_strength = 0.04 * random.uniform(0.8, 1.2)
+        for j in range(n):
+            r = scale[j]
+            a = angle[j]
+            cp = r * pattern[0,:]  
+            cp_rotated = (cp[0] * math.cos(a) - cp[1] * math.sin(a),
+                          cp[0] * math.sin(a) + cp[1] * math.cos(a))
+            offset = cp_rotated[0] * U[j] + cp_rotated[1] * V[j]
+            smooth_offset = offset_strength * (math.cos(offset_angle) * U[j] + math.sin(offset_angle) * V[j])
+            twist = twist_strength * math.sin(j / n * 2 * np.pi + twist_phase)
+            twist_offset = twist * U[j]
+            fiber_point = p[j] + offset + smooth_offset + twist_offset
             fiber_points.append(fiber_point)
         fiber_points = np.array(fiber_points)
         fibers.append(fiber_points)
@@ -390,10 +413,10 @@ def knitting_loop_main(map):
 
         yarn_radius = 0.08 + 0.05*np.sin(np.linspace(0, 8 * np.pi * n_loops, num_points + 1, endpoint=True))
         angle = np.linspace(0, 1 * np.pi * n_loops, num_points + 1, endpoint=True)  # twist angle along the yarn
-        fiber_radius = 0.01
-        n_fibers = 32
+        fiber_radius = 0.02
+        n_fibers = 16
 
-        fibers = generate_fibres(p, U, V, n_fibers=n_fibers, scale=yarn_radius, angle=angle)
+        fibers = generate_fibres(p, U, V, n_fibers=n_fibers, scale=yarn_radius, angle=angle, n_random=3)
         for p in fibers:
             # build mesh for each fiber with smaller tube radius
             obj_fiber = build_mesh(p, U, V, radius=fiber_radius)
@@ -407,8 +430,8 @@ def knitting_loop_main(map):
     scale_uv_map(merged_obj, u_scale=1.0, v_scale=34.0)
     cloth_mod = merged_obj.modifiers.new(name="Cloth", type='CLOTH')
     cloth_mod.point_cache.frame_end = 100
-    solidify_mod = merged_obj.modifiers.new(name="Solidify", type='SOLIDIFY')
-    solidify_mod.thickness = 0.05
+    # solidify_mod = merged_obj.modifiers.new(name="Solidify", type='SOLIDIFY')
+    # solidify_mod.thickness = 0.02
 
     ### smooth object
     bpy.ops.object.shade_smooth()
