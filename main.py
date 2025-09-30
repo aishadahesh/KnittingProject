@@ -2,22 +2,18 @@
 import bpy
 import numpy as np
 import sys
-sys.path.append(r"C:\projects\KnittingProject")     
-# import pick_colors_gui
-# import render_images_gui
+# sys.path.append(r"C:\projects\KnittingProject")     # Roi
+sys.path.append(r"C:\Users\Aisha\KnittingProject")   # Aisha    
+import pick_colors_gui
+import render_images_gui
 import obj_to_mesh
-# import coloring
+import coloring
 import rendering
-# import knitting_loop
-
+import bmesh
+import math
+import mathutils
 
 #%% frame functions
-import math
-import bpy
-import numpy as np
-import mathutils
-import bpy
-
 
 def eval_curve(t, scale, ax=0.25, az=-0.2):
     t = np.asarray(t, dtype=float)
@@ -194,6 +190,47 @@ def plot_circles_in_blender(all_circles):
         mesh.from_pydata(verts, edges, [])
         mesh.update()
 
+def apply_uv_mapping(obj, segments, n_points):
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+
+    uv_layer = bm.loops.layers.uv.new("UVMap")
+
+    for face in bm.faces:
+        for loop in face.loops:
+            v_idx = loop.vert.index
+            ring = v_idx % segments      # position around circumference
+            row = v_idx // segments      # position along length
+
+            u = ring / segments
+            v = row / (n_points - 1)
+            loop[uv_layer].uv = (u, v)
+
+    bm.to_mesh(me)
+    bm.free()
+
+def scale_uv_map(obj, u_scale=1.0, v_scale=1.0):
+    """Scales the UV map of the given object by u_scale and v_scale."""
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        print("No UV map found!")
+        bm.free()
+        return
+
+    for face in bm.faces:
+        for loop in face.loops:
+            u, v = loop[uv_layer].uv
+            loop[uv_layer].uv = (u * u_scale, v * v_scale)
+
+    bm.to_mesh(me)
+    bm.free()
+
+
 def build_mesh(points, U, V, radius, segments=16):
     verts = []
     faces = []
@@ -225,12 +262,7 @@ def build_mesh(points, U, V, radius, segments=16):
     return obj
 
 
-
 #%% knitting loop functions
-import bpy
-import numpy as np
-# import frame_functions
-import mathutils
 
 def count_consecutive_zeros_after(A):
     A = np.asarray(A)
@@ -355,9 +387,6 @@ def knitting_loop_main(map):
         scale = scale_factor[i]
         t, p, dp, ddp = create_curve(loop_res, n_loops, scale, i * dy)
         T, U, V = compute_frenet_frame(t, p, dp, ddp)
-        # T, U, V = compute_orthonormal_frame(dpoints)
-        # obj_fiber = build_mesh(p, U, V, radius=0.05)
-        # created_objects.append(obj_fiber)
 
         yarn_radius = 0.08 + 0.05*np.sin(np.linspace(0, 8 * np.pi * n_loops, num_points + 1, endpoint=True))
         angle = np.linspace(0, 1 * np.pi * n_loops, num_points + 1, endpoint=True)  # twist angle along the yarn
@@ -368,12 +397,18 @@ def knitting_loop_main(map):
         for p in fibers:
             # build mesh for each fiber with smaller tube radius
             obj_fiber = build_mesh(p, U, V, radius=fiber_radius)
+            apply_uv_mapping(obj_fiber, segments=16, n_points=len(p))
             created_objects.append(obj_fiber)
             add_duplicate_index(obj_fiber, i)
 
 
 
-    join_objects(created_objects)
+    merged_obj = join_objects(created_objects)
+    scale_uv_map(merged_obj, u_scale=1.0, v_scale=34.0)
+    cloth_mod = merged_obj.modifiers.new(name="Cloth", type='CLOTH')
+    cloth_mod.point_cache.frame_end = 100
+    solidify_mod = merged_obj.modifiers.new(name="Solidify", type='SOLIDIFY')
+    solidify_mod.thickness = 0.05
 
     ### smooth object
     bpy.ops.object.shade_smooth()
@@ -398,8 +433,8 @@ def main():
         colors = colors[::-1]
 
         knitting_loop_main(bitmap)
-        #obj_to_mesh.add_geo()
-        #coloring.set_colors(colors, "input_")
+        # obj_to_mesh.add_geo()
+        # coloring.set_colors(colors, "input_")
 
         obj = bpy.context.active_object
         if obj:
@@ -442,7 +477,7 @@ else:
     bitmap = bitmap[::-1]
     colors = colors[::-1]
     knitting_loop_main(bitmap)
-    # obj_to_mesh.add_geo()
-    # coloring.set_colors(colors, "input_")
+    obj_to_mesh.add_geo()
+    coloring.set_colors(colors, "input_")
     
     
