@@ -16,32 +16,50 @@ import random
 
 #%% frame functions
 
-def eval_curve(t, scale, ax=0.25, az=-0.2):
+def eval_curve(t, scale, stitch_count=8, stitch_bulge=0.30, stitch_height=1.2, stitch_z=-0.4, yarn_radius=0.25):
     t = np.asarray(t, dtype=float)
     scale = np.asarray(scale, dtype=float)
-    x = ax * np.sin(2*t) + t/(2*np.pi)
-    y = -(np.cos(t) - 1)/2
-    z = az * (np.cos(2*t) - 1)/2
+    
+    # Base curve - create proper knitting loop progression
+    x = stitch_bulge * np.sin(2*t) + t/(2*np.pi)  # Horizontal stitch pattern
+    y = -(np.cos(t) - 1)/2  # Creates the loop shape (U-shaped)
+    z = stitch_z * (np.cos(2*t) - 1)/2  # Depth variation for stitch structure
+    
+    # Apply scale - only where scale is not zero (for dropped stitches)
     x = np.where(scale == 0, t/(2*np.pi), x)
-    return np.column_stack((x, y*scale, z*scale))
+    y = y * scale
+    z = z * scale
+    
+    return np.column_stack((x, y, z))
 
-def eval_curve_derivative(t, scale, ax=0.25, az=-0.2):
+def eval_curve_derivative(t, scale, stitch_count=8, stitch_bulge=0.30, stitch_height=1.2, stitch_z=-0.4, yarn_radius=0.25):
     t = np.asarray(t, dtype=float)
     scale = np.asarray(scale, dtype=float)
-    dx = 2*ax*np.cos(2*t) + 1/(2*np.pi)
+    
+    # Derivatives of the base curve
+    dx = 2*stitch_bulge*np.cos(2*t) + 1/(2*np.pi)
     dy = 0.5*np.sin(t)*scale
-    dz = -az*np.sin(2*t)*scale
+    dz = -stitch_z*np.sin(2*t)*scale
+    
+    # Handle dropped stitches (scale == 0)
     dx = np.where(scale == 0, 1/(2*np.pi), dx)
+    
     return np.column_stack((dx, dy, dz))
 
-def eval_curve_second_derivative(t, scale, ax=0.25, az=-0.2):
+def eval_curve_second_derivative(t, scale, stitch_count=8, stitch_bulge=0.30, stitch_height=1.2, stitch_z=-0.4, yarn_radius=0.25):
     t = np.asarray(t, dtype=float)
     scale = np.asarray(scale, dtype=float)
-    d2x = -4*ax*np.sin(2*t)
+    
+    # Second derivatives of the base curve
+    d2x = -4*stitch_bulge*np.sin(2*t)
     d2y = 0.5*np.cos(t)*scale
-    d2z = -2*az*np.cos(2*t)*scale
+    d2z = -2*stitch_z*np.cos(2*t)*scale
+    
+    # Handle dropped stitches (scale == 0)
     d2x = np.where(scale == 0, 0.0, d2x)
+    
     return np.column_stack((d2x, d2y, d2z))
+
 
 
 def compute_frenet_frame(t, p, dp, ddp):
@@ -238,9 +256,11 @@ def build_mesh(points, U, V, radius, segments=16):
 
     # Generate vertices for each circle
     for i in range(len(points)):
+        # Support both constant radius and variable radius
+        current_radius = radius[i] if isinstance(radius, (list, np.ndarray)) else radius
         for j in range(segments):
             angle = 2 * np.pi * j / segments
-            offset = (np.cos(angle) * U[i]  + np.sin(angle) * V[i]) * radius  # * (1 + 0.5 * np.sin(2 * angle))
+            offset = (np.cos(angle) * U[i]  + np.sin(angle) * V[i]) * current_radius  # * (1 + 0.5 * np.sin(2 * angle))
             verts.append(points[i] + offset)
 
     # Connect vertices between circles
@@ -260,6 +280,63 @@ def build_mesh(points, U, V, radius, segments=16):
 
     obj = bpy.data.objects.new("knittingObject", mesh_data)
     bpy.context.collection.objects.link(obj)
+    return obj
+
+
+def build_mesh_edges_only(points, U, V, radius, segments=16):
+
+    created_objects = []
+    num_points = len(points)
+    
+    # Group vertices by their position in the cross-section (which "strand" they belong to)
+    for strand_idx in range(segments):
+        verts = []
+        edges = []
+        
+        # Collect all vertices for this strand along the entire curve
+        for i in range(num_points):
+            current_radius = radius[i] if isinstance(radius, (list, np.ndarray)) else radius
+            angle = 2 * np.pi * strand_idx / segments
+            offset = (np.cos(angle) * U[i] + np.sin(angle) * V[i]) * current_radius
+            verts.append(points[i] + offset)
+        
+        # Create edges connecting consecutive points along this strand
+        for i in range(len(verts) - 1):
+            edges.append([i, i + 1])
+        
+        # Create mesh for this strand
+        faces = []  # No faces, just edges
+        mesh_data = bpy.data.meshes.new(f"Loop_Strand_{strand_idx}")
+        mesh_data.from_pydata(verts, edges, faces)
+        mesh_data.update()
+        
+        obj = bpy.data.objects.new(f"Loop_Strand_{strand_idx}", mesh_data)
+        bpy.context.collection.objects.link(obj)
+        created_objects.append(obj)
+    
+    return created_objects
+
+
+def convert_edges_to_mesh_with_profile(obj, profile_radius=0.01, profile_segments=8):
+
+    # Make the object active
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    
+    # Convert to curve first
+    bpy.ops.object.convert(target='CURVE')
+    
+    # Set curve properties for circular bevel
+    curve_data = obj.data
+    curve_data.bevel_depth = profile_radius
+    curve_data.bevel_resolution = profile_segments
+    curve_data.use_fill_caps = True
+    
+    # Convert back to mesh to finalize
+    bpy.ops.object.convert(target='MESH')
+    
+    obj.select_set(False)
+    
     return obj
 
 
@@ -288,17 +365,27 @@ def convert_bitmap_to_scales_factors(matrix):
     return np.apply_along_axis(count_consecutive_zeros_after, axis=0, arr=matrix)
 
 def create_curve(loop_res, n_loops, x_scale, tx = 0.0):
-    # t_values = 2 * np.pi * np.arange(loop_res * n_loops) / loop_res
+    stitch_count = 5 
+    stitch_bulge = 0.26   
+    stitch_height = 1.2  
+    stitch_z = -0.48      
+    yarn_radius = 0.19
+    
     t = np.linspace(0, 2 * np.pi * n_loops, loop_res * n_loops + 1, endpoint=True)
     n = len(t)
     x_scale = np.repeat(x_scale, loop_res)
     x_scale = np.append(x_scale, 1)  # Add 1 to the end of the vector
-    p = eval_curve(t, x_scale)
+    
+    p = eval_curve(t, x_scale, stitch_count=stitch_count, stitch_bulge=stitch_bulge, 
+                   stitch_height=stitch_height, stitch_z=stitch_z, yarn_radius=yarn_radius)
     p[:,1] += tx
-    dp = eval_curve_derivative(t, x_scale)
-    ddp = eval_curve_second_derivative(t, x_scale)
+    
+    dp = eval_curve_derivative(t, x_scale, stitch_count=stitch_count, stitch_bulge=stitch_bulge,
+                              stitch_height=stitch_height, stitch_z=stitch_z, yarn_radius=yarn_radius)
+    ddp = eval_curve_second_derivative(t, x_scale, stitch_count=stitch_count, stitch_bulge=stitch_bulge,
+                                      stitch_height=stitch_height, stitch_z=stitch_z, yarn_radius=yarn_radius)
 
-    return t,p, dp, ddp
+    return t, p, dp, ddp
 
 def add_duplicate_index(obj, value):
     mesh = obj.data
@@ -388,8 +475,80 @@ def generate_fibres(p, U, V, n_fibers, scale, angle, n_random = 0):
     
     return fibers
 
+def generate_knitting_radius(base_radius, num_points, loop_res, row_index, scale, n_loops):
+
+    variable_radius = []
+    
+    # Create realistic knitting parameters
+    interlocking_factor = 0.8  # How much loops interlock with adjacent rows
+    randomness = 0.15  # Natural yarn variation
+    
+    for j in range(num_points):
+        # Current loop and position within loop
+        loop_index = j // loop_res
+        loop_position = (j % loop_res) / loop_res
+         
+        # Base yarn thickness varies naturally
+        base_variation = 1.0 + randomness * np.sin(j * 0.37 + row_index * 2.1) * np.cos(j * 0.19)
+        
+        # Compression effects from neighboring loops
+        # Loops compress each other where they touch
+        neighbor_compression = 1.0
+        
+        # Horizontal compression from adjacent loops in same row
+        if loop_index > 0 and loop_index < n_loops - 1:
+            # More compression in middle of row
+            side_compression = 0.85 + 0.15 * np.abs(np.sin(loop_position * np.pi))
+            neighbor_compression *= side_compression
+        
+        # Vertical compression from rows above/below
+        if row_index > 0:
+            # Alternate rows nest into each other - offset pattern
+            if row_index % 2 == 0:
+                vertical_offset = loop_position + 0.5
+            else:
+                vertical_offset = loop_position
+            
+            # Create interlocking compression pattern
+            interlock_pattern = 1.0 - 0.3 * np.exp(-8 * (vertical_offset % 1 - 0.5)**2)
+            neighbor_compression *= interlocking_factor * interlock_pattern + (1 - interlocking_factor)
+        
+        # Loop shape affects compression - more squeezed at "waist"
+        loop_shape_factor = 1.0
+        if 0.2 < loop_position < 0.8:
+            # Main body of loop - varies with position
+            if 0.35 < loop_position < 0.65:
+                # Crown of loop - less compressed
+                loop_shape_factor = 1.2
+            else:
+                # Sides of loop - more compressed  
+                loop_shape_factor = 0.9
+        else:
+            # Connection areas - heavily compressed
+            connection_intensity = min(loop_position / 0.2, (1.0 - loop_position) / 0.2)
+            loop_shape_factor = 0.6 + 0.3 * connection_intensity
+        
+        # Dropped stitch effects
+        stitch_index = min(loop_index, len(scale) - 1) if len(scale) > 0 else 0
+        stitch_scale = scale[stitch_index] if len(scale) > 0 else 1.0
+        drop_factor = 0.4 + 0.6 * stitch_scale  # Thinner for dropped stitches
+        
+        # Combine all factors
+        radius_multiplier = base_variation * neighbor_compression * loop_shape_factor * drop_factor
+            
+        # Apply the radius
+        current_radius = base_radius * radius_multiplier
+        
+        # Ensure minimum thickness for mesh stability
+        current_radius = max(current_radius, base_radius * 0.3)
+        current_radius = min(current_radius, base_radius * 1.8)  # Cap maximum thickness
+        
+        variable_radius.append(current_radius)
+    
+    return variable_radius
+
 def knitting_loop_main(map):
-    dy = 0.55
+    dy = 0.35  # Reduced spacing between rows for better interlocking
 
     scale_factor = convert_bitmap_to_scales_factors(map)
     scale_factor = np.where((scale_factor <= 1), scale_factor, 1 + dy * (scale_factor - 1))
@@ -398,7 +557,7 @@ def knitting_loop_main(map):
     print(f"Number of loops: {n_loops}")
     n_rows = map.shape[0]
     print(f"Number of rows: {n_rows}")
-    loop_res = 128    # loop resolution
+    loop_res = 128    # Reduced resolution for cleaner geometry
     num_points = loop_res * n_loops
 
     del_obj = bpy.context.active_object
@@ -409,27 +568,51 @@ def knitting_loop_main(map):
     for i in range(len(scale_factor)):
         scale = scale_factor[i]
         t, p, dp, ddp = create_curve(loop_res, n_loops, scale, i * dy)
-        T, U, V = compute_frenet_frame(t, p, dp, ddp)
+        T = dp / (np.linalg.norm(dp, axis=1, keepdims=True) + 1e-8)
+        T, U, V = compute_orthonormal_frame(T)
 
-        yarn_radius = 0.08 + 0.05*np.sin(np.linspace(0, 8 * np.pi * n_loops, num_points + 1, endpoint=True))
-        angle = np.linspace(0, 1 * np.pi * n_loops, num_points + 1, endpoint=True)  # twist angle along the yarn
-        fiber_radius = 0.02
-        n_fibers = 16
+        # Create variable yarn radius along the curve
+        base_radius = 0.15  # Base yarn thickness for realistic knitting
+        variable_radius = generate_knitting_radius(
+            base_radius=base_radius,
+            num_points=len(p),
+            loop_res=loop_res,
+            row_index=i,
+            scale=scale,
+            n_loops=n_loops
+        )
+        
+        # Create yarn mesh with variable radius and higher resolution for detail
+        # obj_yarn = build_mesh(p, U, V, radius=variable_radius, segments=12)
+        loop_objects = build_mesh_edges_only(p, U, V, radius=variable_radius, segments=35)
+        
+        # Convert each loop strand to mesh with circular profile
+        for obj_yarn in loop_objects:
+            # Convert edges to mesh with circular profile
+            convert_edges_to_mesh_with_profile(obj_yarn, profile_radius=0.01, profile_segments=8)
+            
+            apply_uv_mapping(obj_yarn, segments=12, n_points=len(p))
+            add_duplicate_index(obj_yarn, i)
+            created_objects.append(obj_yarn)
 
-        fibers = generate_fibres(p, U, V, n_fibers=n_fibers, scale=yarn_radius, angle=angle, n_random=3)
-        for p in fibers:
-            # build mesh for each fiber with smaller tube radius
-            obj_fiber = build_mesh(p, U, V, radius=fiber_radius)
-            apply_uv_mapping(obj_fiber, segments=16, n_points=len(p))
-            created_objects.append(obj_fiber)
-            add_duplicate_index(obj_fiber, i)
+    # # Join all rows into a single mesh
+    # if created_objects:
+    #     merged_obj = join_objects(created_objects)
+    #     scale_uv_map(merged_obj, u_scale=1.0, v_scale=1.0)
+        
+    #     # Add smoothing
+    #     bpy.context.view_layer.objects.active = merged_obj
+    #     bpy.ops.object.shade_smooth()
+        
+    #     # Add subdivision surface for smoother knitting appearance
+    #     subsurf_mod = merged_obj.modifiers.new(name="SubSurf", type='SUBSURF')
+    #     subsurf_mod.levels = 2
 
 
-
-    merged_obj = join_objects(created_objects)
-    scale_uv_map(merged_obj, u_scale=1.0, v_scale=34.0)
-    cloth_mod = merged_obj.modifiers.new(name="Cloth", type='CLOTH')
-    cloth_mod.point_cache.frame_end = 100
+    # merged_obj = join_objects(created_objects)
+    # scale_uv_map(merged_obj, u_scale=1.0, v_scale=34.0)
+    # cloth_mod = merged_obj.modifiers.new(name="Cloth", type='CLOTH')
+    # cloth_mod.point_cache.frame_end = 100
     # solidify_mod = merged_obj.modifiers.new(name="Solidify", type='SOLIDIFY')
     # solidify_mod.thickness = 0.02
 
@@ -456,8 +639,8 @@ def main():
         colors = colors[::-1]
 
         knitting_loop_main(bitmap)
-        # obj_to_mesh.add_geo()
-        # coloring.set_colors(colors, "input_")
+        obj_to_mesh.add_geo()
+        coloring.set_colors(colors, "input_")
 
         obj = bpy.context.active_object
         if obj:
@@ -484,23 +667,40 @@ if Gui:
 else:
     # Run with default bitmap and colors, no GUI
     print("Running in non-GUI mode with default bitmap and colors.")
+    # bitmap = [
+    #     [1, 1, 1, 1, 1],
+    #     [1, 1, 0, 1, 1],
+    #     [1, 0, 0, 0, 1],
+    #     [1, 0, 0, 0, 1],
+    #     [1, 1, 1, 1, 1],
+    # ]
     bitmap = [
-        [1, 1, 1, 1],
-        [1, 1, 1, 1],
-        [1, 1, 1, 1],
-        [1, 1, 1, 1],
+        [1, 1, 1, 1, 1,1,1,1,1,1,1,1,1,1,1,1,1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
+        # [1, 1, 1, 1, 1],
     ]
     bitmap = np.array(bitmap)
+    # colors = [
+    #     (1,0,0,1),
+    #     (0,1,0,1),
+    #     (0,0,1,1),
+    #     (1,1,0,1),
+    #     (1,0,1,1),
+    # ]
     colors = [
         (1,0,0,1),
         (0,1,0,1),
         (0,0,1,1),
-        (1,1,0,1),
     ]
     bitmap = bitmap[::-1]
     colors = colors[::-1]
-    knitting_loop_main(bitmap)
-    obj_to_mesh.add_geo()
-    coloring.set_colors(colors, "input_")
-    
+    knitting_loop_main(bitmap)  # Using knitted variation for realistic fabric
+    # obj_to_mesh.add_geo()
+    # coloring.set_colors(colors, "input_")
     
