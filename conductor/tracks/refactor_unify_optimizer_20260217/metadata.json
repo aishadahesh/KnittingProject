@@ -1,0 +1,8 @@
+{
+  "track_id": "refactor_unify_optimizer_20260217",
+  "type": "refactor",
+  "status": "new",
+  "created_at": "2026-02-17T12:00:00Z",
+  "updated_at": "2026-02-17T12:00:00Z",
+  "description": "Consolidate UI editors into a unified app, centralize hardcoded constants into config.json, and reorganize optimize_knitting.py for a logical, flat, and unified execution flow."
+}
