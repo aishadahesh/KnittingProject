@@ -28,71 +28,6 @@ if not mi.variant():
 
 # %% JAX GEOMETRY LOGIC
 
-# def eval_curve(
-#     t,
-#     scale,
-#     stitch_bulge=0.30,
-#     stitch_z=-0.4,
-#     loop_height=1.5,
-#     curve_skew=0.0,
-#     y_sharp=0.0,
-#     x_bias=0.0,
-#     z_bias=0.0,
-# ):
-#     t, scale = jnp.asarray(t), jnp.asarray(scale)
-#     # Nonlinear phase warp adds flexibility to match stitch structure
-#     t_warp = t + curve_skew * jnp.sin(t)
-#     x = stitch_bulge * jnp.sin(2 * t_warp) + t / (2 * jnp.pi)
-#     y_base = (-(jnp.cos(t_warp) - 1) / 2)
-#     y_sharp_term = (-(jnp.cos(2 * t_warp) - 1) / 2)
-#     y = loop_height * (y_base + y_sharp * y_sharp_term)
-#     z = stitch_z * (jnp.cos(2 * t_warp) - 1) / 2
-
-#     x = x + x_bias * jnp.sin(t_warp)
-#     z = z + z_bias * jnp.sin(t_warp)
-    
-#     x = jnp.where(scale == 0, t/(2*jnp.pi), x)
-#     return jnp.column_stack((x, y * scale, z * scale))
-
-# def eval_curve_derivative(
-#     t,
-#     scale,
-#     stitch_bulge=0.30,
-#     stitch_z=-0.4,
-#     loop_height=1.5,
-#     curve_skew=0.0,
-#     y_sharp=0.0,
-#     x_bias=0.0,
-#     z_bias=0.0,
-# ):
-#     t, scale = jnp.asarray(t), jnp.asarray(scale)
-#     t_warp = t + curve_skew * jnp.sin(t)
-#     warp_dt = 1.0 + curve_skew * jnp.cos(t)
-#     dx = 2 * stitch_bulge * jnp.cos(2 * t_warp) * warp_dt + 1 / (2 * jnp.pi)
-#     dx = dx + x_bias * jnp.cos(t_warp) * warp_dt
-#     dy_base = 0.5 * jnp.sin(t_warp) * warp_dt
-#     dy_sharp = y_sharp * jnp.sin(2 * t_warp) * warp_dt
-#     dy = (dy_base + dy_sharp) * scale * loop_height
-#     dz = -stitch_z * jnp.sin(2 * t_warp) * warp_dt * scale
-#     dz = dz + z_bias * jnp.cos(t_warp) * warp_dt * scale
-#     dx = jnp.where(scale == 0, 1/(2*jnp.pi), dx)
-#     return jnp.column_stack((dx, dy, dz))
-
-# def compute_orthonormal_frame(T):
-#     T = T / (jnp.linalg.norm(T, axis=1, keepdims=True) + 1e-8)
-#     ref = jnp.array([0.0, 0.0, 1.0])
-#     U = jnp.cross(T, ref)
-#     U_norm = jnp.linalg.norm(U, axis=1, keepdims=True)
-    
-#     # Handle parallel cases (Gimbal Lock avoidance)
-#     ref_alt = jnp.array([1.0, 0.0, 0.0])
-#     U_alt = jnp.cross(T, ref_alt)
-#     U = jnp.where(U_norm < 1e-6, U_alt, U)
-    
-#     U = U / (jnp.linalg.norm(U, axis=1, keepdims=True) + 1e-8)
-#     V = jnp.cross(T, U)
-#     return T, U, V
-
 def eval_curve(t, scale, stitch_bulge=0.30, stitch_z=-0.4):
     t, scale = jnp.asarray(t), jnp.asarray(scale)
     x = stitch_bulge * jnp.sin(2*t) + t/(2*jnp.pi)
@@ -246,11 +181,14 @@ def visualize_parameter_effects(params, bitmap, param_names, output_path):
         
         # Create three variants: -20%, current, +20%
         delta = 0.2 * params[i]
-        test_params = [
-            params.copy().at[i].set(params[i] - delta),
-            params,
-            params.copy().at[i].set(params[i] + delta)
-        ]
+        
+        # Handle both list and JAX array
+        params_low = list(params)
+        params_low[i] = params[i] - delta
+        params_high = list(params)
+        params_high[i] = params[i] + delta
+        
+        test_params = [params_low, list(params), params_high]
         colors = ['blue', 'green', 'red']
         labels = [f'-20%', 'current', '+20%']
         
@@ -422,6 +360,924 @@ def view_obj_file(obj_path, color=(0.5, 0.5, 0.8), title="OBJ Viewer"):
     plt.add(Text2D("Controls: drag=rotate, scroll=zoom, shift+drag=pan", pos='bottom-left', s=0.7))
     plt.show()
     return plt
+
+
+# %% INTERACTIVE SPLINE EDITOR (exactly like spline.py - move points & change radius)
+
+class InteractiveSplineEditor:
+    """
+    Interactive spline editor exactly like spline.py.
+    - Click to select control points
+    - Drag to move points (position mode)
+    - W/S to adjust radius (radius mode)
+    - M to toggle between position/radius modes
+    - R to render with Mitsuba
+    - O to continue optimization
+    - F to finish
+    """
+    
+    YARN_COLORS = ["red", "dodgerblue", "gold", "saddlebrown", "forestgreen", "purple"]
+    
+    def __init__(self, geometry_params, bitmap, optimizer=None, ref_img=None):
+        from vedo import Plotter, Text2D, Sphere, Spline, Tube, Line
+        
+        self.geometry_params = np.array(geometry_params, dtype=np.float64)
+        self.bitmap = bitmap
+        self.optimizer = optimizer
+        self.ref_img = ref_img
+        
+        # Generate control points from geometry params
+        self.all_control_points = []
+        self.all_radii = []
+        self.default_radius = float(geometry_params[4])  # radius param
+        
+        self._generate_control_points()
+        
+        # Editor state
+        self.selected_point_idx = None
+        self.selected_row = None
+        self.point_spheres = []
+        self.spline_actors = []
+        self.mesh_actors = []
+        self.dragging = False
+        self.editing_locked = False
+        self.edit_mode = 'position'  # 'position' or 'radius'
+        
+        # Result action
+        self.action = 'finish'
+        
+        # UI elements
+        self.mode_text = None
+        
+        # Plotter
+        self.plotter = Plotter(
+            bg='blackboard', axes=1,
+            title="Knitting Spline Editor - Click to select, drag to move"
+        )
+        
+        # For double-click detection
+        self.last_click_time = 0.0
+    
+    def _generate_control_points(self):
+        """Generate control points from geometry parameters (like spline.py's generate_knit_row)."""
+        # params: [stitch_bulge, stitch_z, loop_height, dy, radius, ...]
+        stitch_bulge = float(self.geometry_params[0])
+        stitch_z = float(self.geometry_params[1])
+        dy = float(self.geometry_params[3])
+        radius = float(self.geometry_params[4])
+        
+        n_rows, n_cols = int(self.bitmap.shape[0]), int(self.bitmap.shape[1])
+        samples_per_stitch = 5
+        
+        np.random.seed(42)  # Reproducible
+        
+        for row in range(n_rows):
+            pts = []
+            # Alternate direction every row
+            col_range = range(n_cols) if row % 2 == 0 else range(n_cols - 1, -1, -1)
+            
+            for c in col_range:
+                # Parameter t from 0 to 2*pi for each stitch
+                if row % 2 == 0:
+                    t_vals = np.linspace(0, 2*np.pi, samples_per_stitch, endpoint=False)
+                else:
+                    t_vals = np.linspace(2*np.pi, 0, samples_per_stitch, endpoint=False)
+                
+                for t in t_vals:
+                    x = stitch_bulge * np.sin(2*t) + t/(2*np.pi)
+                    y = -(np.cos(t) - 1)/2
+                    z = stitch_z * (np.cos(2*t) - 1)/2
+                    
+                    # Offset by column and row
+                    pts.append([c + x, row * dy + y, z])
+            
+            self.all_control_points.append(np.array(pts))
+            self.all_radii.append(np.full(len(pts), radius))
+    
+    def _build_point_spheres(self):
+        """Create clickable spheres for each control point."""
+        from vedo import Sphere, Plane
+        
+        # Add a large ground plane for picking during drag (invisible but pickable)
+        n_rows = len(self.all_control_points)
+        n_cols = int(self.bitmap.shape[1]) if hasattr(self.bitmap, 'shape') else 5
+        center = [n_cols/2, n_rows * self.geometry_params[3] / 2, 0]
+        self.ground_plane = Plane(pos=center, normal=(0, 0, 1), s=(n_cols * 3, n_rows * 3))
+        self.ground_plane.alpha(0.0).pickable(True)  # Invisible but pickable
+        self.plotter.add(self.ground_plane)
+        
+        for r, row_pts in enumerate(self.all_control_points):
+            for i, pt in enumerate(row_pts):
+                sphere = Sphere(pt, r=0.12).color("white").alpha(0.8)  # Larger spheres for easier clicking
+                sphere.pickable(True)
+                self.point_spheres.append(sphere)
+                self.plotter.add(sphere)
+        
+        print(f"Created {len(self.point_spheres)} control point spheres")
+    
+    def rebuild_visuals(self):
+        """Rebuild splines and meshes from current control points with varying radii."""
+        from vedo import Spline, Tube, Line
+        
+        # Remove old actors
+        for actor in self.spline_actors + self.mesh_actors:
+            self.plotter.remove(actor)
+        self.spline_actors.clear()
+        self.mesh_actors.clear()
+        
+        # Rebuild splines and meshes
+        for r, row_pts in enumerate(self.all_control_points):
+            row_color = self.YARN_COLORS[r % len(self.YARN_COLORS)]
+            row_radii = self.all_radii[r]
+            
+            # Create smooth spline
+            row_spline = Spline(row_pts, res=200)
+            n_spline_pts = len(row_spline.vertices)
+            n_ctrl_pts = len(row_pts)
+            
+            # Interpolate radii to match spline resolution
+            if n_ctrl_pts > 1:
+                radii_interp = np.interp(
+                    np.linspace(0, 1, n_spline_pts),
+                    np.linspace(0, 1, n_ctrl_pts),
+                    row_radii
+                )
+            else:
+                radii_interp = np.full(n_spline_pts, row_radii[0])
+            
+            # Spline line visualization
+            spline_line = Line(row_spline.vertices).color(row_color).linewidth(3)
+            self.spline_actors.append(spline_line)
+            self.plotter.add(spline_line)
+            
+            # Mesh tube with varying radius
+            row_mesh = Tube(row_spline.vertices, r=radii_interp, res=8)
+            row_mesh.color(row_color).alpha(0.6).lighting("plastic")
+            row_mesh.pickable(True)  # Make pickable for dragging
+            self.mesh_actors.append(row_mesh)
+            self.plotter.add(row_mesh)
+        
+        self.plotter.render()
+    
+    def update_point_colors(self):
+        """Update point sphere colors based on selection and mode."""
+        flat_idx = 0
+        for r, row_pts in enumerate(self.all_control_points):
+            for i in range(len(row_pts)):
+                sphere = self.point_spheres[flat_idx]
+                if self.selected_row == r and self.selected_point_idx == i:
+                    sphere.color("lime").alpha(1.0)
+                elif self.edit_mode == 'radius':
+                    sphere.color("orange").alpha(0.9)
+                else:
+                    sphere.color("white").alpha(0.8)
+                flat_idx += 1
+    
+    def update_mode_display(self):
+        """Update the mode indicator text."""
+        from vedo import Text2D
+        
+        if self.mode_text:
+            self.plotter.remove(self.mode_text)
+        
+        if self.edit_mode == 'position':
+            mode_str = "MODE: POSITION | M=switch to RADIUS | R=Render | O=Optimize | F=Finish"
+            color = "cyan"
+        else:
+            mode_str = "MODE: RADIUS (+/- or W/S to change) | M=switch to POSITION | R=Render | O=Optimize | F=Finish"
+            color = "orange"
+        
+        self.mode_text = Text2D(mode_str, pos='bottom-center', c=color, s=0.9, bold=True)
+        self.plotter.add(self.mode_text)
+        self.plotter.render()
+    
+    def on_key_press(self, evt):
+        """Handle keyboard input for moving selected point or changing radius."""
+        key = evt.keypress.lower() if evt.keypress else ""
+        
+        if key:
+            print(f"[KEY] '{key}' pressed, mode={self.edit_mode}, selected=({self.selected_row}, {self.selected_point_idx})")
+        
+        # R to render with Mitsuba
+        if key == 'r':
+            self.render_mitsuba()
+            return
+        
+        # O to continue optimization
+        if key == 'o':
+            self.action = 'optimize'
+            self.plotter.close()
+            return
+        
+        # F to finish
+        if key == 'f':
+            self.action = 'finish'
+            self.plotter.close()
+            return
+        
+        # M to toggle mode
+        if key == 'm':
+            if self.edit_mode == 'position':
+                self.edit_mode = 'radius'
+                print("=== RADIUS MODE === Click a point, then +/- or W/S to change radius")
+            else:
+                self.edit_mode = 'position'
+                print("=== POSITION MODE === Drag points or use WASD to move")
+            self.update_mode_display()
+            self.update_point_colors()
+            return
+        
+        # Other keys require a selected point
+        if self.selected_row is None or self.selected_point_idx is None:
+            return
+        
+        r = self.selected_row
+        i = self.selected_point_idx
+        
+        if self.edit_mode == 'radius':
+            # Radius editing mode
+            radius_delta = 0.02  # Bigger step for more visible changes
+            current_radius = self.all_radii[r][i]
+            
+            changed = False
+            if key in ['w', 'up', 'plus', 'equal', '=', '+']:
+                self.all_radii[r][i] = min(0.5, current_radius + radius_delta)
+                changed = True
+                print(f">>> RADIUS INCREASED at Row {r}, Point {i}: {current_radius:.3f} -> {self.all_radii[r][i]:.3f}")
+            elif key in ['s', 'down', 'minus', '-']:
+                self.all_radii[r][i] = max(0.01, current_radius - radius_delta)
+                changed = True
+                print(f">>> RADIUS DECREASED at Row {r}, Point {i}: {current_radius:.3f} -> {self.all_radii[r][i]:.3f}")
+            
+            if changed:
+                self.rebuild_visuals()
+        else:
+            # Position editing mode
+            delta = 0.05
+            pt = self.all_control_points[r][i].copy()
+            
+            moved = False
+            if key == 'w':
+                pt[1] += delta
+                moved = True
+            elif key == 's':
+                pt[1] -= delta
+                moved = True
+            elif key == 'a':
+                pt[0] -= delta
+                moved = True
+            elif key == 'd':
+                pt[0] += delta
+                moved = True
+            elif key == 'q':
+                pt[2] += delta
+                moved = True
+            elif key == 'e':
+                pt[2] -= delta
+                moved = True
+            
+            if moved:
+                self.all_control_points[r][i] = pt
+                flat_idx = sum(len(self.all_control_points[rr]) for rr in range(r)) + i
+                self.point_spheres[flat_idx].pos(pt)
+                self.rebuild_visuals()
+                print(f"Moved point to ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})")
+    
+    def on_mouse_move(self, evt):
+        """Handle mouse drag for moving selected point (position mode only)."""
+        if self.edit_mode != 'position':
+            return
+        if not self.dragging or self.selected_row is None:
+            return
+        if evt.picked3d is None:
+            return
+        
+        new_pos = np.array(evt.picked3d)
+        r = self.selected_row
+        i = self.selected_point_idx
+        
+        # Keep Z from original point (drag in XY plane)
+        orig_z = self.all_control_points[r][i][2]
+        new_pos[2] = orig_z
+        
+        self.all_control_points[r][i] = new_pos
+        flat_idx = sum(len(self.all_control_points[rr]) for rr in range(r)) + i
+        self.point_spheres[flat_idx].pos(new_pos)
+        self.rebuild_visuals()
+    
+    def on_left_button_release(self, evt):
+        """Stop dragging on mouse release."""
+        if self.dragging:
+            self.dragging = False
+    
+    def on_left_click(self, evt):
+        """Handle click: select point, or double-click to deselect."""
+        import time
+        
+        current_time = time.time()
+        double_click = (current_time - self.last_click_time) < 0.3
+        self.last_click_time = current_time
+        
+        if double_click and self.editing_locked:
+            # Double-click: deselect
+            self.editing_locked = False
+            self.selected_row = None
+            self.selected_point_idx = None
+            self.dragging = False
+            self.update_point_colors()
+            self.plotter.render()
+            return
+        
+        # In position mode with editing locked, start dragging
+        # In radius mode, allow selecting new points
+        if self.editing_locked and self.edit_mode == 'position':
+            self.dragging = True
+            return
+        
+        if evt.picked3d is None:
+            print("No picked3d - click not on a pickable surface")
+            return
+        
+        click_pos = np.array(evt.picked3d)
+        
+        # Find closest control point
+        min_dist = float('inf')
+        best_flat_idx = None
+        
+        for flat_idx, sphere in enumerate(self.point_spheres):
+            sphere_pos = np.array(sphere.pos())
+            dist = np.linalg.norm(click_pos - sphere_pos)
+            if dist < min_dist:
+                min_dist = dist
+                best_flat_idx = flat_idx
+        
+        # Select if close enough (increased threshold for easier selection)
+        if min_dist < 0.5 and best_flat_idx is not None:
+            cumsum = 0
+            for r, row_pts in enumerate(self.all_control_points):
+                if best_flat_idx < cumsum + len(row_pts):
+                    self.selected_row = r
+                    self.selected_point_idx = best_flat_idx - cumsum
+                    self.editing_locked = True
+                    self.dragging = (self.edit_mode == 'position')
+                    print(f">>> SELECTED: Row {r}, Point {self.selected_point_idx} (dist={min_dist:.3f})")
+                    self.update_point_colors()
+                    self.plotter.render()
+                    return
+                cumsum += len(row_pts)
+        else:
+            print(f"Click at ({click_pos[0]:.2f}, {click_pos[1]:.2f}, {click_pos[2]:.2f}), nearest dist={min_dist:.3f}")
+    
+    def save_mesh_obj(self, filepath="knitting_spline_mesh.obj"):
+        """Save the current mesh to OBJ file."""
+        from vedo import Spline
+        
+        segments = 8
+        with open(filepath, "w") as f:
+            f.write(f"# Knitting mesh from spline editor\n\n")
+            
+            vertex_offset = 0
+            total_verts = 0
+            total_faces = 0
+            
+            for r, row_pts in enumerate(self.all_control_points):
+                row_radii = self.all_radii[r]
+                
+                row_spline = Spline(row_pts, res=200)
+                spline_pts = row_spline.vertices
+                n_spline_pts = len(spline_pts)
+                n_ctrl_pts = len(row_pts)
+                
+                if n_ctrl_pts > 1:
+                    radii_interp = np.interp(
+                        np.linspace(0, 1, n_spline_pts),
+                        np.linspace(0, 1, n_ctrl_pts),
+                        row_radii
+                    )
+                else:
+                    radii_interp = np.full(n_spline_pts, row_radii[0])
+                
+                f.write(f"# Row {r}\n")
+                f.write(f"o row_{r}\n")
+                
+                # Build tube vertices
+                for i, pt in enumerate(spline_pts):
+                    if i == 0:
+                        tangent = spline_pts[1] - spline_pts[0]
+                    elif i == n_spline_pts - 1:
+                        tangent = spline_pts[-1] - spline_pts[-2]
+                    else:
+                        tangent = spline_pts[i+1] - spline_pts[i-1]
+                    tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
+                    
+                    up = np.array([0, 0, 1])
+                    if abs(np.dot(tangent, up)) > 0.9:
+                        up = np.array([1, 0, 0])
+                    normal = np.cross(tangent, up)
+                    normal = normal / (np.linalg.norm(normal) + 1e-8)
+                    binormal = np.cross(tangent, normal)
+                    
+                    radius = radii_interp[i]
+                    for j in range(segments):
+                        theta = 2 * np.pi * j / segments
+                        offset = radius * (np.cos(theta) * normal + np.sin(theta) * binormal)
+                        v = pt + offset
+                        f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+                        total_verts += 1
+                
+                # Build faces
+                for i in range(n_spline_pts - 1):
+                    for j in range(segments):
+                        v0 = vertex_offset + i * segments + j + 1
+                        v1 = vertex_offset + i * segments + (j + 1) % segments + 1
+                        v2 = vertex_offset + (i + 1) * segments + (j + 1) % segments + 1
+                        v3 = vertex_offset + (i + 1) * segments + j + 1
+                        f.write(f"f {v0} {v1} {v2} {v3}\n")
+                        total_faces += 1
+                
+                vertex_offset += n_spline_pts * segments
+                f.write("\n")
+        
+        print(f"*** SAVED: {filepath} ({total_verts} vertices, {total_faces} faces) ***")
+        return filepath
+    
+    def render_mitsuba(self):
+        """Render current model with Mitsuba and show result."""
+        import matplotlib.pyplot as mplt
+        
+        print("="*60)
+        print("RENDERING WITH MITSUBA...")
+        print("="*60)
+        
+        # Save mesh to OBJ
+        obj_path = os.path.join(OUTPUT_DIR, "meshes", "spline_preview.obj")
+        self.save_mesh_obj(obj_path)
+        
+        if self.optimizer is None:
+            print("No optimizer - creating basic Mitsuba scene...")
+            # Create basic scene
+            scene = mi.load_dict({
+                'type': 'scene',
+                'integrator': {'type': 'path', 'max_depth': 4},
+                'sensor': {
+                    'type': 'perspective',
+                    'fov': 45,
+                    'to_world': mi.ScalarTransform4f.look_at(
+                        origin=[4, 3, 5],
+                        target=[2, 1, 0],
+                        up=[0, 1, 0]
+                    ),
+                    'film': {
+                        'type': 'hdrfilm',
+                        'width': 512,
+                        'height': 512,
+                        'pixel_format': 'rgb',
+                    },
+                    'sampler': {'type': 'independent', 'sample_count': 64},
+                },
+                'light': {
+                    'type': 'constant',
+                    'radiance': {'type': 'rgb', 'value': [0.8, 0.85, 0.9]},
+                },
+                'mesh': {
+                    'type': 'obj',
+                    'filename': obj_path,
+                    'bsdf': {
+                        'type': 'principled',
+                        'base_color': {'type': 'rgb', 'value': [0.8, 0.4, 0.3]},
+                        'roughness': 0.7,
+                    },
+                },
+            })
+        else:
+            scene = mi.load_dict(self.optimizer.get_scene_dict(obj_path, self.geometry_params))
+        
+        img = mi.render(scene, spp=64)
+        img_np = np.clip(np.array(img), 0, 1)
+        
+        # Display
+        has_ref = self.ref_img is not None
+        fig, axes = mplt.subplots(1, 2 if has_ref else 1, figsize=(12 if has_ref else 6, 6))
+        
+        if has_ref:
+            axes[0].imshow(self.ref_img)
+            axes[0].set_title('Reference', fontsize=14, fontweight='bold')
+            axes[0].axis('off')
+            axes[1].imshow(img_np)
+            axes[1].set_title('Current Render', fontsize=14, fontweight='bold')
+            axes[1].axis('off')
+        else:
+            axes.imshow(img_np)
+            axes.set_title('Current Render', fontsize=14, fontweight='bold')
+            axes.axis('off')
+        
+        mplt.tight_layout()
+        mplt.show()
+        print("Render complete! Close the window to continue editing.")
+    
+    def run(self):
+        """Run the interactive spline editor."""
+        from vedo import Text2D
+        
+        # Build control point spheres
+        self._build_point_spheres()
+        
+        # Build initial meshes
+        self.rebuild_visuals()
+        
+        # Add instructions
+        instructions = Text2D(
+            "Controls:\n"
+            "  Click: Select point\n"
+            "  Drag: Move point (position mode)\n"
+            "  Double-click: Deselect\n"
+            "  M: Toggle Position/Radius mode\n"
+            "  W/S: Move up/down or +/- radius\n"
+            "  A/D: Move left/right\n"
+            "  Q/E: Move forward/back\n"
+            "  R: Render with Mitsuba\n"
+            "  O: Continue Optimization\n"
+            "  F: Finish",
+            pos='top-left', c='white', s=0.7, bg='black', alpha=0.8
+        )
+        self.plotter.add(instructions)
+        
+        # Initial mode display
+        self.update_mode_display()
+        
+        # Add callbacks
+        self.plotter.add_callback("KeyPress", self.on_key_press)
+        self.plotter.add_callback("LeftButtonPress", self.on_left_click)
+        self.plotter.add_callback("MouseMove", self.on_mouse_move)
+        self.plotter.add_callback("LeftButtonRelease", self.on_left_button_release)
+        
+        # Show
+        self.plotter.show(interactive=True)
+        
+        # Extract updated params from edited control points/radii
+        updated_params = self._extract_updated_params()
+        
+        return self.all_control_points, self.all_radii, self.action, updated_params
+    
+    def _extract_updated_params(self):
+        """
+        Extract updated geometry parameters from edited control points and radii.
+        Maps the visual edits back to optimizer parameters.
+        """
+        params = list(self.geometry_params)  # Copy original params
+        
+        # Update radius (param[4]) with average of all edited radii
+        all_radii_flat = []
+        for row_radii in self.all_radii:
+            all_radii_flat.extend(row_radii)
+        if len(all_radii_flat) > 0:
+            avg_radius = float(np.mean(all_radii_flat))
+            params[4] = avg_radius
+            print(f"Updated radius param: {self.geometry_params[4]:.4f} -> {avg_radius:.4f}")
+        
+        # Estimate stitch_bulge from X range of control points
+        # stitch_bulge affects the sin(2t) amplitude
+        x_ranges = []
+        for row_pts in self.all_control_points:
+            if len(row_pts) > 1:
+                x_min, x_max = row_pts[:, 0].min(), row_pts[:, 0].max()
+                x_ranges.append(x_max - x_min)
+        if len(x_ranges) > 0:
+            n_cols = self.bitmap.shape[1]
+            avg_x_range = np.mean(x_ranges)
+            # Each stitch spans t=0 to 2*pi, x = stitch_bulge*sin(2t) + t/(2*pi)
+            # For one stitch: x goes from 0 to 1, with bulge adding amplitude of stitch_bulge
+            # Total per row: n_cols stitches, so range ~ n_cols + estimated bulge contribution
+            # This is an approximation - bulge contributes ~2*stitch_bulge per stitch
+            estimated_bulge = (avg_x_range - n_cols) / (2 * n_cols) if n_cols > 0 else params[0]
+            if 0.05 < estimated_bulge < 1.0:  # Sanity check
+                params[0] = estimated_bulge
+                print(f"Estimated stitch_bulge: {self.geometry_params[0]:.4f} -> {estimated_bulge:.4f}")
+        
+        # Estimate dy (row spacing, param[3]) from Y positions
+        if len(self.all_control_points) > 1:
+            row_y_means = []
+            for row_pts in self.all_control_points:
+                row_y_means.append(np.mean(row_pts[:, 1]))
+            dy_estimates = [row_y_means[i+1] - row_y_means[i] for i in range(len(row_y_means)-1)]
+            if len(dy_estimates) > 0:
+                avg_dy = np.mean(dy_estimates)
+                if 0.1 < avg_dy < 2.0:  # Sanity check
+                    params[3] = avg_dy
+                    print(f"Estimated dy (row spacing): {self.geometry_params[3]:.4f} -> {avg_dy:.4f}")
+        
+        # Estimate stitch_z from Z range
+        z_ranges = []
+        for row_pts in self.all_control_points:
+            if len(row_pts) > 1:
+                z_min, z_max = row_pts[:, 2].min(), row_pts[:, 2].max()
+                z_ranges.append(z_max - z_min)
+        if len(z_ranges) > 0:
+            avg_z_range = np.mean(z_ranges)
+            # stitch_z affects cos(2t)-1 amplitude, max amplitude is 2*stitch_z
+            estimated_stitch_z = -avg_z_range / 2 if avg_z_range > 0 else params[1]
+            if -1.0 < estimated_stitch_z < 0:  # Should be negative
+                params[1] = estimated_stitch_z
+                print(f"Estimated stitch_z: {self.geometry_params[1]:.4f} -> {estimated_stitch_z:.4f}")
+        
+        return params
+
+
+def interactive_spline_edit(geometry_params, bitmap, optimizer=None, ref_img=None):
+    """
+    Launch interactive spline editor with point dragging and radius editing.
+    
+    Args:
+        geometry_params: Initial geometry parameters
+        bitmap: 2D array defining knitting pattern
+        optimizer: KnittingOptimizer for Mitsuba rendering
+        ref_img: Reference image to compare against
+        
+    Returns:
+        tuple: (updated_params, action) where action is 'optimize' or 'finish'
+    """
+    editor = InteractiveSplineEditor(geometry_params, bitmap, optimizer, ref_img)
+    control_pts, radii, action, updated_params = editor.run()
+    return updated_params, action
+
+
+# %% INTERACTIVE PARAMETER EDITOR (like spline.py)
+
+class InteractiveParamEditor:
+    """
+    Interactive editor for knitting model parameters with LIVE mesh updates.
+    Works like spline.py - changes are visible immediately in the viewport.
+    """
+    
+    YARN_COLORS = ["red", "dodgerblue", "gold", "saddlebrown", "forestgreen", "purple"]
+    
+    def __init__(self, init_params, bitmap, optimizer=None, ref_img=None):
+        from vedo import Plotter, Text2D, Mesh
+        
+        self.params = np.array(init_params, dtype=np.float64)
+        self.bitmap = bitmap
+        self.optimizer = optimizer
+        self.ref_img = ref_img
+        self.consts = {'BITMAP': bitmap, 'loop_res': 32, 'segments': 8}
+        
+        # Parameter info
+        self.param_names = [
+            'stitch_bulge', 'stitch_z', 'loop_height', 'dy', 'radius',
+            'curve_skew', 'y_sharp', 'x_bias', 'z_bias', 'ellipse_ratio'
+        ]
+        self.param_deltas = [0.02, 0.02, 0.1, 0.02, 0.01, 0.05, 0.05, 0.02, 0.02, 0.05]
+        self.param_ranges = [
+            (0.1, 0.6), (-0.8, -0.1), (0.2, 2.5), (0.05, 1.0), (0.02, 0.3),
+            (-0.6, 0.6), (0.0, 0.8), (-0.2, 0.2), (-0.2, 0.2), (0.4, 1.6)
+        ]
+        
+        # Current selection
+        self.selected_param = 0
+        
+        # Result action
+        self.action = 'finish'
+        
+        # Mesh actors
+        self.mesh_actors = []
+        
+        # UI elements
+        self.info_text = None
+        self.mode_text = None
+        
+        # Plotter
+        self.plotter = Plotter(
+            bg='blackboard', axes=1, 
+            title="Knitting Parameter Editor - Use Arrow Keys to Adjust"
+        )
+        
+    def build_meshes(self):
+        """Build mesh actors from current parameters."""
+        from vedo import Mesh
+        
+        verts_list = compute_knitting_vertices(self.params, self.consts)
+        faces_list = compute_knitting_faces(self.consts['segments'], verts_list)
+        
+        meshes = []
+        for row_idx, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
+            verts_np = np.array(verts)
+            faces_np = np.array(faces)
+            # Convert quads to triangles
+            triangles = []
+            for f in faces_np:
+                triangles.append([f[0], f[1], f[2]])
+                triangles.append([f[0], f[2], f[3]])
+            triangles = np.array(triangles)
+            
+            mesh = Mesh([verts_np, triangles])
+            color = self.YARN_COLORS[row_idx % len(self.YARN_COLORS)]
+            mesh.color(color).lighting('plastic').alpha(0.9)
+            meshes.append(mesh)
+        
+        return meshes
+    
+    def rebuild_visuals(self):
+        """Rebuild meshes with current parameters - LIVE UPDATE."""
+        # Remove old meshes
+        for m in self.mesh_actors:
+            self.plotter.remove(m)
+        self.mesh_actors.clear()
+        
+        # Build new meshes
+        self.mesh_actors = self.build_meshes()
+        for m in self.mesh_actors:
+            self.plotter.add(m)
+        
+        # Update info display
+        self.update_info_display()
+        
+        self.plotter.render()
+    
+    def update_info_display(self):
+        """Update the parameter info text display."""
+        from vedo import Text2D
+        
+        if self.info_text:
+            self.plotter.remove(self.info_text)
+        
+        # Build parameter display string
+        lines = ["=== PARAMETERS ==="]
+        for i, (name, val) in enumerate(zip(self.param_names, self.params)):
+            marker = ">>>" if i == self.selected_param else "   "
+            lines.append(f"{marker} {name}: {val:.4f}")
+        
+        self.info_text = Text2D(
+            "\n".join(lines),
+            pos='top-left', c='white', s=0.7, bg='black', alpha=0.7
+        )
+        self.plotter.add(self.info_text)
+    
+    def update_mode_display(self):
+        """Update mode/instructions text."""
+        from vedo import Text2D
+        
+        if self.mode_text:
+            self.plotter.remove(self.mode_text)
+        
+        name = self.param_names[self.selected_param]
+        self.mode_text = Text2D(
+            f"Selected: {name} | UP/DOWN=select param | LEFT/RIGHT=adjust value | R=Render | O=Optimize | F=Finish",
+            pos='bottom-center', c='yellow', s=0.8, bold=True
+        )
+        self.plotter.add(self.mode_text)
+        self.plotter.render()
+    
+    def on_key_press(self, evt):
+        """Handle keyboard input for parameter adjustment."""
+        key = evt.keypress.lower() if evt.keypress else ""
+        
+        changed = False
+        
+        # Navigation: select parameter
+        if key in ['up', 'w']:
+            self.selected_param = (self.selected_param - 1) % len(self.params)
+            self.update_info_display()
+            self.update_mode_display()
+            return
+        elif key in ['down', 's']:
+            self.selected_param = (self.selected_param + 1) % len(self.params)
+            self.update_info_display()
+            self.update_mode_display()
+            return
+        
+        # Adjust parameter value
+        elif key in ['right', 'd', 'equal', 'plus']:
+            delta = self.param_deltas[self.selected_param]
+            self.params[self.selected_param] += delta
+            changed = True
+        elif key in ['left', 'a', 'minus']:
+            delta = self.param_deltas[self.selected_param]
+            self.params[self.selected_param] -= delta
+            changed = True
+        
+        # Render with Mitsuba
+        elif key == 'r':
+            self.render_mitsuba()
+            return
+        
+        # Continue optimization
+        elif key == 'o':
+            self.action = 'optimize'
+            self.plotter.close()
+            return
+        
+        # Finish
+        elif key == 'f':
+            self.action = 'finish'
+            self.plotter.close()
+            return
+        
+        if changed:
+            # Clamp to valid range
+            vmin, vmax = self.param_ranges[self.selected_param]
+            self.params[self.selected_param] = np.clip(self.params[self.selected_param], vmin, vmax)
+            
+            name = self.param_names[self.selected_param]
+            print(f">>> {name} = {self.params[self.selected_param]:.4f}")
+            
+            # LIVE UPDATE - rebuild meshes immediately
+            self.rebuild_visuals()
+    
+    def render_mitsuba(self):
+        """Render current model with Mitsuba and show result."""
+        if self.optimizer is None:
+            print("No optimizer provided, cannot render with Mitsuba.")
+            return
+        
+        print("="*60)
+        print("RENDERING WITH MITSUBA...")
+        print("="*60)
+        
+        # Generate mesh
+        verts_list = compute_knitting_vertices(self.params, self.consts)
+        faces_list = compute_knitting_faces(self.consts['segments'], verts_list)
+        mesh_data = [(v, [], f, n) for (v, n), f in zip(verts_list, faces_list)]
+        
+        # Save mesh
+        temp_path = os.path.join(OUTPUT_DIR, "meshes", "interactive_preview")
+        save_into_obj_files(mesh_data, temp_path)
+        obj_path = temp_path + "_combined.obj"
+        
+        # Render
+        scene = mi.load_dict(self.optimizer.get_scene_dict(obj_path, self.params))
+        img = mi.render(scene, spp=64)
+        img_np = np.clip(np.array(img), 0, 1)
+        
+        # Display using matplotlib (use mplt to avoid conflict with vedo)
+        import matplotlib.pyplot as mplt
+        
+        has_ref = self.ref_img is not None
+        fig, axes = mplt.subplots(1, 2 if has_ref else 1, figsize=(12 if has_ref else 6, 6))
+        
+        if has_ref:
+            axes[0].imshow(self.ref_img)
+            axes[0].set_title('Reference', fontsize=14, fontweight='bold')
+            axes[0].axis('off')
+            axes[1].imshow(img_np)
+            axes[1].set_title('Current Render', fontsize=14, fontweight='bold')
+            axes[1].axis('off')
+        else:
+            axes.imshow(img_np)
+            axes.set_title('Current Render', fontsize=14, fontweight='bold')
+            axes.axis('off')
+        
+        mplt.tight_layout()
+        mplt.show()
+        print("Render complete! Close the window to continue editing.")
+    
+    def run(self):
+        """Run the interactive editor."""
+        from vedo import Text2D
+        
+        # Build initial meshes
+        self.mesh_actors = self.build_meshes()
+        for m in self.mesh_actors:
+            self.plotter.add(m)
+        
+        # Add instructions
+        instructions = Text2D(
+            "Controls:\n"
+            "  UP/DOWN or W/S: Select parameter\n"
+            "  LEFT/RIGHT or A/D: Adjust value\n"
+            "  R: Render with Mitsuba\n"
+            "  O: Continue Optimization\n"
+            "  F: Finish & Save",
+            pos='top-right', c='white', s=0.7, bg='darkblue', alpha=0.8
+        )
+        self.plotter.add(instructions)
+        
+        # Initial displays
+        self.update_info_display()
+        self.update_mode_display()
+        
+        # Add key callback
+        self.plotter.add_callback("KeyPress", self.on_key_press)
+        
+        # Show
+        self.plotter.show(interactive=True)
+        
+        return list(self.params), self.action
+
+
+def interactive_edit_model(geometry_params, bitmap, optimizer=None, ref_img=None):
+    """
+    Launch interactive parameter editor with LIVE mesh updates.
+    
+    Args:
+        geometry_params: Initial geometry parameters 
+        bitmap: 2D array defining the knitting pattern
+        optimizer: KnittingOptimizer instance for Mitsuba rendering
+        ref_img: Reference image to compare against
+        
+    Returns:
+        tuple: (final_params, action) where action is 'optimize' or 'finish'
+    """
+    editor = InteractiveParamEditor(geometry_params, bitmap, optimizer, ref_img)
+    return editor.run()
 
 
 # %% OPTIMIZATION ENGINE
@@ -1778,11 +2634,14 @@ def visualize_parameter_effects_final(params, bitmap, output_dir):
     for i, name in enumerate(param_names):
         ax = fig.add_subplot(1, n_params, i + 1, projection='3d')
         delta = 0.2 * params[i]
-        test_params = [
-            params.copy().at[i].set(params[i] - delta),
-            params,
-            params.copy().at[i].set(params[i] + delta)
-        ]
+        
+        # Handle both list and JAX array
+        params_low = list(params)
+        params_low[i] = params[i] - delta
+        params_high = list(params)
+        params_high[i] = params[i] + delta
+        
+        test_params = [params_low, list(params), params_high]
         colors = ['blue', 'green', 'red']
         labels = [f'-20%', 'current', '+20%']
         
@@ -1812,7 +2671,10 @@ def compute_jacobian_analysis(params, bitmap):
     print("="*80)
     print("Computing ∂(vertices)/∂(parameters) using JAX automatic differentiation...")
     
-    J = compute_geometry_jacobian(params, bitmap)
+    # Convert to JAX array if needed
+    params_jax = jnp.array(params)
+    J = compute_geometry_jacobian(params_jax, bitmap)
+    J = np.array(J)  # Convert back to numpy for printing
     param_names = [
         'stitch_bulge',
         'stitch_z',
@@ -2192,15 +3054,72 @@ if __name__ == "__main__":
                 spp=16,
                 refine_with_scipy=CAMERA_REFINE_SCIPY,
             )
-        params, best_loss = run_optimization_loop(opt, init_params, MAX_ITERATIONS, 
-                                                 EPSILON, PATIENCE)
+        # ==================== INTERACTIVE EDITING LOOP ====================
+        # Choose editor mode: spline (point-based) or parameter editor
+        params = init_params
+        best_loss = float('inf')
+        
+        print("\n" + "="*80)
+        print("EDITOR MODE SELECTION")
+        print("="*80)
+        print("Choose editor mode:")
+        print("  1. SPLINE EDITOR - Click & drag points, change radius (like spline.py)")
+        print("  2. PARAMETER EDITOR - Adjust global parameters with arrow keys")
+        print()
+        mode_choice = input("Enter choice (1 or 2, default=1): ").strip()
+        use_spline_editor = (mode_choice != '2')
+        
+        while True:
+            print("\n" + "="*80)
+            print("INTERACTIVE MODEL EDITOR")
+            print("="*80)
+            
+            if use_spline_editor:
+                print("SPLINE EDITOR: Click to select points, drag to move, M=radius mode")
+                print("Press R to render with Mitsuba, O to optimize, F to finish.")
+                print("="*80)
+                
+                # Open interactive spline editor (like spline.py - control point editing)
+                # Returns updated params extracted from edited control points
+                params, action = interactive_spline_edit(
+                    params,
+                    BITMAP,
+                    optimizer=opt,
+                    ref_img=ref
+                )
+                print(f"Updated params from spline editor: {[f'{p:.4f}' for p in params]}")
+            else:
+                print("PARAMETER EDITOR: UP/DOWN to select, LEFT/RIGHT to adjust.")
+                print("Press R to render with Mitsuba, O to optimize, F to finish.")
+                print("="*80)
+                
+                # Open interactive parameter editor (global params)
+                params, action = interactive_edit_model(
+                    params,
+                    BITMAP,
+                    optimizer=opt,
+                    ref_img=ref
+                )
+            
+            if action == 'finish':
+                print("\n=== Finishing with current parameters ===")
+                break
+            elif action == 'optimize':
+                print("\n=== Running optimization... ===")
+                params, best_loss = run_optimization_loop(opt, params, MAX_ITERATIONS, 
+                                                         EPSILON, PATIENCE)
+                print(f"Optimization complete! Best loss: {best_loss:.6f}")
+                print("Returning to interactive editor...")
+                # Loop continues - user can edit again, optimize more, or finish
+                # Loop continues - user can edit again, optimize more, or finish
         
         # Generate all visualizations
-        create_before_after_comparison(OUTPUT_DIR, ref, len(opt.loss_history))
-        create_optimization_summary(opt, init_params, params, OUTPUT_DIR)
-        visualize_parameter_effects_final(params, BITMAP, OUTPUT_DIR)
-        compute_jacobian_analysis(params, BITMAP)
-        print_final_summary(opt, init_params, params, best_loss)
+        #if len(opt.loss_history) > 0:
+            #create_before_after_comparison(OUTPUT_DIR, ref, len(opt.loss_history))
+            #create_optimization_summary(opt, init_params, params, OUTPUT_DIR)
+        #visualize_parameter_effects_final(params, BITMAP, OUTPUT_DIR)
+        #compute_jacobian_analysis(params, BITMAP)
+        print_final_summary(opt, init_params, params, best_loss if best_loss != float('inf') else 0.0)
         
         # Save best model
         save_best_model(params, BITMAP, OUTPUT_DIR, spp_final=SPP_FINAL)
