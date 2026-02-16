@@ -11,6 +11,9 @@ import optax
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from new_main import save_into_obj_files
+import torch
+import torchvision.models as models
+
 
 # %% CONFIGURATION & VARIANTS
 OUTPUT_DIR = "opt_outputs"
@@ -24,6 +27,71 @@ if not mi.variant():
         mi.set_variant("llvm_ad_rgb")
 
 # %% JAX GEOMETRY LOGIC
+
+# def eval_curve(
+#     t,
+#     scale,
+#     stitch_bulge=0.30,
+#     stitch_z=-0.4,
+#     loop_height=1.5,
+#     curve_skew=0.0,
+#     y_sharp=0.0,
+#     x_bias=0.0,
+#     z_bias=0.0,
+# ):
+#     t, scale = jnp.asarray(t), jnp.asarray(scale)
+#     # Nonlinear phase warp adds flexibility to match stitch structure
+#     t_warp = t + curve_skew * jnp.sin(t)
+#     x = stitch_bulge * jnp.sin(2 * t_warp) + t / (2 * jnp.pi)
+#     y_base = (-(jnp.cos(t_warp) - 1) / 2)
+#     y_sharp_term = (-(jnp.cos(2 * t_warp) - 1) / 2)
+#     y = loop_height * (y_base + y_sharp * y_sharp_term)
+#     z = stitch_z * (jnp.cos(2 * t_warp) - 1) / 2
+
+#     x = x + x_bias * jnp.sin(t_warp)
+#     z = z + z_bias * jnp.sin(t_warp)
+    
+#     x = jnp.where(scale == 0, t/(2*jnp.pi), x)
+#     return jnp.column_stack((x, y * scale, z * scale))
+
+# def eval_curve_derivative(
+#     t,
+#     scale,
+#     stitch_bulge=0.30,
+#     stitch_z=-0.4,
+#     loop_height=1.5,
+#     curve_skew=0.0,
+#     y_sharp=0.0,
+#     x_bias=0.0,
+#     z_bias=0.0,
+# ):
+#     t, scale = jnp.asarray(t), jnp.asarray(scale)
+#     t_warp = t + curve_skew * jnp.sin(t)
+#     warp_dt = 1.0 + curve_skew * jnp.cos(t)
+#     dx = 2 * stitch_bulge * jnp.cos(2 * t_warp) * warp_dt + 1 / (2 * jnp.pi)
+#     dx = dx + x_bias * jnp.cos(t_warp) * warp_dt
+#     dy_base = 0.5 * jnp.sin(t_warp) * warp_dt
+#     dy_sharp = y_sharp * jnp.sin(2 * t_warp) * warp_dt
+#     dy = (dy_base + dy_sharp) * scale * loop_height
+#     dz = -stitch_z * jnp.sin(2 * t_warp) * warp_dt * scale
+#     dz = dz + z_bias * jnp.cos(t_warp) * warp_dt * scale
+#     dx = jnp.where(scale == 0, 1/(2*jnp.pi), dx)
+#     return jnp.column_stack((dx, dy, dz))
+
+# def compute_orthonormal_frame(T):
+#     T = T / (jnp.linalg.norm(T, axis=1, keepdims=True) + 1e-8)
+#     ref = jnp.array([0.0, 0.0, 1.0])
+#     U = jnp.cross(T, ref)
+#     U_norm = jnp.linalg.norm(U, axis=1, keepdims=True)
+    
+#     # Handle parallel cases (Gimbal Lock avoidance)
+#     ref_alt = jnp.array([1.0, 0.0, 0.0])
+#     U_alt = jnp.cross(T, ref_alt)
+#     U = jnp.where(U_norm < 1e-6, U_alt, U)
+    
+#     U = U / (jnp.linalg.norm(U, axis=1, keepdims=True) + 1e-8)
+#     V = jnp.cross(T, U)
+#     return T, U, V
 
 def eval_curve(t, scale, stitch_bulge=0.30, stitch_z=-0.4):
     t, scale = jnp.asarray(t), jnp.asarray(scale)
@@ -56,7 +124,6 @@ def compute_orthonormal_frame(T):
     U = U / (jnp.linalg.norm(U, axis=1, keepdims=True) + 1e-8)
     V = jnp.cross(T, U)
     return T, U, V
-
 # %% BITMAP PROCESSING
 
 def count_consecutive_zeros_after_jax(A):
@@ -76,7 +143,7 @@ def convert_bitmap_to_scales_factors_jax(matrix):
 
 # %% JACOBIAN COMPUTATION (JAX AUTODIFF)
 
-def compute_geometry_jacobian(params, bitmap):
+def compute_geometry_jacobian(geometry_params, bitmap):
     """Compute Jacobian of vertex positions w.r.t. parameters using JAX autodiff"""
     consts = {'BITMAP': bitmap, 'loop_res': 32, 'segments': 8}
     
@@ -88,16 +155,27 @@ def compute_geometry_jacobian(params, bitmap):
     
     # Compute Jacobian: d(vertices)/d(params)
     jacobian_fn = jax.jacfwd(get_all_vertices)
-    J = jacobian_fn(params)  # Shape: [num_verts, 3, num_params]
+    J = jacobian_fn(geometry_params)  # Shape: [num_verts, 3, num_params]
     
     return J
 
 # %% MESH GENERATION
 
-def compute_knitting_vertices(params, consts):
+def compute_knitting_vertices(geometry_params, consts):
     bitmap = jnp.array(consts["BITMAP"], dtype=float)
     loop_res, segments = consts["loop_res"], consts["segments"]
-    stitch_bulge, stitch_z, dy, radius = params
+    (
+        stitch_bulge,
+        stitch_z,
+        loop_height,
+        dy,
+        radius,
+        curve_skew,
+        y_sharp,
+        x_bias,
+        z_bias,
+        ellipse_ratio,
+    ) = geometry_params
 
     scale_factor = convert_bitmap_to_scales_factors_jax(bitmap)
     scale_factor = jnp.where((scale_factor <= 1), scale_factor, 1 + dy * (scale_factor - 1))
@@ -112,14 +190,30 @@ def compute_knitting_vertices(params, consts):
         x_scale = jnp.repeat(scale_row, loop_res)
         x_scale = jnp.append(x_scale, 1.0)
 
-        p = eval_curve(t, x_scale, stitch_bulge, stitch_z).at[:, 1].add(row_idx * dy)
-        dp = eval_curve_derivative(t, x_scale, stitch_bulge, stitch_z)
+        p = eval_curve(
+            t,
+            x_scale,
+            stitch_bulge,
+            stitch_z,
+        ).at[:, 1].add(row_idx * dy)
+        dp = eval_curve_derivative(
+            t,
+            x_scale,
+            stitch_bulge,
+            stitch_z,
+        )
         T, U, V = compute_orthonormal_frame(dp)
+        
+        # radius_varying = jnp.clip(radius * (1.0 + 0.3 * jnp.sin(t)), 0.01, 0.5)
 
         j_indices = jnp.arange(segments)
         angles = 2 * jnp.pi * j_indices / segments
-        offsets = (U[:, None, :] * jnp.cos(angles)[None, :, None] + 
-                   V[:, None, :] * jnp.sin(angles)[None, :, None]) * radius
+        radius_u = radius * ellipse_ratio
+        radius_v = radius
+        offsets = (
+            U[:, None, :] * jnp.cos(angles)[None, :, None] * radius_u
+            + V[:, None, :] * jnp.sin(angles)[None, :, None] * radius_v
+        )
         
         verts = (p[:, None, :] + offsets).reshape(-1, 3)
         verts_list.append((verts, len(p)))
@@ -144,10 +238,11 @@ def visualize_parameter_effects(params, bitmap, param_names, output_path):
     """Create 3D visualizations showing how each parameter affects geometry"""
     consts = {'BITMAP': bitmap, 'loop_res': 32, 'segments': 8}
     
-    fig = plt.figure(figsize=(20, 5))
+    n_params = len(param_names)
+    fig = plt.figure(figsize=(5 * n_params, 5))
     
     for i, name in enumerate(param_names):
-        ax = fig.add_subplot(1, 4, i+1, projection='3d')
+        ax = fig.add_subplot(1, n_params, i + 1, projection='3d')
         
         # Create three variants: -20%, current, +20%
         delta = 0.2 * params[i]
@@ -181,10 +276,294 @@ def visualize_parameter_effects(params, bitmap, param_names, output_path):
     plt.close()
     print(f"✓ Saved parameter effect visualization: {output_path}")
 
+# %% 3D VIEWER (VEDO)
+
+def view_model(geometry_params, bitmap, row_colors=None, title="Knitting Model Viewer"):
+    """
+    View the knitting model interactively using vedo.
+    
+    Args:
+        geometry_params: Array of geometry parameters
+            [stitch_bulge, stitch_z, loop_height, dy, radius, curve_skew, y_sharp, x_bias, z_bias, ellipse_ratio]
+        bitmap: 2D array defining the knitting pattern
+        row_colors: Optional list of (r, g, b) tuples per row (values 0-1)
+        title: Window title
+    """
+    try:
+        from vedo import Mesh, Plotter, Text2D
+    except ImportError:
+        print("vedo not installed. Install with: pip install vedo")
+        return
+    
+    consts = {'BITMAP': bitmap, 'loop_res': 32, 'segments': 8}
+    segments = consts['segments']
+    
+    # Compute mesh geometry
+    verts_list = compute_knitting_vertices(geometry_params, consts)
+    faces_list = compute_knitting_faces(segments, verts_list)
+    
+    # Default row colors if not provided
+    n_rows = len(verts_list)
+    if row_colors is None:
+        palette = [
+            (0.15, 0.35, 0.75),  # Blue
+            (0.90, 0.75, 0.20),  # Yellow  
+            (0.85, 0.25, 0.25),  # Red
+            (0.30, 0.70, 0.40),  # Green
+        ]
+        row_colors = [palette[i % len(palette)] for i in range(n_rows)]
+    
+    # Create meshes for each row
+    meshes = []
+    for row_idx, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
+        verts_np = np.array(verts)
+        # vedo expects triangulated faces or can handle quads
+        # Convert quad faces to triangles
+        faces_np = np.array(faces)
+        triangles = []
+        for f in faces_np:
+            triangles.append([f[0], f[1], f[2]])
+            triangles.append([f[0], f[2], f[3]])
+        triangles = np.array(triangles)
+        
+        mesh = Mesh([verts_np, triangles])
+        color = row_colors[row_idx % len(row_colors)]
+        mesh.color(color)
+        mesh.lighting('glossy')
+        meshes.append(mesh)
+    
+    # Create plotter and show
+    plt = Plotter(title=title, bg='white', bg2='lightgray')
+    plt.add(meshes)
+    plt.add(Text2D("Controls: drag=rotate, scroll=zoom, shift+drag=pan", pos='bottom-left', s=0.7))
+    plt.show()
+    return plt
+
+
+def view_model_from_mesh_data(mesh_data_list, row_colors=None, title="Knitting Model Viewer"):
+    """
+    View the knitting model from pre-computed mesh data using vedo.
+    
+    Args:
+        mesh_data_list: List of (verts, edges, faces, n_points) tuples
+        row_colors: Optional list of (r, g, b) tuples per row (values 0-1)
+        title: Window title
+    """
+    try:
+        from vedo import Mesh, Plotter, Text2D
+    except ImportError:
+        print("vedo not installed. Install with: pip install vedo")
+        return
+    
+    n_rows = len(mesh_data_list)
+    if row_colors is None:
+        palette = [
+            (0.15, 0.35, 0.75),  # Blue
+            (0.90, 0.75, 0.20),  # Yellow
+            (0.85, 0.25, 0.25),  # Red
+            (0.30, 0.70, 0.40),  # Green
+        ]
+        row_colors = [palette[i % len(palette)] for i in range(n_rows)]
+    
+    meshes = []
+    for row_idx, (verts, edges, faces, n_points) in enumerate(mesh_data_list):
+        verts_np = np.array(verts)
+        faces_np = np.array(faces)
+        # Convert quads to triangles
+        triangles = []
+        for f in faces_np:
+            triangles.append([f[0], f[1], f[2]])
+            triangles.append([f[0], f[2], f[3]])
+        triangles = np.array(triangles)
+        
+        mesh = Mesh([verts_np, triangles])
+        color = row_colors[row_idx % len(row_colors)]
+        mesh.color(color)
+        mesh.lighting('glossy')
+        meshes.append(mesh)
+    
+    plt = Plotter(title=title, bg='white', bg2='lightgray')
+    plt.add(meshes)
+    plt.add(Text2D("Controls: drag=rotate, scroll=zoom, shift+drag=pan", pos='bottom-left', s=0.7))
+    plt.show()
+    return plt
+
+
+def view_obj_file(obj_path, color=(0.5, 0.5, 0.8), title="OBJ Viewer"):
+    """
+    View an OBJ file using vedo.
+    
+    Args:
+        obj_path: Path to the OBJ file (or list of paths)
+        color: RGB tuple (0-1) or list of colors for multiple files
+        title: Window title
+    """
+    try:
+        from vedo import load, Plotter, Text2D
+    except ImportError:
+        print("vedo not installed. Install with: pip install vedo")
+        return
+    
+    if isinstance(obj_path, str):
+        obj_path = [obj_path]
+        color = [color]
+    elif not isinstance(color, list):
+        color = [color] * len(obj_path)
+    
+    meshes = []
+    for path, c in zip(obj_path, color):
+        mesh = load(path)
+        mesh.color(c)
+        mesh.lighting('glossy')
+        meshes.append(mesh)
+    
+    plt = Plotter(title=title, bg='white', bg2='lightgray')
+    plt.add(meshes)
+    plt.add(Text2D("Controls: drag=rotate, scroll=zoom, shift+drag=pan", pos='bottom-left', s=0.7))
+    plt.show()
+    return plt
+
+
 # %% OPTIMIZATION ENGINE
 
+# Default colorful yarn palette (similar to reference image)
+DEFAULT_YARN_PALETTE = [
+    (0.15, 0.35, 0.75),  # Blue
+    (0.90, 0.75, 0.20),  # Yellow
+    (0.85, 0.25, 0.25),  # Red
+    (0.30, 0.70, 0.40),  # Green
+    (0.85, 0.45, 0.20),  # Orange
+    (0.60, 0.30, 0.70),  # Purple
+    (0.20, 0.65, 0.75),  # Cyan
+    (0.90, 0.55, 0.65),  # Pink
+]
+
+# Color definitions for the specific pattern
+COLOR_BROWN = (0.45, 0.25, 0.15)
+COLOR_BLUE = (0.15, 0.35, 0.75)
+COLOR_YELLOW = (0.95, 0.85, 0.20)
+COLOR_RED = (0.85, 0.20, 0.20)
+
+def get_loop_color(row_idx, loop_idx):
+    """Get color for a specific loop based on pattern:
+    Row 0: Brown (all loops)
+    Row 1: Red/Yellow alternating per loop
+    Row 2: Blue (all loops)
+    Then repeat pattern...
+    """
+    pattern_row = row_idx % 3
+    if pattern_row == 0:
+        return COLOR_BROWN
+    elif pattern_row == 1:
+        # Red for even loops, Yellow for odd
+        return COLOR_RED if loop_idx % 2 == 0 else COLOR_YELLOW
+    else:  # pattern_row == 2
+        return COLOR_BLUE
+
+def save_colored_obj_files(mesh_data_list, base_filename="knitting_model"):
+    """Save each row as a separate OBJ file for per-row coloring."""
+    obj_paths = []
+    for i, (verts, edges, faces, n_points) in enumerate(mesh_data_list):
+        filepath = f"{base_filename}_row_{i:02d}.obj"
+        with open(filepath, 'w') as f:
+            f.write(f"# Knitting Model - Row {i}\n")
+            f.write(f"o knittingRow_{i}\n\n")
+            for vert in verts:
+                if hasattr(vert, 'tolist'):
+                    v = vert.tolist()
+                else:
+                    v = vert
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            f.write("\n")
+            for face in faces:
+                face_indices = [str(idx + 1) for idx in face]
+                f.write(f"f {' '.join(face_indices)}\n")
+        obj_paths.append(filepath)
+    return obj_paths
+
+def save_per_loop_obj_files(mesh_data_list, base_filename="knitting_model", loop_res=32, segments=8):
+    """Save each loop as a separate OBJ file for per-loop coloring.
+    
+    Returns:
+        obj_paths: list of (row_idx, loop_idx, filepath) tuples
+    """
+    obj_info = []  # (row_idx, loop_idx, filepath)
+    
+    for row_idx, (verts, edges, faces, n_points) in enumerate(mesh_data_list):
+        verts_np = np.array(verts)
+        faces_np = np.array(faces)
+        
+        # n_points = loop_res * n_loops + 1
+        n_loops = (n_points - 1) // loop_res
+        
+        for loop_idx in range(n_loops):
+            # Vertex indices for this loop (including overlap at ends for continuity)
+            start_pt = loop_idx * loop_res
+            end_pt = (loop_idx + 1) * loop_res + 1  # +1 for overlap
+            if end_pt > n_points:
+                end_pt = n_points
+            
+            # Vertex range in flattened array (each point has `segments` vertices)
+            v_start = start_pt * segments
+            v_end = end_pt * segments
+            
+            loop_verts = verts_np[v_start:v_end]
+            
+            # Face indices for this loop
+            # Each segment ring creates (loop_res) quads per loop
+            # Face vertex indices reference points 0 to (end_pt - start_pt - 1)
+            n_loop_pts = end_pt - start_pt
+            i_grid, j_grid = np.meshgrid(np.arange(n_loop_pts - 1), np.arange(segments), indexing='ij')
+            v0 = i_grid * segments + j_grid
+            v1 = i_grid * segments + (j_grid + 1) % segments
+            v2 = (i_grid + 1) * segments + (j_grid + 1) % segments
+            v3 = (i_grid + 1) * segments + j_grid
+            loop_faces = np.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4)
+            
+            filepath = f"{base_filename}_row_{row_idx:02d}_loop_{loop_idx:02d}.obj"
+            with open(filepath, 'w') as f:
+                f.write(f"# Knitting Model - Row {row_idx}, Loop {loop_idx}\n")
+                f.write(f"o knittingRow_{row_idx}_loop_{loop_idx}\n\n")
+                for vert in loop_verts:
+                    if hasattr(vert, 'tolist'):
+                        v = vert.tolist()
+                    else:
+                        v = list(vert)
+                    f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+                f.write("\n")
+                for face in loop_faces:
+                    face_indices = [str(int(idx) + 1) for idx in face]
+                    f.write(f"f {' '.join(face_indices)}\n")
+            
+            obj_info.append((row_idx, loop_idx, filepath))
+    
+    return obj_info
+#%%
+
 class KnittingOptimizer:
-    def __init__(self, reference_img, bitmap, learning_rate=0.01):
+    # Yarn palette matching reference: Brown, Blue, Yellow, Red (repeating)
+    YARN_PALETTE = [
+        (0.45, 0.25, 0.15),  # Brown
+        (0.15, 0.35, 0.75),  # Blue
+        (0.95, 0.85, 0.20),  # Yellow
+        (0.85, 0.20, 0.20),  # Red
+    ]
+    
+    def __init__(
+        self,
+        reference_img,
+        bitmap,
+        learning_rate=0.01,
+        optimize_texture=False,
+        texture_learning_rate=0.05,
+        initial_texture_rgb=(0.8, 0.4, 0.3),
+        camera_params=(3.0, 45.0),
+        # Clip / crop controls for loss computation
+        loss_center_crop=(1.0, 1.0),
+        loss_weights=(0.7, 0.3),
+        row_colors=None,  # Per-row colors: list of (r, g, b) tuples
+        use_colored_rows=True,  # Enable per-row coloring
+    ):
         self.bitmap = bitmap
         self.consts = {'BITMAP': bitmap, 'loop_res': 32, 'segments': 8}
         self.optimizer = optax.adam(learning_rate)
@@ -201,31 +580,166 @@ class KnittingOptimizer:
         # Use reference resolution for rendering (maintains gradients)
         self.res_height = self.ref_height
         self.res_width = self.ref_width
+
+        # Loss crop (clip) mask: compute loss only on a central region
+        self.loss_center_crop = (float(loss_center_crop[0]), float(loss_center_crop[1]))
+        self.loss_mask_np = self._build_center_crop_mask(self.loss_center_crop)
+        self.loss_mask_tensor = mi.TensorXf(self.loss_mask_np)
+        self.ref_tensor = mi.TensorXf(self.ref_array)
+        self.loss_weights = (float(loss_weights[0]), float(loss_weights[1]))
         
         # Track optimization history
         self.loss_history = []
         self.param_history = []
         self.gradient_history = []  # Track gradients for each parameter
 
-    def get_scene_dict(self, obj_path, params):
+        # Camera + texture controls
+        self.camera_params = (float(camera_params[0]), float(camera_params[1]))  # (dist_mult, fov_deg)
+
+        self.optimize_texture = bool(optimize_texture)
+        self.texture_optimizer = optax.adam(texture_learning_rate)
+        self.texture_opt_state = None
+        self.texture_rgb = jnp.array(initial_texture_rgb, dtype=jnp.float32)
+        
+        # Per-row coloring
+        self.use_colored_rows = use_colored_rows
+        n_rows = bitmap.shape[0]
+        if row_colors is not None:
+            self.row_colors = list(row_colors)
+        else:
+            # Cycle through palette for all rows
+            self.row_colors = [self.YARN_PALETTE[i % len(self.YARN_PALETTE)] for i in range(n_rows)]
+
+        self.texture_history = []
+
+        # Cache for expensive bbox computation
+        self._bbox_cache_key = None
+        self._bbox_cache = None
+
+    def _build_center_crop_mask(self, center_crop):
+        """Create an (H,W,3) mask with ones in the center crop and zeros elsewhere."""
+        crop_w, crop_h = float(center_crop[0]), float(center_crop[1])
+        crop_w = float(np.clip(crop_w, 0.05, 1.0))
+        crop_h = float(np.clip(crop_h, 0.05, 1.0))
+
+        h, w = int(self.res_height), int(self.res_width)
+        x0 = int(round((1.0 - crop_w) * 0.5 * w))
+        x1 = int(round((1.0 + crop_w) * 0.5 * w))
+        y0 = int(round((1.0 - crop_h) * 0.5 * h))
+        y1 = int(round((1.0 + crop_h) * 0.5 * h))
+
+        x0 = max(0, min(w, x0))
+        x1 = max(0, min(w, x1))
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+
+        mask = np.zeros((h, w, 3), dtype=np.float32)
+        mask[y0:y1, x0:x1, :] = 1.0
+        return mask
+
+    def _masked_mse_np(self, img_np, ref_np):
+        diff = (img_np - ref_np) * self.loss_mask_np
+        denom = float(np.sum(self.loss_mask_np))
+        denom = denom if denom > 0 else 1.0
+        return float(np.sum(diff * diff) / denom)
+
+    def _compute_loss_dr(self, img_tensor):
+        mask = self.loss_mask_tensor
+        ref = self.ref_tensor
+        denom = dr.sum(mask) + 1e-8
+
+        # Pixel MSE on masked region
+        diff = (img_tensor - ref) * mask
+        pixel_mse = dr.sum(dr.sqr(diff)) / denom
+
+        # Normalized MSE to reduce sensitivity to global exposure/brightness
+        img_mean = dr.sum(img_tensor * mask) / denom
+        ref_mean = dr.sum(ref * mask) / denom
+        img_center = (img_tensor - img_mean) * mask
+        ref_center = (ref - ref_mean) * mask
+        img_var = dr.sum(dr.sqr(img_center)) / denom
+        ref_var = dr.sum(dr.sqr(ref_center)) / denom
+        img_norm = img_center / dr.sqrt(img_var + 1e-8)
+        ref_norm = ref_center / dr.sqrt(ref_var + 1e-8)
+        norm_mse = dr.sum(dr.sqr(img_norm - ref_norm)) / denom
+
+        w_pixel, w_norm = self.loss_weights
+        return w_pixel * pixel_mse + w_norm * norm_mse
+
+    def _compute_bbox(self, geometry_params_np):
+        """Compute axis-aligned bounding box of the current mesh in world space."""
+        key = tuple(np.round(np.asarray(geometry_params_np, dtype=np.float32), 6).tolist())
+        if self._bbox_cache_key == key and self._bbox_cache is not None:
+            return self._bbox_cache
+
+        verts_list = compute_knitting_vertices(geometry_params_np, self.consts)
+        all_verts = jnp.concatenate([v for v, _ in verts_list], axis=0)
+        all_verts_np = np.asarray(all_verts, dtype=np.float32)
+        vmin = np.min(all_verts_np, axis=0)
+        vmax = np.max(all_verts_np, axis=0)
+
+        self._bbox_cache_key = key
+        self._bbox_cache = (vmin, vmax)
+        return vmin, vmax
+
+    def view(self, geometry_params, title="Knitting Model"):
+        """
+        View the current model interactively using vedo.
+        
+        Args:
+            geometry_params: Array of geometry parameters
+            title: Window title
+        """
+        return view_model(geometry_params, self.bitmap, row_colors=self.row_colors, title=title)
+
+    def get_scene_dict(self, obj_path, params, camera_params=None, texture_rgb=None):
         """Create Mitsuba scene with properly framed camera and clean background"""
         n_rows, n_loops = self.bitmap.shape
-        _, stitch_z, dy, _ = params
+        # params = [stitch_bulge, stitch_z, loop_height, dy, radius, curve_skew, y_sharp, x_bias, z_bias, ellipse_ratio]
+        params_np = np.asarray(params, dtype=np.float32)
+        dy = float(params_np[3])
+
+        if camera_params is None:
+            camera_params = self.camera_params
+        dist_mult, fov = float(camera_params[0]), float(camera_params[1])
+
+        if texture_rgb is None:
+            texture_rgb = self.texture_rgb
+        texture_rgb = [float(texture_rgb[0]), float(texture_rgb[1]), float(texture_rgb[2])]
         
-        # Center the camera on the mesh
-        center = [n_loops / 2.0, ((n_rows - 1) * dy) / 2.0, stitch_z / 2.0]
-        
-        # Optimal camera distance found from testing
-        dist = max(n_loops, n_rows * dy) * 1.05
+        # Fit camera to mesh bounding box (prevents cropping / too-close framing)
+        vmin, vmax = self._compute_bbox(params_np)
+        center_np = (vmin + vmax) * 0.5
+        width = float(vmax[0] - vmin[0])
+        height = float(vmax[1] - vmin[1])
+        depth = float(vmax[2] - vmin[2])
+
+        # Aspect ratio from film
+        aspect = float(self.res_width) / float(self.res_height)
+        vfov = np.deg2rad(float(fov))
+        vfov = max(vfov, 1e-3)
+        hfov = 2.0 * np.arctan(np.tan(vfov * 0.5) * aspect)
+
+        # Distance needed to fit width/height within fov
+        dist_h = (0.5 * height) / max(np.tan(vfov * 0.5), 1e-6)
+        dist_w = (0.5 * width) / max(np.tan(hfov * 0.5), 1e-6)
+        dist = max(dist_h, dist_w)
+
+        # Tighter padding so the object fills more of the frame
+        dist = float(dist) * float(dist_mult)
+        dist = dist + float(depth) * 0.20 + 0.01
+
+        center = [float(center_np[0]), float(center_np[1]), float(center_np[2])]
+        origin = [center[0], center[1], float(vmax[2]) + dist]
         
         return {
             "type": "scene",
             "integrator": {"type": "path", "max_depth": 2},
             "sensor": {
                 "type": "perspective",
-                "fov": 45,
+                "fov": fov,
                 "to_world": mi.ScalarTransform4f.look_at(
-                    origin=[center[0], center[1], center[2] + dist], 
+                    origin=origin,
                     target=center, 
                     up=[0, 1, 0]
                 ),
@@ -258,10 +772,260 @@ class KnittingOptimizer:
                 "filename": obj_path,
                 "bsdf": {
                     "type": "diffuse", 
-                    "reflectance": {"type": "rgb", "value": [0.8, 0.4, 0.3]}
+                    "reflectance": {"type": "rgb", "value": texture_rgb}
                 }
             }
         }
+
+    def get_colored_scene_dict(self, obj_paths, params, camera_params=None):
+        """Create Mitsuba scene with per-row colored meshes."""
+        n_rows, n_loops = self.bitmap.shape
+        params_np = np.asarray(params, dtype=np.float32)
+        dy = float(params_np[3])
+
+        if camera_params is None:
+            camera_params = self.camera_params
+        dist_mult, fov = float(camera_params[0]), float(camera_params[1])
+
+        # Fit camera to mesh bounding box
+        vmin, vmax = self._compute_bbox(params_np)
+        center_np = (vmin + vmax) * 0.5
+        width = float(vmax[0] - vmin[0])
+        height = float(vmax[1] - vmin[1])
+        depth = float(vmax[2] - vmin[2])
+
+        aspect = float(self.res_width) / float(self.res_height)
+        vfov = np.deg2rad(float(fov))
+        vfov = max(vfov, 1e-3)
+        hfov = 2.0 * np.arctan(np.tan(vfov * 0.5) * aspect)
+
+        dist_h = (0.5 * height) / max(np.tan(vfov * 0.5), 1e-6)
+        dist_w = (0.5 * width) / max(np.tan(hfov * 0.5), 1e-6)
+        dist = max(dist_h, dist_w)
+        dist = float(dist) * float(dist_mult)
+        dist = dist + float(depth) * 0.20 + 0.01
+
+        center = [float(center_np[0]), float(center_np[1]), float(center_np[2])]
+        origin = [center[0], center[1], float(vmax[2]) + dist]
+
+        scene_dict = {
+            "type": "scene",
+            "integrator": {"type": "path", "max_depth": 2},
+            "sensor": {
+                "type": "perspective",
+                "fov": fov,
+                "to_world": mi.ScalarTransform4f.look_at(
+                    origin=origin,
+                    target=center,
+                    up=[0, 1, 0]
+                ),
+                "film": {
+                    "type": "hdrfilm",
+                    "width": self.res_width,
+                    "height": self.res_height,
+                    "rfilter": {"type": "gaussian"},
+                    "pixel_format": "rgb"
+                },
+            },
+            "emitter": {
+                "type": "constant",
+                "radiance": {"type": "rgb", "value": [0.9, 0.9, 0.9]}
+            },
+            "light1": {
+                "type": "point",
+                "position": [center[0] + n_loops*0.5, center[1] + n_rows*dy*0.5, center[2] + dist*0.7],
+                "intensity": {"type": "rgb", "value": [2.0, 2.0, 2.0]}
+            },
+            "light2": {
+                "type": "point",
+                "position": [center[0] - n_loops*0.5, center[1] - n_rows*dy*0.3, center[2] + dist*0.5],
+                "intensity": {"type": "rgb", "value": [1.0, 1.0, 1.0]}
+            },
+        }
+
+        # Add each row as a separate colored mesh
+        for i, obj_path in enumerate(obj_paths):
+            color = self.row_colors[i % len(self.row_colors)]
+            scene_dict[f"mesh_row_{i}"] = {
+                "type": "obj",
+                "filename": obj_path,
+                "bsdf": {
+                    "type": "diffuse",
+                    "reflectance": {"type": "rgb", "value": list(color)}
+                }
+            }
+
+        return scene_dict
+
+    def get_per_loop_colored_scene_dict(self, obj_info, params, camera_params=None):
+        """Create Mitsuba scene with per-loop colored meshes.
+        
+        Args:
+            obj_info: list of (row_idx, loop_idx, filepath) tuples from save_per_loop_obj_files
+        """
+        n_rows, n_loops = self.bitmap.shape
+        params_np = np.asarray(params, dtype=np.float32)
+        dy = float(params_np[3])
+
+        if camera_params is None:
+            camera_params = self.camera_params
+        dist_mult, fov = float(camera_params[0]), float(camera_params[1])
+
+        # Fit camera to mesh bounding box
+        vmin, vmax = self._compute_bbox(params_np)
+        center_np = (vmin + vmax) * 0.5
+        width = float(vmax[0] - vmin[0])
+        height = float(vmax[1] - vmin[1])
+        depth = float(vmax[2] - vmin[2])
+
+        aspect = float(self.res_width) / float(self.res_height)
+        vfov = np.deg2rad(float(fov))
+        vfov = max(vfov, 1e-3)
+        hfov = 2.0 * np.arctan(np.tan(vfov * 0.5) * aspect)
+
+        dist_h = (0.5 * height) / max(np.tan(vfov * 0.5), 1e-6)
+        dist_w = (0.5 * width) / max(np.tan(hfov * 0.5), 1e-6)
+        dist = max(dist_h, dist_w)
+        dist = float(dist) * float(dist_mult)
+        dist = dist + float(depth) * 0.20 + 0.01
+
+        center = [float(center_np[0]), float(center_np[1]), float(center_np[2])]
+        origin = [center[0], center[1], float(vmax[2]) + dist]
+
+        scene_dict = {
+            "type": "scene",
+            "integrator": {"type": "path", "max_depth": 2},
+            "sensor": {
+                "type": "perspective",
+                "fov": fov,
+                "to_world": mi.ScalarTransform4f.look_at(
+                    origin=origin,
+                    target=center,
+                    up=[0, 1, 0]
+                ),
+                "film": {
+                    "type": "hdrfilm",
+                    "width": self.res_width,
+                    "height": self.res_height,
+                    "rfilter": {"type": "gaussian"},
+                    "pixel_format": "rgb"
+                },
+            },
+            "emitter": {
+                "type": "constant",
+                "radiance": {"type": "rgb", "value": [0.9, 0.9, 0.9]}
+            },
+            "light1": {
+                "type": "point",
+                "position": [center[0] + n_loops*0.5, center[1] + n_rows*dy*0.5, center[2] + dist*0.7],
+                "intensity": {"type": "rgb", "value": [2.0, 2.0, 2.0]}
+            },
+            "light2": {
+                "type": "point",
+                "position": [center[0] - n_loops*0.5, center[1] - n_rows*dy*0.3, center[2] + dist*0.5],
+                "intensity": {"type": "rgb", "value": [1.0, 1.0, 1.0]}
+            },
+        }
+
+        # Add each loop as a separate colored mesh
+        for row_idx, loop_idx, obj_path in obj_info:
+            color = get_loop_color(row_idx, loop_idx)
+            scene_dict[f"mesh_row_{row_idx}_loop_{loop_idx}"] = {
+                "type": "obj",
+                "filename": obj_path,
+                "bsdf": {
+                    "type": "diffuse",
+                    "reflectance": {"type": "rgb", "value": list(color)}
+                }
+            }
+
+        return scene_dict
+
+    def _find_scene_key(self, params_scene, predicate):
+        for k in params_scene.keys():
+            if predicate(k):
+                return k
+        return None
+
+    def calibrate_camera_to_reference(
+        self,
+        geometry_params,
+        output_dir=OUTPUT_DIR,
+        dist_mult_grid=(0.85, 0.95, 1.05, 1.15, 1.25),
+        fov_grid=(30.0, 40.0, 45.0, 50.0, 60.0),
+        spp=16,
+        refine_with_scipy=False,
+        scipy_max_iter=25,
+    ):
+        """Find camera params (distance multiplier, fov) that best match the reference image.
+
+        This keeps the film resolution equal to the reference resolution.
+        """
+        geometry_params = np.array(geometry_params, dtype=np.float32)
+
+        # Build mesh once
+        verts_list = compute_knitting_vertices(geometry_params, self.consts)
+        faces_list = compute_knitting_faces(self.consts['segments'], verts_list)
+        mesh_data = [(v, [], f, n) for (v, n), f in zip(verts_list, faces_list)]
+        path = os.path.join(output_dir, "meshes", "camera_calib.obj")
+        
+        if self.use_colored_rows:
+            loop_res = self.consts['loop_res']
+            segments = self.consts['segments']
+            obj_info = save_per_loop_obj_files(mesh_data, path.replace(".obj", ""), loop_res, segments)
+        else:
+            save_into_obj_files(mesh_data, path.replace(".obj", ""))
+            obj_path = path.replace(".obj", "_combined.obj")
+
+        best_loss = float('inf')
+        best_params = self.camera_params
+
+        for dist_mult in dist_mult_grid:
+            for fov in fov_grid:
+                if self.use_colored_rows:
+                    scene = mi.load_dict(self.get_per_loop_colored_scene_dict(obj_info, geometry_params, camera_params=(dist_mult, fov)))
+                else:
+                    scene = mi.load_dict(self.get_scene_dict(obj_path, geometry_params, camera_params=(dist_mult, fov)))
+                img = mi.render(scene, spp=spp)
+                loss = self._masked_mse_np(np.array(img), self.ref_array)
+                if loss < best_loss:
+                    best_loss = loss
+                    best_params = (float(dist_mult), float(fov))
+
+        # Optional local refinement
+        if refine_with_scipy:
+            try:
+                from scipy.optimize import minimize
+
+                def objective(x):
+                    dist_mult, fov = float(x[0]), float(x[1])
+                    # keep params in reasonable bounds
+                    dist_mult = float(np.clip(dist_mult, 0.5, 2.0))
+                    fov = float(np.clip(fov, 20.0, 75.0))
+                    if self.use_colored_rows:
+                        scene = mi.load_dict(self.get_per_loop_colored_scene_dict(obj_info, geometry_params, camera_params=(dist_mult, fov)))
+                    else:
+                        scene = mi.load_dict(self.get_scene_dict(obj_path, geometry_params, camera_params=(dist_mult, fov)))
+                    img = mi.render(scene, spp=spp)
+                    return self._masked_mse_np(np.array(img), self.ref_array)
+
+                result = minimize(
+                    objective,
+                    x0=np.array(best_params, dtype=np.float32),
+                    method='Nelder-Mead',
+                    options={'maxiter': int(scipy_max_iter), 'disp': False},
+                )
+                cand = (float(result.x[0]), float(result.x[1]))
+                cand_loss = float(result.fun)
+                if cand_loss < best_loss:
+                    best_loss = cand_loss
+                    best_params = cand
+            except Exception as e:
+                print(f"  ⚠ SciPy refinement skipped: {e}")
+
+        self.camera_params = best_params
+        print(f"  ✓ Calibrated camera: dist_mult={best_params[0]:.3f}, fov={best_params[1]:.1f}°, loss={best_loss:.6f}")
+        return best_params, best_loss
     
     def render_parameter_variations(self, params, param_names):
         """Render the scene with parameter variations to show their effects"""
@@ -283,9 +1047,14 @@ class KnittingOptimizer:
                 mesh_data = [(v, [], f, n) for (v, n), f in zip(verts_list, faces_list)]
                 
                 path = os.path.join(OUTPUT_DIR, "meshes", f"temp_var_{name}_{label}.obj")
-                save_into_obj_files(mesh_data, path.replace(".obj", ""))
-                
-                scene = mi.load_dict(self.get_scene_dict(path.replace(".obj", "_combined.obj"), p_var))
+                if self.use_colored_rows:
+                    loop_res = self.consts['loop_res']
+                    segments = self.consts['segments']
+                    obj_info = save_per_loop_obj_files(mesh_data, path.replace(".obj", ""), loop_res, segments)
+                    scene = mi.load_dict(self.get_per_loop_colored_scene_dict(obj_info, p_var))
+                else:
+                    save_into_obj_files(mesh_data, path.replace(".obj", ""))
+                    scene = mi.load_dict(self.get_scene_dict(path.replace(".obj", "_combined.obj"), p_var))
                 img = mi.render(scene, spp=16)  # Lower spp for speed
                 
                 variations[f"{name}_{label}"] = np.array(img)
@@ -294,8 +1063,9 @@ class KnittingOptimizer:
     
     def visualize_epoch_summary(self, params, current_img, loss, param_names):
         """Create comprehensive visualization after each epoch"""
-        fig = plt.figure(figsize=(20, 14))
-        gs = fig.add_gridspec(5, 5, hspace=0.3, wspace=0.3)
+        n_params = len(param_names)
+        fig = plt.figure(figsize=(20, 3 + 2.5 * n_params))
+        gs = fig.add_gridspec(n_params + 1, 5, hspace=0.3, wspace=0.3)
         
         params_np = np.array(params)
         
@@ -350,12 +1120,30 @@ class KnittingOptimizer:
                 # Quick render (reuse epoch mesh for current params)
                 if sign == 0:
                     # Reuse the epoch mesh instead of regenerating
-                    epoch_obj = os.path.join(OUTPUT_DIR, "meshes", f"epoch_{self.iteration:03d}_combined.obj")
-                    if os.path.exists(epoch_obj):
-                        scene = mi.load_dict(self.get_scene_dict(epoch_obj, p_var))
-                        img = mi.render(scene, spp=16)
-                        images.append(np.array(img))
-                        continue
+                    if self.use_colored_rows:
+                        # Check for per-loop files
+                        epoch_loop_0 = os.path.join(OUTPUT_DIR, "meshes", f"epoch_{self.iteration:03d}_row_00_loop_00.obj")
+                        if os.path.exists(epoch_loop_0):
+                            # Reconstruct obj_info from saved files
+                            n_rows, n_loops = self.bitmap.shape
+                            obj_info = []
+                            for r in range(n_rows):
+                                for l in range(n_loops):
+                                    fpath = os.path.join(OUTPUT_DIR, "meshes", f"epoch_{self.iteration:03d}_row_{r:02d}_loop_{l:02d}.obj")
+                                    if os.path.exists(fpath):
+                                        obj_info.append((r, l, fpath))
+                            if obj_info:
+                                scene = mi.load_dict(self.get_per_loop_colored_scene_dict(obj_info, p_var))
+                                img = mi.render(scene, spp=16)
+                                images.append(np.array(img))
+                                continue
+                    else:
+                        epoch_obj = os.path.join(OUTPUT_DIR, "meshes", f"epoch_{self.iteration:03d}_combined.obj")
+                        if os.path.exists(epoch_obj):
+                            scene = mi.load_dict(self.get_scene_dict(epoch_obj, p_var))
+                            img = mi.render(scene, spp=16)
+                            images.append(np.array(img))
+                            continue
                 
                 # Generate mesh for variation
                 verts_list = compute_knitting_vertices(p_var, self.consts)
@@ -363,9 +1151,14 @@ class KnittingOptimizer:
                 mesh_data = [(v, [], f, n) for (v, n), f in zip(verts_list, faces_list)]
                 
                 path = os.path.join(OUTPUT_DIR, "meshes", f"temp_var_{self.iteration}_{i}_{sign}.obj")
-                save_into_obj_files(mesh_data, path.replace(".obj", ""))
-                
-                scene = mi.load_dict(self.get_scene_dict(path.replace(".obj", "_combined.obj"), p_var))
+                if self.use_colored_rows:
+                    loop_res = self.consts['loop_res']
+                    segments = self.consts['segments']
+                    obj_info = save_per_loop_obj_files(mesh_data, path.replace(".obj", ""), loop_res, segments)
+                    scene = mi.load_dict(self.get_per_loop_colored_scene_dict(obj_info, p_var))
+                else:
+                    save_into_obj_files(mesh_data, path.replace(".obj", ""))
+                    scene = mi.load_dict(self.get_scene_dict(path.replace(".obj", "_combined.obj"), p_var))
                 img = mi.render(scene, spp=16)
                 images.append(np.array(img))
                 
@@ -419,6 +1212,210 @@ class KnittingOptimizer:
         plt.show()
         plt.close()
 
+    # Modification inside KnittingOptimizer.step()
+    def compute_hybrid_loss(rendered_tensor, reference_tensor, mask):
+        # 1. Standard Pixel MSE (keeps global color/position)
+        pixel_loss = dr.sum(dr.sqr((rendered_tensor - reference_tensor) * mask)) / dr.sum(mask)
+        
+        # 2. Perceptual/Semantic Loss (NeuroDiff3D approach)
+        # Convert Mitsuba tensors to Torch to use the feature extractor
+        torch_render = self.mi_to_torch(rendered_tensor)
+        torch_ref = self.mi_to_torch(reference_tensor)
+        
+        feat_render = self.feature_extractor(torch_render)
+        feat_ref = self.feature_extractor(torch_ref)
+        
+        perceptual_loss = torch.mean((feat_render - feat_ref)**2)
+        
+        # Combine (weights derived from NeuroDiff3D's multimodal fusion)
+        return 0.5 * pixel_loss + 0.5 * perceptual_loss.item()
+    
+    def compute_perceptual_loss(self, rendered_mi, reference_mi):
+        """Helper to compute Perceptual Loss using PyTorch features."""
+        
+        # Initialize VGG if not already done (Semantic Encoder [cite: 235])
+        if not hasattr(self, 'vgg'):
+            self.vgg = models.vgg16(pretrained=True).features[:16].eval().cuda()
+            for p in self.vgg.parameters(): p.requires_grad = False
+
+        # Convert Mitsuba to Torch [cite: 259]
+        def to_torch(mi_img):
+            t = torch.from_numpy(np.array(mi_img)).permute(2, 0, 1).unsqueeze(0).cuda()
+            t.requires_grad = True
+            return t
+
+        render_t = to_torch(rendered_mi)
+        ref_t = to_torch(reference_mi).detach()
+
+        # Extract features (Semantic Information [cite: 221, 234])
+        feat_render = self.vgg(render_t)
+        feat_ref = self.vgg(ref_t)
+        
+        loss = torch.mean((feat_render - feat_ref)**2)
+        loss.backward()
+        
+        # Extract gradient dL/dImage to inject back into Mitsuba
+        grad_img = render_t.grad.detach().cpu().numpy().squeeze().transpose(1, 2, 0)
+        
+        return float(loss.item()), grad_img
+    
+    # def step(self, params, epsilon=0.01):
+    #     self.iteration += 1
+    #     params_np = np.array(params)
+        
+    #     # Generate mesh geometry from current parameters
+    #     verts_list = compute_knitting_vertices(params_np, self.consts)
+    #     faces_list = compute_knitting_faces(self.consts['segments'], verts_list)
+    #     mesh_data = [(v, [], f, n) for (v, n), f in zip(verts_list, faces_list)]
+        
+    #     # Save mesh to OBJ file (one per epoch)
+    #     path = os.path.join(OUTPUT_DIR, "meshes", f"epoch_{self.iteration:03d}.obj")
+    #     save_into_obj_files(mesh_data, path.replace(".obj", ""))
+    #     obj_path = path.replace(".obj", "_combined.obj")
+
+    #     scene = mi.load_dict(self.get_scene_dict(obj_path, params_np))
+        
+    #     # Access mesh vertex positions through scene parameters
+    #     params_scene = mi.traverse(scene)
+    #     vertex_key = [k for k in params_scene.keys() if 'vertex_positions' in k]
+
+    #     # Optional: enable texture gradient
+    #     tex_key = None
+    #     if self.optimize_texture:
+    #         tex_key = self._find_scene_key(params_scene, lambda k: ('reflectance' in k and 'value' in k))
+    #         if tex_key is None:
+    #             tex_key = self._find_scene_key(params_scene, lambda k: 'reflectance' in k)
+    #         if tex_key is not None:
+    #             tex_val = params_scene[tex_key]
+    #             dr.enable_grad(tex_val)
+    #             params_scene[tex_key] = tex_val
+        
+    #     if len(vertex_key) > 0:
+    #         # Enable gradient tracking on vertex positions
+    #         vertex_positions = params_scene[vertex_key[0]]
+    #         dr.enable_grad(vertex_positions)
+    #         params_scene[vertex_key[0]] = vertex_positions
+    #         params_scene.update()
+            
+    #         # Differentiable rendering (at reference resolution)
+    #         img = mi.render(scene, params=params_scene, spp=32)
+            
+    #         # Compute masked loss with gradient tracking (clip ignores background)
+    #         ref_flat = dr.ravel(mi.TensorXf(self.ref_array))
+    #         img_flat = dr.ravel(img)
+    #         mask_flat = dr.ravel(self.loss_mask_tensor)
+    #         diff = (img_flat - ref_flat) * mask_flat
+    #         loss_dr = dr.sum(dr.sqr(diff)) / (dr.sum(mask_flat) + 1e-8)
+            
+    #         # Backward pass through renderer
+    #         dr.backward(loss_dr)
+            
+    #         # Extract gradients from vertex positions
+    #         vertex_grads = dr.grad(vertex_positions)
+
+    #         # Extract gradient for texture reflectance
+    #         tex_grads_np = None
+    #         if self.optimize_texture and tex_key is not None:
+    #             try:
+    #                 tex_grad = dr.grad(params_scene[tex_key])
+    #                 tex_grads_np = np.array(tex_grad, dtype=np.float32).reshape(-1)[:3]
+    #             except Exception:
+    #                 tex_grads_np = None
+            
+    #         # Compute parameter gradients using chain rule with JAX Jacobian
+    #         J = compute_geometry_jacobian(params_np, self.bitmap)
+    #         vertex_grads_np = np.array(vertex_grads).reshape(-1, 3)
+            
+    #         # Compute gradients: sum over vertices of (dL/dv_i * dv_i/dp_j)
+    #         grads_np = np.zeros(len(params_np))
+    #         for i in range(len(params_np)):
+    #             grads_np[i] = np.sum(vertex_grads_np * J[:, :, i])
+            
+    #         # Convert loss to numpy (properly extract scalar value from DrJit type)
+    #         base_loss = float(dr.sum(loss_dr)[0])
+    #         base_img = np.array(img)
+    #     else:
+    #         # Fallback: use finite differences if gradient tracking fails
+    #         print("Gradient tracking unavailable, using finite differences")
+    #         img = mi.render(scene, spp=32)
+    #         base_loss = self._masked_mse_np(np.array(img), self.ref_array)
+    #         base_img = np.array(img)
+            
+    #         # Finite difference gradients
+    #         grads_np = np.zeros(len(params_np))
+    #         for i in range(len(params_np)):
+    #             p_eps = params_np.copy()
+    #             p_eps[i] += epsilon
+    #             verts_list_eps = compute_knitting_vertices(p_eps, self.consts)
+    #             faces_list_eps = compute_knitting_faces(self.consts['segments'], verts_list_eps)
+    #             mesh_data_eps = [(v, [], f, n) for (v, n), f in zip(verts_list_eps, faces_list_eps)]
+                
+    #             path_eps = os.path.join(OUTPUT_DIR, "meshes", f"temp_eps_{i}.obj")
+    #             save_into_obj_files(mesh_data_eps, path_eps.replace(".obj", ""))
+    #             scene_eps = mi.load_dict(self.get_scene_dict(path_eps.replace(".obj", "_combined.obj"), p_eps))
+    #             img_eps = mi.render(scene_eps, spp=32)
+    #             loss_eps = self._masked_mse_np(np.array(img_eps), self.ref_array)
+    #             grads_np[i] = (loss_eps - base_loss) / epsilon
+                
+    #             # Clean up temp file
+    #             try:
+    #                 os.remove(path_eps.replace(".obj", "_combined.obj"))
+    #                 os.remove(path_eps)
+    #             except:
+    #                 pass
+
+    #         tex_grads_np = None
+        
+    #     # Update parameters using Adam optimizer
+    #     if self.opt_state is None: 
+    #         self.opt_state = self.optimizer.init(jnp.array(params))
+    #     updates, self.opt_state = self.optimizer.update(jnp.array(grads_np), self.opt_state)
+    #     new_params = optax.apply_updates(jnp.array(params), updates)
+
+    #     # Update texture via differentiable gradients (if available)
+    #     if self.optimize_texture and tex_grads_np is not None and len(tex_grads_np) == 3:
+    #         if self.texture_opt_state is None:
+    #             self.texture_opt_state = self.texture_optimizer.init(self.texture_rgb)
+
+    #         tex_updates, self.texture_opt_state = self.texture_optimizer.update(
+    #             jnp.array(tex_grads_np, dtype=jnp.float32),
+    #             self.texture_opt_state,
+    #         )
+    #         self.texture_rgb = optax.apply_updates(self.texture_rgb, tex_updates)
+    #         self.texture_rgb = jnp.clip(self.texture_rgb, 0.0, 1.0)
+    #         self.texture_history.append(np.array(self.texture_rgb))
+        
+    #     # Clip to physical reality
+    #     # [stitch_bulge, stitch_z, loop_height, dy, radius, curve_skew]
+    #     new_params = jnp.clip(
+    #         new_params,
+    #         jnp.array([0.1, -0.8, 0.2, 0.05, 0.02]),
+    #         jnp.array([0.6, -0.1, 2.5, 1.0, 0.3])
+    #     )
+        
+    #     # Track history
+    #     self.loss_history.append(base_loss)
+    #     self.param_history.append(new_params)
+    #     self.gradient_history.append(grads_np)
+        
+    #     # Display progress
+    #     param_names = ['bulge', 'z', 'loop_h', 'dy', 'rad', 'skew']
+    #     grad_str = ' | '.join([f"∂L/∂{name}={g:+.4f}" for name, g in zip(param_names, grads_np)])
+    #     print(f"\nEpoch {self.iteration:02d} | Loss: {base_loss:.6f}")
+    #     print(f"  Gradients: {grad_str}")
+    #     print(f"  Parameters: {np.round(new_params, 4)}")
+    #     if self.optimize_texture:
+    #         print(f"  Texture RGB: {np.round(np.array(self.texture_rgb), 4)}")
+    #     print(f"  [Using DrJit autodiff through Mitsuba renderer]")
+        
+    #     # Save progress render
+    #     mi.util.write_bitmap(os.path.join(OUTPUT_DIR, "renders", f"iter_{self.iteration:03d}.png"), base_img)
+        
+    #     # Create comprehensive visualization
+    #     print(f"  Creating epoch visualization...")
+    #     self.visualize_epoch_summary(new_params, base_img, base_loss, param_names)
+        
+    #     return new_params
     def step(self, params, epsilon=0.01):
         self.iteration += 1
         params_np = np.array(params)
@@ -428,49 +1425,30 @@ class KnittingOptimizer:
         faces_list = compute_knitting_faces(self.consts['segments'], verts_list)
         mesh_data = [(v, [], f, n) for (v, n), f in zip(verts_list, faces_list)]
         
-        # Save mesh to OBJ file (one per epoch)
+        # Save mesh to OBJ file(s)
         path = os.path.join(OUTPUT_DIR, "meshes", f"epoch_{self.iteration:03d}.obj")
+        
+        # Always save combined OBJ for gradient computation
         save_into_obj_files(mesh_data, path.replace(".obj", ""))
-        obj_path = path.replace(".obj", "_combined.obj")
+        obj_path_combined = path.replace(".obj", "_combined.obj")
         
-        # Build complete scene
-        n_rows, n_loops = self.bitmap.shape
-        _, stitch_z, dy, _ = params_np
-        center = [n_loops / 2.0, ((n_rows - 1) * dy) / 2.0, stitch_z / 2.0]
-        dist = max(n_loops, n_rows * dy) * 1.05
-        
-        scene = mi.load_dict({
-            "type": "scene",
-            "integrator": {"type": "path", "max_depth": 2},
-            "sensor": {
-                "type": "perspective",
-                "fov": 45,
-                "to_world": mi.ScalarTransform4f.look_at(
-                    origin=[center[0], center[1], center[2] + dist], 
-                    target=center, 
-                    up=[0, 1, 0]
-                ),
-                "film": {
-                    "type": "hdrfilm", 
-                    "width": self.res_width, 
-                    "height": self.res_height, 
-                    "rfilter": {"type": "gaussian"}
-                },
-            },
-            "light": {"type": "constant", "radiance": {"type": "rgb", "value": 0.8}},
-            "mesh": {
-                "type": "obj",
-                "filename": obj_path,
-                "bsdf": {
-                    "type": "diffuse",
-                    "reflectance": {"type": "rgb", "value": [0.8, 0.4, 0.3]}
-                }
-            }
-        })
+        # For gradient computation, use combined mesh (single vertex_positions array)
+        scene = mi.load_dict(self.get_scene_dict(obj_path_combined, params_np))
         
         # Access mesh vertex positions through scene parameters
         params_scene = mi.traverse(scene)
         vertex_key = [k for k in params_scene.keys() if 'vertex_positions' in k]
+
+        # Optional: enable texture gradient
+        tex_key = None
+        if self.optimize_texture:
+            tex_key = self._find_scene_key(params_scene, lambda k: ('reflectance' in k and 'value' in k))
+            if tex_key is None:
+                tex_key = self._find_scene_key(params_scene, lambda k: 'reflectance' in k)
+            if tex_key is not None:
+                tex_val = params_scene[tex_key]
+                dr.enable_grad(tex_val)
+                params_scene[tex_key] = tex_val
         
         if len(vertex_key) > 0:
             # Enable gradient tracking on vertex positions
@@ -482,16 +1460,23 @@ class KnittingOptimizer:
             # Differentiable rendering (at reference resolution)
             img = mi.render(scene, params=params_scene, spp=32)
             
-            # Compute loss with gradient tracking (no resizing needed)
-            ref_flat = dr.ravel(mi.TensorXf(self.ref_array))    ##Convert the input into a contiguous flat array.
-            img_flat = dr.ravel(img)
-            loss_dr = dr.mean(dr.sqr(img_flat - ref_flat))
+            # Compute blended loss with gradient tracking (clip ignores background)
+            loss_dr = self._compute_loss_dr(img)
             
             # Backward pass through renderer
             dr.backward(loss_dr)
             
             # Extract gradients from vertex positions
             vertex_grads = dr.grad(vertex_positions)
+
+            # Extract gradient for texture reflectance
+            tex_grads_np = None
+            if self.optimize_texture and tex_key is not None:
+                try:
+                    tex_grad = dr.grad(params_scene[tex_key])
+                    tex_grads_np = np.array(tex_grad, dtype=np.float32).reshape(-1)[:3]
+                except Exception:
+                    tex_grads_np = None
             
             # Compute parameter gradients using chain rule with JAX Jacobian
             J = compute_geometry_jacobian(params_np, self.bitmap)
@@ -503,13 +1488,13 @@ class KnittingOptimizer:
                 grads_np[i] = np.sum(vertex_grads_np * J[:, :, i])
             
             # Convert loss to numpy (properly extract scalar value from DrJit type)
-            base_loss = float(dr.sum(loss_dr)[0])
+            base_loss = float(dr.ravel(loss_dr)[0])
             base_img = np.array(img)
         else:
             # Fallback: use finite differences if gradient tracking fails
-            print("  ⚠ Gradient tracking unavailable, using finite differences")
+            print("Gradient tracking unavailable, using finite differences")
             img = mi.render(scene, spp=32)
-            base_loss = np.mean((np.array(img) - self.ref_array)**2)
+            base_loss = self._masked_mse_np(np.array(img), self.ref_array)
             base_img = np.array(img)
             
             # Finite difference gradients
@@ -525,7 +1510,7 @@ class KnittingOptimizer:
                 save_into_obj_files(mesh_data_eps, path_eps.replace(".obj", ""))
                 scene_eps = mi.load_dict(self.get_scene_dict(path_eps.replace(".obj", "_combined.obj"), p_eps))
                 img_eps = mi.render(scene_eps, spp=32)
-                loss_eps = np.mean((np.array(img_eps) - self.ref_array)**2)
+                loss_eps = self._masked_mse_np(np.array(img_eps), self.ref_array)
                 grads_np[i] = (loss_eps - base_loss) / epsilon
                 
                 # Clean up temp file
@@ -534,38 +1519,71 @@ class KnittingOptimizer:
                     os.remove(path_eps)
                 except:
                     pass
+
+            tex_grads_np = None
         
         # Update parameters using Adam optimizer
         if self.opt_state is None: 
             self.opt_state = self.optimizer.init(jnp.array(params))
         updates, self.opt_state = self.optimizer.update(jnp.array(grads_np), self.opt_state)
         new_params = optax.apply_updates(jnp.array(params), updates)
+
+        # Update texture via differentiable gradients (if available)
+        if self.optimize_texture and tex_grads_np is not None and len(tex_grads_np) == 3:
+            if self.texture_opt_state is None:
+                self.texture_opt_state = self.texture_optimizer.init(self.texture_rgb)
+
+            tex_updates, self.texture_opt_state = self.texture_optimizer.update(
+                jnp.array(tex_grads_np, dtype=jnp.float32),
+                self.texture_opt_state,
+            )
+            self.texture_rgb = optax.apply_updates(self.texture_rgb, tex_updates)
+            self.texture_rgb = jnp.clip(self.texture_rgb, 0.0, 1.0)
+            self.texture_history.append(np.array(self.texture_rgb))
         
         # Clip to physical reality
-        new_params = jnp.clip(new_params, jnp.array([0.1, -0.8, 0.1, 0.02]), jnp.array([0.6, -0.1, 1.0, 0.3]))
+        # [stitch_bulge, stitch_z, loop_height, dy, radius, curve_skew, y_sharp, x_bias, z_bias, ellipse_ratio]
+        new_params = jnp.clip(
+            new_params,
+            jnp.array([0.1, -0.8, 0.2, 0.05, 0.02, -0.6, 0.0, -0.2, -0.2, 0.4]),
+            jnp.array([0.6, -0.1, 2.5, 1.0, 0.3, 0.6, 0.8, 0.2, 0.2, 1.6])
+        )
         
         # Track history
         self.loss_history.append(base_loss)
         self.param_history.append(new_params)
         self.gradient_history.append(grads_np)
         
+        # Render colored version for visualization if enabled
+        if self.use_colored_rows:
+            # Use per-loop coloring for pattern: Brown, Blue, Yellow/Red alternating
+            loop_res = self.consts['loop_res']
+            segments = self.consts['segments']
+            obj_info = save_per_loop_obj_files(mesh_data, path.replace(".obj", ""), loop_res, segments)
+            colored_scene = mi.load_dict(self.get_per_loop_colored_scene_dict(obj_info, params_np))
+            colored_img = mi.render(colored_scene, spp=32)
+            display_img = np.array(colored_img)
+        else:
+            display_img = base_img
+        
         # Display progress
-        param_names = ['bulge', 'z', 'dy', 'rad']
+        param_names = ['bulge', 'z', 'loop_h', 'dy', 'rad', 'skew', 'y_sharp', 'x_bias', 'z_bias', 'ellipse']
         grad_str = ' | '.join([f"∂L/∂{name}={g:+.4f}" for name, g in zip(param_names, grads_np)])
         print(f"\nEpoch {self.iteration:02d} | Loss: {base_loss:.6f}")
         print(f"  Gradients: {grad_str}")
         print(f"  Parameters: {np.round(new_params, 4)}")
+        if self.optimize_texture:
+            print(f"  Texture RGB: {np.round(np.array(self.texture_rgb), 4)}")
         print(f"  [Using DrJit autodiff through Mitsuba renderer]")
         
         # Save progress render
-        mi.util.write_bitmap(os.path.join(OUTPUT_DIR, "renders", f"iter_{self.iteration:03d}.png"), base_img)
+        mi.util.write_bitmap(os.path.join(OUTPUT_DIR, "renders", f"iter_{self.iteration:03d}.png"), display_img)
         
         # Create comprehensive visualization
         print(f"  Creating epoch visualization...")
-        self.visualize_epoch_summary(new_params, base_img, base_loss, param_names)
+        self.visualize_epoch_summary(new_params, display_img, base_loss, param_names)
         
         return new_params
-
 # %% MAIN EXECUTION
 
 def print_hyperparameters(learning_rate, max_epochs, spp_opt, spp_final, epsilon, patience):
@@ -586,8 +1604,14 @@ def print_initial_parameters(params):
     print(f"\nInitial Parameters: {params}")
     print(f"  stitch_bulge: {params[0]:.4f}")
     print(f"  stitch_z:     {params[1]:.4f}")
-    print(f"  dy (spacing): {params[2]:.4f}")
-    print(f"  radius:       {params[3]:.4f}\n")
+    print(f"  loop_height:  {params[2]:.4f}")
+    print(f"  dy (spacing): {params[3]:.4f}")
+    print(f"  radius:       {params[4]:.4f}")
+    print(f"  curve_skew:   {params[5]:.4f}\n")
+    print(f"  y_sharp:      {params[6]:.4f}")
+    print(f"  x_bias:       {params[7]:.4f}")
+    print(f"  z_bias:       {params[8]:.4f}")
+    print(f"  ellipse_ratio:{params[9]:.4f}\n")
 
 def run_optimization_loop(optimizer, params, max_epochs, epsilon, patience):
     """Execute the main optimization loop with early stopping"""
@@ -604,11 +1628,11 @@ def run_optimization_loop(optimizer, params, max_epochs, epsilon, patience):
             best_loss = current_loss
             best_params = params
             patience_counter = 0
-            print(f"  ✓ New best loss: {best_loss:.6f}")
+            print(f"New best loss: {best_loss:.6f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n✓ Converged! No improvement for {patience} iterations.")
+                print(f"\nConverged! No improvement for {patience} iterations.")
                 params = best_params
                 break
     
@@ -624,7 +1648,7 @@ def create_before_after_comparison(output_dir, ref_img, total_iters):
     last_render_path = os.path.join(output_dir, "renders", f"iter_{total_iters:03d}.png")
     
     if not (os.path.exists(first_render_path) and os.path.exists(last_render_path)):
-        print("  ⚠ Render files not found, skipping comparison")
+        print("Render files not found, skipping comparison")
         return
     
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -660,7 +1684,18 @@ def create_optimization_summary(optimizer, init_params, final_params, output_dir
     print("="*80)
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    param_names = ['stitch_bulge', 'stitch_z', 'dy', 'radius']
+    param_names = [
+        'stitch_bulge',
+        'stitch_z',
+        'loop_height',
+        'dy',
+        'radius',
+        'curve_skew',
+        'y_sharp',
+        'x_bias',
+        'z_bias',
+        'ellipse_ratio',
+    ]
     
     # 1. Loss Curve
     ax = axes[0, 0]
@@ -720,16 +1755,28 @@ def visualize_parameter_effects_final(params, bitmap, output_dir):
     print("VISUALIZING PARAMETER EFFECTS ON GEOMETRY")
     print("="*80)
     
-    param_names = ['stitch_bulge', 'stitch_z', 'dy', 'radius']
+    param_names = [
+        'stitch_bulge',
+        'stitch_z',
+        'loop_height',
+        'dy',
+        'radius',
+        'curve_skew',
+        'y_sharp',
+        'x_bias',
+        'z_bias',
+        'ellipse_ratio',
+    ]
     save_path = os.path.join(output_dir, "parameter_effects.png")
     visualize_parameter_effects(params, bitmap, param_names, save_path)
     
     # Show interactively
     consts = {'BITMAP': bitmap, 'loop_res': 32, 'segments': 8}
-    fig = plt.figure(figsize=(20, 5))
+    n_params = len(param_names)
+    fig = plt.figure(figsize=(5 * n_params, 5))
     
     for i, name in enumerate(param_names):
-        ax = fig.add_subplot(1, 4, i+1, projection='3d')
+        ax = fig.add_subplot(1, n_params, i + 1, projection='3d')
         delta = 0.2 * params[i]
         test_params = [
             params.copy().at[i].set(params[i] - delta),
@@ -766,7 +1813,18 @@ def compute_jacobian_analysis(params, bitmap):
     print("Computing ∂(vertices)/∂(parameters) using JAX automatic differentiation...")
     
     J = compute_geometry_jacobian(params, bitmap)
-    param_names = ['stitch_bulge', 'stitch_z', 'dy', 'radius']
+    param_names = [
+        'stitch_bulge',
+        'stitch_z',
+        'loop_height',
+        'dy',
+        'radius',
+        'curve_skew',
+        'y_sharp',
+        'x_bias',
+        'z_bias',
+        'ellipse_ratio',
+    ]
     
     print(f"Jacobian shape: {J.shape}")
     print(f"  → {J.shape[0]} vertices")
@@ -787,7 +1845,18 @@ def print_final_summary(optimizer, init_params, final_params, best_loss):
     print(f"Final Loss:        {optimizer.loss_history[-1]:.6f}")
     print(f"Best Loss:         {best_loss:.6f}")
     
-    param_names = ['stitch_bulge', 'stitch_z', 'dy', 'radius']
+    param_names = [
+        'stitch_bulge',
+        'stitch_z',
+        'loop_height',
+        'dy',
+        'radius',
+        'curve_skew',
+        'y_sharp',
+        'x_bias',
+        'z_bias',
+        'ellipse_ratio',
+    ]
     init_arr = np.array(init_params)
     final_arr = np.array(final_params)
     
@@ -825,7 +1894,7 @@ def test_parameters(params, reference_img, bitmap, output_dir="opt_outputs"):
     
     # Render with matching camera setup - try multiple camera distances to find best match
     n_rows, n_loops = bitmap.shape
-    _, stitch_z, dy, _ = params_np
+    _, stitch_z, _, dy, _, _, _, _, _, _ = params_np
     center = [n_loops / 2.0, ((n_rows - 1) * dy) / 2.0, stitch_z / 2.0]
     
     print("\n📷 Camera calibration: Testing different distances to minimize loss...")
@@ -948,12 +2017,14 @@ def save_best_model(params, bitmap, output_dir, spp_final=128):
     # Create high-quality final render with matching framing
     print(f"Creating final high-quality render ({spp_final} spp)...")
     n_rows, n_loops = bitmap.shape
-    _, stitch_z, dy, _ = params_np
+    _, stitch_z, _, dy, _, _, _, _, _, _ = params_np
     
     # Use same camera settings as optimization
     center = [n_loops / 2.0, ((n_rows - 1) * dy) / 2.0, stitch_z / 2.0]
-    dist = max(n_loops, n_rows * dy) * 1.05
-    
+    # dist = max(n_loops, n_rows * dy) * 1.05
+    dist = max(n_loops, n_rows * dy) *0.7
+    # CHANGE HERE
+
     # Calculate rectangular resolution
     mesh_aspect = n_loops / n_rows
     final_height = 512
@@ -974,7 +2045,6 @@ def save_best_model(params, bitmap, output_dir, spp_final=128):
                 "type": "hdrfilm", 
                 "width": final_width, 
                 "height": final_height, 
-                "height": 512,
                 "rfilter": {"type": "gaussian"},
                 "pixel_format": "rgb"
             },
@@ -1022,25 +2092,69 @@ def save_best_model(params, bitmap, output_dir, spp_final=128):
 if __name__ == "__main__":
     # ==================== HYPERPARAMETERS ====================
     LEARNING_RATE = 0.005
-    MAX_EPOCHS = 5
+    MAX_ITERATIONS = 1
     SPP_OPTIMIZATION = 32
     SPP_FINAL = 128
     EPSILON = 0.01
-    PATIENCE = 5
-    
+    PATIENCE = MAX_ITERATIONS
     # TEST MODE: Set to True to test known parameters without optimization
     TEST_MODE = False
+
+    # Extra optimization controls
+    OPTIMIZE_TEXTURE = True
+    TEXTURE_LEARNING_RATE = 0.05
+    INITIAL_TEXTURE_RGB = (0.8, 0.4, 0.3)
+
+    # Clip (crop) region used for LOSS only (keeps render resolution unchanged)
+    # Example: (0.6, 0.6) means use only the central 60% width/height for loss.
+    LOSS_CENTER_CROP = (0.55, 0.70)
+
+    # Make a bigger model (more loops/rows) but still compare a clip
+    BITMAP_ROWS = 9
+    BITMAP_LOOPS = 4
+
+    OPTIMIZE_CAMERA = True  # calibrate once before geometry optimization
+    FORCE_CAMERA_PARAMS = True  # if True, skip calibration and use manual params below
+    CAMERA_DIST_MULT = 0.70
+    CAMERA_FOV = 45.0
+    CAMERA_GRID_DIST = (0.85, 0.95, 1.05, 1.15, 1.25)
+    CAMERA_GRID_FOV = (35.0, 40.0, 45.0, 50.0, 55.0)
+    CAMERA_REFINE_SCIPY = False
     epsilon = 0.001
-    TEST_PARAMS = [ 0.2993+epsilon, -0.3505+epsilon, 0.40109998+epsilon, 0.1497+epsilon]
+    TEST_PARAMS = [
+        0.2993 + epsilon,
+        -0.3505 + epsilon,
+        1.0,
+        0.40109998 + epsilon,
+        0.1497 + epsilon,
+        0.0,
+        0.30,
+        0.05,
+        0.02,
+        0.60,
+    ]
     # =========================================================
     
     # Load reference image and setup
     # ref = Image.open("referenceImage.jpg").convert("RGB")
-    ref = Image.open("referenceImage.jpg").convert("RGB")
-    BITMAP = jnp.ones((19, 17))
+    # ref = Image.open("referenceImage.jpg").convert("RGB")
+    ref = Image.open("referenceImage_cropped_new1.jpg").convert("RGB")
+
+    BITMAP = jnp.ones((BITMAP_ROWS, BITMAP_LOOPS))
     # init_params = [0.2749, -0.375, 0.4210, 0.1251]
     epsilon = 0.001
-    init_params= [ 0.2993+epsilon, -0.3505+epsilon, 0.40109998+epsilon, 0.1497+epsilon]
+    init_params = [
+        0.2993 + epsilon,
+        -0.3505 + epsilon,
+        1.5,
+        0.40109998 + epsilon,
+        0.18 + epsilon,
+        0.0,
+        0.30,
+        0.05,
+        0.02,
+        0.60,
+    ]
     
     if TEST_MODE:
         print("="*80)
@@ -1049,14 +2163,36 @@ if __name__ == "__main__":
         test_parameters(TEST_PARAMS, ref, BITMAP, OUTPUT_DIR)
     else:
         # Display configuration
-        print_hyperparameters(LEARNING_RATE, MAX_EPOCHS, SPP_OPTIMIZATION, 
+        print_hyperparameters(LEARNING_RATE, MAX_ITERATIONS, SPP_OPTIMIZATION, 
                              SPP_FINAL, EPSILON, PATIENCE)
         
         print_initial_parameters(init_params)
         
         # Run optimization
-        opt = KnittingOptimizer(ref, BITMAP, learning_rate=LEARNING_RATE)
-        params, best_loss = run_optimization_loop(opt, init_params, MAX_EPOCHS, 
+        opt = KnittingOptimizer(
+            ref,
+            BITMAP,
+            learning_rate=LEARNING_RATE,
+            optimize_texture=OPTIMIZE_TEXTURE,
+            texture_learning_rate=TEXTURE_LEARNING_RATE,
+            initial_texture_rgb=INITIAL_TEXTURE_RGB,
+            loss_center_crop=LOSS_CENTER_CROP,
+            camera_params=(CAMERA_DIST_MULT, CAMERA_FOV),
+        )
+
+        if OPTIMIZE_CAMERA and not FORCE_CAMERA_PARAMS:
+            print("\n" + "="*80)
+            print("CAMERA CALIBRATION (MATCH REFERENCE RESOLUTION / FRAMING)")
+            print("="*80)
+            opt.calibrate_camera_to_reference(
+                init_params,
+                output_dir=OUTPUT_DIR,
+                dist_mult_grid=CAMERA_GRID_DIST,
+                fov_grid=CAMERA_GRID_FOV,
+                spp=16,
+                refine_with_scipy=CAMERA_REFINE_SCIPY,
+            )
+        params, best_loss = run_optimization_loop(opt, init_params, MAX_ITERATIONS, 
                                                  EPSILON, PATIENCE)
         
         # Generate all visualizations
