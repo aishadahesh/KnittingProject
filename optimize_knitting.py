@@ -10,7 +10,7 @@ import jax
 import optax
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from new_main import save_into_obj_files
+
 import torch
 import torchvision.models as models
 
@@ -166,6 +166,49 @@ def compute_knitting_faces(segments, verts_list):
         v3 = (i_grid + 1) * segments + j_grid
         faces_list.append(jnp.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4))
     return faces_list
+
+def save_into_obj_files(mesh_data_list, base_filename="knitting_model"):
+    """
+    Saves mesh data into a combined OBJ file.
+    
+    Args:
+        mesh_data_list: List of (verts, edges, faces, n_points) tuples
+        base_filename: Base name for the output OBJ file
+    """
+    # Option 1: Save as a single combined OBJ file
+    combined_filename = f"{base_filename}_combined.obj"
+    vertex_offset = 0
+    
+    with open(combined_filename, 'w') as f:
+        f.write(f"# Knitting Model - Combined Mesh\n")
+        f.write(f"# Generated with {len(mesh_data_list)} mesh parts\n\n")
+        
+        for i, (verts, edges, faces, n_points) in enumerate(mesh_data_list):
+            f.write(f"# Mesh part {i+1}\n")
+            f.write(f"o knittingMesh_{i}\n\n")
+            
+            # Write vertices
+            for vert in verts:
+                # Convert numpy array to list if needed
+                if hasattr(vert, 'tolist'):
+                    v = vert.tolist()
+                else:
+                    v = vert
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            
+            f.write("\n")
+            
+            # Write faces (OBJ uses 1-based indexing)
+            for face in faces:
+                # Adjust indices by vertex_offset and add 1 for OBJ format
+                face_indices = [str(idx + vertex_offset + 1) for idx in face]
+                f.write(f"f {' '.join(face_indices)}\n")
+            
+            f.write("\n")
+            vertex_offset += len(verts)
+    
+    print(f"✓ Saved combined mesh to: {combined_filename}")
+
 
 # %% PARAMETER VISUALIZATION
 
@@ -3127,5 +3170,4 @@ if __name__ == "__main__":
         print("\n" + "="*80)
         print("All visualizations complete and displayed interactively!")
         print("="*80)
-# %%
 
