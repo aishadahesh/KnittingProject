@@ -10,9 +10,9 @@
 - **PyTorch & Torchvision**: Used for calculating Perceptual Loss via pre-trained VGG16 models.
 
 ## Visualization & UI
+- **Trame & VTK**: Core interactive 3D visualization and reactive UI framework.
 - **Matplotlib**: Generating plots, progress visualizations, and simple GUI overlays.
 - **PIL (Pillow)**: Image loading, processing, and cropping.
-- **Vedo**: (Optional) Interactive 3D mesh visualization.
 
 ## Development Tools
 - **Git**: Version control.
