@@ -7,5 +7,3 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-- [x] **Track: Replace UI with Trame-based Frontend**
-  *Link: [./tracks/trame_ui_20260217/](./tracks/trame_ui_20260217/)*
