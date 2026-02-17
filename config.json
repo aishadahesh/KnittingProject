@@ -1,0 +1,79 @@
+{
+  "rendering": {
+    "output_dir": "opt_outputs",
+    "spp_optimization": 32,
+    "spp_final": 128,
+    "camera_dist_mult": 0.70,
+    "camera_fov": 45.0,
+    "camera_grid_dist": [0.85, 0.95, 1.05, 1.15, 1.25],
+    "camera_grid_fov": [30.0, 40.0, 45.0, 50.0, 60.0],
+    "mitsuba_variant": "cuda_ad_rgb",
+    "mitsuba_variant_fallback": "llvm_ad_rgb"
+  },
+  "geometry": {
+    "bitmap_rows": 9,
+    "bitmap_loops": 4,
+    "loop_res": 32,
+    "segments": 8,
+    "initial_params": [
+      0.3003,
+      -0.3495,
+      1.5,
+      0.4021,
+      0.181,
+      0.0,
+      0.30,
+      0.05,
+      0.02,
+      0.60
+    ],
+    "param_names": [
+      "stitch_bulge",
+      "stitch_z",
+      "loop_height",
+      "dy",
+      "radius",
+      "curve_skew",
+      "y_sharp",
+      "x_bias",
+      "z_bias",
+      "ellipse_ratio"
+    ],
+    "param_ranges": [
+      [0.1, 0.6],
+      [-0.8, -0.1],
+      [0.2, 2.5],
+      [0.05, 1.0],
+      [0.02, 0.3],
+      [-0.6, 0.6],
+      [0.0, 0.8],
+      [-0.2, 0.2],
+      [-0.2, 0.2],
+      [0.4, 1.6]
+    ],
+    "param_deltas": [0.02, 0.02, 0.1, 0.02, 0.01, 0.05, 0.05, 0.02, 0.02, 0.05]
+  },
+  "optimization": {
+    "learning_rate": 0.005,
+    "max_epochs": 1,
+    "epsilon": 0.01,
+    "patience": 1,
+    "optimize_texture": true,
+    "texture_learning_rate": 0.05,
+    "initial_texture_rgb": [0.8, 0.4, 0.3],
+    "loss_center_crop": [0.55, 0.70],
+    "loss_weights": [0.7, 0.3],
+    "use_colored_rows": true
+  },
+  "ui": {
+    "yarn_colors": [
+      [0.85, 0.20, 0.20],
+      [0.12, 0.56, 1.0],
+      [1.0, 0.84, 0.0],
+      [0.54, 0.27, 0.07],
+      [0.13, 0.55, 0.13],
+      [0.5, 0.0, 0.5]
+    ],
+    "reference_image": "referenceImage_cropped_new1.jpg"
+  }
+}
