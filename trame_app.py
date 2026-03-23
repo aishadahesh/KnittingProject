@@ -110,7 +110,7 @@ def update_vtk_meshes():
         
         if not mesh_actors:
             faces_list = compute_knitting_faces(seg, verts_list)
-            for i, (verts, faces) in enumerate(zip(verts_list, faces_list)):
+            for i, ((verts, _), faces) in enumerate(zip(verts_list, faces_list)):
                 polydata = vtk.vtkPolyData()
                 points = vtk.vtkPoints()
                 points.SetData(numpy_support.numpy_to_vtk(np.array(verts), deep=True))
@@ -121,7 +121,7 @@ def update_vtk_meshes():
                 tris[0::2], tris[1::2] = f_np[:, [0, 1, 2]], f_np[:, [0, 2, 3]]
                 cells = np.column_stack([np.full(len(tris), 3), tris])
                 vtk_cells = vtk.vtkCellArray()
-                vtk_cells.ImportLegacyFormat(numpy_support.numpy_to_vtkIdTypeArray(cells, deep=True))
+                vtk_cells.ImportLegacyFormat(numpy_support.numpy_to_vtkIdTypeArray(cells.ravel(), deep=True))
                 polydata.SetPolys(vtk_cells)
                 
                 mapper = vtk.vtkPolyDataMapper()
@@ -213,6 +213,8 @@ def on_mode_change(mode, **kwargs):
     global handle_widgets, ctrl_pts
     print(f"UI Mode -> {mode}")
     if mode == 'spline':
+        for h in handle_widgets: h.Off()
+        handle_widgets.clear()
         ctrl_pts = generate_initial_ctrl_pts()
         for row in ctrl_pts:
             for p in row:
@@ -231,7 +233,7 @@ def on_mode_change(mode, **kwargs):
             flat_pts = np.concatenate(ctrl_pts)
             state.p3 = float(np.mean(np.diff([np.mean(row[:,1]) for row in ctrl_pts]))) if len(ctrl_pts)>1 else state.p3
             z_range = np.max(flat_pts[:,2]) - np.min(flat_pts[:,2])
-            state.p1 = float(-z_range / 2) if z_range > 0 else state.p1
+            state.p1 = float(-z_range) if z_range > 0 else state.p1
         for h in handle_widgets: h.Off()
         handle_widgets.clear()
     safe_view_update()

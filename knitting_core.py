@@ -145,18 +145,13 @@ def save_combined_obj(mesh_data_list, base_filename="knitting_model"):
     combined_filename = f"{base_filename}_combined.obj"
     vertex_offset = 0
     with open(combined_filename, 'w') as f:
-        f.write("# Knitting Model
-
-")
+        f.write("# Knitting Model\n")
         for i, (verts, _, faces, _) in enumerate(mesh_data_list):
-            f.write(f"o mesh_{i}
-")
-            for v in verts: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}
-")
+            f.write(f"o mesh_{i}\n")
+            for v in verts: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
             for face in faces:
                 idx_str = ' '.join([str(int(idx) + vertex_offset + 1) for idx in face])
-                f.write(f"f {idx_str}
-")
+                f.write(f"f {idx_str}\n")
             vertex_offset += len(verts)
 
 def save_per_loop_objs(mesh_data_list, base_filename, loop_res, segments):
@@ -177,11 +172,9 @@ def save_per_loop_objs(mesh_data_list, base_filename, loop_res, segments):
             l_faces = np.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4)
             path = f"{base_filename}_r{row_idx:02d}_l{loop_idx:02d}.obj"
             with open(path, 'w') as f:
-                for v in l_verts: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}
-")
+                for v in l_verts: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
                 for fa in l_faces: 
-                    f.write(f"f {' '.join([str(int(x)+1) for x in fa])}
-")
+                    f.write(f"f {' '.join([str(int(x)+1) for x in fa])}")
             obj_info.append((row_idx, loop_idx, path))
     return obj_info
 
