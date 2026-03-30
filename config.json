@@ -11,7 +11,7 @@
     "mitsuba_variant_fallback": "llvm_ad_rgb"
   },
   "geometry": {
-    "bitmap_rows": 9,
+    "bitmap_rows": 3,
     "bitmap_loops": 4,
     "loop_res": 32,
     "segments": 8,
