@@ -382,7 +382,7 @@ class KnittingOptimizer:
                    (vmax[0]-vmin[0])/np.tan(np.deg2rad(fov)*0.5 * 
                    self.res_width/self.res_height)) * 0.5 * dm + (vmax[2]-vmin[2])*0.2
         return {
-            "type": "scene", "integrator": {"type": "path", "max_depth": 2},
+            "type": "scene", "integrator": {"type": "prb", "max_depth": 2},
             "sensor": {
                 "type": "perspective", "fov": fov,
                 "to_world": mi.ScalarTransform4f.look_at(

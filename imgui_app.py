@@ -7,8 +7,13 @@ Stack:
   - knitting_core : zero changes
 """
 
+# %% PYOPENGL CONFIG FOR WAYLAND/LINUX
+import os, sys
+if sys.platform.startswith("linux"):
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+
 # %% IMPORTS
-import os, threading
+import threading
 import numpy as np
 from PIL import Image
 from scipy.interpolate import CubicSpline
@@ -408,6 +413,7 @@ def main():
     # ── Dear ImGui ────────────────────────────────────────────────────────────
     imgui.create_context()
     io = imgui.get_io()
+    io.config_windows_move_from_title_bar_only = True
     io.config_flags |= imgui.ConfigFlags_.docking_enable
     io.config_flags |= imgui.ConfigFlags_.viewports_enable
     io.set_ini_filename(os.path.join(PROJECT_ROOT, "imgui_layout.ini"))
