@@ -1,3 +1,23 @@
+# Import core reconstruction logic from the shared core module (triggers dynamic GPU preloading)
+from knitting_core import (
+    CONFIG,
+    INITIAL_PARAMS,
+    PARAM_DELTAS,
+    PARAM_INDEX,
+    PARAM_NAMES,
+    PARAM_RANGES,
+    REFERENCE_IMAGE_PATH,
+    build_parametric_control_rows,
+    build_display_meshes,
+    compute_knitting_vertices,
+    compute_knitting_vertices_jit,
+    compute_knitting_faces,
+    get_loop_color,
+    save_combined_obj,
+    KnittingOptimizer,
+    run_optimization_loop
+)
+
 import os
 import numpy as np
 import base64
@@ -20,26 +40,6 @@ from trame_server.controller import FunctionNotImplementedError
 # VTK imports
 import vtk
 from vtk.util import numpy_support
-
-# Import core reconstruction logic from the shared core module
-from knitting_core import (
-    CONFIG,
-    INITIAL_PARAMS,
-    PARAM_DELTAS,
-    PARAM_INDEX,
-    PARAM_NAMES,
-    PARAM_RANGES,
-    REFERENCE_IMAGE_PATH,
-    build_parametric_control_rows,
-    build_display_meshes,
-    compute_knitting_vertices,
-    compute_knitting_vertices_jit,
-    compute_knitting_faces,
-    get_loop_color,
-    save_combined_obj,
-    KnittingOptimizer,
-    run_optimization_loop
-)
 
 # %% SERVER SETUP
 server = get_server()

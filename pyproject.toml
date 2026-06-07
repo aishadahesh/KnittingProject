@@ -17,3 +17,8 @@ dependencies = [
     "vedo>=2026.6.1",
     "vtk>=9.6.2",
 ]
+
+[project.optional-dependencies]
+gpu = [
+    "jax[cuda12]; sys_platform == 'linux'",
+]

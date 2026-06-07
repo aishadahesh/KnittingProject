@@ -1,5 +1,24 @@
 # %% IMPORTS
 import os
+import sys
+import glob
+import ctypes
+
+# ── Dynamic library path setup for GPU/CUDA ──────────────────────────────────
+# Prevents JAX from hogging VRAM
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+# Preloads venv-packaged nvidia shared libraries to resolve symbols globally on Linux
+if sys.platform.startswith("linux"):
+    for path in sys.path:
+        if path.endswith("site-packages") and os.path.exists(os.path.join(path, "nvidia")):
+            for so_path in sorted(glob.glob(os.path.join(path, "nvidia/**/*.so*"), recursive=True)):
+                try:
+                    ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+                except Exception:
+                    pass
+            break
+
 import json
 import numpy as np
 from PIL import Image

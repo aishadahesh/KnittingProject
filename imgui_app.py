@@ -13,17 +13,6 @@ if sys.platform.startswith("linux"):
     os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 # %% IMPORTS
-import threading
-import numpy as np
-from PIL import Image
-from scipy.interpolate import CubicSpline
-
-import glfw
-from imgui_bundle import imgui, imguizmo
-from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
-import moderngl
-
-import mitsuba as mi
 from knitting_core import (
     CONFIG,
     INITIAL_PARAMS,
@@ -37,6 +26,18 @@ from knitting_core import (
     compute_knitting_vertices, compute_knitting_faces,
     get_loop_color, save_combined_obj, KnittingOptimizer, run_optimization_loop,
 )
+
+import threading
+import numpy as np
+from PIL import Image
+from scipy.interpolate import CubicSpline
+
+import glfw
+from imgui_bundle import imgui, imguizmo
+from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
+import moderngl
+
+import mitsuba as mi
 import jax.numpy as jnp
 
 # %% CONFIG SHORTCUTS

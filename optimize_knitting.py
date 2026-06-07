@@ -1,12 +1,7 @@
 # %% IMPORTS
 import os
-import numpy as np
-from PIL import Image
-import mitsuba as mi
-import jax.numpy as jnp
-from functools import partial
 
-# Import core reconstruction logic
+# Import core reconstruction logic (triggers dynamic GPU preloading)
 from knitting_core import (
     CONFIG,
     INITIAL_PARAMS,
@@ -22,11 +17,17 @@ from knitting_core import (
     get_loop_color
 )
 
+import numpy as np
+from PIL import Image
+import mitsuba as mi
+import jax.numpy as jnp
+from functools import partial
+
 # Conditional imports for UI components
 try:
     from vedo import Plotter, Mesh, Text2D, Sphere, Plane, Spline
 except ImportError:
-    print("vedo not installed. Standalone Interactive App will be unavailable.")
+    print("vedo not installed. Standalone   Interactive App will be unavailable.")
 
 # %% LEGACY INTERACTIVE UI (VEDO)
 
