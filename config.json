@@ -15,43 +15,56 @@
     "bitmap_loops": 4,
     "loop_res": 32,
     "segments": 8,
-    "initial_params": [
-      0.3003,
-      -0.3495,
-      1.5,
-      0.4021,
-      0.181,
-      0.0,
-      0.30,
-      0.05,
-      0.02,
-      0.60
-    ],
-    "param_names": [
-      "stitch_bulge",
-      "stitch_z",
-      "loop_height",
-      "dy",
-      "radius",
-      "curve_skew",
-      "y_sharp",
-      "x_bias",
-      "z_bias",
-      "ellipse_ratio"
-    ],
-    "param_ranges": [
-      [0.1, 0.6],
-      [-0.8, -0.1],
-      [0.2, 2.5],
-      [0.05, 1.0],
-      [0.02, 0.3],
-      [-0.6, 0.6],
-      [0.0, 0.8],
-      [-0.2, 0.2],
-      [-0.2, 0.2],
-      [0.4, 1.6]
-    ],
-    "param_deltas": [0.02, 0.02, 0.1, 0.02, 0.01, 0.05, 0.05, 0.02, 0.02, 0.05]
+    "parameters": [
+      {
+        "name": "stitch_bulge",
+        "initial": 0.3003,
+        "range": [0.1, 0.6],
+        "delta": 0.02
+      },
+      {
+        "name": "stitch_z",
+        "initial": -0.3495,
+        "range": [-0.8, -0.1],
+        "delta": 0.02
+      },
+      {
+        "name": "loop_height_1",
+        "initial": 1.5,
+        "range": [0.0, 2.5],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_2",
+        "initial": 3.0,
+        "range": [0.0, 5.0],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_3",
+        "initial": 4.5,
+        "range": [0.0, 7.5],
+        "delta": 0.1
+      },
+      {
+        "name": "dy",
+        "initial": 0.4021,
+        "range": [0.00, 1.0],
+        "delta": 0.00
+      },
+      {
+        "name": "radius",
+        "initial": 0.181,
+        "range": [0.02, 0.3],
+        "delta": 0.01
+      },
+      {
+        "name": "ellipse_ratio",
+        "initial": 0.6,
+        "range": [0.4, 1.6],
+        "delta": 0.05
+      }
+    ]
   },
   "optimization": {
     "learning_rate": 0.005,
@@ -74,6 +87,6 @@
       [0.13, 0.55, 0.13],
       [0.5, 0.0, 0.5]
     ],
-    "reference_image": "referenceImage_cropped_new1.jpg"
+    "reference_image": "refImg.png"
   }
 }

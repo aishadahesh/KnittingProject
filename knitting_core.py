@@ -12,12 +12,160 @@ from functools import partial
 
 # %% CONFIGURATION LOADING
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_project_path(path):
+    """Resolves a config path relative to the project root."""
+    if os.path.isabs(path):
+        return path
+    return os.path.join(PROJECT_ROOT, path)
+
+
 def load_config(config_path="config.json"):
     """Loads project configuration from a JSON file."""
-    with open(config_path, 'r') as f:
+    with open(resolve_project_path(config_path), 'r') as f:
         return json.load(f)
 
 CONFIG = load_config()
+REFERENCE_IMAGE_PATH = resolve_project_path(CONFIG['ui']['reference_image'])
+
+def load_geometry_parameters():
+    """Loads geometry parameter definitions from the required array-of-structs config."""
+    geometry_cfg = CONFIG['geometry']
+    parameters = geometry_cfg.get('parameters')
+    if not isinstance(parameters, list) or not parameters:
+        raise ValueError("CONFIG['geometry']['parameters'] must be a non-empty list.")
+
+    required_keys = {'name', 'initial', 'range', 'delta'}
+    for index, param in enumerate(parameters):
+        if not isinstance(param, dict):
+            raise ValueError(f"CONFIG['geometry']['parameters'][{index}] must be an object.")
+
+        missing_keys = required_keys - param.keys()
+        if missing_keys:
+            missing_list = ', '.join(sorted(missing_keys))
+            raise ValueError(
+                f"CONFIG['geometry']['parameters'][{index}] is missing keys: {missing_list}."
+            )
+
+    return parameters
+
+GEOMETRY_PARAMETERS = load_geometry_parameters()
+PARAM_NAMES = [param['name'] for param in GEOMETRY_PARAMETERS]
+INITIAL_PARAMS = [param['initial'] for param in GEOMETRY_PARAMETERS]
+PARAM_RANGES = [param['range'] for param in GEOMETRY_PARAMETERS]
+PARAM_DELTAS = [param['delta'] for param in GEOMETRY_PARAMETERS]
+PARAM_INDEX = {name: index for index, name in enumerate(PARAM_NAMES)}
+PARAM_LOWER_BOUNDS = jnp.array([bounds[0] for bounds in PARAM_RANGES])
+PARAM_UPPER_BOUNDS = jnp.array([bounds[1] for bounds in PARAM_RANGES])
+LOOP_HEIGHT_PARAM_NAMES = [
+    f"loop_height_{scale_factor}"
+    for scale_factor in range(1, CONFIG['geometry']['bitmap_rows'] + 1)
+]
+
+missing_loop_height_params = [
+    name for name in LOOP_HEIGHT_PARAM_NAMES
+    if name not in PARAM_INDEX
+]
+if missing_loop_height_params:
+    missing_list = ', '.join(missing_loop_height_params)
+    raise ValueError(f"Missing loop height parameters: {missing_list}.")
+
+LOOP_HEIGHT_PARAM_INDICES = tuple(PARAM_INDEX[name] for name in LOOP_HEIGHT_PARAM_NAMES)
+
+def get_param_value(params, name):
+    """Returns a geometry parameter by name from a positional parameter vector."""
+    return params[PARAM_INDEX[name]]
+
+def get_loop_height_lookup(params):
+    """Builds a lookup table where index == discrete bitmap scale factor."""
+    loop_heights = [0.0]
+    loop_heights.extend(float(params[index]) for index in LOOP_HEIGHT_PARAM_INDICES)
+    return np.array(loop_heights, dtype=np.float32)
+
+def get_loop_height_lookup_jax(params):
+    """JAX version of the discrete loop height lookup table."""
+    return jnp.concatenate(
+        (jnp.array([0.0], dtype=jnp.float32), jnp.take(params, jnp.array(LOOP_HEIGHT_PARAM_INDICES))),
+        axis=0,
+    )
+
+def get_display_periods(params, bitmap):
+    """Returns the translational display periods for tiled unit-cell previews."""
+    bitmap_array = np.asarray(bitmap)
+    x_period = float(bitmap_array.shape[1])
+    y_period = float(bitmap_array.shape[0]) * float(get_param_value(params, 'dy'))
+    return x_period, y_period
+
+def build_display_meshes(verts_list, faces_list, params, bitmap, horizontal_copies, vertical_copies):
+    """Expands the base unit-cell meshes into display-only tiled duplicates."""
+    horizontal_copies = max(0, int(horizontal_copies))
+    vertical_copies = max(0, int(vertical_copies))
+
+    if horizontal_copies == 0 and vertical_copies == 0:
+        row_indices = list(range(len(verts_list)))
+        return verts_list, faces_list, row_indices
+
+    x_period, y_period = get_display_periods(params, bitmap)
+    display_verts_list = []
+    display_faces_list = []
+    row_indices = []
+
+    for y_tile in range(-vertical_copies, vertical_copies + 1):
+        for x_tile in range(-horizontal_copies, horizontal_copies + 1):
+            translation = np.array([x_tile * x_period, y_tile * y_period, 0.0], dtype=np.float32)
+            for row_index, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
+                display_verts_list.append((np.asarray(verts, dtype=np.float32) + translation, n_points))
+                display_faces_list.append(faces)
+                row_indices.append(row_index)
+
+    return display_verts_list, display_faces_list, row_indices
+
+def compute_bitmap_scale_factors(bitmap):
+    """Computes per-stitch vertical span counts directly from the bitmap pattern."""
+    bitmap_array = np.asarray(bitmap, dtype=np.float32) > 0.5
+    n_rows, n_cols = bitmap_array.shape
+    scale_factors = np.zeros((n_rows, n_cols), dtype=np.float32)
+
+    for col_idx in range(n_cols):
+        active_rows = np.flatnonzero(bitmap_array[:, col_idx])
+        for active_index, row_idx in enumerate(active_rows):
+            next_row = active_rows[active_index + 1] if active_index + 1 < len(active_rows) else n_rows
+            scale_factors[row_idx, col_idx] = float(next_row - row_idx)
+
+    return scale_factors
+
+def build_parametric_control_rows(params, bitmap, samples_per_loop=5):
+    """Builds spline control rows from the same shared parameterization as the mesh path."""
+    stitch_bulge = float(get_param_value(params, 'stitch_bulge'))
+    stitch_z = float(get_param_value(params, 'stitch_z'))
+    dy = float(get_param_value(params, 'dy'))
+    loop_height_lookup = get_loop_height_lookup(params)
+    scale_factors = compute_bitmap_scale_factors(bitmap)
+    n_rows, n_cols = scale_factors.shape
+    base_t_values = np.linspace(0.0, 2.0 * np.pi, samples_per_loop, endpoint=False)
+    rows = []
+
+    for row_idx in range(n_rows):
+        row_points = []
+        col_indices = range(n_cols) if row_idx % 2 == 0 else range(n_cols - 1, -1, -1)
+        t_values = base_t_values if row_idx % 2 == 0 else base_t_values[::-1]
+
+        for col_idx in col_indices:
+            loop_scale = int(scale_factors[row_idx, col_idx])
+            has_loop = 1.0 if loop_scale > 0.0 else 0.0
+            loop_height = float(loop_height_lookup[loop_scale])
+            for t in t_values:
+                x = col_idx + (stitch_bulge * np.sin(2.0 * t) if has_loop else 0.0) + t / (2.0 * np.pi)
+                y = row_idx * dy - loop_height * (np.cos(t) - 1.0) / 2.0
+                z = has_loop * stitch_z * (np.cos(2.0 * t) - 1.0) / 2.0
+                row_points.append([x, y, z])
+
+        row_points.append([n_cols if row_idx % 2 == 0 else 0.0, row_idx * dy, 0.0])
+        rows.append(np.array(row_points, dtype=float))
+
+    return rows
 
 # Set Mitsuba variant from configuration
 if not mi.variant():
@@ -27,29 +175,29 @@ if not mi.variant():
         mi.set_variant(CONFIG['rendering']['mitsuba_variant_fallback'])
 
 # Initialize output directories
-OUTPUT_DIR = CONFIG['rendering']['output_dir']
+OUTPUT_DIR = resolve_project_path(CONFIG['rendering']['output_dir'])
 for sub_dir in ["meshes", "renders"]:
     os.makedirs(os.path.join(OUTPUT_DIR, sub_dir), exist_ok=True)
 
 # %% GEOMETRY ENGINE (JAX)
 
 @jax.jit
-def eval_curve_batch(t, scale, stitch_bulge, stitch_z):
+def eval_curve_batch(t, has_loop, loop_height, stitch_bulge, stitch_z):
     """Vectorized evaluation of the knitting curve geometry."""
     x = stitch_bulge * jnp.sin(2 * t) + t / (2 * jnp.pi)
-    y = -(jnp.cos(t) - 1) / 2
-    z = stitch_z * (jnp.cos(2 * t) - 1) / 2
-    x = jnp.where(scale == 0, t / (2 * jnp.pi), x)
-    return jnp.stack([x, y * scale, z * scale], axis=-1)
+    y = loop_height * (-(jnp.cos(t) - 1) / 2)
+    z = stitch_z * (jnp.cos(2 * t) - 1) / 2 * has_loop
+    x = jnp.where(has_loop == 0.0, t / (2 * jnp.pi), x)
+    return jnp.stack((jnp.asarray(x), jnp.asarray(y), jnp.asarray(z)), axis=-1)
 
 @jax.jit
-def eval_curve_derivative_batch(t, scale, stitch_bulge, stitch_z):
+def eval_curve_derivative_batch(t, has_loop, loop_height, stitch_bulge, stitch_z):
     """Vectorized evaluation of the knitting curve derivatives."""
-    dx = 2 * stitch_bulge * jnp.cos(2 * t) + 1 / (2 * jnp.pi)
-    dy = 0.5 * jnp.sin(t) * scale
-    dz = -stitch_z * jnp.sin(2 * t) * scale
-    dx = jnp.where(scale == 0, 1 / (2 * jnp.pi), dx)
-    return jnp.stack([dx, dy, dz], axis=-1)
+    d_x = 2 * stitch_bulge * jnp.cos(2 * t) + 1 / (2 * jnp.pi)
+    d_y = 0.5 * jnp.sin(t) * loop_height
+    d_z = -stitch_z * jnp.sin(2 * t) * has_loop
+    d_x = jnp.where(has_loop == 0.0, 1 / (2 * jnp.pi), d_x)
+    return jnp.stack((jnp.asarray(d_x), jnp.asarray(d_y), jnp.asarray(d_z)), axis=-1)
 
 @jax.jit
 def compute_orthonormal_frame_batch(tangent):
@@ -70,32 +218,38 @@ def compute_orthonormal_frame_batch(tangent):
 @partial(jax.jit, static_argnums=(2, 3))
 def compute_knitting_vertices_jit(geometry_params, bitmap, loop_res, segments):
     """JIT-compiled function to generate all mesh vertices for the pattern."""
-    (stitch_bulge, stitch_z, loop_height, dy, radius, 
-     _, _, _, _, ellipse_ratio) = geometry_params
+    stitch_bulge = geometry_params[PARAM_INDEX['stitch_bulge']]
+    stitch_z = geometry_params[PARAM_INDEX['stitch_z']]
+    dy = geometry_params[PARAM_INDEX['dy']]
+    radius = geometry_params[PARAM_INDEX['radius']]
+    ellipse_ratio = geometry_params[PARAM_INDEX['ellipse_ratio']]
+    loop_height_lookup = get_loop_height_lookup_jax(geometry_params)
     
     def count_consecutive_zeros(row):
+        row = row > 0.5
         n = len(row)
         indices = jnp.arange(n)
-        mask = (indices[:, None] < indices[None, :])
-        masked_row = jnp.where(mask, row[None, :], 999)
-        nonzero_mask = (masked_row != 0) & mask
-        first_nonzero = jnp.argmax(nonzero_mask.astype(jnp.int32), axis=1)
-        counts = jnp.where(jnp.any(nonzero_mask, axis=1), 
-                           first_nonzero - indices, n - indices - 1)
-        return jnp.where(row == 1, counts + 1, 0)
+        future_active = (indices[:, None] < indices[None, :]) & row[None, :]
+        next_active = jnp.argmax(future_active.astype(jnp.int32), axis=1)
+        counts = jnp.where(
+            jnp.any(future_active, axis=1),
+            next_active - indices,
+            n - indices,
+        )
+        return jnp.where(row, counts, 0).astype(jnp.float32)
     
-    scale_factor = jax.vmap(count_consecutive_zeros)(bitmap)
-    scale_factor = jnp.where((scale_factor <= 1), scale_factor, 
-                             1 + dy * (scale_factor - 1))
+    scale_factor = jax.vmap(count_consecutive_zeros)(bitmap.T).T
     
     n_rows, n_loops = bitmap.shape
     t_vals = jnp.linspace(0.0, 2 * jnp.pi * n_loops, loop_res * n_loops + 1)
     
     def process_row(row_idx, row_scales):
-        x_scale = jnp.append(jnp.repeat(row_scales, loop_res), 1.0)
-        pos = eval_curve_batch(t_vals, x_scale, stitch_bulge, stitch_z)
+        loop_scales = jnp.append(jnp.repeat(row_scales, loop_res), 1.0).astype(jnp.int32)
+        loop_heights = jnp.take(loop_height_lookup, loop_scales)
+        has_loops = (loop_scales > 0).astype(jnp.float32)
+        pos = eval_curve_batch(t_vals, has_loops, loop_heights, stitch_bulge, stitch_z)
         pos = pos.at[:, 1].add(row_idx * dy)
-        d_pos = eval_curve_derivative_batch(t_vals, x_scale, stitch_bulge, stitch_z)
+        d_pos = eval_curve_derivative_batch(t_vals, has_loops, loop_heights, stitch_bulge, stitch_z)
         u_frame, v_frame = compute_orthonormal_frame_batch(d_pos)
         
         angles = jnp.linspace(0, 2 * jnp.pi, segments, endpoint=False)
@@ -276,9 +430,11 @@ class KnittingOptimizer:
         if self.opt_state is None:
             self.opt_state = self.optimizer.init(jnp.array(params))
         updates, self.opt_state = self.optimizer.update(jnp.array(grads), self.opt_state)
-        new_params = jnp.clip(optax.apply_updates(jnp.array(params), updates), 
-                              jnp.array([r[0] for r in CONFIG['geometry']['param_ranges']]), 
-                              jnp.array([r[1] for r in CONFIG['geometry']['param_ranges']]))
+        new_params = jnp.clip(
+            optax.apply_updates(jnp.array(params), updates),
+            PARAM_LOWER_BOUNDS,
+            PARAM_UPPER_BOUNDS,
+        )
         self.loss_history.append(current_loss)
         self.param_history.append(new_params)
         print(f"Epoch {self.iteration:02d} | Loss: {current_loss:.6f}")

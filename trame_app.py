@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import base64
+import mimetypes
 from io import BytesIO
 from PIL import Image
 
@@ -23,6 +24,14 @@ from vtk.util import numpy_support
 # Import core reconstruction logic from the shared core module
 from knitting_core import (
     CONFIG,
+    INITIAL_PARAMS,
+    PARAM_DELTAS,
+    PARAM_INDEX,
+    PARAM_NAMES,
+    PARAM_RANGES,
+    REFERENCE_IMAGE_PATH,
+    build_parametric_control_rows,
+    build_display_meshes,
     compute_knitting_vertices,
     compute_knitting_vertices_jit,
     compute_knitting_faces,
@@ -37,11 +46,12 @@ server = get_server()
 state, ctrl = server.state, server.controller
 
 # %% GLOBAL CONTEXT
-REFERENCE_PATH = CONFIG['ui']['reference_image']
+REFERENCE_PATH = REFERENCE_IMAGE_PATH
 try:
+    reference_mime = mimetypes.guess_type(REFERENCE_PATH)[0] or "image/png"
     with open(REFERENCE_PATH, "rb") as f:
         ref_data = f.read()
-        ref_base64 = f"data:image/png;base64,{base64.b64encode(ref_data).decode()}"
+        ref_base64 = f"data:{reference_mime};base64,{base64.b64encode(ref_data).decode()}"
     ref_pil = Image.open(REFERENCE_PATH).convert("RGB")
 except Exception as e:
     print(f"Error loading reference image: {e}")
@@ -52,12 +62,12 @@ BITMAP = jnp.ones((CONFIG['geometry']['bitmap_rows'], CONFIG['geometry']['bitmap
 OPTIMIZER = KnittingOptimizer(ref_pil, BITMAP)
 
 # %% STATE INITIALIZATION
-PARAM_NAMES = CONFIG['geometry']['param_names']
-init_vals = CONFIG['geometry']['initial_params']
-for i, val in enumerate(init_vals):
+for i, val in enumerate(INITIAL_PARAMS):
     state[f"p{i}"] = float(val)
 
 state.mode = 'parameter' 
+state.display_copies_x = 0
+state.display_copies_y = 0
 state.render_base64 = ""
 state.ref_base64 = ref_base64
 state.optimizing = False
@@ -99,44 +109,54 @@ def get_current_params():
     """Constructs the parameter list from individual state variables."""
     return [state[f"p{i}"] for i in range(len(PARAM_NAMES))]
 
+def clear_vtk_meshes():
+    global mesh_actors
+    for actor, _ in mesh_actors:
+        renderer.RemoveActor(actor)
+    mesh_actors = []
+
+def set_vtk_meshes(verts_list, faces_list, row_indices):
+    global mesh_actors
+    clear_vtk_meshes()
+    for display_index, ((verts, _), faces) in enumerate(zip(verts_list, faces_list)):
+        polydata = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        points.SetData(numpy_support.numpy_to_vtk(np.array(verts), deep=True))
+        polydata.SetPoints(points)
+
+        f_np = np.array(faces)
+        tris = np.empty((len(f_np) * 2, 3), dtype=np.int32)
+        tris[0::2], tris[1::2] = f_np[:, [0, 1, 2]], f_np[:, [0, 2, 3]]
+        cells = np.column_stack([np.full(len(tris), 3), tris])
+        vtk_cells = vtk.vtkCellArray()
+        vtk_cells.ImportLegacyFormat(numpy_support.numpy_to_vtkIdTypeArray(cells.ravel(), deep=True))
+        polydata.SetPolys(vtk_cells)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(get_loop_color(row_indices[display_index], 0))
+        renderer.AddActor(actor)
+        mesh_actors.append((actor, polydata))
+
 def update_vtk_meshes():
     """Synchronizes VTK actors with current global parameters."""
-    global mesh_actors
-    res, seg = CONFIG['geometry']['loop_res'], CONFIG['geometry']['segments']
     params = get_current_params()
     
     try:
         verts_list = compute_knitting_vertices(params, BITMAP)
-        
-        if not mesh_actors:
-            faces_list = compute_knitting_faces(seg, verts_list)
-            for i, ((verts, _), faces) in enumerate(zip(verts_list, faces_list)):
-                polydata = vtk.vtkPolyData()
-                points = vtk.vtkPoints()
-                points.SetData(numpy_support.numpy_to_vtk(np.array(verts), deep=True))
-                polydata.SetPoints(points)
-                
-                f_np = np.array(faces)
-                tris = np.empty((len(f_np) * 2, 3), dtype=np.int32)
-                tris[0::2], tris[1::2] = f_np[:, [0, 1, 2]], f_np[:, [0, 2, 3]]
-                cells = np.column_stack([np.full(len(tris), 3), tris])
-                vtk_cells = vtk.vtkCellArray()
-                vtk_cells.ImportLegacyFormat(numpy_support.numpy_to_vtkIdTypeArray(cells.ravel(), deep=True))
-                polydata.SetPolys(vtk_cells)
-                
-                mapper = vtk.vtkPolyDataMapper()
-                mapper.SetInputData(polydata)
-                actor = vtk.vtkActor()
-                actor.SetMapper(mapper)
-                actor.GetProperty().SetColor(get_loop_color(i, 0))
-                renderer.AddActor(actor)
-                mesh_actors.append((actor, polydata))
-            renderer.ResetCamera()
-        else:
-            for i, (verts, _) in enumerate(verts_list):
-                polydata = mesh_actors[i][1]
-                polydata.GetPoints().SetData(numpy_support.numpy_to_vtk(np.array(verts), deep=True))
-                polydata.Modified()
+        faces_list = compute_knitting_faces(CONFIG['geometry']['segments'], verts_list)
+        display_vl, display_fl, row_indices = build_display_meshes(
+            verts_list,
+            faces_list,
+            params,
+            BITMAP,
+            state.display_copies_x,
+            state.display_copies_y,
+        )
+        set_vtk_meshes(display_vl, display_fl, row_indices)
+        renderer.ResetCamera()
         
         safe_view_update()
     except Exception as e:
@@ -146,7 +166,9 @@ def update_mesh_from_splines():
     """Real-time mesh update based on manual control point positions."""
     global ctrl_pts
     res, seg = CONFIG['geometry']['loop_res'], CONFIG['geometry']['segments']
-    radius, ratio = state.p4, state.p9
+    radius = state[f"p{PARAM_INDEX['radius']}"]
+    ratio = state[f"p{PARAM_INDEX['ellipse_ratio']}"]
+    verts_list = []
     
     for r, row_pts in enumerate(ctrl_pts):
         spline_x, spline_y, spline_z = vtk.vtkCardinalSpline(), vtk.vtkCardinalSpline(), vtk.vtkCardinalSpline()
@@ -169,9 +191,18 @@ def update_mesh_from_splines():
         V = np.cross(T, U)
         angles = np.linspace(0, 2*np.pi, seg, endpoint=False)
         offsets = U[:,None,:] * np.cos(angles)[None,:,None] * radius * ratio + V[:,None,:] * np.sin(angles)[None,:,None] * radius
-        
-        mesh_actors[r][1].GetPoints().SetData(numpy_support.numpy_to_vtk((pts[:,None,:] + offsets).reshape(-1, 3), deep=True))
-        mesh_actors[r][1].Modified()
+        verts_list.append(((pts[:,None,:] + offsets).reshape(-1, 3), n_points))
+
+    faces_list = compute_knitting_faces(seg, verts_list)
+    display_vl, display_fl, row_indices = build_display_meshes(
+        verts_list,
+        faces_list,
+        get_current_params(),
+        BITMAP,
+        state.display_copies_x,
+        state.display_copies_y,
+    )
+    set_vtk_meshes(display_vl, display_fl, row_indices)
     
     safe_view_update()
 
@@ -191,20 +222,7 @@ def on_handle_interaction(obj, event):
     update_mesh_from_splines()
 
 def generate_initial_ctrl_pts():
-    bulge, z, _, dy, _ = get_current_params()[:5]
-    n_r, n_c = BITMAP.shape
-    rows = []
-    for r in range(n_r):
-        pts = []
-        cols = range(n_c) if r % 2 == 0 else range(n_c - 1, -1, -1)
-        for c in cols:
-            t_v = np.linspace(0, 2*np.pi, 5, endpoint=False)
-            if r % 2 != 0: t_v = t_v[::-1]
-            for t in t_v:
-                pts.append([c + bulge*np.sin(2*t) + t/(2*np.pi), r*dy - (np.cos(t)-1)/2, z*(np.cos(2*t)-1)/2])
-        pts.append([n_c if r % 2 == 0 else 0, r*dy, 0])
-        rows.append(np.array(pts))
-    return rows
+    return build_parametric_control_rows(get_current_params(), BITMAP)
 
 # %% REACTIVE CALLBACKS
 
@@ -238,10 +256,17 @@ def on_mode_change(mode, **kwargs):
         handle_widgets.clear()
     safe_view_update()
 
-@state.change(*(f"p{i}" for i in range(len(init_vals))))
+@state.change(*(f"p{i}" for i in range(len(INITIAL_PARAMS))))
 def on_params_change(**kwargs):
     if state.mode == 'parameter':
         update_vtk_meshes()
+
+@state.change("display_copies_x", "display_copies_y")
+def on_display_copies_change(display_copies_x, display_copies_y, **kwargs):
+    if state.mode == 'parameter':
+        update_vtk_meshes()
+    else:
+        update_mesh_from_splines()
 
 # %% ACTIONS
 
@@ -303,11 +328,17 @@ with SinglePageWithDrawerLayout(server) as layout:
 
     with layout.drawer:
         with vuetify3.VList():
+            with vuetify3.VListItem():
+                vuetify3.VSlider(label="Copies X", v_model=("display_copies_x", 0), min=0, max=5,
+                                 step=1, hide_details=True, thumb_label="always", density="compact")
+            with vuetify3.VListItem():
+                vuetify3.VSlider(label="Copies Y", v_model=("display_copies_y", 0), min=0, max=5,
+                                 step=1, hide_details=True, thumb_label="always", density="compact")
             for i, name in enumerate(PARAM_NAMES):
                 with vuetify3.VListItem():
-                    vmin, vmax = CONFIG['geometry']['param_ranges'][i]
+                    vmin, vmax = PARAM_RANGES[i]
                     vuetify3.VSlider(label=name, v_model=(f"p{i}",), min=vmin, max=vmax,
-                                     step=CONFIG['geometry']['param_deltas'][i], 
+                                     step=PARAM_DELTAS[i], 
                                      hide_details=True, thumb_label="always", density="compact")
 
 if __name__ == "__main__":

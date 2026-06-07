@@ -21,15 +21,21 @@ import moderngl
 import mitsuba as mi
 from knitting_core import (
     CONFIG,
+    INITIAL_PARAMS,
+    PARAM_INDEX,
+    PARAM_NAMES,
+    PARAM_RANGES,
+    PROJECT_ROOT,
+    REFERENCE_IMAGE_PATH,
+    build_parametric_control_rows,
+    build_display_meshes,
     compute_knitting_vertices, compute_knitting_faces,
     get_loop_color, save_combined_obj, KnittingOptimizer, run_optimization_loop,
 )
 import jax.numpy as jnp
 
 # %% CONFIG SHORTCUTS
-PARAM_NAMES  = CONFIG['geometry']['param_names']
-PARAM_RANGES = CONFIG['geometry']['param_ranges']
-PARAM_INIT   = list(CONFIG['geometry']['initial_params'])
+PARAM_INIT   = list(INITIAL_PARAMS)
 BITMAP_NP    = np.ones((CONFIG['geometry']['bitmap_rows'],
                         CONFIG['geometry']['bitmap_loops']))
 BITMAP_JNP   = jnp.array(BITMAP_NP)
@@ -198,23 +204,44 @@ class Camera:
 class MeshRenderer:
     def __init__(self, ctx, vp_w, vp_h):
         self.ctx     = ctx
-        self.vp_w    = vp_w
-        self.vp_h    = vp_h
         self.prog    = ctx.program(vertex_shader=MESH_VERT, fragment_shader=MESH_FRAG)
         self.pt_prog = ctx.program(vertex_shader=PT_VERT,   fragment_shader=PT_FRAG)
-        self.fbo     = ctx.framebuffer(
-            color_attachments=[ctx.texture((vp_w, vp_h), 4)],
-            depth_attachment=ctx.depth_renderbuffer((vp_w, vp_h)),
-        )
+        self.vp_w    = 1
+        self.vp_h    = 1
+        self.color_tex = None
+        self.depth_rb = None
+        self.fbo = None
         self.meshes = []      # list of (vao, n_indices, color)
         self.pt_vao = None
         self.n_pts  = 0
+        self.resize(vp_w, vp_h)
 
     @property
     def texture_id(self):
         return self.fbo.color_attachments[0].glo
 
-    def set_meshes(self, verts_list, faces_list):
+    def resize(self, vp_w, vp_h):
+        vp_w = max(1, int(vp_w))
+        vp_h = max(1, int(vp_h))
+        if self.fbo is not None and vp_w == self.vp_w and vp_h == self.vp_h:
+            return
+
+        if self.fbo is not None:
+            self.fbo.release()
+            self.color_tex.release()
+            self.depth_rb.release()
+
+        self.vp_w = vp_w
+        self.vp_h = vp_h
+        self.color_tex = self.ctx.texture((vp_w, vp_h), 4)
+        self.color_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.depth_rb = self.ctx.depth_renderbuffer((vp_w, vp_h))
+        self.fbo = self.ctx.framebuffer(
+            color_attachments=[self.color_tex],
+            depth_attachment=self.depth_rb,
+        )
+
+    def set_meshes(self, verts_list, faces_list, row_indices=None):
         for vao, _, _ in self.meshes:
             vao.release()
         self.meshes.clear()
@@ -230,7 +257,7 @@ class MeshRenderer:
                 (self.ctx.buffer(v.tobytes()),  '3f', 'in_pos'),
                 (self.ctx.buffer(nm.tobytes()), '3f', 'in_norm'),
             ], self.ctx.buffer(tris.astype(np.int32).tobytes()))
-            color = get_loop_color(i, 0)
+            color = get_loop_color(row_indices[i] if row_indices is not None else i, 0)
             self.meshes.append((vao, len(tris) * 3, color))
 
     def set_ctrl_pts(self, flat_pts):
@@ -286,24 +313,7 @@ class SplineManager:
         self._row_starts = [0]
 
     def init_from_params(self, params):
-        bulge, z, _, dy, _ = params[:5]
-        n_r, n_c = self.bitmap.shape
-        rows = []
-        for r in range(n_r):
-            pts  = []
-            cols = range(n_c) if r % 2 == 0 else range(n_c - 1, -1, -1)
-            for c in cols:
-                t_v = np.linspace(0, 2*np.pi, 5, endpoint=False)
-                if r % 2 != 0: t_v = t_v[::-1]
-                for t in t_v:
-                    pts.append([
-                        c + bulge * np.sin(2*t) + t / (2*np.pi),
-                        r * dy - (np.cos(t) - 1) / 2,
-                        z * (np.cos(2*t) - 1) / 2,
-                    ])
-            pts.append([n_c if r % 2 == 0 else 0, r * dy, 0.0])
-            rows.append(np.array(pts, dtype=float))
-        self.ctrl_rows = rows
+        self.ctrl_rows = build_parametric_control_rows(params, self.bitmap)
         self._rebuild()
 
     def _rebuild(self):
@@ -324,8 +334,8 @@ class SplineManager:
         self._rebuild()
 
     def build_mesh(self, params):
-        radius = params[4]
-        ratio  = params[9]
+        radius = params[PARAM_INDEX['radius']]
+        ratio  = params[PARAM_INDEX['ellipse_ratio']]
         seg    = self.config['geometry']['segments']
         res    = self.config['geometry']['loop_res']
         n_out  = res * self.bitmap.shape[1] + 1
@@ -355,12 +365,30 @@ def pil_to_texture(ctx, pil_img):
     tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
     return tex
 
+
+def draw_fitted_texture(texture_id, tex_w, tex_h, avail_w, avail_h, flip_y=False):
+    """Draws a texture centered inside the available region while preserving aspect."""
+    if tex_w <= 0 or tex_h <= 0 or avail_w <= 1 or avail_h <= 1:
+        return
+
+    scale = min(avail_w / tex_w, avail_h / tex_h)
+    draw_w = max(1.0, tex_w * scale)
+    draw_h = max(1.0, tex_h * scale)
+    offset_x = max(0.0, (avail_w - draw_w) * 0.5)
+    offset_y = max(0.0, (avail_h - draw_h) * 0.5)
+    cursor = imgui.get_cursor_pos()
+    imgui.set_cursor_pos((cursor.x + offset_x, cursor.y + offset_y))
+
+    uv0 = imgui.ImVec2(0, 1) if flip_y else imgui.ImVec2(0, 0)
+    uv1 = imgui.ImVec2(1, 0) if flip_y else imgui.ImVec2(1, 1)
+    imgui.image(imgui.ImTextureRef(texture_id), imgui.ImVec2(draw_w, draw_h), uv0=uv0, uv1=uv1)
+
 # %% MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
     # ── Reference image ──────────────────────────────────────────────────────
     try:
-        ref_pil = Image.open(CONFIG['ui']['reference_image']).convert("RGB")
+        ref_pil = Image.open(REFERENCE_IMAGE_PATH).convert("RGB")
     except Exception:
         ref_pil = Image.new("RGB", (256, 256), (60, 40, 40))
 
@@ -380,21 +408,32 @@ def main():
     # ── Dear ImGui ────────────────────────────────────────────────────────────
     imgui.create_context()
     io = imgui.get_io()
-    io.set_ini_filename("")
+    io.config_flags |= imgui.ConfigFlags_.docking_enable
+    io.config_flags |= imgui.ConfigFlags_.viewports_enable
+    io.set_ini_filename(os.path.join(PROJECT_ROOT, "imgui_layout.ini"))
     impl = GlfwRenderer(window)
+
+    style = imgui.get_style()
+    style.window_menu_button_position = imgui.Dir_.none
+    if io.config_flags & imgui.ConfigFlags_.viewports_enable:
+        style.window_rounding = 0.0
+        style.color_(imgui.Col_.window_bg).w = 1.0
 
     # ── moderngl (shares the existing GL context) ─────────────────────────────
     ctx = moderngl.create_context()
 
     # ── Scene objects ─────────────────────────────────────────────────────────
     camera   = Camera()
-    VP_W, VP_H = 500, 700
-    renderer = MeshRenderer(ctx, VP_W, VP_H)
+    renderer = MeshRenderer(ctx, 960, 720)
     spline   = SplineManager(BITMAP_NP, CONFIG)
 
     # ── Mutable app state ─────────────────────────────────────────────────────
     s = dict(
         params           = list(PARAM_INIT),
+        bitmap           = np.ones((CONFIG['geometry']['bitmap_rows'],
+                                    CONFIG['geometry']['bitmap_loops']), dtype=np.float32),
+        display_copies_x = 0,
+        display_copies_y = 0,
         mode             = 'parameter',     # 'parameter' | 'spline'
         hover_idx        = -1,
         selected_idx     = -1,
@@ -410,18 +449,43 @@ def main():
 
     # ── Initial mesh ──────────────────────────────────────────────────────────
     def rebuild_param_mesh():
-        vl = compute_knitting_vertices(s['params'], BITMAP_NP)
+        vl = compute_knitting_vertices(s['params'], s['bitmap'])
         fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
-        renderer.set_meshes(vl, fl)
+        display_vl, display_fl, row_indices = build_display_meshes(
+            vl,
+            fl,
+            s['params'],
+            s['bitmap'],
+            s['display_copies_x'],
+            s['display_copies_y'],
+        )
+        renderer.set_meshes(display_vl, display_fl, row_indices)
         renderer.set_ctrl_pts([])
 
     def rebuild_spline_mesh():
         vl = spline.build_mesh(s['params'])
         fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
-        renderer.set_meshes(vl, fl)
+        display_vl, display_fl, row_indices = build_display_meshes(
+            vl,
+            fl,
+            s['params'],
+            s['bitmap'],
+            s['display_copies_x'],
+            s['display_copies_y'],
+        )
+        renderer.set_meshes(display_vl, display_fl, row_indices)
         renderer.set_ctrl_pts(spline.flat_pts)
 
     rebuild_param_mesh()
+
+    def on_bitmap_change():
+        spline.bitmap     = s['bitmap']
+        optimizer.bitmap  = jnp.array(s['bitmap'])
+        if s['mode'] == 'parameter':
+            rebuild_param_mesh()
+        else:
+            spline.init_from_params(s['params'])
+            rebuild_spline_mesh()
 
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
@@ -429,7 +493,7 @@ def main():
     # ── Background worker threads ─────────────────────────────────────────────
     def bg_render():
         try:
-            vl = compute_knitting_vertices(s['params'], BITMAP_NP)
+            vl = compute_knitting_vertices(s['params'], s['bitmap'])
             fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
             mesh_data = [(v, [], f, n) for (v, n), f in zip(vl, fl)]
             path = os.path.join(CONFIG['rendering']['output_dir'], "meshes", "imgui_preview")
@@ -477,15 +541,44 @@ def main():
             s['pending_tex'] = False
 
         win_w, win_h = glfw.get_window_size(window)
-        SIDEBAR_W    = 290
+
+        viewport = imgui.get_main_viewport()
+        imgui.set_next_window_pos(viewport.pos)
+        imgui.set_next_window_size(viewport.size)
+        imgui.set_next_window_viewport(viewport.id_)
+        host_flags = (
+            imgui.WindowFlags_.no_docking |
+            imgui.WindowFlags_.no_title_bar |
+            imgui.WindowFlags_.no_collapse |
+            imgui.WindowFlags_.no_resize |
+            imgui.WindowFlags_.no_move |
+            imgui.WindowFlags_.no_bring_to_front_on_focus |
+            imgui.WindowFlags_.no_nav_focus |
+            imgui.WindowFlags_.menu_bar
+        )
+        dockspace_flags = imgui.DockNodeFlags_.passthru_central_node
+        imgui.push_style_var(imgui.StyleVar_.window_rounding, 0.0)
+        imgui.push_style_var(imgui.StyleVar_.window_border_size, 0.0)
+        imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(0.0, 0.0))
+        imgui.begin("MainDockSpace", flags=host_flags)
+        imgui.pop_style_var(3)
+        if imgui.begin_menu_bar():
+            if imgui.begin_menu("Window"):
+                clicked_reset, _ = imgui.menu_item("Reset Layout")
+                if clicked_reset:
+                    try:
+                        os.remove(os.path.join(PROJECT_ROOT, "imgui_layout.ini"))
+                    except FileNotFoundError:
+                        pass
+                imgui.end_menu()
+            imgui.end_menu_bar()
+        imgui.dock_space_over_viewport(flags=dockspace_flags)
+        imgui.end()
 
         # ── Sidebar ───────────────────────────────────────────────────────────
-        imgui.set_next_window_pos((0, 0))
-        imgui.set_next_window_size((SIDEBAR_W, win_h))
-        imgui.begin("##sidebar", flags=(
-            imgui.WindowFlags_.no_title_bar | imgui.WindowFlags_.no_resize |
-            imgui.WindowFlags_.no_move      | imgui.WindowFlags_.no_scrollbar
-        ))
+        imgui.set_next_window_pos((20, 20), cond=imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size((320, 820), cond=imgui.Cond_.first_use_ever)
+        imgui.begin("Controls")
 
         imgui.text("Mode")
         imgui.same_line()
@@ -498,6 +591,16 @@ def main():
             s['mode'] = 'spline'
             spline.init_from_params(s['params'])
             rebuild_spline_mesh()
+
+        changed_x, new_copies_x = imgui.slider_int("Copies X", s['display_copies_x'], 0, 5)
+        changed_y, new_copies_y = imgui.slider_int("Copies Y", s['display_copies_y'], 0, 5)
+        if changed_x or changed_y:
+            s['display_copies_x'] = new_copies_x
+            s['display_copies_y'] = new_copies_y
+            if s['mode'] == 'parameter':
+                rebuild_param_mesh()
+            else:
+                rebuild_spline_mesh()
 
         imgui.separator()
         imgui.text("Parameters")
@@ -519,7 +622,8 @@ def main():
 
         imgui.separator()
         imgui.spacing()
-        btn_w = (SIDEBAR_W - 20) // 2
+        avail_controls_w = imgui.get_content_region_avail().x
+        btn_w = max(120, (avail_controls_w - imgui.get_style().item_spacing.x) * 0.5)
 
         is_rendering = s['is_rendering']
         if is_rendering:
@@ -559,36 +663,63 @@ def main():
                 "RMB drag: orbit\nScroll: zoom   MMB: pan",
             )
 
+        imgui.separator()
+        imgui.text("Pattern")
+        imgui.same_line()
+        if imgui.small_button("Reset##bmap"):
+            s['bitmap'][:] = 1.0
+            on_bitmap_change()
+
+        nr, nc = s['bitmap'].shape
+        CELL_W, CELL_H = 22, 16
+        grid_w = nc * CELL_W + (nc - 1) * 2
+        offset_x = max(0.0, (imgui.get_content_region_avail().x - grid_w) / 2)
+        bmap_changed = False
+        imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(2, 2))
+        for r in range(nr):
+            imgui.set_cursor_pos_x(imgui.get_cursor_pos().x + offset_x)
+            for c in range(nc):
+                val = s['bitmap'][r, c]
+                if val > 0:
+                    imgui.push_style_color(imgui.Col_.button,         (0.18, 0.62, 0.28, 1.0))
+                    imgui.push_style_color(imgui.Col_.button_hovered, (0.28, 0.72, 0.38, 1.0))
+                else:
+                    imgui.push_style_color(imgui.Col_.button,         (0.22, 0.22, 0.22, 1.0))
+                    imgui.push_style_color(imgui.Col_.button_hovered, (0.35, 0.35, 0.35, 1.0))
+                if imgui.button(f"##bm_{r}_{c}", imgui.ImVec2(CELL_W, CELL_H)):
+                    s['bitmap'][r, c] = 0.0 if val > 0 else 1.0
+                    bmap_changed = True
+                imgui.pop_style_color(2)
+                if c < nc - 1:
+                    imgui.same_line()
+        imgui.pop_style_var()
+        if bmap_changed:
+            on_bitmap_change()
+
         imgui.end()
 
         # ── Content panels ────────────────────────────────────────────────────
-        panel_x = SIDEBAR_W
-        panel_w = (win_w - SIDEBAR_W) // 3
-
         # ── 3D viewport panel ─────────────────────────────────────────────────
-        imgui.set_next_window_pos((panel_x, 0))
-        imgui.set_next_window_size((panel_w, win_h))
-        imgui.begin("3D View##vp", flags=(
-            imgui.WindowFlags_.no_title_bar | imgui.WindowFlags_.no_resize |
-            imgui.WindowFlags_.no_move      | imgui.WindowFlags_.no_scroll_with_mouse
-        ))
+        imgui.set_next_window_pos((360, 20), cond=imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size((840, 820), cond=imgui.Cond_.first_use_ever)
+        imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
         imgui.text("3D Viewport")
 
         avail_x, avail_y = imgui.get_content_region_avail()
-        scale     = min(avail_x / VP_W, avail_y / VP_H)
-        disp_w    = int(VP_W * scale)
-        disp_h    = int(VP_H * scale)
+        disp_w = max(1, int(avail_x))
+        disp_h = max(1, int(avail_y))
+        renderer.resize(disp_w, disp_h)
         draw_pos  = imgui.get_cursor_screen_pos()
         s['vp_origin'] = (draw_pos.x, draw_pos.y)
-        s['vp_scale']  = scale
+        s['vp_scale']  = 1.0
 
         # Render mesh → FBO
-        mvp = camera.mvp(VP_W, VP_H)
-        mv  = camera.mv(VP_W, VP_H)
+        mvp = camera.mvp(disp_w, disp_h)
+        mv  = camera.mv(disp_w, disp_h)
         renderer.render(mvp, mv, s['hover_idx'], s['selected_idx'])
 
         # Display FBO (flip UV Y so OpenGL origin is correct)
-        imgui.image(imgui.ImTextureRef(renderer.texture_id), imgui.ImVec2(disp_w, disp_h), uv0=imgui.ImVec2(0, 1), uv1=imgui.ImVec2(1, 0))
+        draw_fitted_texture(renderer.texture_id, disp_w, disp_h, avail_x, avail_y, flip_y=True)
         is_hovered   = imgui.is_item_hovered()
         s['mouse_in_vp'] = is_hovered
 
@@ -599,7 +730,7 @@ def main():
 
             # Build column-major Matrix16 objects via .values buffer
             view_m = M16(); view_m.values[:] = camera.view().T.flatten()
-            proj_m = M16(); proj_m.values[:] = camera.proj(VP_W, VP_H).T.flatten()
+            proj_m = M16(); proj_m.values[:] = camera.proj(disp_w, disp_h).T.flatten()
 
             mat = np.eye(4, dtype=np.float32)
             mat[0, 3] = pos[0]; mat[1, 3] = pos[1]; mat[2, 3] = pos[2]
@@ -621,8 +752,9 @@ def main():
         # ── Viewport mouse interaction ────────────────────────────────────────
         mx, my = imgui.get_mouse_pos()
         # Local coords in viewport image space (y=0 at top of displayed image)
-        lx = (mx - s['vp_origin'][0]) / scale
-        ly = (my - s['vp_origin'][1]) / scale
+        viewport_scale = max(float(s['vp_scale']), 1e-6)
+        lx = (mx - s['vp_origin'][0]) / viewport_scale
+        ly = (my - s['vp_origin'][1]) / viewport_scale
 
         if is_hovered:
             curr = (mx, my)
@@ -642,7 +774,7 @@ def main():
                     imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()
                 )
                 if not gizmo_active:
-                    ro, rd = camera.unproject(lx, ly, VP_W, VP_H)
+                    ro, rd = camera.unproject(lx, ly, disp_w, disp_h)
                     # Hover
                     best_t, best_i = np.inf, -1
                     for i, pt in enumerate(spline.flat_pts):
@@ -662,34 +794,38 @@ def main():
         imgui.end()
 
         # ── Render result panel ───────────────────────────────────────────────
-        imgui.set_next_window_pos((panel_x + panel_w, 0))
-        imgui.set_next_window_size((panel_w, win_h))
-        imgui.begin("##render_panel", flags=(
-            imgui.WindowFlags_.no_title_bar | imgui.WindowFlags_.no_resize |
-            imgui.WindowFlags_.no_move
-        ))
+        imgui.set_next_window_pos((1220, 20), cond=imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size((420, 360), cond=imgui.Cond_.first_use_ever)
+        imgui.begin("Mitsuba Render")
         imgui.text("Mitsuba Render")
         if s['render_tex']:
             avail_x, avail_y = imgui.get_content_region_avail()
-            rw, rh = s['render_tex'].width, s['render_tex'].height
-            sc = min(avail_x / rw, avail_y / rh)
-            imgui.image(imgui.ImTextureRef(s['render_tex'].glo), imgui.ImVec2(rw * sc, rh * sc))
+            draw_fitted_texture(
+                s['render_tex'].glo,
+                s['render_tex'].width,
+                s['render_tex'].height,
+                avail_x,
+                avail_y,
+            )
         else:
-            imgui.text_disabled("(click Render)")
+            imgui.spacing()
+            imgui.text_disabled("Render output will appear here.")
+            imgui.text_disabled("Use the button in the left rail.")
         imgui.end()
 
         # ── Reference image panel ─────────────────────────────────────────────
-        imgui.set_next_window_pos((panel_x + panel_w * 2, 0))
-        imgui.set_next_window_size((win_w - panel_x - panel_w * 2, win_h))
-        imgui.begin("##ref_panel", flags=(
-            imgui.WindowFlags_.no_title_bar | imgui.WindowFlags_.no_resize |
-            imgui.WindowFlags_.no_move
-        ))
+        imgui.set_next_window_pos((1220, 400), cond=imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size((420, 440), cond=imgui.Cond_.first_use_ever)
+        imgui.begin("Reference Image")
         imgui.text("Reference Image")
         avail_x, avail_y = imgui.get_content_region_avail()
-        rw, rh = ref_tex.width, ref_tex.height
-        sc = min(avail_x / rw, avail_y / rh)
-        imgui.image(imgui.ImTextureRef(ref_tex.glo), imgui.ImVec2(rw * sc, rh * sc))
+        draw_fitted_texture(
+            ref_tex.glo,
+            ref_tex.width,
+            ref_tex.height,
+            avail_x,
+            avail_y,
+        )
         imgui.end()
 
         # ── Final GL clear + imgui draw ───────────────────────────────────────
@@ -699,6 +835,11 @@ def main():
         ctx.screen.use()
         ctx.clear(0.08, 0.08, 0.08, 1.0)
         impl.render(imgui.get_draw_data())
+        if io.config_flags & imgui.ConfigFlags_.viewports_enable:
+            backup_window = glfw.get_current_context()
+            imgui.update_platform_windows()
+            imgui.render_platform_windows_default()
+            glfw.make_context_current(backup_window)
         glfw.swap_buffers(window)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────

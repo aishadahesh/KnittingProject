@@ -9,6 +9,11 @@ from functools import partial
 # Import core reconstruction logic
 from knitting_core import (
     CONFIG,
+    INITIAL_PARAMS,
+    PARAM_DELTAS,
+    PARAM_NAMES,
+    PARAM_RANGES,
+    REFERENCE_IMAGE_PATH,
     compute_knitting_vertices,
     compute_knitting_faces,
     save_combined_obj,
@@ -60,9 +65,6 @@ class InteractiveModelEditor:
 
     def _on_key(self, event):
         k = event.keypress
-        p_names = CONFIG['geometry']['param_names']
-        ranges = CONFIG['geometry']['param_ranges']
-        deltas = CONFIG['geometry']['param_deltas']
         
         if k == 'o':
             print("Starting optimization from legacy UI...")
@@ -70,18 +72,18 @@ class InteractiveModelEditor:
             self._update_display()
         elif k == 'f':
             self.plotter.close()
-        elif k in [str(i) for i in range(len(p_names))]:
+        elif k in [str(i) for i in range(len(PARAM_NAMES))]:
             self.selected_idx = int(k)
-            print(f"Selected: {p_names[self.selected_idx]}")
+            print(f"Selected: {PARAM_NAMES[self.selected_idx]}")
         elif k == 'Up':
             self.params[self.selected_idx] = np.clip(
-                self.params[self.selected_idx] + deltas[self.selected_idx],
-                ranges[self.selected_idx][0], ranges[self.selected_idx][1])
+                self.params[self.selected_idx] + PARAM_DELTAS[self.selected_idx],
+                PARAM_RANGES[self.selected_idx][0], PARAM_RANGES[self.selected_idx][1])
             self._update_display()
         elif k == 'Down':
             self.params[self.selected_idx] = np.clip(
-                self.params[self.selected_idx] - deltas[self.selected_idx],
-                ranges[self.selected_idx][0], ranges[self.selected_idx][1])
+                self.params[self.selected_idx] - PARAM_DELTAS[self.selected_idx],
+                PARAM_RANGES[self.selected_idx][0], PARAM_RANGES[self.selected_idx][1])
             self._update_display()
 
 # %% STANDALONE EXECUTION
@@ -91,12 +93,12 @@ if __name__ == "__main__":
     print("KNITTING RECONSTRUCTION - STANDALONE MODE")
     print("=" * 80)
     
-    ref_img = Image.open(CONFIG['ui']['reference_image']).convert("RGB")
+    ref_img = Image.open(REFERENCE_IMAGE_PATH).convert("RGB")
     bitmap = jnp.ones((CONFIG['geometry']['bitmap_rows'], CONFIG['geometry']['bitmap_loops']))
     optimizer = KnittingOptimizer(ref_img, bitmap)
     
     try:
-        editor = InteractiveModelEditor(optimizer, CONFIG['geometry']['initial_params'])
+        editor = InteractiveModelEditor(optimizer, INITIAL_PARAMS)
         editor.plotter.show(interactive=True)
     except NameError:
         print("\n[ERROR] Vedo is not installed. Standalone mode requires 'vedo'.")
