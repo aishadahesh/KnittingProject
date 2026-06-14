@@ -11,7 +11,7 @@
     "mitsuba_variant_fallback": "llvm_ad_rgb"
   },
   "geometry": {
-    "bitmap_rows": 3,
+    "bitmap_rows": 10,
     "bitmap_loops": 4,
     "loop_res": 32,
     "segments": 8,
@@ -44,6 +44,48 @@
         "name": "loop_height_3",
         "initial": 4.5,
         "range": [0.0, 7.5],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_4",
+        "initial": 6.0,
+        "range": [0.0, 10.0],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_5",
+        "initial": 7.5,
+        "range": [0.0, 12.5],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_6",
+        "initial": 9.0,
+        "range": [0.0, 15.0],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_7",
+        "initial": 10.5,
+        "range": [0.0, 17.5],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_8",
+        "initial": 12.0,
+        "range": [0.0, 20.0],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_9",
+        "initial": 13.5,
+        "range": [0.0, 22.5],
+        "delta": 0.1
+      },
+      {
+        "name": "loop_height_10",
+        "initial": 15.0,
+        "range": [0.0, 25.0],
         "delta": 0.1
       },
       {

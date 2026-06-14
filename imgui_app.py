@@ -21,6 +21,7 @@ from knitting_core import (
     PARAM_RANGES,
     PROJECT_ROOT,
     REFERENCE_IMAGE_PATH,
+    LOOP_HEIGHT_PARAM_INDICES,
     build_parametric_control_rows,
     build_display_meshes,
     compute_knitting_vertices, compute_knitting_faces,
@@ -39,6 +40,10 @@ import moderngl
 
 import mitsuba as mi
 import jax.numpy as jnp
+
+import tkinter as tk
+from tkinter import filedialog as _filedialog
+import json as _json
 
 # %% CONFIG SHORTCUTS
 PARAM_INIT   = list(INITIAL_PARAMS)
@@ -64,12 +69,13 @@ void main() {
 MESH_FRAG = """
 #version 330
 in  vec3 v_norm;
-uniform vec3 color;
+uniform vec3  color;
+uniform float model_alpha;
 out vec4 f_color;
 void main() {
     vec3  L    = normalize(vec3(0.5, 1.0, 0.8));
     float diff = clamp(dot(normalize(v_norm), L), 0.0, 1.0);
-    f_color = vec4(color * (0.25 + 0.75 * diff), 1.0);
+    f_color = vec4(color * (0.25 + 0.75 * diff), model_alpha);
 }
 """
 
@@ -98,6 +104,42 @@ void main() {
     if      (state == 2) f_color = vec4(1.0, 1.0, 0.0, 1.0);  // drag  → yellow
     else if (state == 1) f_color = vec4(1.0, 0.5, 0.0, 1.0);  // hover → orange
     else                 f_color = vec4(1.0, 1.0, 1.0, 0.9);  // normal → white
+}
+"""
+
+BG_VERT = """
+#version 330
+in vec2 in_pos;
+out vec2 v_uv;
+uniform float bg_scale_x;
+uniform float bg_scale_y;
+uniform float bg_rotation;
+uniform float bg_offset_x;
+uniform float bg_offset_y;
+void main() {
+    v_uv = in_pos * 0.5 + 0.5;
+    vec2 c = v_uv - 0.5;
+    float cr = cos(bg_rotation);
+    float sr = sin(bg_rotation);
+    vec2 rot = vec2(cr * c.x - sr * c.y, sr * c.x + cr * c.y);
+    v_uv = vec2(rot.x / max(bg_scale_x, 0.01) - bg_offset_x,
+                rot.y / max(bg_scale_y, 0.01) - bg_offset_y) + 0.5;
+    gl_Position = vec4(in_pos, 0.9999, 1.0);
+}
+"""
+
+BG_FRAG = """
+#version 330
+in vec2 v_uv;
+uniform sampler2D bg_tex;
+uniform float bg_alpha;
+out vec4 f_color;
+void main() {
+    // clamp so areas outside the image show transparent (viewport crops naturally)
+    vec2 clamped = clamp(v_uv, 0.0, 1.0);
+    if (distance(clamped, v_uv) > 0.001) discard;
+    vec4 col = texture(bg_tex, clamped);
+    f_color = vec4(col.rgb, bg_alpha);
 }
 """
 
@@ -133,6 +175,16 @@ def compute_normals(verts, tris):
     np.add.at(n, tris[:,1], fn)
     np.add.at(n, tris[:,2], fn)
     return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
+
+def rotation_matrix_xyz(rx, ry, rz):
+    """4×4 rotation matrix from XYZ Euler angles (radians), applied as Rz @ Ry @ Rx."""
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1,0,0,0],[0,cx,-sx,0],[0,sx,cx,0],[0,0,0,1]], dtype=np.float32)
+    Ry = np.array([[cy,0,sy,0],[0,1,0,0],[-sy,0,cy,0],[0,0,0,1]], dtype=np.float32)
+    Rz = np.array([[cz,-sz,0,0],[sz,cz,0,0],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
+    return Rz @ Ry @ Rx
 
 def ray_sphere_hit(ro, rd, center, radius):
     """Returns t of nearest intersection, or np.inf on miss."""
@@ -212,6 +264,13 @@ class MeshRenderer:
         self.ctx     = ctx
         self.prog    = ctx.program(vertex_shader=MESH_VERT, fragment_shader=MESH_FRAG)
         self.pt_prog = ctx.program(vertex_shader=PT_VERT,   fragment_shader=PT_FRAG)
+        self.bg_prog = ctx.program(vertex_shader=BG_VERT,   fragment_shader=BG_FRAG)
+        # Full-screen quad for background (triangle strip)
+        quad = np.array([[-1,-1],[1,-1],[-1,1],[1,1]], dtype=np.float32)
+        self.bg_vao = ctx.vertex_array(
+            self.bg_prog,
+            [(ctx.buffer(quad.tobytes()), '2f', 'in_pos')],
+        )
         self.vp_w    = 1
         self.vp_h    = 1
         self.color_tex = None
@@ -247,7 +306,7 @@ class MeshRenderer:
             depth_attachment=self.depth_rb,
         )
 
-    def set_meshes(self, verts_list, faces_list, row_indices=None):
+    def set_meshes(self, verts_list, faces_list, row_indices=None, colors=None):
         for vao, _, _ in self.meshes:
             vao.release()
         self.meshes.clear()
@@ -263,7 +322,11 @@ class MeshRenderer:
                 (self.ctx.buffer(v.tobytes()),  '3f', 'in_pos'),
                 (self.ctx.buffer(nm.tobytes()), '3f', 'in_norm'),
             ], self.ctx.buffer(tris.astype(np.int32).tobytes()))
-            color = get_loop_color(row_indices[i] if row_indices is not None else i, 0)
+            row_idx = row_indices[i] if row_indices is not None else i
+            if colors is not None:
+                color = colors[row_idx % len(colors)]
+            else:
+                color = get_loop_color(row_idx, 0)
             self.meshes.append((vao, len(tris) * 3, color))
 
     def set_ctrl_pts(self, flat_pts):
@@ -277,18 +340,49 @@ class MeshRenderer:
         vbo = self.ctx.buffer(pts.tobytes())
         self.pt_vao = self.ctx.vertex_array(self.pt_prog, [(vbo, '3f', 'in_pos')])
 
-    def render(self, mvp, mv, hover_idx=-1, selected_idx=-1):
+    def render(self, mvp, mv, hover_idx=-1, selected_idx=-1,
+               bg_tex=None, bg_alpha=0.5, bg_scale_x=1.0, bg_scale_y=1.0,
+               bg_rotation=0.0, bg_offset_x=0.0, bg_offset_y=0.0,
+               model_alpha=1.0):
         self.fbo.use()
         self.ctx.viewport = (0, 0, self.vp_w, self.vp_h)
         self.ctx.clear(0.12, 0.12, 0.12, 1.0)
+
+        # ── Draw reference-image background quad ──────────────────────────────
+        if bg_tex is not None:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.CULL_FACE)
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            bg_tex.use(0)
+            self.bg_prog['bg_tex'].value     = 0
+            self.bg_prog['bg_alpha'].value    = float(bg_alpha)
+            self.bg_prog['bg_scale_x'].value  = float(bg_scale_x)
+            self.bg_prog['bg_scale_y'].value  = float(bg_scale_y)
+            self.bg_prog['bg_rotation'].value = float(bg_rotation)
+            self.bg_prog['bg_offset_x'].value = float(bg_offset_x)
+            self.bg_prog['bg_offset_y'].value = float(bg_offset_y)
+            self.bg_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.disable(moderngl.BLEND)
+
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.enable(moderngl.CULL_FACE)
+
+        # Enable blending for transparent model
+        use_model_blend = model_alpha < 0.9999
+        if use_model_blend:
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
         for vao, n_idx, color in self.meshes:
             self.prog['mvp'].write(mvp.T.tobytes())
             self.prog['mv'].write(mv.T.tobytes())
             self.prog['color'].value = tuple(float(c) for c in color)
+            self.prog['model_alpha'].value = float(model_alpha)
             vao.render(moderngl.TRIANGLES)
+
+        if use_model_blend:
+            self.ctx.disable(moderngl.BLEND)
 
         if self.pt_vao:
             self.ctx.disable(moderngl.DEPTH_TEST)
@@ -311,15 +405,17 @@ def _interp_spline(ctrl_pts, n_out):
     )
 
 class SplineManager:
-    def __init__(self, bitmap, config):
-        self.bitmap     = bitmap
-        self.config     = config
+    def __init__(self, bitmap, config, samples_per_loop=5):
+        self.bitmap          = bitmap
+        self.config          = config
+        self.samples_per_loop = samples_per_loop
         self.ctrl_rows  = []                          # list of (N,3) arrays
         self.flat_pts   = np.empty((0, 3), np.float32)
         self._row_starts = [0]
 
     def init_from_params(self, params):
-        self.ctrl_rows = build_parametric_control_rows(params, self.bitmap)
+        self.ctrl_rows = build_parametric_control_rows(
+            params, self.bitmap, self.samples_per_loop)
         self._rebuild()
 
     def _rebuild(self):
@@ -437,8 +533,7 @@ def main():
     # ── Mutable app state ─────────────────────────────────────────────────────
     s = dict(
         params           = list(PARAM_INIT),
-        bitmap           = np.ones((CONFIG['geometry']['bitmap_rows'],
-                                    CONFIG['geometry']['bitmap_loops']), dtype=np.float32),
+        bitmap           = np.ones((3, CONFIG['geometry']['bitmap_loops']), dtype=np.float32),
         display_copies_x = 0,
         display_copies_y = 0,
         mode             = 'parameter',     # 'parameter' | 'spline'
@@ -452,6 +547,44 @@ def main():
         mouse_in_vp      = False,
         vp_origin        = (0.0, 0.0),      # screen pos of viewport image widget
         vp_scale         = 1.0,
+        # Reference-image background overlay
+        show_ref_bg      = False,
+        ref_bg_alpha     = 0.5,
+        ref_bg_scale_x   = 1.0,
+        ref_bg_scale_y   = 1.0,
+        ref_bg_rotation  = 0.0,
+        ref_bg_offset_x  = 0.0,
+        ref_bg_offset_y  = 0.0,
+        # Model opacity
+        model_alpha      = 1.0,
+        # Yarn / material colors — one per row, cycled from config palette
+        yarn_colors      = [
+            list(CONFIG['ui']['yarn_colors'][i % len(CONFIG['ui']['yarn_colors'])])
+            for i in range(3)   # starts at bitmap_rows=3
+        ],
+        # Mitsuba camera
+        mi_cam_dist_mult = float(CONFIG['rendering']['camera_dist_mult']),
+        mi_cam_fov       = float(CONFIG['rendering']['camera_fov']),
+        # Bitmap grid dimensions
+        bitmap_rows      = 3,
+        bitmap_cols      = CONFIG['geometry']['bitmap_loops'],
+        # Spline control-point density
+        samples_per_loop = 5,
+        # Model rotation (Euler angles, radians)
+        model_rot_x        = 0.0,
+        model_rot_y        = 0.0,
+        model_rot_z        = 0.0,
+        model_rot_dragging = False,   # LMB held for free model rotation
+        # Model translation
+        model_tx           = 0.0,
+        model_ty           = 0.0,
+        model_tz           = 0.0,
+        model_drag_mode    = 'rotate',   # 'rotate' | 'translate'
+        # Save / load UI
+        save_path        = os.path.join(PROJECT_ROOT, 'params.json'),
+        load_path        = os.path.join(PROJECT_ROOT, 'params.json'),
+        status_msg       = '',
+        mesh_center      = np.zeros(3, dtype=np.float32),  # bounding-box center for pivot
     )
 
     # ── Initial mesh ──────────────────────────────────────────────────────────
@@ -466,8 +599,9 @@ def main():
             s['display_copies_x'],
             s['display_copies_y'],
         )
-        renderer.set_meshes(display_vl, display_fl, row_indices)
+        renderer.set_meshes(display_vl, display_fl, row_indices, colors=s['yarn_colors'])
         renderer.set_ctrl_pts([])
+        _recompute_center(display_vl)
 
     def rebuild_spline_mesh():
         vl = spline.build_mesh(s['params'])
@@ -480,8 +614,16 @@ def main():
             s['display_copies_x'],
             s['display_copies_y'],
         )
-        renderer.set_meshes(display_vl, display_fl, row_indices)
+        renderer.set_meshes(display_vl, display_fl, row_indices, colors=s['yarn_colors'])
         renderer.set_ctrl_pts(spline.flat_pts)
+        _recompute_center(display_vl)
+
+    def _recompute_center(display_vl):
+        """Compute bounding-box center of all display vertices and store in s['mesh_center']."""
+        if not display_vl:
+            return
+        all_pts = np.concatenate([v for v, _ in display_vl], axis=0)
+        s['mesh_center'] = ((all_pts.min(axis=0) + all_pts.max(axis=0)) * 0.5).astype(np.float32)
 
     rebuild_param_mesh()
 
@@ -494,6 +636,129 @@ def main():
             spline.init_from_params(s['params'])
             rebuild_spline_mesh()
 
+    def on_bitmap_resize(new_rows, new_cols):
+        """Resize the bitmap grid, preserving existing values where possible."""
+        max_rows = len(LOOP_HEIGHT_PARAM_INDICES)
+        new_rows = max(1, min(int(new_rows), max_rows))
+        new_cols = max(1, min(int(new_cols), 16))
+        old = s['bitmap']
+        old_r, old_c = old.shape
+        new_bm = np.ones((new_rows, new_cols), dtype=np.float32)
+        cr = min(old_r, new_rows)
+        cc = min(old_c, new_cols)
+        new_bm[:cr, :cc] = old[:cr, :cc]
+        s['bitmap']      = new_bm
+        s['bitmap_rows'] = new_rows
+        s['bitmap_cols'] = new_cols
+        _sync_yarn_colors(new_rows)
+        on_bitmap_change()
+
+    def _sync_yarn_colors(n):
+        """Ensure yarn_colors has exactly n entries, cycling the config palette for new ones."""
+        palette = CONFIG['ui']['yarn_colors']
+        while len(s['yarn_colors']) < n:
+            idx = len(s['yarn_colors'])
+            s['yarn_colors'].append(list(palette[idx % len(palette)]))
+        if len(s['yarn_colors']) > n:
+            del s['yarn_colors'][n:]
+
+    # ── Save / Load parameters ────────────────────────────────────────────────
+    def _pick_file(mode):
+        """Opens a native file dialog on the main thread; returns path string or ''."""
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        if mode == 'save':
+            path = _filedialog.asksaveasfilename(
+                parent=root,
+                title='Save parameters',
+                defaultextension='.json',
+                filetypes=[('JSON files', '*.json'), ('All files', '*.*')],
+                initialfile=os.path.basename(s['save_path']),
+                initialdir=os.path.dirname(s['save_path']),
+            )
+        else:
+            path = _filedialog.askopenfilename(
+                parent=root,
+                title='Load parameters',
+                filetypes=[('JSON files', '*.json'), ('All files', '*.*')],
+                initialdir=os.path.dirname(s['load_path']),
+            )
+        root.destroy()
+        return path or ''
+
+    def do_save_params():
+        path = _pick_file('save')
+        if not path:
+            return
+        data = {
+            'params':           {PARAM_NAMES[i]: s['params'][i] for i in range(len(PARAM_NAMES))},
+            'bitmap':           s['bitmap'].tolist(),
+            'yarn_colors':      s['yarn_colors'],
+            'mi_cam_dist_mult': s['mi_cam_dist_mult'],
+            'mi_cam_fov':       s['mi_cam_fov'],
+            'samples_per_loop': s['samples_per_loop'],
+            'display_copies_x': s['display_copies_x'],
+            'display_copies_y': s['display_copies_y'],
+            'ref_bg_alpha':     s['ref_bg_alpha'],
+            'ref_bg_scale_x':   s['ref_bg_scale_x'],
+            'ref_bg_scale_y':   s['ref_bg_scale_y'],
+            'ref_bg_offset_x':  s['ref_bg_offset_x'],
+            'ref_bg_offset_y':  s['ref_bg_offset_y'],
+            'model_alpha':      s['model_alpha'],
+            'ref_bg_rotation':  s['ref_bg_rotation'],
+            'model_rot_x':      s['model_rot_x'],
+            'model_rot_y':      s['model_rot_y'],
+            'model_rot_z':      s['model_rot_z'],
+            'model_tx':         s['model_tx'],
+            'model_ty':         s['model_ty'],
+            'model_tz':         s['model_tz'],
+            'model_drag_mode':  s['model_drag_mode'],
+        }
+        try:
+            with open(path, 'w') as f:
+                _json.dump(data, f, indent=2)
+            s['save_path']  = path
+            s['status_msg'] = f'Saved → {os.path.basename(path)}'
+        except Exception as e:
+            s['status_msg'] = f'Save error: {e}'
+
+    def do_load_params():
+        path = _pick_file('load')
+        if not path:
+            return
+        try:
+            with open(path, 'r') as f:
+                data = _json.load(f)
+            # params
+            p_dict = data.get('params', {})
+            for i, name in enumerate(PARAM_NAMES):
+                if name in p_dict:
+                    lo, hi = PARAM_RANGES[i]
+                    s['params'][i] = float(np.clip(p_dict[name], lo, hi))
+            # bitmap
+            if 'bitmap' in data:
+                bm = np.array(data['bitmap'], dtype=np.float32)
+                s['bitmap_rows'] = bm.shape[0]
+                s['bitmap_cols'] = bm.shape[1]
+                s['bitmap']      = bm
+            # optional fields
+            for key in ('yarn_colors', 'mi_cam_dist_mult', 'mi_cam_fov',
+                        'samples_per_loop', 'display_copies_x', 'display_copies_y',
+                        'ref_bg_alpha', 'ref_bg_scale_x', 'ref_bg_scale_y', 'ref_bg_rotation',
+                        'ref_bg_offset_x', 'ref_bg_offset_y', 'model_alpha',
+                        'model_rot_x', 'model_rot_y', 'model_rot_z',
+                        'model_tx', 'model_ty', 'model_tz', 'model_drag_mode'):
+                if key in data:
+                    s[key] = data[key]
+            s['load_path']  = path
+            s['status_msg'] = f'Loaded ← {os.path.basename(path)}'
+            spline.samples_per_loop = s['samples_per_loop']
+            _sync_yarn_colors(s['bitmap_rows'])
+            on_bitmap_change()
+        except Exception as e:
+            s['status_msg'] = f'Load error: {e}'
+
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
 
@@ -505,7 +770,9 @@ def main():
             mesh_data = [(v, [], f, n) for (v, n), f in zip(vl, fl)]
             path = os.path.join(CONFIG['rendering']['output_dir'], "meshes", "imgui_preview")
             save_combined_obj(mesh_data, path)
-            scene  = optimizer.get_scene_dict(path + "_combined.obj", s['params'])
+            cam_params = (s['mi_cam_dist_mult'], s['mi_cam_fov'])
+            scene  = optimizer.get_scene_dict(path + "_combined.obj", s['params'],
+                                              camera_params=cam_params)
             img    = mi.render(mi.load_dict(scene), spp=128)
             arr    = (np.clip(np.array(img), 0, 1) * 255).astype(np.uint8)
             s['render_result'] = Image.fromarray(arr)
@@ -656,7 +923,7 @@ def main():
             imgui.spacing()
             imgui.text_colored(
                 (0.9, 0.7, 0.3, 1.0),
-                "RMB drag: orbit   Scroll: zoom\nLMB click: select point\nDrag gizmo arrows to move",
+                "LMB drag: rotate/move model\nRMB drag: orbit   Scroll: zoom\nLMB click: select point\nDrag gizmo arrows to move",
             )
             imgui.text(f"Points: {len(spline.flat_pts)}")
             if s['hover_idx'] >= 0:
@@ -667,9 +934,154 @@ def main():
             imgui.spacing()
             imgui.text_colored(
                 (0.6, 0.8, 0.6, 1.0),
-                "RMB drag: orbit\nScroll: zoom   MMB: pan",
+                "LMB drag: rotate/move model\nRMB drag: orbit   Scroll: zoom\nMMB: pan",
             )
 
+        # ── Viewport background image ─────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Viewport Background"):
+            _, s['show_ref_bg'] = imgui.checkbox("Show reference overlay", s['show_ref_bg'])
+            if s['show_ref_bg']:
+                ch, s['ref_bg_alpha'] = imgui.slider_float(
+                    "Opacity##bg", s['ref_bg_alpha'], 0.0, 1.0, "%.2f")
+                imgui.text("Width ")
+                imgui.same_line()
+                ch, s['ref_bg_scale_x'] = imgui.drag_float(
+                    "##bgsx", s['ref_bg_scale_x'], 0.01, 0.01, 50.0, "W: %.2f")
+                imgui.text("Height")
+                imgui.same_line()
+                ch, s['ref_bg_scale_y'] = imgui.drag_float(
+                    "##bgsy", s['ref_bg_scale_y'], 0.01, 0.01, 50.0, "H: %.2f")
+                if imgui.small_button("1:1##bg"):
+                    s['ref_bg_scale_x'] = s['ref_bg_scale_y'] = 1.0
+                imgui.same_line()
+                if imgui.small_button("Link W=H##bg"):
+                    s['ref_bg_scale_y'] = s['ref_bg_scale_x']
+                imgui.text("Pan X  ")
+                imgui.same_line()
+                ch, s['ref_bg_offset_x'] = imgui.drag_float(
+                    "##bgox", s['ref_bg_offset_x'], 0.001, -2.0, 2.0, "X: %.3f")
+                imgui.text("Pan Y  ")
+                imgui.same_line()
+                ch, s['ref_bg_offset_y'] = imgui.drag_float(
+                    "##bgoy", s['ref_bg_offset_y'], 0.001, -2.0, 2.0, "Y: %.3f")
+                if imgui.small_button("Center##bg"):
+                    s['ref_bg_offset_x'] = s['ref_bg_offset_y'] = 0.0
+                ch, s['ref_bg_rotation'] = imgui.slider_float(
+                    "Rotation##bg", s['ref_bg_rotation'],
+                    -float(np.pi), float(np.pi), "%.2f rad")
+
+        # ── Model opacity ─────────────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Model Opacity"):
+            _, s['model_alpha'] = imgui.slider_float(
+                "Opacity##mdl", s['model_alpha'], 0.0, 1.0, "%.2f")
+
+        # ── Yarn colors ───────────────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Yarn Colors"):
+            colors_changed = False
+            n_colors = len(s['yarn_colors'])
+            for ci in range(n_colors):
+                col = s['yarn_colors'][ci]
+                changed_c, new_col = imgui.color_edit3(
+                    f"Color {ci + 1}##yc{ci}",
+                    (float(col[0]), float(col[1]), float(col[2])),
+                )
+                if changed_c:
+                    s['yarn_colors'][ci] = list(new_col)
+                    colors_changed = True
+            if colors_changed:
+                if s['mode'] == 'parameter':
+                    rebuild_param_mesh()
+                else:
+                    rebuild_spline_mesh()
+
+        # ── Mitsuba camera ────────────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Mitsuba Camera"):
+            _, s['mi_cam_dist_mult'] = imgui.slider_float(
+                "Dist mult##mi", s['mi_cam_dist_mult'], 0.3, 3.0, "%.2f")
+            _, s['mi_cam_fov'] = imgui.slider_float(
+                "FoV (deg)##mi", s['mi_cam_fov'], 10.0, 120.0, "%.1f")
+
+        # ── Model rotation ────────────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Model Transform"):
+            pi = float(np.pi)
+            # ─ drag-mode radio buttons ─────────────────────────────────────
+            imgui.text("LMB drag:")
+            imgui.same_line()
+            if imgui.radio_button("Rotate##dm",    s['model_drag_mode'] == 'rotate'):
+                s['model_drag_mode'] = 'rotate'
+            imgui.same_line()
+            if imgui.radio_button("Translate##dm", s['model_drag_mode'] == 'translate'):
+                s['model_drag_mode'] = 'translate'
+            imgui.spacing()
+            # ─ rotation sliders ──────────────────────────────────────────
+            imgui.text_colored((0.8, 0.8, 0.4, 1.0), "Rotation")
+            _, s['model_rot_x'] = imgui.slider_float(
+                "X##mrot", s['model_rot_x'], -pi, pi, "X: %.2f rad")
+            _, s['model_rot_y'] = imgui.slider_float(
+                "Y##mrot", s['model_rot_y'], -pi, pi, "Y: %.2f rad")
+            _, s['model_rot_z'] = imgui.slider_float(
+                "Z##mrot", s['model_rot_z'], -pi, pi, "Z: %.2f rad")
+            if imgui.small_button("Reset rot##mrot"):
+                s['model_rot_x'] = s['model_rot_y'] = s['model_rot_z'] = 0.0
+            imgui.spacing()
+            # ─ translation drag fields ────────────────────────────────
+            imgui.text_colored((0.4, 0.8, 0.8, 1.0), "Position")
+            _, s['model_tx'] = imgui.drag_float(
+                "X##mpos", s['model_tx'], 0.01, -100.0, 100.0, "X: %.3f")
+            _, s['model_ty'] = imgui.drag_float(
+                "Y##mpos", s['model_ty'], 0.01, -100.0, 100.0, "Y: %.3f")
+            _, s['model_tz'] = imgui.drag_float(
+                "Z##mpos", s['model_tz'], 0.01, -100.0, 100.0, "Z: %.3f")
+            if imgui.small_button("Reset pos##mpos"):
+                s['model_tx'] = s['model_ty'] = s['model_tz'] = 0.0
+            imgui.same_line()
+            if imgui.small_button("Reset all##mall"):
+                s['model_rot_x'] = s['model_rot_y'] = s['model_rot_z'] = 0.0
+                s['model_tx']    = s['model_ty']    = s['model_tz']    = 0.0
+
+        # ── Bitmap grid size ──────────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Bitmap Resolution"):
+            max_rows = len(LOOP_HEIGHT_PARAM_INDICES)
+            ch_r, new_rows = imgui.slider_int(
+                "Rows##bres", s['bitmap_rows'], 1, max_rows)
+            ch_c, new_cols = imgui.slider_int(
+                "Columns##bres", s['bitmap_cols'], 1, 16)
+            if ch_r or ch_c:
+                on_bitmap_resize(new_rows, new_cols)
+
+        # ── Spline resolution ─────────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Spline Resolution"):
+            ch_spl, new_spl = imgui.slider_int(
+                "Samples/loop##spl", s['samples_per_loop'], 2, 20)
+            if ch_spl:
+                s['samples_per_loop']       = new_spl
+                spline.samples_per_loop     = new_spl
+                if s['mode'] == 'spline':
+                    spline.init_from_params(s['params'])
+                    rebuild_spline_mesh()
+
+        # ── Save / Load parameters ────────────────────────────────────────────
+        imgui.separator()
+        if imgui.collapsing_header("Save / Load Parameters"):
+            avail_sl_w = imgui.get_content_region_avail().x
+            half_w = max(100, (avail_sl_w - imgui.get_style().item_spacing.x) * 0.5)
+            if imgui.button("Save params…", (half_w, 0)):
+                do_save_params()
+            imgui.same_line()
+            if imgui.button("Load params…", (half_w, 0)):
+                do_load_params()
+            if s['status_msg']:
+                imgui.spacing()
+                imgui.text_colored((0.4, 0.9, 0.4, 1.0), s['status_msg'])
+
+        # ── Pattern ───────────────────────────────────────────────────────────
         imgui.separator()
         imgui.text("Pattern")
         imgui.same_line()
@@ -720,10 +1132,36 @@ def main():
         s['vp_origin'] = (draw_pos.x, draw_pos.y)
         s['vp_scale']  = 1.0
 
-        # Render mesh → FBO
-        mvp = camera.mvp(disp_w, disp_h)
-        mv  = camera.mv(disp_w, disp_h)
-        renderer.render(mvp, mv, s['hover_idx'], s['selected_idx'])
+        # Render mesh → FBO (optionally with background overlay)
+        model_rot = rotation_matrix_xyz(
+            s['model_rot_x'], s['model_rot_y'], s['model_rot_z'])
+        # Model matrix: T(user) @ T(center) @ R @ T(-center)
+        # This pivots rotation around the mesh center, then lets the user
+        # freely translate the result anywhere.
+        cx, cy, cz = s['mesh_center']
+        # T(-center)
+        Tneg = np.eye(4, dtype=np.float32)
+        Tneg[0, 3], Tneg[1, 3], Tneg[2, 3] = -cx, -cy, -cz
+        # T(+center)
+        Tpos = np.eye(4, dtype=np.float32)
+        Tpos[0, 3], Tpos[1, 3], Tpos[2, 3] = cx, cy, cz
+        # T(user offset)
+        Tuser = np.eye(4, dtype=np.float32)
+        Tuser[0, 3], Tuser[1, 3], Tuser[2, 3] = s['model_tx'], s['model_ty'], s['model_tz']
+        model_mat = (Tuser @ Tpos @ model_rot @ Tneg).astype(np.float32)
+        mvp = (camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
+        mv  = (camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
+        renderer.render(
+            mvp, mv, s['hover_idx'], s['selected_idx'],
+            bg_tex      = ref_tex if s['show_ref_bg'] else None,
+            bg_alpha    = s['ref_bg_alpha'],
+            bg_scale_x  = s['ref_bg_scale_x'],
+            bg_scale_y  = s['ref_bg_scale_y'],
+            bg_rotation = s['ref_bg_rotation'],
+            bg_offset_x = s['ref_bg_offset_x'],
+            bg_offset_y = s['ref_bg_offset_y'],
+            model_alpha = s['model_alpha'],
+        )
 
         # Display FBO (flip UV Y so OpenGL origin is correct)
         draw_fitted_texture(renderer.texture_id, disp_w, disp_h, avail_x, avail_y, flip_y=True)
@@ -770,10 +1208,45 @@ def main():
             if prev_mouse:
                 dx = mx - prev_mouse[0]
                 dy = my - prev_mouse[1]
-                if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS:
+                lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT)  == glfw.PRESS
+                rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+                mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE)== glfw.PRESS
+
+                # Decide if LMB should rotate the model:
+                # – always in parameter mode
+                # – in spline mode only when gizmo isn't active and no point hovered
+                if s['mode'] == 'spline' and s['selected_idx'] >= 0 and (
+                        imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()):
+                    lmb_rotates_model = False
+                elif s['mode'] == 'spline' and s['hover_idx'] >= 0:
+                    lmb_rotates_model = False
+                else:
+                    lmb_rotates_model = True
+
+                if lmb and lmb_rotates_model and s['model_rot_dragging']:
+                    sens = 0.005
+                    if s['model_drag_mode'] == 'rotate':
+                        s['model_rot_y'] += dx * sens
+                        s['model_rot_x'] += dy * sens
+                    else:
+                        # Translate in camera right/up plane
+                        view = camera.view()
+                        right = view[0, :3]
+                        up    = view[1, :3]
+                        t_sens = camera.dist * 0.003
+                        s['model_tx'] += float(right[0]) * dx * t_sens - float(up[0]) * dy * t_sens
+                        s['model_ty'] += float(right[1]) * dx * t_sens - float(up[1]) * dy * t_sens
+                        s['model_tz'] += float(right[2]) * dx * t_sens - float(up[2]) * dy * t_sens
+                elif rmb:
                     camera.orbit(dx, dy)
-                elif glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS:
+                elif mmb:
                     camera.pan(dx, dy)
+
+            # Track LMB press/release for model drag
+            if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+                s['model_rot_dragging'] = True
+            else:
+                s['model_rot_dragging'] = False
 
             # ── Spline handle hover + select (LMB click) ─────────────────────
             if s['mode'] == 'spline' and len(spline.flat_pts) > 0:
