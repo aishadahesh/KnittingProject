@@ -1,0 +1,8 @@
+﻿# Extra dependencies for mujoco_fabric_scanner.py
+# This project currently uses Python 3.9, so MuJoCo is pinned below the newer
+# releases that may not publish Windows cp39 wheels.
+# Install into this project's venv:
+#   .venv\Scripts\python.exe -m pip install -r requirements-mujoco.txt
+
+mujoco==3.2.7
+robot_descriptions>=1.12
