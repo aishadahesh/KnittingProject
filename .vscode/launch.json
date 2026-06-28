@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Knitting App (uv)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/guided_workflow_app.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "python": "uv",
+      "pythonArgs": ["run", "python"],
+      "justMyCode": false,
+      "purpose": ["debug-in-terminal"]
+    },
+    {
+      "name": "Run Current File (uv)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${fileDirname}",
+      "console": "integratedTerminal",
+      "python": "uv",
+      "pythonArgs": ["run", "python"],
+      "justMyCode": false,
+      "purpose": ["debug-in-terminal"]
+    }
+  ]
+}

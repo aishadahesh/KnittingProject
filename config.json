@@ -1,134 +1,72 @@
 {
-  "rendering": {
-    "output_dir": "opt_outputs",
-    "spp_optimization": 32,
-    "spp_final": 128,
-    "camera_dist_mult": 0.70,
-    "camera_fov": 45.0,
-    "camera_grid_dist": [0.85, 0.95, 1.05, 1.15, 1.25],
-    "camera_grid_fov": [30.0, 40.0, 45.0, 50.0, 60.0],
-    "mitsuba_variant": "cuda_ad_rgb",
-    "mitsuba_variant_fallback": "llvm_ad_rgb"
+  "ui": {
+    "reference_image": "refImg.png",
+    "yarn_colors": [
+      [0.85, 0.12, 0.1],
+      [0.95, 0.82, 0.2],
+      [0.14, 0.45, 0.9],
+      [0.35, 0.18, 0.08]
+    ]
   },
   "geometry": {
-    "bitmap_rows": 10,
-    "bitmap_loops": 4,
-    "loop_res": 32,
-    "segments": 8,
+    "bitmap_rows": 5,
+    "bitmap_loops": 5,
+    "loop_res": 16,
+    "segments": 16,
     "parameters": [
       {
         "name": "stitch_bulge",
-        "initial": 0.3003,
-        "range": [0.1, 0.6],
-        "delta": 0.02
-      },
-      {
-        "name": "stitch_z",
-        "initial": -0.3495,
-        "range": [-0.8, -0.1],
-        "delta": 0.02
-      },
-      {
-        "name": "loop_height_1",
-        "initial": 1.5,
-        "range": [0.0, 2.5],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_2",
-        "initial": 3.0,
-        "range": [0.0, 5.0],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_3",
-        "initial": 4.5,
-        "range": [0.0, 7.5],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_4",
-        "initial": 6.0,
-        "range": [0.0, 10.0],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_5",
-        "initial": 7.5,
-        "range": [0.0, 12.5],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_6",
-        "initial": 9.0,
-        "range": [0.0, 15.0],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_7",
-        "initial": 10.5,
-        "range": [0.0, 17.5],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_8",
-        "initial": 12.0,
-        "range": [0.0, 20.0],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_9",
-        "initial": 13.5,
-        "range": [0.0, 22.5],
-        "delta": 0.1
-      },
-      {
-        "name": "loop_height_10",
-        "initial": 15.0,
-        "range": [0.0, 25.0],
-        "delta": 0.1
-      },
-      {
-        "name": "dy",
-        "initial": 0.4021,
-        "range": [0.00, 1.0],
-        "delta": 0.00
-      },
-      {
-        "name": "radius",
-        "initial": 0.181,
-        "range": [0.02, 0.3],
+        "initial": 0.25,
+        "range": [0.0, 1.0],
         "delta": 0.01
       },
       {
+        "name": "stitch_z",
+        "initial": -0.2,
+        "range": [-1.0, 1.0],
+        "delta": 0.01
+      },
+      {
+        "name": "dy",
+        "initial": 1.0,
+        "range": [0.2, 3.0],
+        "delta": 0.01
+      },
+      {
+        "name": "radius",
+        "initial": 0.08,
+        "range": [0.01, 0.5],
+        "delta": 0.005
+      },
+      {
         "name": "ellipse_ratio",
-        "initial": 0.6,
-        "range": [0.4, 1.6],
-        "delta": 0.05
+        "initial": 1.0,
+        "range": [0.2, 3.0],
+        "delta": 0.01
+      },
+      {
+        "name": "default_loop_height",
+        "initial": 1.6,
+        "range": [0.1, 6.0],
+        "delta": 0.01
       }
     ]
   },
-  "optimization": {
-    "learning_rate": 0.005,
-    "max_epochs": 1,
-    "epsilon": 0.01,
-    "patience": 1,
-    "optimize_texture": true,
-    "texture_learning_rate": 0.05,
-    "initial_texture_rgb": [0.8, 0.4, 0.3],
-    "loss_center_crop": [0.55, 0.70],
-    "loss_weights": [0.7, 0.3],
-    "use_colored_rows": true
+  "rendering": {
+    "mitsuba_variant": "cuda_ad_rgb",
+    "mitsuba_variant_fallback": "llvm_ad_rgb",
+    "output_dir": "opt_outputs",
+    "camera_dist_mult": 1.1,
+    "camera_fov": 40.0,
+    "spp_optimization": 8
   },
-  "ui": {
-    "yarn_colors": [
-      [0.85, 0.20, 0.20],
-      [0.12, 0.56, 1.0],
-      [1.0, 0.84, 0.0],
-      [0.54, 0.27, 0.07],
-      [0.13, 0.55, 0.13],
-      [0.5, 0.0, 0.5]
-    ],
-    "reference_image": "refImg.png"
+  "optimization": {
+    "learning_rate": 0.02,
+    "loss_weights": {
+      "l2": 1.0
+    },
+    "loss_center_crop": [1.0, 1.0],
+    "max_epochs": 30,
+    "patience": 8
   }
 }

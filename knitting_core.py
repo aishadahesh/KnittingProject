@@ -28,6 +28,8 @@ import jax.numpy as jnp
 import jax 
 import optax
 from functools import partial
+from scipy.interpolate import CubicSpline
+
 
 # %% CONFIGURATION LOADING
 
@@ -52,12 +54,12 @@ REFERENCE_IMAGE_PATH = resolve_project_path(CONFIG['ui']['reference_image'])
 def load_geometry_parameters():
     """Loads geometry parameter definitions from the required array-of-structs config."""
     geometry_cfg = CONFIG['geometry']
-    parameters = geometry_cfg.get('parameters')
-    if not isinstance(parameters, list) or not parameters:
+    raw_parameters = geometry_cfg.get('parameters')
+    if not isinstance(raw_parameters, list) or not raw_parameters:
         raise ValueError("CONFIG['geometry']['parameters'] must be a non-empty list.")
 
     required_keys = {'name', 'initial', 'range', 'delta'}
-    for index, param in enumerate(parameters):
+    for index, param in enumerate(raw_parameters):
         if not isinstance(param, dict):
             raise ValueError(f"CONFIG['geometry']['parameters'][{index}] must be an object.")
 
@@ -67,6 +69,38 @@ def load_geometry_parameters():
             raise ValueError(
                 f"CONFIG['geometry']['parameters'][{index}] is missing keys: {missing_list}."
             )
+
+    loop_height_names = [
+        f"loop_height_{scale_factor}"
+        for scale_factor in range(1, int(geometry_cfg['bitmap_rows']) + 1)
+    ]
+
+    params_by_name = {param['name']: param for param in raw_parameters}
+    default_param = params_by_name.get('default_loop_height')
+    parameters = [dict(param) for param in raw_parameters if param['name'] != 'default_loop_height']
+    existing_names = {param['name'] for param in parameters}
+
+    if default_param is not None:
+        lo, hi = default_param['range']
+        base = float(default_param['initial'])
+        for scale_factor, name in enumerate(loop_height_names, start=1):
+            if name in existing_names:
+                continue
+            parameters.append({
+                'name': name,
+                'initial': float(np.clip(base * scale_factor, lo, hi)),
+                'range': list(default_param['range']),
+                'delta': default_param['delta'],
+            })
+            existing_names.add(name)
+
+    missing_loop_height_params = [
+        name for name in loop_height_names
+        if name not in existing_names
+    ]
+    if missing_loop_height_params:
+        missing_list = ', '.join(missing_loop_height_params)
+        raise ValueError(f"Missing loop height parameters: {missing_list}.")
 
     return parameters
 
@@ -82,15 +116,6 @@ LOOP_HEIGHT_PARAM_NAMES = [
     f"loop_height_{scale_factor}"
     for scale_factor in range(1, CONFIG['geometry']['bitmap_rows'] + 1)
 ]
-
-missing_loop_height_params = [
-    name for name in LOOP_HEIGHT_PARAM_NAMES
-    if name not in PARAM_INDEX
-]
-if missing_loop_height_params:
-    missing_list = ', '.join(missing_loop_height_params)
-    raise ValueError(f"Missing loop height parameters: {missing_list}.")
-
 LOOP_HEIGHT_PARAM_INDICES = tuple(PARAM_INDEX[name] for name in LOOP_HEIGHT_PARAM_NAMES)
 
 def get_param_value(params, name):
@@ -469,3 +494,77 @@ def run_optimization_loop(optimizer, params):
         if l < best_l - 1e-6: best_l, best_p, count = l, params, 0
         elif (count := count + 1) >= cfg['patience']: break
     return best_p, best_l
+
+# %% SPLINE INTERPOLATION ───────────────────────────────────────────────────────
+
+def _interp_spline(ctrl_pts, n_out):
+    ctrl_pts = np.asarray(ctrl_pts, dtype=float)
+    if len(ctrl_pts) <= 1:
+        return np.repeat(ctrl_pts, n_out, axis=0)
+
+    seg_len = np.linalg.norm(np.diff(ctrl_pts, axis=0), axis=1)
+    t = np.concatenate(([0.0], np.cumsum(np.maximum(seg_len, 1e-6))))
+    t_out = np.linspace(t[0], t[-1], n_out)
+    if len(ctrl_pts) == 2:
+        return np.column_stack([
+            np.interp(t_out, t, ctrl_pts[:, i]) for i in range(3)
+        ])
+    return np.column_stack([
+        CubicSpline(t, ctrl_pts[:, i], bc_type="natural")(t_out)
+        for i in range(3)
+    ])
+
+
+class SplineManager:
+    def __init__(self, bitmap, config, samples_per_loop=5):
+        self.bitmap          = bitmap
+        self.config          = config
+        self.samples_per_loop = samples_per_loop
+        self.ctrl_rows  = []                          # list of (N,3) arrays
+        self.flat_pts   = np.empty((0, 3), np.float32)
+        self._row_starts = [0]
+
+    def init_from_params(self, params):
+        self.ctrl_rows = build_parametric_control_rows(
+            params, self.bitmap, self.samples_per_loop)
+        self._rebuild()
+
+    def _rebuild(self):
+        self._row_starts = [0]
+        for row in self.ctrl_rows:
+            self._row_starts.append(self._row_starts[-1] + len(row))
+        self.flat_pts = (
+            np.concatenate(self.ctrl_rows).astype(np.float32)
+            if self.ctrl_rows else np.empty((0, 3), np.float32)
+        )
+
+    def move(self, flat_idx, pos):
+        for r in range(len(self.ctrl_rows)):
+            s, e = self._row_starts[r], self._row_starts[r + 1]
+            if s <= flat_idx < e:
+                self.ctrl_rows[r][flat_idx - s] = pos
+                break
+        self._rebuild()
+
+    def build_mesh(self, params):
+        radius = params[PARAM_INDEX['radius']]
+        ratio  = params[PARAM_INDEX['ellipse_ratio']]
+        seg    = self.config['geometry']['segments']
+        res    = self.config['geometry']['loop_res']
+        n_out  = res * self.bitmap.shape[1] + 1
+        verts_list = []
+        for row in self.ctrl_rows:
+            pts = _interp_spline(row, n_out)
+            T   = np.gradient(pts, axis=0)
+            T  /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
+            U   = np.cross(T, [0, 0, 1])
+            bad = np.linalg.norm(U, axis=1) < 1e-6
+            U[bad] = np.cross(T[bad], [1, 0, 0])
+            U  /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-8
+            V   = np.cross(T, U)
+            angles  = np.linspace(0, 2*np.pi, seg, endpoint=False)
+            offsets = (U[:,None,:] * np.cos(angles)[None,:,None] * radius * ratio
+                     + V[:,None,:] * np.sin(angles)[None,:,None] * radius)
+            verts_list.append(((pts[:,None,:] + offsets).reshape(-1, 3), n_out))
+        return verts_list
+

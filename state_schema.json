@@ -1,0 +1,364 @@
+{
+  "workflow_stages": [
+    {
+      "title": "Align",
+      "subtitle": "Match the model and reference image in the viewport."
+    },
+    {
+      "title": "Pattern",
+      "subtitle": "Set bitmap size, row visibility, and stitch pattern."
+    },
+    {
+      "title": "Geometry",
+      "subtitle": "Tune physical knitting parameters manually."
+    },
+    {
+      "title": "Material",
+      "subtitle": "Choose opacity and yarn colors."
+    },
+    {
+      "title": "Texture",
+      "subtitle": "Tune the yarn texture tint and see it live."
+    },
+    {
+      "title": "Lighting",
+      "subtitle": "Adjust scene lighting and see it live."
+    },
+    {
+      "title": "Spline",
+      "subtitle": "Refine control points when the coarse shape is close."
+    },
+    {
+      "title": "Review",
+      "subtitle": "Render, save, load, and run the existing optimizer."
+    }
+  ],
+  "texture_param_keys": [
+    "texture_ridge_strength",
+    "texture_ridge_scale",
+    "texture_fiber_strength",
+    "texture_fiber_scale",
+    "texture_noise_strength",
+    "texture_scale_x",
+    "texture_scale_y",
+    "texture_chevron_angle",
+    "texture_fiber_sharpness",
+    "texture_groove_darkness",
+    "texture_center_shadow",
+    "texture_gloss_strength",
+    "texture_highlight_width",
+    "texture_color_band_strength",
+    "texture_color_band_scale",
+    "texture_color_band_shift",
+    "texture_saturation",
+    "texture_contrast"
+  ],
+  "material_uniform_aliases": {
+    "render_texture_color": "texture_tint",
+    "render_light_color": "light_color",
+    "render_light_intensity": "light_intensity",
+    "model_alpha": "model_alpha"
+  },
+  "overlay_defaults": {
+    "show_ref_bg": true,
+    "ref_bg_alpha": 1.0,
+    "ref_bg_scale": [1.0, 1.0],
+    "ref_bg_lock_dimensions": true,
+    "ref_bg_lock_zoom": false,
+    "ref_bg_rotation": 0.0,
+    "ref_bg_offset": [0.0, 0.0]
+  },
+  "saved_state_keys": [
+    "workflow_step",
+    "mode",
+    "show_ref_bg",
+    "ref_bg_alpha",
+    "ref_bg_lock_dimensions",
+    "ref_bg_lock_zoom",
+    "model_alpha",
+    "use_row_colors",
+    "row_colors",
+    "row_visible",
+    "texture_ridge_strength",
+    "texture_ridge_scale",
+    "texture_fiber_strength",
+    "texture_fiber_scale",
+    "texture_noise_strength",
+    "texture_scale_x",
+    "texture_scale_y",
+    "texture_chevron_angle",
+    "texture_fiber_sharpness",
+    "texture_groove_darkness",
+    "texture_center_shadow",
+    "texture_gloss_strength",
+    "texture_highlight_width",
+    "texture_color_band_strength",
+    "texture_color_band_scale",
+    "texture_color_band_shift",
+    "texture_saturation",
+    "texture_contrast",
+    "render_light_intensity",
+    "mi_cam_dist_mult",
+    "mi_cam_fov",
+    "view_fov",
+    "viewport_zoom",
+    "viewport_pan",
+    "samples_per_loop",
+    "display_copies",
+    "ref_bg_scale",
+    "ref_bg_offset",
+    "model_rot",
+    "model_scale",
+    "model_t",
+    "bitmap_size",
+    "single_model_color",
+    "render_texture_color",
+    "render_light_color"
+  ],
+  "texture_control_groups": [
+    {
+      "title": "Scale and direction",
+      "controls": [
+        {
+          "key": "texture_scale_x",
+          "label": "Scale X",
+          "min": 0.25,
+          "max": 4.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_scale_y",
+          "label": "Scale Y",
+          "min": 0.25,
+          "max": 4.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_chevron_angle",
+          "label": "Chevron angle",
+          "min": -1.57,
+          "max": 1.57,
+          "format": "%.2f rad"
+        }
+      ]
+    },
+    {
+      "title": "Fibers and roughness",
+      "controls": [
+        {
+          "key": "texture_ridge_strength",
+          "label": "Stitch ridge depth",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_ridge_scale",
+          "label": "Stitch ridge spacing",
+          "min": 1.0,
+          "max": 24.0,
+          "format": "%.1f"
+        },
+        {
+          "key": "texture_fiber_strength",
+          "label": "Fiber streak depth",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_fiber_scale",
+          "label": "Fiber streak spacing",
+          "min": 4.0,
+          "max": 80.0,
+          "format": "%.1f"
+        },
+        {
+          "key": "texture_fiber_sharpness",
+          "label": "Fiber sharpness",
+          "min": 0.35,
+          "max": 4.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_noise_strength",
+          "label": "Uneven roughness",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        }
+      ]
+    },
+    {
+      "title": "Stitch shadows",
+      "controls": [
+        {
+          "key": "texture_groove_darkness",
+          "label": "Dark groove depth",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_center_shadow",
+          "label": "Center crease shadow",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        }
+      ]
+    },
+    {
+      "title": "Gloss",
+      "controls": [
+        {
+          "key": "texture_gloss_strength",
+          "label": "Gloss strength",
+          "min": 0.0,
+          "max": 2.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_highlight_width",
+          "label": "Highlight width",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        }
+      ]
+    },
+    {
+      "title": "Reference color pattern",
+      "controls": [
+        {
+          "key": "texture_color_band_strength",
+          "label": "Blue/yellow/red/brown mix",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_color_band_scale",
+          "label": "Color repeat scale",
+          "min": 0.1,
+          "max": 8.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_color_band_shift",
+          "label": "Color phase",
+          "min": -12.0,
+          "max": 12.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_saturation",
+          "label": "Saturation",
+          "min": 0.0,
+          "max": 2.5,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_contrast",
+          "label": "Contrast",
+          "min": 0.25,
+          "max": 2.5,
+          "format": "%.2f"
+        }
+      ]
+    }
+  ],
+  "texture_preset_buttons": [
+    {
+      "label": "Soft yarn",
+      "preset": "soft_yarn",
+      "same_line": false
+    },
+    {
+      "label": "Strong fibers",
+      "preset": "strong_fibers",
+      "same_line": true
+    },
+    {
+      "label": "Reference-like",
+      "preset": "reference_like",
+      "same_line": false
+    },
+    {
+      "label": "Clear texture",
+      "preset": "clear",
+      "same_line": false
+    }
+  ],
+  "texture_presets": {
+    "soft_yarn": {
+      "texture_ridge_strength": 0.35,
+      "texture_ridge_scale": 7.0,
+      "texture_fiber_strength": 0.25,
+      "texture_fiber_scale": 28.0,
+      "texture_noise_strength": 0.12,
+      "texture_fiber_sharpness": 1.2,
+      "texture_groove_darkness": 0.14,
+      "texture_center_shadow": 0.08,
+      "texture_gloss_strength": 0.14,
+      "texture_highlight_width": 0.38
+    },
+    "strong_fibers": {
+      "texture_ridge_strength": 0.65,
+      "texture_ridge_scale": 11.0,
+      "texture_fiber_strength": 0.75,
+      "texture_fiber_scale": 52.0,
+      "texture_noise_strength": 0.28,
+      "texture_fiber_sharpness": 2.8,
+      "texture_groove_darkness": 0.36,
+      "texture_center_shadow": 0.22,
+      "texture_gloss_strength": 0.45,
+      "texture_highlight_width": 0.2
+    },
+    "reference_like": {
+      "texture_scale_x": 1.25,
+      "texture_scale_y": 0.85,
+      "texture_chevron_angle": 0.82,
+      "texture_ridge_strength": 0.72,
+      "texture_ridge_scale": 9.5,
+      "texture_fiber_strength": 0.72,
+      "texture_fiber_scale": 58.0,
+      "texture_fiber_sharpness": 3.0,
+      "texture_noise_strength": 0.22,
+      "texture_groove_darkness": 0.48,
+      "texture_center_shadow": 0.34,
+      "texture_gloss_strength": 0.65,
+      "texture_highlight_width": 0.16,
+      "texture_color_band_strength": 0.75,
+      "texture_color_band_scale": 1.15,
+      "texture_color_band_shift": 0.0,
+      "texture_saturation": 1.35,
+      "texture_contrast": 1.35
+    },
+    "clear": {
+      "render_texture_color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture_ridge_strength": 0.0,
+      "texture_ridge_scale": 8.0,
+      "texture_fiber_strength": 0.0,
+      "texture_fiber_scale": 34.0,
+      "texture_noise_strength": 0.0,
+      "texture_scale_x": 1.0,
+      "texture_scale_y": 1.0,
+      "texture_chevron_angle": 0.75,
+      "texture_fiber_sharpness": 1.8,
+      "texture_groove_darkness": 0.0,
+      "texture_center_shadow": 0.0,
+      "texture_gloss_strength": 0.0,
+      "texture_highlight_width": 0.28,
+      "texture_color_band_strength": 0.0,
+      "texture_color_band_scale": 1.0,
+      "texture_color_band_shift": 0.0,
+      "texture_saturation": 1.0,
+      "texture_contrast": 1.0
+    }
+  }
+}
