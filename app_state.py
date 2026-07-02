@@ -7,8 +7,8 @@ import jax.numpy as jnp
 from PIL import Image
 
 from knitting_core import (
-    SplineManager, compute_knitting_vertices, compute_knitting_faces,
-    save_combined_obj
+    compute_knitting_vertices, compute_knitting_faces,
+    save_combined_obj, build_parametric_control_rows, build_spline_mesh
 )
 
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +74,9 @@ DEFAULT_STATE_CONFIG = {
         'samples_per_loop': 5,
         'display_copies': np.array([0, 0], dtype=np.int32),
         'mesh_center': np.zeros(3, dtype=np.float32),
+        'ctrl_rows': [],
+        'flat_pts': np.empty((0, 3), np.float32),
+        '_row_starts': [0],
     },
     # ── Viewport, Camera & Interaction ────────────────────────────────────────
     'viewport': {
@@ -150,9 +153,8 @@ STATE_DEFAULTS = {
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 
 class AppState:
-    def __init__(self, camera, spline, renderer):
+    def __init__(self, camera, renderer):
         self.camera = camera
-        self.spline = spline
         self.renderer = renderer
         self._data = {k: _clone(v) for k, v in STATE_DEFAULTS.items()}
 
@@ -179,7 +181,7 @@ class AppState:
             raise AttributeError(f"'AppState' object has no attribute '{name}'") from None
 
     def __setattr__(self, name, value):
-        if name in ('camera', 'spline', 'optimizer', 'renderer', '_data'):
+        if name in ('camera', 'optimizer', 'renderer', '_data'):
             super().__setattr__(name, value)
         else:
             self._data[name] = value
@@ -240,56 +242,60 @@ class AppState:
         self._recompute_center(display_vl)
 
     def rebuild_spline_mesh(self):
-        vl = self.spline.build_mesh(self.params)
+        vl = build_spline_mesh(self.ctrl_rows, self.params, config, _pidx, self.bitmap_size[1])
         fl = compute_knitting_faces(config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
-        self.renderer.set_ctrl_pts(self.spline.flat_pts)
+        self.renderer.set_ctrl_pts(self.flat_pts)
         self._recompute_center(display_vl)
 
     def _recompute_center(self, display_vl):
         if not display_vl:
-            return
-        all_pts = np.concatenate([v for v, _ in display_vl], axis=0)
-        self.mesh_center = ((all_pts.min(axis=0) + all_pts.max(axis=0)) * 0.5).astype(np.float32)
+            self.mesh_center = np.zeros(3, dtype=np.float32)
+        else:
+            all_v = np.vstack([v for v, _ in display_vl])
+            self.mesh_center = (all_v.min(axis=0) + all_v.max(axis=0)) / 2.0
+        self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
+
+    def _rebuild_spline_points(self):
+        self._row_starts = np.concatenate(([0], np.cumsum([len(r) for r in self.ctrl_rows]))).tolist()
+        self.flat_pts = np.concatenate(self.ctrl_rows).astype(np.float32) if self.ctrl_rows else np.empty((0, 3), np.float32)
+
+    def move_ctrl_pt(self, flat_idx, pos):
+        r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
+        if 0 <= r < len(self.ctrl_rows):
+            self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
+            self._rebuild_spline_points()
 
     def center_model_on_view(self):
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
 
     def _fresh_rebuild_rows(self):
-        temp = SplineManager(self.bitmap, config, _pidx, _lh_idx, samples_per_loop=self.samples_per_loop)
-        temp.init_from_params(self.params)
-        return [row.copy() for row in temp.ctrl_rows]
+        return build_parametric_control_rows(self.params, self.bitmap, _pidx, _lh_idx, self.samples_per_loop)
 
     def rebuild_spline_from_params(self):
-        self.spline.ctrl_rows = self._fresh_rebuild_rows()
-        self.spline._rebuild()
-        self.param_ref_ctrl_rows = [row.copy() for row in self.spline.ctrl_rows]
+        self.ctrl_rows = self._fresh_rebuild_rows()
+        self._rebuild_spline_points()
+        self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
         self.rebuild_spline_mesh()
 
     def nudge_spline_from_params(self):
         target_rows = self._fresh_rebuild_rows()
         ref_rows = self.get('param_ref_ctrl_rows')
-        if (
-            not ref_rows
-            or len(ref_rows) != len(target_rows)
-            or len(self.spline.ctrl_rows) != len(target_rows)
-            or any(r.shape != t.shape for r, t in zip(ref_rows, target_rows))
-            or any(c.shape != t.shape for c, t in zip(self.spline.ctrl_rows, target_rows))
-        ):
-            self.spline.ctrl_rows = [row.copy() for row in target_rows]
+        if not ref_rows or len(self.ctrl_rows) != len(target_rows) or any(c.shape != t.shape for c, t in zip(self.ctrl_rows, target_rows)):
+            self.ctrl_rows = [row.copy() for row in target_rows]
         else:
             nudged_rows = []
-            for current_row, ref_row, target_row in zip(self.spline.ctrl_rows, ref_rows, target_rows):
+            for current_row, ref_row, target_row in zip(self.ctrl_rows, ref_rows, target_rows):
                 nudged_rows.append(current_row + (target_row - ref_row))
-            self.spline.ctrl_rows = nudged_rows
-        self.spline._rebuild()
+            self.ctrl_rows = nudged_rows
+        self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
         self.rebuild_spline_mesh()
 
     def debug_compare_to_fresh_rebuild(self):
         fresh_rows = self._fresh_rebuild_rows()
-        curr_rows = self.spline.ctrl_rows
+        curr_rows = self.ctrl_rows
         if len(curr_rows) != len(fresh_rows):
             return {
                 'ok': False,
@@ -338,7 +344,7 @@ class AppState:
         snap = {k: _clone(v) for k, v in self._data.items() if k not in exclude}
         for attr in CAMERA_ATTRIBUTES:
             snap[f'camera_{attr}'] = _clone(getattr(self.camera, attr))
-        snap['ctrl_rows'] = [row.copy() for row in self.spline.ctrl_rows]
+        snap['ctrl_rows'] = [row.copy() for row in self.ctrl_rows]
         return snap
 
     def push_undo(self, label):
@@ -356,10 +362,8 @@ class AppState:
             setattr(self.camera, attr, _clone(snap[f'camera_{attr}']))
         self.camera.fov_deg = self.view_fov
 
-        self.spline.bitmap = self.bitmap
-        self.spline.samples_per_loop = self.samples_per_loop
-        self.spline.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
-        self.spline._rebuild()
+        self.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
+        self._rebuild_spline_points()
         self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
 
         self.rebuild_spline_mesh()
@@ -379,8 +383,6 @@ class AppState:
     # ── BITMAP / WORKFLOW UPDATES ─────────────────────────────────────────────
 
     def on_bitmap_change(self):
-        self.spline.bitmap = self.bitmap
-        self.spline.samples_per_loop = self.samples_per_loop
         self.rebuild_spline_from_params()
 
     def on_bitmap_resize(self, new_rows, new_cols):
@@ -429,7 +431,7 @@ class AppState:
             'format_version': 2,
             'params': params_to_save,
             'bitmap': self.bitmap.tolist(),
-            'spline_control_rows': [row.tolist() for row in self.spline.ctrl_rows],
+            'spline_control_rows': [row.tolist() for row in self.ctrl_rows],
             'gui_state': gui_state,
         }
         try:
@@ -503,8 +505,8 @@ class AppState:
 
             self.rebuild_spline_from_params()
             if loaded_spline_rows:
-                self.spline.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]
-                self.spline._rebuild()
+                self.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]
+                self._rebuild_spline_points()
                 self.param_ref_ctrl_rows = [row.copy() for row in self._param_control_rows()]
                 self.rebuild_spline_mesh()
         except Exception as e:

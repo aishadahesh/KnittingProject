@@ -21,9 +21,7 @@ from imgui_bundle import imgui, imguizmo
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 import jax.numpy as jnp
 
-from knitting_core import (
-    SplineManager,
-)
+
 from rendering import Camera, MeshRenderer, pil_to_texture
 from app_state import AppState, config, _pidx, _lh_idx, resolve_project_path
 from gui import (
@@ -81,10 +79,8 @@ def main():
     for d in ("meshes", "renders"):
         os.makedirs(os.path.join(resolve_project_path(config["rendering"]["output_dir"]), d), exist_ok=True)
 
-    spline   = SplineManager(np.ones((3, config['knit_parameters']['bitmap_loops']), dtype=np.float32), config, _pidx, _lh_idx)
-
     # ── App state ─────────────────────────────────────────────────────────────
-    state = AppState(camera, spline, renderer)
+    state = AppState(camera, renderer)
 
     # Initial state load/build
     if os.path.exists(state.load_path):

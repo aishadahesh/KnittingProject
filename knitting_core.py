@@ -47,7 +47,7 @@ def _scale_factors_jax(bitmap):
 
 
 @jax.jit
-def eval_curve_batch(t, hl, lh, sb, sz):
+def eval_curve(t, hl, lh, sb, sz):
     x = sb * jnp.sin(2 * t) + t / (2 * jnp.pi)
     y = lh * (-(jnp.cos(t) - 1) / 2)
     z = sz * (jnp.cos(2 * t) - 1) / 2 * hl
@@ -56,7 +56,7 @@ def eval_curve_batch(t, hl, lh, sb, sz):
 
 
 @jax.jit
-def eval_curve_derivative_batch(t, hl, lh, sb, sz):
+def eval_curve_derivative(t, hl, lh, sb, sz):
     dx = 2 * sb * jnp.cos(2 * t) + 1 / (2 * jnp.pi)
     dy = 0.5 * jnp.sin(t) * lh
     dz = -sz * jnp.sin(2 * t) * hl
@@ -65,7 +65,7 @@ def eval_curve_derivative_batch(t, hl, lh, sb, sz):
 
 
 @jax.jit
-def compute_orthonormal_frame_batch(tan):
+def compute_orthonormal_frame(tan):
     t = tan / (jnp.linalg.norm(tan, axis=-1, keepdims=True) + 1e-8)
     u = jnp.cross(t, jnp.array([0.0, 0.0, 1.0]))
     u = jnp.where(jnp.linalg.norm(u, axis=-1, keepdims=True) < 1e-6, jnp.cross(t, jnp.array([1.0, 0.0, 0.0])), u)
@@ -74,7 +74,7 @@ def compute_orthonormal_frame_batch(tan):
 
 
 @partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx):
+def compute_knitting_vertices(params, bitmap, loop_res, seg, indices, lh_idx):
     bulge_idx, stz_idx, dy_idx, rad_idx, rat_idx = indices
     bulge, stz = params[bulge_idx], params[stz_idx]
     dy, rad, rat = params[dy_idx], params[rad_idx], params[rat_idx]
@@ -90,9 +90,9 @@ def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx
         ls = jnp.append(jnp.repeat(srow, loop_res), 1.0).astype(jnp.int32)
         h = jnp.take(lut, ls)
         has = (ls > 0).astype(jnp.float32)
-        p = eval_curve_batch(t, has, h, bulge, stz).at[:, 1].add(i * dy)
-        d = eval_curve_derivative_batch(t, has, h, bulge, stz)
-        u, v = compute_orthonormal_frame_batch(d)
+        p = eval_curve(t, has, h, bulge, stz).at[:, 1].add(i * dy)
+        d = eval_curve_derivative(t, has, h, bulge, stz)
+        u, v = compute_orthonormal_frame(d)
         off = u[:, None, :] * ca * rad * rat + v[:, None, :] * sa * rad
         return (p[:, None, :] + off).reshape(-1, 3)
 
@@ -103,7 +103,7 @@ def compute_knitting_vertices(params, bitmap, config, pidx, lh_idx):
     seg = config["knit_parameters"]["segments"]
     res = config["knit_parameters"]["loop_res"]
     indices = (pidx["stitch_bulge"], pidx["stitch_z"], pidx["dy"], pidx["radius"], pidx["ellipse_ratio"])
-    v = compute_knitting_vertices_jit(
+    v = compute_knitting_vertices(
         jnp.asarray(params, dtype=jnp.float32),
         jnp.asarray(bitmap, dtype=jnp.float32),
         res,
@@ -141,7 +141,7 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     s = np.repeat(sf, spl, axis=1)
     has = (s > 0).astype(np.float32)
     h = lut[s]
-    c = np.array(eval_curve_batch(
+    c = np.array(eval_curve(
         jnp.asarray(t[None, :]), jnp.asarray(has), jnp.asarray(h), bulge, stz
     ), dtype=np.float32, copy=True)
     c[:, :, 0] += xoff[None, :]
@@ -165,49 +165,28 @@ def save_combined_obj(mesh_data_list, base_filename="knitting_model"):
             off += len(v)
 
 
-class SplineManager:
-    def __init__(self, bitmap, config, pidx, lh_idx, samples_per_loop=5):
-        self.bitmap, self.config, self.samples_per_loop = bitmap, config, samples_per_loop
-        self.pidx, self.lh_idx = pidx, lh_idx
-        self.ctrl_rows, self.flat_pts, self._row_starts = [], np.empty((0, 3), np.float32), [0]
-
-    def init_from_params(self, params):
-        self.ctrl_rows = build_parametric_control_rows(params, self.bitmap, self.pidx, self.lh_idx, self.samples_per_loop)
-        self._rebuild()
-
-    def _rebuild(self):
-        self._row_starts = np.concatenate(([0], np.cumsum([len(r) for r in self.ctrl_rows]))).tolist()
-        self.flat_pts = np.concatenate(self.ctrl_rows).astype(np.float32) if self.ctrl_rows else np.empty((0, 3), np.float32)
-
-    def move(self, flat_idx, pos):
-        r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
-        if 0 <= r < len(self.ctrl_rows):
-            self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
-            self._rebuild()
-
-    def build_mesh(self, params):
-        p = np.asarray(params)
-        idx = self.pidx
-        rad, rat = p[idx["radius"]], p[idx["ellipse_ratio"]]
-        seg, res = self.config["knit_parameters"]["segments"], self.config["knit_parameters"]["loop_res"]
-        nout = res * self.bitmap.shape[1] + 1
-        a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
-        ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
-        out = []
-        for r in self.ctrl_rows:
-            cp = np.asarray(r, dtype=float)
-            if len(cp) <= 1:
-                pts = np.repeat(cp, nout, axis=0)
-            else:
-                t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp, axis=0), axis=1), 1e-6))))
-                to = np.linspace(t[0], t[-1], nout)
-                pts = np.column_stack([np.interp(to, t, cp[:, i]) for i in range(3)]) if len(cp) == 2 else np.column_stack([CubicSpline(t, cp[:, i], bc_type="natural")(to) for i in range(3)])
-            T = np.gradient(pts, axis=0)
-            T /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
-            U = np.cross(T, [0, 0, 1])
-            b = np.linalg.norm(U, axis=1) < 1e-6
-            U[b] = np.cross(T[b], [1, 0, 0])
-            U /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-8
-            V = np.cross(T, U)
-            out.append(((pts[:, None, :] + U[:, None, :] * ca * rad * rat + V[:, None, :] * sa * rad).reshape(-1, 3), nout))
-        return out
+def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width):
+    p = np.asarray(params)
+    rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
+    seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
+    nout = res * bitmap_width + 1
+    a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
+    ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
+    out = []
+    for r in ctrl_rows:
+        cp = np.asarray(r, dtype=float)
+        if len(cp) <= 1:
+            pts = np.repeat(cp, nout, axis=0)
+        else:
+            t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp, axis=0), axis=1), 1e-6))))
+            to = np.linspace(t[0], t[-1], nout)
+            pts = np.column_stack([np.interp(to, t, cp[:, i]) for i in range(3)]) if len(cp) == 2 else np.column_stack([CubicSpline(t, cp[:, i], bc_type="natural")(to) for i in range(3)])
+        T = np.gradient(pts, axis=0)
+        T /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
+        U = np.cross(T, [0, 0, 1])
+        b = np.linalg.norm(U, axis=1) < 1e-6
+        U[b] = np.cross(T[b], [1, 0, 0])
+        U /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-8
+        V = np.cross(T, U)
+        out.append(((pts[:, None, :] + U[:, None, :] * ca * rad * rat + V[:, None, :] * sa * rad).reshape(-1, 3), nout))
+    return out

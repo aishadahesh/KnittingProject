@@ -453,9 +453,9 @@ def draw_sidebar(state, renderer):
         if ch_spl:
             state.push_undo("Spline resolution")
             state.samples_per_loop = new_spl
-            state.spline.samples_per_loop = new_spl
+            state.samples_per_loop = new_spl
             state.rebuild_spline_from_params()
-        imgui.text(f"Points: {len(state.spline.flat_pts)}")
+        imgui.text(f"Points: {len(state.flat_pts)}")
         if state.hover_idx >= 0:
             imgui.text(f"Hover: {state.hover_idx}")
         if state.selected_idx >= 0:
@@ -515,15 +515,15 @@ def draw_viewport(state, renderer, ref_tex, window):
     visible_ctrl_index_map = {}
     if state.mode == 'spline':
         visible_chunks = []
-        for row_idx, row in enumerate(state.spline.ctrl_rows):
-            if row_idx < len(state.row_visible) and not bool(state.row_visible[row_idx]):
+        for row_idx, row in enumerate(state.ctrl_rows):
+            if not state.row_visible[row_idx]:
                 continue
-            start = state.spline._row_starts[row_idx]
+            start = state._row_starts[row_idx]
             end = start + len(row)
             visible_chunks.append(np.arange(start, end, dtype=np.int32))
         if visible_chunks:
             visible_ctrl_indices = np.concatenate(visible_chunks)
-            visible_ctrl_pts = state.spline.flat_pts[visible_ctrl_indices]
+            visible_ctrl_pts = state.flat_pts[visible_ctrl_indices]
         else:
             visible_ctrl_pts = np.empty((0, 3), dtype=np.float32)
         renderer.set_ctrl_pts(visible_ctrl_pts)
@@ -585,7 +585,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         # In spline mode, derive the bbox from visible control points for stable,
         # predictable resize behavior.
         if state.mode == 'spline' and len(visible_ctrl_indices) > 0:
-            ctrl_pts = state.spline.flat_pts[visible_ctrl_indices]
+            ctrl_pts = state.flat_pts[visible_ctrl_indices]
             world_pts = transform_points(ctrl_pts, model_matrix)
             view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
             homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
@@ -704,7 +704,7 @@ def draw_viewport(state, renderer, ref_tex, window):
 
     # ImGuizmo
     if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map:
-        local_pos = state.spline.flat_pts[state.selected_idx].astype(np.float32)
+        local_pos = state.flat_pts[state.selected_idx].astype(np.float32)
         pos = transform_points([local_pos], model_mat)[0].astype(np.float32)
         M16 = imguizmo.im_guizmo.Matrix16
 
@@ -734,7 +734,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 state.gizmo_edit_active = True
             new_world = np.array(obj_m.values[12:15], dtype=np.float32)
             new_local = transform_points([new_world], np.linalg.inv(model_mat))[0]
-            state.spline.move(state.selected_idx, new_local)
+            state.move_ctrl_pt(state.selected_idx, new_local)
             state.rebuild_spline_mesh()
         elif state.gizmo_edit_active and not imguizmo.im_guizmo.is_using():
             state.gizmo_edit_active = False
@@ -772,7 +772,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_mouse = np.array([lx, ly], dtype=np.float32)
             state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
             if state.mode == 'spline':
-                state.bbox_start_ctrl_rows = [row.copy() for row in state.spline.ctrl_rows]
+                state.bbox_start_ctrl_rows = [row.copy() for row in state.ctrl_rows]
             suppress_mesh_click = True
 
         active_handle = int(state.get('bbox_active_handle', -1))
@@ -814,8 +814,8 @@ def draw_viewport(state, renderer, ref_tex, window):
                         pivot = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32)
                     else:
                         pivot = np.asarray(state.mesh_center, dtype=np.float32)
-                    state.spline.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
-                    state.spline._rebuild()
+                    state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
+                    state._rebuild_spline_points()
                     state.rebuild_spline_mesh()
 
             start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
@@ -934,7 +934,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()
             )
             if not gizmo_active:
-                visible_ctrl_pts = state.spline.flat_pts[visible_ctrl_indices]
+                visible_ctrl_pts = state.flat_pts[visible_ctrl_indices]
                 world_pts = transform_points(visible_ctrl_pts, model_mat)
                 homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
                 view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
