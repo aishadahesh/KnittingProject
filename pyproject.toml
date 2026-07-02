@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.4.6",
     "optax>=0.2.8",
     "pillow>=12.2.0",
+    "pydantic>=2.13.4",
     "pyopengl>=3.1.10",
     "scipy>=1.17.1",
     "vedo>=2026.6.1",

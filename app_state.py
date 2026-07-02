@@ -7,15 +7,27 @@ import jax.numpy as jnp
 from PIL import Image
 
 from knitting_core import (
-    CONFIG, PARAM_NAMES, INITIAL_PARAMS, PARAM_INDEX, PARAM_RANGES,
-    LOOP_HEIGHT_PARAM_INDICES, compute_knitting_vertices, compute_knitting_faces,
-    save_combined_obj, run_optimization_loop, PROJECT_ROOT
+    SplineManager, compute_knitting_vertices, compute_knitting_faces,
+    save_combined_obj
 )
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+resolve_project_path = lambda p: p if os.path.isabs(p) else os.path.join(project_root, p)
+
+with open(os.path.join(project_root, "config.json"), "r") as f:
+    config = json.load(f)
+
+_pidx = {p["name"]: i for i, p in enumerate(config["knit_parameters"]["parameters"])}
+_lh_params = sorted(
+    [p["name"] for p in config["knit_parameters"]["parameters"] if p["name"].startswith("loop_height_")],
+    key=lambda name: int(name.split("_")[-1])
+)
+_lh_idx = tuple(_pidx[name] for name in _lh_params)
 
 # %% STATE CONSTRAINTS ─────────────────────────────────────────────────────────
 
 def _load_state_schema(filename='state_schema.json'):
-    schema_path = os.path.join(PROJECT_ROOT, filename)
+    schema_path = os.path.join(project_root, filename)
     with open(schema_path, 'r') as handle:
         return json.load(handle)
 
@@ -42,12 +54,12 @@ DEFAULT_STATE_CONFIG = {
     # ── Workflow / UI State ───────────────────────────────────────────────────
     'ui': {
         'workflow_step': 0,
-        'mode': 'parameter',
+        'mode': 'spline',
         'hover_idx': -1,
         'selected_idx': -1,
         'status_msg': '',
-        'save_path': os.path.join(PROJECT_ROOT, 'params.json'),
-        'load_path': os.path.join(PROJECT_ROOT, 'params.json'),
+        'save_path': os.path.join(project_root, 'params.json'),
+        'load_path': os.path.join(project_root, 'params.json'),
         'autosave_enabled': True,
         'autosave_interval_sec': 1.0,
         'autosave_last_time': 0.0,
@@ -56,9 +68,9 @@ DEFAULT_STATE_CONFIG = {
     },
     # ── Geometry & Knitting Parameters ────────────────────────────────────────
     'geometry': {
-        'params': list(INITIAL_PARAMS),
-        'bitmap': np.ones((3, CONFIG['geometry']['bitmap_loops']), dtype=np.float32),
-        'bitmap_size': np.array([3, CONFIG['geometry']['bitmap_loops']], dtype=np.int32),
+        'params': [p['initial'] for p in config['knit_parameters']['parameters']],
+        'bitmap': np.ones((3, config['knit_parameters']['bitmap_loops']), dtype=np.float32),
+        'bitmap_size': np.array([3, config['knit_parameters']['bitmap_loops']], dtype=np.int32),
         'samples_per_loop': 5,
         'display_copies': np.array([0, 0], dtype=np.int32),
         'mesh_center': np.zeros(3, dtype=np.float32),
@@ -74,7 +86,7 @@ DEFAULT_STATE_CONFIG = {
         'selected_mesh_idx': -1,
         'view_fov': 45.0,
         'model_rot': np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        'model_scale': 1.0,
+        'model_scale': np.array([1.0, 1.0, 1.0], dtype=np.float32),
         'model_rot_dragging': False,
         'model_t': np.array([0.0, 0.0, 0.0], dtype=np.float32),
         'model_drag_undo_active': False,
@@ -96,7 +108,7 @@ DEFAULT_STATE_CONFIG = {
         'single_model_color': np.array([0.85, 0.12, 0.10], dtype=np.float32),
         'use_row_colors': False,
         'row_colors': [
-            list(CONFIG['ui']['yarn_colors'][i % len(CONFIG['ui']['yarn_colors'])])
+            list(config['knit_parameters']['yarn_colors'][i % len(config['knit_parameters']['yarn_colors'])])
             for i in range(3)
         ],
         'row_visible': np.ones(3, dtype=bool),
@@ -104,18 +116,6 @@ DEFAULT_STATE_CONFIG = {
         # Texture parameters populated directly from clear base + soft_yarn preset
         **{k: v for k, v in TEXTURE_PRESETS['clear'].items() if k != 'render_texture_color'},
         **TEXTURE_PRESETS['soft_yarn'],
-    },
-    # ── Mitsuba Rendering & Optimization ──────────────────────────────────────
-    'mitsuba': {
-        'is_rendering': False,
-        'is_optimizing': False,
-        'render_result': None,
-        'pending_tex': False,
-        'render_tex': None,
-        'render_light_color': np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        'render_light_intensity': 0.9,
-        'mi_cam_dist_mult': float(CONFIG['rendering']['camera_dist_mult']),
-        'mi_cam_fov': float(CONFIG['rendering']['camera_fov']),
     }
 }
 
@@ -150,10 +150,9 @@ STATE_DEFAULTS = {
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 
 class AppState:
-    def __init__(self, camera, spline, optimizer, renderer):
+    def __init__(self, camera, spline, renderer):
         self.camera = camera
         self.spline = spline
-        self.optimizer = optimizer
         self.renderer = renderer
         self._data = {k: _clone(v) for k, v in STATE_DEFAULTS.items()}
 
@@ -199,7 +198,7 @@ class AppState:
     # ── MESH GENERATION HELPERS ───────────────────────────────────────────────
 
     def _sync_row_colors(self, n_rows):
-        palette = CONFIG['ui']['yarn_colors']
+        palette = config['knit_parameters']['yarn_colors']
         self.row_colors = self.row_colors[:n_rows] + [
             list(palette[i % len(palette)]) for i in range(len(self.row_colors), n_rows)
         ]
@@ -214,7 +213,7 @@ class AppState:
         if not verts_list:
             return [], [], []
         x_period = max(float(self.bitmap_size[1]), 1e-6)
-        y_period = max(float(self.bitmap_size[0]) * abs(float(self.params[PARAM_INDEX['dy']])), 1e-6)
+        y_period = max(float(self.bitmap_size[0]) * abs(float(self.params[_pidx['dy']])), 1e-6)
         display_vl, display_fl, display_meta = [], [], []
         for y_tile in range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1):
             for x_tile in range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1):
@@ -233,8 +232,8 @@ class AppState:
         return self.row_colors if self.use_row_colors else [self.single_model_color]
 
     def rebuild_param_mesh(self):
-        vl = compute_knitting_vertices(self.params, self.bitmap)
-        fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
+        vl = compute_knitting_vertices(self.params, self.bitmap, config, _pidx, _lh_idx)
+        fl = compute_knitting_faces(config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts([])
@@ -242,7 +241,7 @@ class AppState:
 
     def rebuild_spline_mesh(self):
         vl = self.spline.build_mesh(self.params)
-        fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
+        fl = compute_knitting_faces(config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts(self.spline.flat_pts)
@@ -257,13 +256,75 @@ class AppState:
     def center_model_on_view(self):
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
 
+    def _fresh_rebuild_rows(self):
+        temp = SplineManager(self.bitmap, config, _pidx, _lh_idx, samples_per_loop=self.samples_per_loop)
+        temp.init_from_params(self.params)
+        return [row.copy() for row in temp.ctrl_rows]
+
+    def rebuild_spline_from_params(self):
+        self.spline.ctrl_rows = self._fresh_rebuild_rows()
+        self.spline._rebuild()
+        self.param_ref_ctrl_rows = [row.copy() for row in self.spline.ctrl_rows]
+        self.rebuild_spline_mesh()
+
+    def nudge_spline_from_params(self):
+        target_rows = self._fresh_rebuild_rows()
+        ref_rows = self.get('param_ref_ctrl_rows')
+        if (
+            not ref_rows
+            or len(ref_rows) != len(target_rows)
+            or len(self.spline.ctrl_rows) != len(target_rows)
+            or any(r.shape != t.shape for r, t in zip(ref_rows, target_rows))
+            or any(c.shape != t.shape for c, t in zip(self.spline.ctrl_rows, target_rows))
+        ):
+            self.spline.ctrl_rows = [row.copy() for row in target_rows]
+        else:
+            nudged_rows = []
+            for current_row, ref_row, target_row in zip(self.spline.ctrl_rows, ref_rows, target_rows):
+                nudged_rows.append(current_row + (target_row - ref_row))
+            self.spline.ctrl_rows = nudged_rows
+        self.spline._rebuild()
+        self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
+        self.rebuild_spline_mesh()
+
+    def debug_compare_to_fresh_rebuild(self):
+        fresh_rows = self._fresh_rebuild_rows()
+        curr_rows = self.spline.ctrl_rows
+        if len(curr_rows) != len(fresh_rows):
+            return {
+                'ok': False,
+                'reason': 'row_count_mismatch',
+                'curr_rows': len(curr_rows),
+                'fresh_rows': len(fresh_rows),
+            }
+        all_d = []
+        for curr, fresh in zip(curr_rows, fresh_rows):
+            if curr.shape != fresh.shape:
+                return {
+                    'ok': False,
+                    'reason': 'row_shape_mismatch',
+                    'curr_shape': tuple(curr.shape),
+                    'fresh_shape': tuple(fresh.shape),
+                }
+            d = np.linalg.norm(curr - fresh, axis=1)
+            all_d.append(d)
+        all_d = np.concatenate(all_d) if all_d else np.zeros((0,), dtype=np.float32)
+        if all_d.size == 0:
+            return {'ok': True, 'mean': 0.0, 'max': 0.0, 'p95': 0.0}
+        return {
+            'ok': True,
+            'mean': float(np.mean(all_d)),
+            'max': float(np.max(all_d)),
+            'p95': float(np.percentile(all_d, 95.0)),
+        }
+
     def current_model_matrix(self):
         from rendering import rotation_matrix_xyz
         model_rot = rotation_matrix_xyz(*self.model_rot)
         model_s = np.eye(4, dtype=np.float32)
-        model_s[0, 0] = float(self.model_scale)
-        model_s[1, 1] = float(self.model_scale)
-        model_s[2, 2] = float(self.model_scale)
+        model_s[0, 0] = 1.0
+        model_s[1, 1] = 1.0
+        model_s[2, 2] = 1.0
         tneg, tpos, tuser = np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32)
         tneg[:3, 3] = -self.mesh_center
         tpos[:3, 3] = self.mesh_center
@@ -299,13 +360,9 @@ class AppState:
         self.spline.samples_per_loop = self.samples_per_loop
         self.spline.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
         self.spline._rebuild()
+        self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
 
-        self.optimizer.bitmap = jnp.array(self.bitmap)
-        if self.mode == 'parameter':
-            self.renderer.set_ctrl_pts([])
-            self.rebuild_param_mesh()
-        else:
-            self.rebuild_spline_mesh()
+        self.rebuild_spline_mesh()
 
     def undo_last(self):
         if not self.undo_stack:
@@ -323,15 +380,11 @@ class AppState:
 
     def on_bitmap_change(self):
         self.spline.bitmap = self.bitmap
-        self.optimizer.bitmap = jnp.array(self.bitmap)
-        if self.mode == 'parameter':
-            self.rebuild_param_mesh()
-        else:
-            self.spline.init_from_params(self.params)
-            self.rebuild_spline_mesh()
+        self.spline.samples_per_loop = self.samples_per_loop
+        self.rebuild_spline_from_params()
 
     def on_bitmap_resize(self, new_rows, new_cols):
-        new_rows = max(1, min(int(new_rows), int(CONFIG['geometry']['bitmap_rows'])))
+        new_rows = max(1, min(int(new_rows), int(config['knit_parameters']['bitmap_rows'])))
         new_cols = max(1, min(int(new_cols), 16))
         old = self.bitmap
         new_bm = np.ones((new_rows, new_cols), dtype=np.float32)
@@ -351,12 +404,12 @@ class AppState:
         return None
 
     def fit_loop_heights_to_rows(self):
-        dy = float(self.params[PARAM_INDEX['dy']])
+        dy = float(self.params[_pidx['dy']])
         for span in range(1, self.bitmap_size[0] + 1):
             name = f"loop_height_{span}"
-            if name in PARAM_INDEX:
-                idx = PARAM_INDEX[name]
-                lo, hi = PARAM_RANGES[idx]
+            if name in _pidx:
+                idx = _pidx[name]
+                lo, hi = config['knit_parameters']['parameters'][idx]["range"]
                 self.params[idx] = float(np.clip(span * dy, lo, hi))
         self.on_bitmap_change()
 
@@ -365,7 +418,7 @@ class AppState:
     def save_params(self, path, silent=False):
         params_to_save = {
             name: float(self.params[i])
-            for i, name in enumerate(PARAM_NAMES)
+            for i, name in enumerate(p["name"] for p in config['knit_parameters']['parameters'])
             if (span := self.loop_height_span(name)) is None or span <= self.bitmap_size[0]
         }
         gui_state = {k: json_ready(self._data[k]) for k in SAVED_STATE_KEYS if k in self._data}
@@ -395,7 +448,7 @@ class AppState:
         now = time.monotonic()
         if now - float(self.autosave_last_time) < float(self.autosave_interval_sec):
             return
-        target_path = self.save_path or os.path.join(PROJECT_ROOT, 'params.json')
+        target_path = self.save_path or os.path.join(project_root, 'params.json')
         self.save_params(target_path, silent=True)
 
     def load_params(self, path):
@@ -403,10 +456,10 @@ class AppState:
             with open(path, 'r') as f:
                 data = json.load(f)
             p_dict = data.get('params', {})
-            for i, name in enumerate(PARAM_NAMES):
-                if name in p_dict:
-                    lo, hi = PARAM_RANGES[i]
-                    self.params[i] = float(np.clip(p_dict[name], lo, hi))
+            for i, pd in enumerate(config['knit_parameters']['parameters']):
+                if pd["name"] in p_dict:
+                    lo, hi = pd["range"]
+                    self.params[i] = float(np.clip(p_dict[pd["name"]], lo, hi))
 
             if 'bitmap' in data:
                 self.bitmap = np.array(data['bitmap'], dtype=np.float32)
@@ -421,11 +474,12 @@ class AppState:
                 if val is not None:
                     default_val = STATE_DEFAULTS.get(key)
                     if isinstance(default_val, np.ndarray):
-                        self._data[key] = np.array(val, dtype=default_val.dtype)
+                        arr = np.array(val, dtype=default_val.dtype)
+                        if key == 'model_scale' and arr.size == 1:
+                            arr = np.array([float(arr.item()), float(arr.item()), float(arr.item())], dtype=default_val.dtype)
+                        self._data[key] = arr
                     else:
                         self._data[key] = val
-
-
 
             for attr in CAMERA_ATTRIBUTES:
                 field = f'camera_{attr}'
@@ -441,56 +495,17 @@ class AppState:
 
             self._sync_row_colors(self.bitmap_size[0])
             self._sync_row_visibility(self.bitmap_size[0])
+            self.mode = 'spline'
             self.camera.fov_deg = self.view_fov
             self.load_path = path
             self.status_msg = f'Loaded ← {os.path.basename(path)}'
             self.spline.samples_per_loop = self.samples_per_loop
 
-            self.on_bitmap_change()
+            self.rebuild_spline_from_params()
             if loaded_spline_rows:
                 self.spline.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]
                 self.spline._rebuild()
-                if self.mode == 'spline':
-                    self.rebuild_spline_mesh()
+                self.param_ref_ctrl_rows = [row.copy() for row in self._param_control_rows()]
+                self.rebuild_spline_mesh()
         except Exception as e:
-            self.status_msg = f'Load error: {e}'
-
-    # ── BACKGROUND THREAD TRIGGERS ────────────────────────────────────────────
-
-    def start_background_render(self):
-        if not self.is_rendering:
-            self.is_rendering = True
-            threading.Thread(target=self._bg_render_job, daemon=True).start()
-
-    def _bg_render_job(self):
-        try:
-            import mitsuba as mi
-            vl = compute_knitting_vertices(self.params, self.bitmap)
-            fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
-            path = os.path.join(CONFIG['rendering']['output_dir'], "meshes", "imgui_preview")
-            save_combined_obj([(v, [], f, n) for (v, n), f in zip(vl, fl)], path)
-            scene = self.optimizer.get_scene_dict(path + "_combined.obj", self.params, camera_params=(self.mi_cam_dist_mult, self.mi_cam_fov))
-            scene['mesh']['bsdf']['reflectance']['value'] = [float(v) for v in self.render_texture_color]
-            scene['emitter']['radiance']['value'] = [float(self.render_light_intensity) * float(v) for v in self.render_light_color]
-            arr = (np.clip(np.array(mi.render(mi.load_dict(scene), spp=128)), 0, 1) * 255).astype(np.uint8)
-            self.render_result = Image.fromarray(arr)
-            self.pending_tex   = True
-        except Exception as e:
-            print(f"Render error: {e}")
-        finally:
-            self.is_rendering = False
-
-    def start_background_optimize(self):
-        if not self.is_optimizing:
-            self.is_optimizing = True
-            threading.Thread(target=self._bg_optimize_job, daemon=True).start()
-
-    def _bg_optimize_job(self):
-        try:
-            new_params, _ = run_optimization_loop(self.optimizer, self.params)
-            self.params[:] = [float(v) for v in new_params]
-            self.rebuild_param_mesh()
-        except Exception as e:
-            print(f"Optimize error: {e}")
-        finally:
-            self.is_optimizing = False
+            self.status_msg = f"Load error: {e}"

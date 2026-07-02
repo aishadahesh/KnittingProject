@@ -6,10 +6,7 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 
 from rendering import draw_fitted_texture, transform_points
-from app_state import WORKFLOW_STAGES, TEXTURE_CONTROL_GROUPS, TEXTURE_PRESET_BUTTONS
-from knitting_core import (
-    PARAM_NAMES, PARAM_RANGES, PARAM_INDEX, CONFIG
-)
+from app_state import WORKFLOW_STAGES, TEXTURE_CONTROL_GROUPS, TEXTURE_PRESET_BUTTONS, config
 
 # %% FILE PICKER HELPERS ───────────────────────────────────────────────────────
 
@@ -118,10 +115,7 @@ def draw_sidebar(state, renderer):
     stage = int(np.clip(state.workflow_step, 0, len(WORKFLOW_STAGES) - 1))
 
     def rebuild_current_mesh():
-        if state.mode == 'spline':
-            state.rebuild_spline_mesh()
-        else:
-            state.rebuild_param_mesh()
+        state.rebuild_spline_mesh()
 
     # Copies configuration (vectorized display_copies)
     changed_x, new_copies_x = imgui.slider_int("Copies X", int(state.display_copies[0]), 0, 5)
@@ -211,8 +205,8 @@ def draw_sidebar(state, renderer):
 
         if alignment_locked:
             imgui.begin_disabled()
-        imgui.text_wrapped("Viewport controls: Shift+LMB rotate, Shift+MMB scale, Shift+RMB translate.")
-        imgui.text_wrapped("Image controls: Mouse wheel zoom, drag (no Shift) pan image.")
+        imgui.text_wrapped("Viewport controls: Shift+LMB rotate, Shift+RMB translate.")
+        imgui.text_wrapped("Camera controls: Mouse wheel zoom camera. Drag in the viewport to move the model.")
         pi = float(np.pi)
         imgui.text_colored((0.8, 0.8, 0.4, 1.0), "Rotation")
         
@@ -234,11 +228,7 @@ def draw_sidebar(state, renderer):
             if changed:
                 state.model_t[idx] = val
 
-        changed_scale, new_scale = imgui.slider_float("Scale##align_scale", float(state.model_scale), 0.05, 20.0, "%.3f")
-        if imgui.is_item_activated():
-            state.push_undo("Model scale")
-        if changed_scale:
-            state.model_scale = new_scale
+        imgui.text_disabled("Scale via bbox handles in the viewport.")
 
         if imgui.small_button("Center model##align"):
             state.push_undo("Center model")
@@ -247,14 +237,13 @@ def draw_sidebar(state, renderer):
         if imgui.small_button("Reset transform##align"):
             state.push_undo("Reset transform")
             state.model_rot[:] = 0.0
-            state.model_scale = 1.0
             state.center_model_on_view()
         if alignment_locked:
             imgui.end_disabled()
 
     elif stage == 1:
         imgui.text("Pattern and Rows")
-        max_rows = int(CONFIG['geometry']['bitmap_rows'])
+        max_rows = int(config['knit_parameters']['bitmap_rows'])
         ch_r, new_rows = imgui.slider_int("Rows##bres", int(state.bitmap_size[0]), 1, max_rows)
         ch_c, new_cols = imgui.slider_int("Columns##bres", int(state.bitmap_size[1]), 1, 16)
         if ch_r or ch_c:
@@ -317,23 +306,36 @@ def draw_sidebar(state, renderer):
     elif stage == 2:
         imgui.text("Geometry Parameters")
         params_changed = False
-        for i, name in enumerate(PARAM_NAMES):
-            span = state.loop_height_span(name)
+        for i, pd in enumerate(config["knit_parameters"]["parameters"]):
+            span = state.loop_height_span(pd["name"])
             if span is not None and span > state.bitmap_size[0]:
                 continue
-            lo, hi = PARAM_RANGES[i]
-            changed, new_val = imgui.slider_float(f"##p{i}", state.params[i], lo, hi, format=f"{name}: %.3f")
+            lo, hi = pd["range"]
+            changed, new_val = imgui.slider_float(f"##p{i}", state.params[i], lo, hi, format=f"{pd['name']}: %.3f")
             if imgui.is_item_activated():
-                state.push_undo(name)
+                state.push_undo(pd["name"])
             if changed:
                 state.params[i] = new_val
                 params_changed = True
+        if imgui.small_button("Rebuild from params##rebuild_params"):
+            state.push_undo("Rebuild from params")
+            state.rebuild_spline_from_params()
+        imgui.same_line()
+        if imgui.small_button("Debug compare rebuild##rebuild_params"):
+            stats = state.debug_compare_to_fresh_rebuild()
+            if stats.get('ok'):
+                state.status_msg = (
+                    f"Rebuild delta: mean={stats['mean']:.6f}, "
+                    f"p95={stats['p95']:.6f}, max={stats['max']:.6f}"
+                )
+            else:
+                state.status_msg = f"Rebuild compare failed: {stats.get('reason', 'unknown')}"
         if imgui.small_button("Fit loop heights to rows##fit_loop_heights"):
             state.push_undo("Loop heights")
             state.fit_loop_heights_to_rows()
             params_changed = False
         if params_changed:
-            rebuild_current_mesh()
+            state.nudge_spline_from_params()
 
     elif stage == 3:
         imgui.text("Material")
@@ -443,66 +445,25 @@ def draw_sidebar(state, renderer):
 
     elif stage == 6:
         imgui.text("Spline Refinement")
-        imgui.text("Mode")
-        imgui.same_line()
-        if imgui.radio_button("Param", state.mode == 'parameter') and state.mode != 'parameter':
-            state.push_undo("Mode")
-            state.mode = 'parameter'
-            renderer.set_ctrl_pts([])
-            state.rebuild_param_mesh()
-        imgui.same_line()
-        if imgui.radio_button("Spline", state.mode == 'spline') and state.mode != 'spline':
-            state.push_undo("Mode")
-            state.mode = 'spline'
-            state.spline.init_from_params(state.params)
-            state.rebuild_spline_mesh()
+        imgui.text_disabled("Spline is the canonical editing path.")
+        if imgui.small_button("Rebuild spline from params##spline_rebuild"):
+            state.push_undo("Rebuild from params")
+            state.rebuild_spline_from_params()
         ch_spl, new_spl = imgui.slider_int("Samples/loop##spl", state.samples_per_loop, 2, 20)
         if ch_spl:
             state.push_undo("Spline resolution")
             state.samples_per_loop = new_spl
             state.spline.samples_per_loop = new_spl
-            if state.mode == 'spline':
-                state.spline.init_from_params(state.params)
-                state.rebuild_spline_mesh()
-        if state.mode == 'spline':
-            imgui.text(f"Points: {len(state.spline.flat_pts)}")
-            if state.hover_idx >= 0:
-                imgui.text(f"Hover: {state.hover_idx}")
-            if state.selected_idx >= 0:
-                imgui.text(f"Selected: {state.selected_idx}")
-            imgui.text_wrapped("Select a white point in the viewport, then drag the gizmo arrows to refine it.")
-        else:
-            imgui.text_wrapped("Switch to Spline mode when the parameter model is already close.")
+            state.rebuild_spline_from_params()
+        imgui.text(f"Points: {len(state.spline.flat_pts)}")
+        if state.hover_idx >= 0:
+            imgui.text(f"Hover: {state.hover_idx}")
+        if state.selected_idx >= 0:
+            imgui.text(f"Selected: {state.selected_idx}")
+        imgui.text_wrapped("Select a white point in the viewport, then drag the gizmo arrows to refine it.")
 
     elif stage == 7:
-        imgui.text("Review and Render")
-        _, state.mi_cam_dist_mult = imgui.slider_float("Render dist mult##mi", state.mi_cam_dist_mult, 0.3, 3.0, "%.2f")
-        _, state.mi_cam_fov = imgui.slider_float("Render FoV##mi", state.mi_cam_fov, 10.0, 120.0, "%.1f")
-        imgui.separator()
-        avail_controls_w = imgui.get_content_region_avail().x
-        btn_w = max(120, (avail_controls_w - imgui.get_style().item_spacing.x) * 0.5)
-        
-        is_rendering = state.is_rendering
-        if is_rendering:
-            imgui.begin_disabled()
-        if imgui.button("Render##btn" if not is_rendering else "Rendering...", (btn_w, 0)):
-            state.start_background_render()
-        if is_rendering:
-            imgui.end_disabled()
-        
-        imgui.same_line()
-        is_optimizing = state.is_optimizing
-        import mitsuba as mi
-        mitsuba_ad_available = "_ad_" in (mi.variant() or "")
-        if is_optimizing or not mitsuba_ad_available:
-            imgui.begin_disabled()
-        if imgui.button("Optimize##btn" if not is_optimizing else "Running...", (btn_w, 0)):
-            state.start_background_optimize()
-        if is_optimizing or not mitsuba_ad_available:
-            imgui.end_disabled()
-        if not mitsuba_ad_available:
-            imgui.text_disabled(f"Optimize needs CUDA/LLVM AD. Current Mitsuba: {mi.variant()}")
-        
+        imgui.text("Review parameters")
         imgui.separator()
         half_w = max(100, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
         if imgui.button("Save params...", (half_w, 0)):
@@ -546,7 +507,32 @@ def draw_viewport(state, renderer, ref_tex, window):
     model_mat = state.current_model_matrix()
     mvp = (state.camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
     mv  = (state.camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
-    bg_zoom = state.camera.zoom_factor() if state.ref_bg_lock_zoom else 1.0
+    bg_zoom = state.camera.zoom_factor()
+
+    render_hover_idx = state.hover_idx
+    render_selected_idx = state.selected_idx
+    visible_ctrl_indices = np.empty((0,), dtype=np.int32)
+    visible_ctrl_index_map = {}
+    if state.mode == 'spline':
+        visible_chunks = []
+        for row_idx, row in enumerate(state.spline.ctrl_rows):
+            if row_idx < len(state.row_visible) and not bool(state.row_visible[row_idx]):
+                continue
+            start = state.spline._row_starts[row_idx]
+            end = start + len(row)
+            visible_chunks.append(np.arange(start, end, dtype=np.int32))
+        if visible_chunks:
+            visible_ctrl_indices = np.concatenate(visible_chunks)
+            visible_ctrl_pts = state.spline.flat_pts[visible_ctrl_indices]
+        else:
+            visible_ctrl_pts = np.empty((0, 3), dtype=np.float32)
+        renderer.set_ctrl_pts(visible_ctrl_pts)
+        visible_ctrl_index_map = {
+            int(flat_idx): int(local_idx)
+            for local_idx, flat_idx in enumerate(visible_ctrl_indices.tolist())
+        }
+        render_hover_idx = visible_ctrl_index_map.get(int(state.hover_idx), -1)
+        render_selected_idx = visible_ctrl_index_map.get(int(state.selected_idx), -1)
 
     bg_uniforms = {
         'bg_scale_x':  state.ref_bg_scale[0] * bg_zoom,
@@ -561,7 +547,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     renderer.render(
         mvp, mv,
         state.get_material_uniforms(),
-        state.hover_idx, state.selected_idx,
+        render_hover_idx, render_selected_idx,
         hover_mesh_idx=state.hover_mesh_idx,
         selected_mesh_idx=state.selected_mesh_idx,
         visible_rows=state.row_visible,
@@ -578,7 +564,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         avail_x,
         avail_y,
         flip_y=True,
-        zoom=state.viewport_zoom,
+        zoom=1.0,
         pan=state.viewport_pan,
     )
     if drawn_rect is not None:
@@ -587,9 +573,137 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.vp_scale = float(draw_w / max(float(disp_w), 1.0))
     is_hovered = imgui.is_item_hovered()
     state.mouse_in_vp = is_hovered
+    mx, my = imgui.get_mouse_pos()
+    viewport_scale = max(float(state.vp_scale), 1e-6)
+    lx = (mx - state.vp_origin[0]) / viewport_scale
+    ly = (my - state.vp_origin[1]) / viewport_scale
+
+    def projected_mesh_bounds(model_matrix=None):
+        if model_matrix is None:
+            model_matrix = model_mat
+
+        # In spline mode, derive the bbox from visible control points for stable,
+        # predictable resize behavior.
+        if state.mode == 'spline' and len(visible_ctrl_indices) > 0:
+            ctrl_pts = state.spline.flat_pts[visible_ctrl_indices]
+            world_pts = transform_points(ctrl_pts, model_matrix)
+            view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
+            clip = homo @ view_proj.T
+            valid = clip[:, 3] > 1e-6
+            if not np.any(valid):
+                return None
+            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
+            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
+            in_view = (
+                valid
+                & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0)
+                & (ndc[:, 1] >= -1.0) & (ndc[:, 1] <= 1.0)
+            )
+            if not np.any(in_view):
+                return None
+            screen = np.column_stack((
+                (ndc[:, 0] * 0.5 + 0.5) * disp_w,
+                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
+            ))
+            all_pts = screen[in_view]
+            x_min, y_min = np.min(all_pts, axis=0)
+            x_max, y_max = np.max(all_pts, axis=0)
+            w = max(1.0, float(x_max - x_min))
+            h = max(1.0, float(y_max - y_min))
+            pad_x = 0.10 * w
+            pad_y = 0.10 * h
+            x_min = float(np.clip(x_min - pad_x, 0.0, disp_w - 1.0))
+            y_min = float(np.clip(y_min - pad_y, 0.0, disp_h - 1.0))
+            x_max = float(np.clip(x_max + pad_x, 0.0, disp_w - 1.0))
+            y_max = float(np.clip(y_max + pad_y, 0.0, disp_h - 1.0))
+            if x_max - x_min < 12.0 or y_max - y_min < 12.0:
+                return None
+            return x_min, y_min, x_max, y_max
+
+        if not renderer.mesh_pick_data:
+            return None
+        view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+        pts_2d = []
+        for verts, row_idx in renderer.mesh_pick_data:
+            if state.row_visible is not None and row_idx < len(state.row_visible) and not bool(state.row_visible[row_idx]):
+                continue
+            if len(verts) == 0:
+                continue
+            stride = max(1, len(verts) // 300)
+            sample = verts[::stride]
+            world_pts = transform_points(sample, model_matrix)
+            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
+            clip = homo @ view_proj.T
+            valid = clip[:, 3] > 1e-6
+            if not np.any(valid):
+                continue
+            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
+            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
+            in_view = (
+                valid
+                & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0)
+                & (ndc[:, 1] >= -1.0) & (ndc[:, 1] <= 1.0)
+            )
+            if not np.any(in_view):
+                continue
+            screen = np.column_stack((
+                (ndc[:, 0] * 0.5 + 0.5) * disp_w,
+                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
+            ))
+            pts_2d.append(screen[in_view])
+        if not pts_2d:
+            return None
+        all_pts = np.concatenate(pts_2d, axis=0)
+        x_min, y_min = np.min(all_pts, axis=0)
+        x_max, y_max = np.max(all_pts, axis=0)
+        pad = 6.0
+        x_min = float(np.clip(x_min - pad, 0.0, disp_w - 1.0))
+        y_min = float(np.clip(y_min - pad, 0.0, disp_h - 1.0))
+        x_max = float(np.clip(x_max + pad, 0.0, disp_w - 1.0))
+        y_max = float(np.clip(y_max + pad, 0.0, disp_h - 1.0))
+        if x_max - x_min < 12.0 or y_max - y_min < 12.0:
+            return None
+        return x_min, y_min, x_max, y_max
+
+    def bounds_handles(bounds):
+        x_min, y_min, x_max, y_max = bounds
+        x_mid = 0.5 * (x_min + x_max)
+        y_mid = 0.5 * (y_min + y_max)
+        return [
+            (x_min, y_min), (x_mid, y_min), (x_max, y_min),
+            (x_max, y_mid),
+            (x_max, y_max), (x_mid, y_max), (x_min, y_max),
+            (x_min, y_mid),
+        ]
+
+    gizmo_bounds = projected_mesh_bounds()
+    handle_radius = 6.0
+    active_handle = int(state.get('bbox_active_handle', -1))
+    hover_handle = -1
+    if gizmo_bounds is not None and is_hovered:
+        handles = bounds_handles(gizmo_bounds)
+        d2 = [((lx - hx) ** 2 + (ly - hy) ** 2) for hx, hy in handles]
+        best_idx = int(np.argmin(d2))
+        if d2[best_idx] <= (handle_radius + 3.0) ** 2:
+            hover_handle = best_idx
+    state.bbox_hover_handle = hover_handle
+
+    if gizmo_bounds is not None:
+        dl = imgui.get_window_draw_list()
+        ox, oy = float(state.vp_origin[0]), float(state.vp_origin[1])
+        x_min, y_min, x_max, y_max = gizmo_bounds
+        rect_col = imgui.get_color_u32((0.95, 0.95, 0.95, 0.92))
+        dl.add_rect((ox + x_min, oy + y_min), (ox + x_max, oy + y_max), rect_col, 0.0, 2.0, 0)
+        for i, (hx, hy) in enumerate(bounds_handles(gizmo_bounds)):
+            is_hot = (i == hover_handle or i == active_handle)
+            fill = imgui.get_color_u32((0.95, 0.65, 0.10, 1.0) if is_hot else (0.96, 0.96, 0.96, 0.95))
+            stroke = imgui.get_color_u32((0.12, 0.12, 0.12, 1.0))
+            dl.add_circle_filled((ox + hx, oy + hy), handle_radius, fill, 16)
+            dl.add_circle((ox + hx, oy + hy), handle_radius, stroke, 16, 1.5)
 
     # ImGuizmo
-    if state.mode == 'spline' and state.selected_idx >= 0:
+    if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map:
         local_pos = state.spline.flat_pts[state.selected_idx].astype(np.float32)
         pos = transform_points([local_pos], model_mat)[0].astype(np.float32)
         M16 = imguizmo.im_guizmo.Matrix16
@@ -601,9 +715,13 @@ def draw_viewport(state, renderer, ref_tex, window):
         mat[0, 3] = pos[0]; mat[1, 3] = pos[1]; mat[2, 3] = pos[2]
         obj_m = M16(); obj_m.values[:] = mat.T.flatten()
 
-        imguizmo.im_guizmo.set_orthographic(False)
+        imguizmo.im_guizmo.set_orthographic(True)
         imguizmo.im_guizmo.set_drawlist()
-        imguizmo.im_guizmo.set_rect(draw_pos.x, draw_pos.y, disp_w, disp_h)
+        gizmo_x = float(state.vp_origin[0])
+        gizmo_y = float(state.vp_origin[1])
+        gizmo_w = float(disp_w) * float(state.vp_scale)
+        gizmo_h = float(disp_h) * float(state.vp_scale)
+        imguizmo.im_guizmo.set_rect(gizmo_x, gizmo_y, gizmo_w, gizmo_h)
         changed = imguizmo.im_guizmo.manipulate(
             view_m, proj_m,
             imguizmo.im_guizmo.OPERATION.translate,
@@ -622,21 +740,104 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.gizmo_edit_active = False
 
     # Mouse interaction inside the viewport
-    mx, my = imgui.get_mouse_pos()
     alignment_locked = bool(state.show_ref_bg and state.ref_bg_lock_zoom)
-    viewport_scale = max(float(state.vp_scale), 1e-6)
-    lx = (mx - state.vp_origin[0]) / viewport_scale
-    ly = (my - state.vp_origin[1]) / viewport_scale
 
+    def viewport_pixel_delta_to_world(dx_px, dy_px):
+        aspect = max(1.0, disp_w) / max(1.0, disp_h)
+        half_h = max(1e-4, float(state.camera.dist) * np.tan(np.radians(float(state.camera.fov_deg)) * 0.5))
+        half_w = half_h * aspect
+        wu_x = (2.0 * half_w) / max(float(disp_w), 1.0)
+        wu_y = (2.0 * half_h) / max(float(disp_h), 1.0)
+        view = state.camera.view()
+        right = view[0, :3]
+        up = view[1, :3]
+        return right * (float(dx_px) * wu_x) - up * (float(dy_px) * wu_y)
+
+    def pixel_drag_to_world_delta(dx_screen, dy_screen):
+        # Convert screen-space mouse delta to viewport-pixel delta.
+        dx_px = float(dx_screen) / max(float(state.vp_scale), 1e-6)
+        dy_px = float(dy_screen) / max(float(state.vp_scale), 1e-6)
+        return viewport_pixel_delta_to_world(dx_px, dy_px)
+
+    suppress_mesh_click = False
     if is_hovered:
         io = imgui.get_io()
+        lmb_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+
+        # Bounding-box resize handles (window-like scaling in screen space).
+        if gizmo_bounds is not None and hover_handle >= 0 and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:
+            state.push_undo("Bounding box scale")
+            state.bbox_active_handle = int(hover_handle)
+            state.bbox_start_bounds = np.array(gizmo_bounds, dtype=np.float32)
+            state.bbox_start_mouse = np.array([lx, ly], dtype=np.float32)
+            state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
+            if state.mode == 'spline':
+                state.bbox_start_ctrl_rows = [row.copy() for row in state.spline.ctrl_rows]
+            suppress_mesh_click = True
+
+        active_handle = int(state.get('bbox_active_handle', -1))
+        if active_handle >= 0 and lmb_down and state.get('bbox_start_bounds') is not None:
+            x0_min, y0_min, x0_max, y0_max = [float(v) for v in state.bbox_start_bounds]
+            old_w = max(1e-4, x0_max - x0_min)
+            old_h = max(1e-4, y0_max - y0_min)
+            min_size = 20.0
+
+            x_min, y_min, x_max, y_max = x0_min, y0_min, x0_max, y0_max
+            if active_handle in (0, 7, 6):
+                x_min = min(lx, x0_max - min_size)
+            if active_handle in (2, 3, 4):
+                x_max = max(lx, x0_min + min_size)
+            if active_handle in (0, 1, 2):
+                y_min = min(ly, y0_max - min_size)
+            if active_handle in (4, 5, 6):
+                y_max = max(ly, y0_min + min_size)
+
+            new_w = max(1e-4, x_max - x_min)
+            new_h = max(1e-4, y_max - y_min)
+            sx = new_w / old_w
+            sy = new_h / old_h
+            if state.mode == 'spline':
+                if active_handle in (1, 5):
+                    scale_vec = np.array([1.0, sy, 1.0], dtype=np.float32)
+                elif active_handle in (3, 7):
+                    scale_vec = np.array([sx, 1.0, 1.0], dtype=np.float32)
+                else:
+                    scale_vec = np.array([sx, sy, 1.0], dtype=np.float32)
+                base_rows = state.get('bbox_start_ctrl_rows')
+                if base_rows:
+                    visible_rows_local = [
+                        row for row_idx, row in enumerate(base_rows)
+                        if row_idx < len(state.row_visible) and bool(state.row_visible[row_idx])
+                    ]
+                    if visible_rows_local:
+                        pts = np.concatenate(visible_rows_local, axis=0)
+                        pivot = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32)
+                    else:
+                        pivot = np.asarray(state.mesh_center, dtype=np.float32)
+                    state.spline.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
+                    state.spline._rebuild()
+                    state.rebuild_spline_mesh()
+
+            start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
+            old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
+            new_cx, new_cy = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
+            correction = viewport_pixel_delta_to_world(new_cx - old_cx, new_cy - old_cy)
+            state.model_t = (start_t + correction).astype(np.float32)
+            suppress_mesh_click = True
+        elif active_handle >= 0 and not lmb_down:
+            state.bbox_active_handle = -1
+            state.bbox_start_bounds = None
+            state.bbox_start_mouse = None
+            state.bbox_start_t = None
+            state.bbox_start_ctrl_rows = None
+
         state.hover_mesh_idx = renderer.pick_mesh_index(model_mat, state.camera, disp_w, disp_h, lx, ly, visible_rows=state.row_visible)
 
         if state.selected_mesh_idx >= 0 and io.key_alt:
             # Closest cursor available in Dear ImGui; used as eyedropper cue.
             imgui.set_mouse_cursor(imgui.MouseCursor_.hand)
 
-        if imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:
+        if imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt and not suppress_mesh_click:
             state.selected_mesh_idx = state.hover_mesh_idx
 
         if state.selected_mesh_idx >= 0 and io.key_alt and imgui.is_mouse_clicked(imgui.MouseButton_.left):
@@ -647,20 +848,36 @@ def draw_viewport(state, renderer, ref_tex, window):
                 state.push_undo("Pick yarn color")
                 state.use_row_colors = True
                 state.row_colors[row_idx] = sampled.tolist()
-                if state.mode == 'spline':
-                    state.rebuild_spline_mesh()
-                else:
-                    state.rebuild_param_mesh()
+                state.rebuild_spline_mesh()
     else:
         state.hover_mesh_idx = -1
+        active_handle = int(state.get('bbox_active_handle', -1))
+        lmb_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+        if active_handle >= 0 and not lmb_down:
+            state.bbox_active_handle = -1
+            state.bbox_start_bounds = None
+            state.bbox_start_mouse = None
+            state.bbox_start_t = None
+            state.bbox_start_ctrl_rows = None
 
     if is_hovered:
         curr = (mx, my)
+        bbox_drag_active = int(state.get('bbox_active_handle', -1)) >= 0
+        spline_drag_active = (
+            state.mode == 'spline'
+            and (
+                (state.selected_idx >= 0 and (imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()))
+                or state.hover_idx >= 0
+            )
+        )
 
         io = imgui.get_io()
         if io.mouse_wheel != 0 and not io.key_shift:
-            zoom_factor = float(np.exp(io.mouse_wheel * 0.1))
-            state.viewport_zoom = float(np.clip(float(state.viewport_zoom) * zoom_factor, 0.25, 8.0))
+            # Orthographic camera zoom by changing distance and re-rendering.
+            zoom_factor = float(np.exp(io.mouse_wheel * 0.12))
+            state.camera.dist = float(np.clip(float(state.camera.dist) / zoom_factor, 1.0, 200.0))
+            # Keep legacy image zoom neutral to avoid pixelated post-scale.
+            state.viewport_zoom = 1.0
 
         if state.get('prev_mouse') is not None:
             prev = state.prev_mouse
@@ -688,17 +905,14 @@ def draw_viewport(state, renderer, ref_tex, window):
                     state.model_rot[1] += dx * sens
                     state.model_rot[0] += dy * sens
                 elif rmb:
-                    view = state.camera.view()
-                    right = view[0, :3]
-                    up    = view[1, :3]
-                    t_sens = state.camera.dist * 0.003
-                    state.model_t += (right * dx - up * dy) * t_sens
+                    state.model_t += pixel_drag_to_world_delta(dx, dy)
                 elif mmb:
-                    scale_factor = float(np.exp(-dy * 0.01))
-                    state.model_scale = float(np.clip(float(state.model_scale) * scale_factor, 0.05, 20.0))
-            elif (lmb or mmb or rmb) and not shift_down:
-                state.viewport_pan[0] += dx
-                state.viewport_pan[1] += dy
+                    pass
+            elif lmb and not shift_down and not bbox_drag_active and not spline_drag_active:
+                if not state.model_drag_undo_active:
+                    state.push_undo("Model translate")
+                    state.model_drag_undo_active = True
+                state.model_t += pixel_drag_to_world_delta(dx, dy)
 
         if (
             not alignment_locked
@@ -715,12 +929,13 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.model_drag_undo_active = False
 
         # Spline handle hover + select
-        if state.mode == 'spline' and len(state.spline.flat_pts) > 0:
+        if state.mode == 'spline' and len(visible_ctrl_indices) > 0:
             gizmo_active = state.selected_idx >= 0 and (
                 imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()
             )
             if not gizmo_active:
-                world_pts = transform_points(state.spline.flat_pts, model_mat)
+                visible_ctrl_pts = state.spline.flat_pts[visible_ctrl_indices]
+                world_pts = transform_points(visible_ctrl_pts, model_mat)
                 homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
                 view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
                 clip = homo @ view_proj.T
@@ -739,7 +954,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 d2 = np.sum((screen - np.array([lx, ly], dtype=np.float32)) ** 2, axis=1)
                 d2[~in_view] = np.inf
                 best_i = int(np.argmin(d2))
-                best_i = best_i if d2[best_i] <= 16.0 ** 2 else -1
+                best_i = int(visible_ctrl_indices[best_i]) if d2[best_i] <= 16.0 ** 2 else -1
                 state.hover_idx = best_i
                 if imgui.is_mouse_clicked(imgui.MouseButton_.left):
                     state.selected_idx = best_i
@@ -751,25 +966,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.end()
 
 
-def draw_mitsuba_panel(state):
-    imgui.set_next_window_pos((1220, 20), cond=imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size((420, 360), cond=imgui.Cond_.first_use_ever)
-    imgui.begin("Mitsuba Render")
-    imgui.text("Mitsuba Render")
-    if state.render_tex:
-        avail_x, avail_y = imgui.get_content_region_avail()
-        draw_fitted_texture(
-            state.render_tex.glo,
-            state.render_tex.width,
-            state.render_tex.height,
-            avail_x,
-            avail_y,
-        )
-    else:
-        imgui.spacing()
-        imgui.text_disabled("Render output will appear here.")
-        imgui.text_disabled("Use the button in the left rail.")
-    imgui.end()
+
 
 
 def draw_reference_image_panel(state, ref_tex):
