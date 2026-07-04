@@ -22,8 +22,16 @@ from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 import jax.numpy as jnp
 
 
+import json
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+resolve_project_path = lambda p: p if os.path.isabs(p) else os.path.join(project_root, p)
+
+with open(os.path.join(project_root, "config.json"), "r") as f:
+    config = json.load(f)
+
 from rendering import Camera, MeshRenderer, pil_to_texture
-from app_state import AppState, config, _pidx, _lh_idx, resolve_project_path
+from app_state import AppState
 from gui import (
      draw_menu_bar,
      draw_sidebar,

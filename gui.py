@@ -6,7 +6,6 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 
 from rendering import draw_fitted_texture, transform_points
-from app_state import WORKFLOW_STAGES, TEXTURE_CONTROL_GROUPS, TEXTURE_PRESET_BUTTONS, config
 
 # %% FILE PICKER HELPERS ───────────────────────────────────────────────────────
 
@@ -50,17 +49,17 @@ def draw_menu_bar(state):
 
 
 def draw_workflow_header(state):
-    stage_idx = int(np.clip(state.workflow_step, 0, len(WORKFLOW_STAGES) - 1))
-    title, subtitle = WORKFLOW_STAGES[stage_idx]
-    imgui.text(f"Step {stage_idx + 1} of {len(WORKFLOW_STAGES)}")
+    stage_idx = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
+    title, subtitle = state.workflow_stages[stage_idx]
+    imgui.text(f"Step {stage_idx + 1} of {len(state.workflow_stages)}")
     imgui.text_colored((0.92, 0.74, 0.34, 1.0), title)
     imgui.text_wrapped(subtitle)
     imgui.spacing()
 
     avail_w = imgui.get_content_region_avail().x
-    dot_w = max(18.0, (avail_w - (len(WORKFLOW_STAGES) - 1) * 4.0) / len(WORKFLOW_STAGES))
+    dot_w = max(18.0, (avail_w - (len(state.workflow_stages) - 1) * 4.0) / len(state.workflow_stages))
     imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(4, 2))
-    for i, _ in enumerate(WORKFLOW_STAGES):
+    for i, _ in enumerate(state.workflow_stages):
         active = i == stage_idx
         color = (0.25, 0.55, 0.85, 1.0) if active else (0.22, 0.22, 0.22, 1.0)
         hover = (0.35, 0.65, 0.95, 1.0) if active else (0.34, 0.34, 0.34, 1.0)
@@ -69,13 +68,13 @@ def draw_workflow_header(state):
         if imgui.button(f"{i + 1}##stage_{i}", imgui.ImVec2(dot_w, 22)):
             state.workflow_step = i
         imgui.pop_style_color(2)
-        if i < len(WORKFLOW_STAGES) - 1:
+        if i < len(state.workflow_stages) - 1:
             imgui.same_line()
     imgui.pop_style_var()
 
     imgui.spacing()
     back_disabled = stage_idx == 0
-    next_disabled = stage_idx == len(WORKFLOW_STAGES) - 1
+    next_disabled = stage_idx == len(state.workflow_stages) - 1
     nav_w = max(90, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
     if back_disabled:
         imgui.begin_disabled()
@@ -87,7 +86,7 @@ def draw_workflow_header(state):
     if next_disabled:
         imgui.begin_disabled()
     if imgui.button("Next##workflow", (nav_w, 0)):
-        state.workflow_step = min(len(WORKFLOW_STAGES) - 1, stage_idx + 1)
+        state.workflow_step = min(len(state.workflow_stages) - 1, stage_idx + 1)
     if next_disabled:
         imgui.end_disabled()
     imgui.separator()
@@ -112,7 +111,7 @@ def draw_sidebar(state, renderer):
     imgui.text_disabled(last_undo)
     imgui.separator()
 
-    stage = int(np.clip(state.workflow_step, 0, len(WORKFLOW_STAGES) - 1))
+    stage = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
 
     def rebuild_current_mesh():
         state.rebuild_spline_mesh()
@@ -243,7 +242,7 @@ def draw_sidebar(state, renderer):
 
     elif stage == 1:
         imgui.text("Pattern and Rows")
-        max_rows = int(config['knit_parameters']['bitmap_rows'])
+        max_rows = int(state.config['knit_parameters']['bitmap_rows'])
         ch_r, new_rows = imgui.slider_int("Rows##bres", int(state.bitmap_size[0]), 1, max_rows)
         ch_c, new_cols = imgui.slider_int("Columns##bres", int(state.bitmap_size[1]), 1, 16)
         if ch_r or ch_c:
@@ -306,7 +305,7 @@ def draw_sidebar(state, renderer):
     elif stage == 2:
         imgui.text("Geometry Parameters")
         params_changed = False
-        for i, pd in enumerate(config["knit_parameters"]["parameters"]):
+        for i, pd in enumerate(state.config["knit_parameters"]["parameters"]):
             span = state.loop_height_span(pd["name"])
             if span is not None and span > state.bitmap_size[0]:
                 continue
@@ -387,7 +386,7 @@ def draw_sidebar(state, renderer):
         if imgui.small_button("Copy material##texture"):
             state.push_undo("Render texture")
             state.render_texture_color = state.single_model_color.copy()
-        for group in TEXTURE_CONTROL_GROUPS:
+        for group in state.texture_control_groups:
             imgui.separator()
             imgui.text(group['title'])
             for control in group['controls']:
@@ -406,7 +405,7 @@ def draw_sidebar(state, renderer):
                     state[key] = new_val
 
         imgui.separator()
-        for preset in TEXTURE_PRESET_BUTTONS:
+        for preset in state.texture_preset_buttons:
             if preset.get('same_line'):
                 imgui.same_line()
             if imgui.small_button(f"{preset['label']}##texture"):

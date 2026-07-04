@@ -11,152 +11,148 @@ from knitting_core import (
     save_combined_obj, build_parametric_control_rows, build_spline_mesh
 )
 
-project_root = os.path.dirname(os.path.abspath(__file__))
-resolve_project_path = lambda p: p if os.path.isabs(p) else os.path.join(project_root, p)
-
-with open(os.path.join(project_root, "config.json"), "r") as f:
-    config = json.load(f)
-
-_pidx = {p["name"]: i for i, p in enumerate(config["knit_parameters"]["parameters"])}
-_lh_params = sorted(
-    [p["name"] for p in config["knit_parameters"]["parameters"] if p["name"].startswith("loop_height_")],
-    key=lambda name: int(name.split("_")[-1])
-)
-_lh_idx = tuple(_pidx[name] for name in _lh_params)
-
-# %% STATE CONSTRAINTS ─────────────────────────────────────────────────────────
-
-def _load_state_schema(filename='state_schema.json'):
-    schema_path = os.path.join(project_root, filename)
-    with open(schema_path, 'r') as handle:
-        return json.load(handle)
-
-
-STATE_SCHEMA = _load_state_schema()
-
-WORKFLOW_STAGES = tuple(
-    (item['title'], item['subtitle'])
-    for item in STATE_SCHEMA['workflow_stages']
-)
-
-TEXTURE_CONTROL_GROUPS = tuple(STATE_SCHEMA['texture_control_groups'])
-TEXTURE_PRESET_BUTTONS = tuple(STATE_SCHEMA['texture_preset_buttons'])
-TEXTURE_PRESETS = dict(STATE_SCHEMA['texture_presets'])
-
-TEXTURE_PARAM_KEYS = tuple(STATE_SCHEMA['texture_param_keys'])
-MATERIAL_UNIFORM_ALIASES = dict(STATE_SCHEMA['material_uniform_aliases'])
-SAVED_STATE_KEYS = tuple(STATE_SCHEMA['saved_state_keys'])
-OVERLAY_DEFAULTS = dict(STATE_SCHEMA.get('overlay_defaults', {}))
-
-CAMERA_ATTRIBUTES = ('dist', 'az', 'el', 'target')
-
-DEFAULT_STATE_CONFIG = {
-    # ── Workflow / UI State ───────────────────────────────────────────────────
-    'ui': {
-        'workflow_step': 0,
-        'mode': 'spline',
-        'hover_idx': -1,
-        'selected_idx': -1,
-        'status_msg': '',
-        'save_path': os.path.join(project_root, 'params.json'),
-        'load_path': os.path.join(project_root, 'params.json'),
-        'autosave_enabled': True,
-        'autosave_interval_sec': 1.0,
-        'autosave_last_time': 0.0,
-        'undo_stack': [],
-        'max_undo': 40,
-    },
-    # ── Geometry & Knitting Parameters ────────────────────────────────────────
-    'geometry': {
-        'params': [p['initial'] for p in config['knit_parameters']['parameters']],
-        'bitmap': np.ones((3, config['knit_parameters']['bitmap_loops']), dtype=np.float32),
-        'bitmap_size': np.array([3, config['knit_parameters']['bitmap_loops']], dtype=np.int32),
-        'samples_per_loop': 5,
-        'display_copies': np.array([0, 0], dtype=np.int32),
-        'mesh_center': np.zeros(3, dtype=np.float32),
-        'ctrl_rows': [],
-        'flat_pts': np.empty((0, 3), np.float32),
-        '_row_starts': [0],
-    },
-    # ── Viewport, Camera & Interaction ────────────────────────────────────────
-    'viewport': {
-        'mouse_in_vp': False,
-        'vp_origin': np.array([0.0, 0.0], dtype=np.float32),
-        'vp_scale': 1.0,
-        'viewport_zoom': 1.0,
-        'viewport_pan': np.array([0.0, 0.0], dtype=np.float32),
-        'hover_mesh_idx': -1,
-        'selected_mesh_idx': -1,
-        'view_fov': 45.0,
-        'model_rot': np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        'model_scale': np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        'model_rot_dragging': False,
-        'model_t': np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        'model_drag_undo_active': False,
-        'gizmo_edit_active': False,
-    },
-    # ── Reference Overlay ─────────────────────────────────────────────────────
-    'overlay': {
-        'show_ref_bg': bool(OVERLAY_DEFAULTS.get('show_ref_bg', False)),
-        'ref_bg_alpha': float(OVERLAY_DEFAULTS.get('ref_bg_alpha', 0.5)),
-        'ref_bg_scale': np.array(OVERLAY_DEFAULTS.get('ref_bg_scale', [1.0, 1.0]), dtype=np.float32),
-        'ref_bg_lock_dimensions': bool(OVERLAY_DEFAULTS.get('ref_bg_lock_dimensions', True)),
-        'ref_bg_lock_zoom': bool(OVERLAY_DEFAULTS.get('ref_bg_lock_zoom', False)),
-        'ref_bg_rotation': float(OVERLAY_DEFAULTS.get('ref_bg_rotation', 0.0)),
-        'ref_bg_offset': np.array(OVERLAY_DEFAULTS.get('ref_bg_offset', [0.0, 0.0]), dtype=np.float32),
-    },
-    # ── Material & Appearance ─────────────────────────────────────────────────
-    'material': {
-        'model_alpha': 1.0,
-        'single_model_color': np.array([0.85, 0.12, 0.10], dtype=np.float32),
-        'use_row_colors': False,
-        'row_colors': [
-            list(config['knit_parameters']['yarn_colors'][i % len(config['knit_parameters']['yarn_colors'])])
-            for i in range(3)
-        ],
-        'row_visible': np.ones(3, dtype=bool),
-        'render_texture_color': np.array([0.8, 0.4, 0.3], dtype=np.float32),
-        # Texture parameters populated directly from clear base + soft_yarn preset
-        **{k: v for k, v in TEXTURE_PRESETS['clear'].items() if k != 'render_texture_color'},
-        **TEXTURE_PRESETS['soft_yarn'],
-    }
-}
-
-def json_ready(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, (list, tuple)):
-        return [json_ready(v) for v in value]
-    if isinstance(value, dict):
-        return {k: json_ready(v) for k, v in value.items()}
-    return value
-
-def _clone(v):
-    if isinstance(v, np.ndarray):
-        return v.copy()
-    if isinstance(v, list):
-        return [_clone(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _clone(x) for k, x in v.items()}
-    return v
-
-
-STATE_DEFAULTS = {
-    key: value
-    for section in DEFAULT_STATE_CONFIG.values()
-    for key, value in section.items()
-}
-
-
+# %% APP STATE ─────────────────────────────────────────────────────────────────
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 
 class AppState:
+    @staticmethod
+    def _json_ready(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (list, tuple)):
+            return [AppState._json_ready(v) for v in value]
+        if isinstance(value, dict):
+            return {k: AppState._json_ready(v) for k, v in value.items()}
+        return value
+
+    @staticmethod
+    def _clone(v):
+        if isinstance(v, np.ndarray):
+            return v.copy()
+        if isinstance(v, list):
+            return [AppState._clone(x) for x in v]
+        if isinstance(v, dict):
+            return {k: AppState._clone(x) for k, x in v.items()}
+        return v
+
     def __init__(self, camera, renderer):
         self.camera = camera
         self.renderer = renderer
-        self._data = {k: _clone(v) for k, v in STATE_DEFAULTS.items()}
+
+        # Project root and configurations
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        super().__setattr__('project_root', project_root)
+        super().__setattr__('resolve_project_path', lambda p: p if os.path.isabs(p) else os.path.join(project_root, p))
+
+        with open(os.path.join(project_root, "config.json"), "r") as f:
+            config_data = json.load(f)
+        super().__setattr__('config', config_data)
+
+        pidx = {p["name"]: i for i, p in enumerate(config_data["knit_parameters"]["parameters"])}
+        super().__setattr__('_pidx', pidx)
+
+        lh_params = sorted(
+            [p["name"] for p in config_data["knit_parameters"]["parameters"] if p["name"].startswith("loop_height_")],
+            key=lambda name: int(name.split("_")[-1])
+        )
+        lh_idx = tuple(pidx[name] for name in lh_params)
+        super().__setattr__('_lh_idx', lh_idx)
+
+        # Load schema config
+        schema_path = os.path.join(project_root, 'state_schema.json')
+        with open(schema_path, 'r') as handle:
+            schema = json.load(handle)
+
+        super().__setattr__('workflow_stages', tuple(
+            (item['title'], item['subtitle'])
+            for item in schema['workflow_stages']
+        ))
+        super().__setattr__('texture_control_groups', tuple(schema['texture_control_groups']))
+        super().__setattr__('texture_preset_buttons', tuple(schema['texture_preset_buttons']))
+        super().__setattr__('texture_presets', dict(schema['texture_presets']))
+        super().__setattr__('texture_param_keys', tuple(schema['texture_param_keys']))
+        super().__setattr__('material_uniform_aliases', dict(schema['material_uniform_aliases']))
+        super().__setattr__('saved_state_keys', tuple(schema['saved_state_keys']))
+        super().__setattr__('camera_attributes', ('dist', 'az', 'el', 'target'))
+
+        overlay_defaults = dict(schema.get('overlay_defaults', {}))
+
+        default_state_config = {
+            'ui': {
+                'workflow_step': 0,
+                'mode': 'spline',
+                'hover_idx': -1,
+                'selected_idx': -1,
+                'status_msg': '',
+                'save_path': os.path.join(project_root, 'params.json'),
+                'load_path': os.path.join(project_root, 'params.json'),
+                'autosave_enabled': True,
+                'autosave_interval_sec': 1.0,
+                'autosave_last_time': 0.0,
+                'undo_stack': [],
+                'max_undo': 40,
+            },
+            'geometry': {
+                'params': [p['initial'] for p in config_data['knit_parameters']['parameters']],
+                'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
+                'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
+                'samples_per_loop': 5,
+                'display_copies': np.array([0, 0], dtype=np.int32),
+                'mesh_center': np.zeros(3, dtype=np.float32),
+                'ctrl_rows': [],
+                'flat_pts': np.empty((0, 3), np.float32),
+                '_row_starts': [0],
+            },
+            'viewport': {
+                'mouse_in_vp': False,
+                'vp_origin': np.array([0.0, 0.0], dtype=np.float32),
+                'vp_scale': 1.0,
+                'viewport_zoom': 1.0,
+                'viewport_pan': np.array([0.0, 0.0], dtype=np.float32),
+                'hover_mesh_idx': -1,
+                'selected_mesh_idx': -1,
+                'view_fov': 45.0,
+                'model_rot': np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                'model_scale': np.array([1.0, 1.0, 1.0], dtype=np.float32),
+                'model_rot_dragging': False,
+                'model_t': np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                'model_drag_undo_active': False,
+                'gizmo_edit_active': False,
+            },
+            'overlay': {
+                'show_ref_bg': bool(overlay_defaults.get('show_ref_bg', False)),
+                'ref_bg_alpha': float(overlay_defaults.get('ref_bg_alpha', 0.5)),
+                'ref_bg_scale': np.array(overlay_defaults.get('ref_bg_scale', [1.0, 1.0]), dtype=np.float32),
+                'ref_bg_lock_dimensions': bool(overlay_defaults.get('ref_bg_lock_dimensions', True)),
+                'ref_bg_lock_zoom': bool(overlay_defaults.get('ref_bg_lock_zoom', False)),
+                'ref_bg_rotation': float(overlay_defaults.get('ref_bg_rotation', 0.0)),
+                'ref_bg_offset': np.array(overlay_defaults.get('ref_bg_offset', [0.0, 0.0]), dtype=np.float32),
+            },
+            'material': {
+                'model_alpha': 1.0,
+                'single_model_color': np.array([0.85, 0.12, 0.10], dtype=np.float32),
+                'use_row_colors': False,
+                'row_colors': [
+                    list(config_data['knit_parameters']['yarn_colors'][i % len(config_data['knit_parameters']['yarn_colors'])])
+                    for i in range(3)
+                ],
+                'row_visible': np.ones(3, dtype=bool),
+                'render_texture_color': np.array([0.8, 0.4, 0.3], dtype=np.float32),
+                **{k: v for k, v in self.texture_presets['clear'].items() if k != 'render_texture_color'},
+                **self.texture_presets['soft_yarn'],
+            }
+        }
+
+        state_defaults = {
+            key: value
+            for section in default_state_config.values()
+            for key, value in section.items()
+        }
+        super().__setattr__('_state_defaults', state_defaults)
+
+        self._data = {k: self._clone(v) for k, v in state_defaults.items()}
 
     # ── DICTIONARY INTERFACE ──────────────────────────────────────────────────
 
@@ -181,7 +177,7 @@ class AppState:
             raise AttributeError(f"'AppState' object has no attribute '{name}'") from None
 
     def __setattr__(self, name, value):
-        if name in ('camera', 'optimizer', 'renderer', '_data'):
+        if name in ('camera', 'optimizer', 'renderer', '_data') or name in self.__dict__:
             super().__setattr__(name, value)
         else:
             self._data[name] = value
@@ -190,17 +186,17 @@ class AppState:
 
     def get_material_uniforms(self):
         """Returns standard material properties as a dict mapped to shader uniform names."""
-        uniforms = {k: self._data[k] for k in TEXTURE_PARAM_KEYS}
+        uniforms = {k: self._data[k] for k in self.texture_param_keys}
         uniforms.update({
             uniform_name: self._data[state_key]
-            for state_key, uniform_name in MATERIAL_UNIFORM_ALIASES.items()
+            for state_key, uniform_name in self.material_uniform_aliases.items()
         })
         return uniforms
 
     # ── MESH GENERATION HELPERS ───────────────────────────────────────────────
 
     def _sync_row_colors(self, n_rows):
-        palette = config['knit_parameters']['yarn_colors']
+        palette = self.config['knit_parameters']['yarn_colors']
         self.row_colors = self.row_colors[:n_rows] + [
             list(palette[i % len(palette)]) for i in range(len(self.row_colors), n_rows)
         ]
@@ -215,7 +211,7 @@ class AppState:
         if not verts_list:
             return [], [], []
         x_period = max(float(self.bitmap_size[1]), 1e-6)
-        y_period = max(float(self.bitmap_size[0]) * abs(float(self.params[_pidx['dy']])), 1e-6)
+        y_period = max(float(self.bitmap_size[0]) * abs(float(self.params[self._pidx['dy']])), 1e-6)
         display_vl, display_fl, display_meta = [], [], []
         for y_tile in range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1):
             for x_tile in range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1):
@@ -234,16 +230,16 @@ class AppState:
         return self.row_colors if self.use_row_colors else [self.single_model_color]
 
     def rebuild_param_mesh(self):
-        vl = compute_knitting_vertices(self.params, self.bitmap, config, _pidx, _lh_idx)
-        fl = compute_knitting_faces(config['knit_parameters']['segments'], vl)
+        vl = compute_knitting_vertices(self.params, self.bitmap, self.config, self._pidx, self._lh_idx)
+        fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts([])
         self._recompute_center(display_vl)
 
     def rebuild_spline_mesh(self):
-        vl = build_spline_mesh(self.ctrl_rows, self.params, config, _pidx, self.bitmap_size[1])
-        fl = compute_knitting_faces(config['knit_parameters']['segments'], vl)
+        vl = build_spline_mesh(self.ctrl_rows, self.params, self.config, self._pidx, self.bitmap_size[1])
+        fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts(self.flat_pts)
@@ -271,7 +267,7 @@ class AppState:
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
 
     def _fresh_rebuild_rows(self):
-        return build_parametric_control_rows(self.params, self.bitmap, _pidx, _lh_idx, self.samples_per_loop)
+        return build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
 
     def rebuild_spline_from_params(self):
         self.ctrl_rows = self._fresh_rebuild_rows()
@@ -341,9 +337,9 @@ class AppState:
 
     def snapshot_state(self):
         exclude = {'render_tex', 'render_result', 'undo_stack'}
-        snap = {k: _clone(v) for k, v in self._data.items() if k not in exclude}
-        for attr in CAMERA_ATTRIBUTES:
-            snap[f'camera_{attr}'] = _clone(getattr(self.camera, attr))
+        snap = {k: self._clone(v) for k, v in self._data.items() if k not in exclude}
+        for attr in self.camera_attributes:
+            snap[f'camera_{attr}'] = self._clone(getattr(self.camera, attr))
         snap['ctrl_rows'] = [row.copy() for row in self.ctrl_rows]
         return snap
 
@@ -357,9 +353,9 @@ class AppState:
     def restore_snapshot(self, snap):
         for k, v in snap.items():
             if not k.startswith('camera_') and k not in ('ctrl_rows', 'label'):
-                self._data[k] = _clone(v)
-        for attr in CAMERA_ATTRIBUTES:
-            setattr(self.camera, attr, _clone(snap[f'camera_{attr}']))
+                self._data[k] = self._clone(v)
+        for attr in self.camera_attributes:
+            setattr(self.camera, attr, self._clone(snap[f'camera_{attr}']))
         self.camera.fov_deg = self.view_fov
 
         self.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
@@ -375,9 +371,9 @@ class AppState:
         self.status_msg = 'Undid last change'
 
     def apply_texture_preset(self, preset_name, undo_label="Texture preset"):
-        if preset_name in TEXTURE_PRESETS:
+        if preset_name in self.texture_presets:
             self.push_undo(undo_label)
-            for k, val in TEXTURE_PRESETS[preset_name].items():
+            for k, val in self.texture_presets[preset_name].items():
                 setattr(self, k, np.array(val, dtype=np.float32) if isinstance(val, list) else val)
 
     # ── BITMAP / WORKFLOW UPDATES ─────────────────────────────────────────────
@@ -386,7 +382,7 @@ class AppState:
         self.rebuild_spline_from_params()
 
     def on_bitmap_resize(self, new_rows, new_cols):
-        new_rows = max(1, min(int(new_rows), int(config['knit_parameters']['bitmap_rows'])))
+        new_rows = max(1, min(int(new_rows), int(self.config['knit_parameters']['bitmap_rows'])))
         new_cols = max(1, min(int(new_cols), 16))
         old = self.bitmap
         new_bm = np.ones((new_rows, new_cols), dtype=np.float32)
@@ -406,12 +402,12 @@ class AppState:
         return None
 
     def fit_loop_heights_to_rows(self):
-        dy = float(self.params[_pidx['dy']])
+        dy = float(self.params[self._pidx['dy']])
         for span in range(1, self.bitmap_size[0] + 1):
             name = f"loop_height_{span}"
-            if name in _pidx:
-                idx = _pidx[name]
-                lo, hi = config['knit_parameters']['parameters'][idx]["range"]
+            if name in self._pidx:
+                idx = self._pidx[name]
+                lo, hi = self.config['knit_parameters']['parameters'][idx]["range"]
                 self.params[idx] = float(np.clip(span * dy, lo, hi))
         self.on_bitmap_change()
 
@@ -420,12 +416,12 @@ class AppState:
     def save_params(self, path, silent=False):
         params_to_save = {
             name: float(self.params[i])
-            for i, name in enumerate(p["name"] for p in config['knit_parameters']['parameters'])
+            for i, name in enumerate(p["name"] for p in self.config['knit_parameters']['parameters'])
             if (span := self.loop_height_span(name)) is None or span <= self.bitmap_size[0]
         }
-        gui_state = {k: json_ready(self._data[k]) for k in SAVED_STATE_KEYS if k in self._data}
-        for attr in CAMERA_ATTRIBUTES:
-            gui_state[f'camera_{attr}'] = json_ready(getattr(self.camera, attr))
+        gui_state = {k: AppState._json_ready(self._data[k]) for k in self.saved_state_keys if k in self._data}
+        for attr in self.camera_attributes:
+            gui_state[f'camera_{attr}'] = AppState._json_ready(getattr(self.camera, attr))
 
         data = {
             'format_version': 2,
@@ -450,7 +446,7 @@ class AppState:
         now = time.monotonic()
         if now - float(self.autosave_last_time) < float(self.autosave_interval_sec):
             return
-        target_path = self.save_path or os.path.join(project_root, 'params.json')
+        target_path = self.save_path or os.path.join(self.project_root, 'params.json')
         self.save_params(target_path, silent=True)
 
     def load_params(self, path):
@@ -458,7 +454,7 @@ class AppState:
             with open(path, 'r') as f:
                 data = json.load(f)
             p_dict = data.get('params', {})
-            for i, pd in enumerate(config['knit_parameters']['parameters']):
+            for i, pd in enumerate(self.config['knit_parameters']['parameters']):
                 if pd["name"] in p_dict:
                     lo, hi = pd["range"]
                     self.params[i] = float(np.clip(p_dict[pd["name"]], lo, hi))
@@ -471,10 +467,10 @@ class AppState:
             gui_state = data.get('gui_state', {})
             get_val = lambda k, d=None: gui_state.get(k, data.get(k, d))
 
-            for key in SAVED_STATE_KEYS:
+            for key in self.saved_state_keys:
                 val = get_val(key)
                 if val is not None:
-                    default_val = STATE_DEFAULTS.get(key)
+                    default_val = self._state_defaults.get(key)
                     if isinstance(default_val, np.ndarray):
                         arr = np.array(val, dtype=default_val.dtype)
                         if key == 'model_scale' and arr.size == 1:
@@ -483,7 +479,7 @@ class AppState:
                     else:
                         self._data[key] = val
 
-            for attr in CAMERA_ATTRIBUTES:
+            for attr in self.camera_attributes:
                 field = f'camera_{attr}'
                 val = get_val(field)
                 if val is not None:
@@ -501,13 +497,12 @@ class AppState:
             self.camera.fov_deg = self.view_fov
             self.load_path = path
             self.status_msg = f'Loaded ← {os.path.basename(path)}'
-            self.spline.samples_per_loop = self.samples_per_loop
 
             self.rebuild_spline_from_params()
             if loaded_spline_rows:
                 self.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]
                 self._rebuild_spline_points()
-                self.param_ref_ctrl_rows = [row.copy() for row in self._param_control_rows()]
+                self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
                 self.rebuild_spline_mesh()
         except Exception as e:
             self.status_msg = f"Load error: {e}"
