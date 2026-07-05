@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "pyopengl>=3.1.10",
     "scipy>=1.17.1",
+    "ur-rtde>=1.6.0",
     "vedo>=2026.6.1",
     "vtk>=9.6.2",
 ]
