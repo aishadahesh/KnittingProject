@@ -8,7 +8,7 @@
       "args": [
         "run",
         "python",
-        "guided_workflow_app.py"
+        "app.py"
       ],
       "options": {
         "cwd": "${workspaceFolder}"

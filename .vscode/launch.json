@@ -5,7 +5,7 @@
       "name": "Run Knitting App (uv)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/guided_workflow_app.py",
+      "program": "${workspaceFolder}/app.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "python": "uv",

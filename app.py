@@ -21,35 +21,35 @@ from imgui_bundle import imgui, imguizmo
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 import jax.numpy as jnp
 
-from knitting_core import (
-    CONFIG,
-    PROJECT_ROOT,
-    REFERENCE_IMAGE_PATH,
-    KnittingOptimizer,
-    SplineManager,
-)
+
+import json
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+resolve_project_path = lambda p: p if os.path.isabs(p) else os.path.join(project_root, p)
+
+with open(os.path.join(project_root, "config.json"), "r") as f:
+    config = json.load(f)
+
 from rendering import Camera, MeshRenderer, pil_to_texture
 from app_state import AppState
 from gui import (
-    draw_menu_bar,
-    draw_sidebar,
-    draw_viewport,
-    draw_mitsuba_panel,
-    draw_reference_image_panel,
+     draw_menu_bar,
+     draw_sidebar,
+     draw_viewport,
+     draw_reference_image_panel,
 )
 
 # %% MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
+    project_root = os.path.dirname(os.path.abspath(__file__))
     # ── Reference image ──────────────────────────────────────────────────────
     try:
-        ref_pil = Image.open(REFERENCE_IMAGE_PATH).convert("RGB")
+        ref_pil = Image.open(resolve_project_path(config["ui"]["reference_image"])).convert("RGB")
     except Exception:
         ref_pil = Image.new("RGB", (256, 256), (60, 40, 40))
 
-    bitmap_np = np.ones((CONFIG['geometry']['bitmap_rows'], CONFIG['geometry']['bitmap_loops']))
-    bitmap_jnp = jnp.array(bitmap_np)
-    optimizer = KnittingOptimizer(ref_pil, bitmap_jnp)
+
 
     # ── GLFW + OpenGL ─────────────────────────────────────────────────────────
     if not glfw.init():
@@ -68,7 +68,7 @@ def main():
     io.config_windows_move_from_title_bar_only = True
     io.config_flags |= imgui.ConfigFlags_.docking_enable
     io.config_flags |= imgui.ConfigFlags_.viewports_enable
-    io.set_ini_filename(os.path.join(PROJECT_ROOT, "imgui_layout.ini"))
+    io.set_ini_filename(os.path.join(project_root, "imgui_layout.ini"))
     impl = GlfwRenderer(window)
 
     style = imgui.get_style()
@@ -83,37 +83,45 @@ def main():
     # ── Scene objects ─────────────────────────────────────────────────────────
     camera   = Camera()
     renderer = MeshRenderer(ctx, 960, 720)
-    spline   = SplineManager(np.ones((3, CONFIG['geometry']['bitmap_loops']), dtype=np.float32), CONFIG)
+    # Create meshes/renders output directories
+    for d in ("meshes", "renders"):
+        os.makedirs(os.path.join(resolve_project_path(config["rendering"]["output_dir"]), d), exist_ok=True)
 
     # ── App state ─────────────────────────────────────────────────────────────
-    state = AppState(camera, spline, optimizer, renderer)
+    state = AppState(camera, renderer)
 
     # Initial state load/build
     if os.path.exists(state.load_path):
         state.load_params(state.load_path)
         if state.status_msg.startswith('Load error:'):
-            state.rebuild_param_mesh()
+            state.rebuild_spline_from_params()
     else:
-        state.rebuild_param_mesh()
+        state.rebuild_spline_from_params()
 
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
+    undo_shortcut_was_down = False
     while not glfw.window_should_close(window):
         glfw.poll_events()
         impl.process_inputs()
         imgui.new_frame()
         imguizmo.im_guizmo.begin_frame()
 
+        ctrl_down = (
+            glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
+            or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+        )
+        z_down = glfw.get_key(window, glfw.KEY_Z) == glfw.PRESS
+        undo_shortcut_down = ctrl_down and z_down
+        if undo_shortcut_down and not undo_shortcut_was_down and state.undo_stack:
+            state.undo_last()
+        undo_shortcut_was_down = undo_shortcut_down
+
         # Camera movement is disabled in the viewport; only model transforms are interactive.
 
-        # Upload pending render texture (must happen on GL thread)
-        if state.pending_tex and state.render_result is not None:
-            if state.render_tex:
-                state.render_tex.release()
-            state.render_tex  = pil_to_texture(ctx, state.render_result)
-            state.pending_tex = False
+
 
         win_w, win_h = glfw.get_window_size(window)
 
@@ -148,8 +156,7 @@ def main():
         # ── 3D Viewport ───────────────────────────────────────────────────────
         draw_viewport(state, renderer, ref_tex, window)
 
-        # ── Mitsuba Render Result ─────────────────────────────────────────────
-        draw_mitsuba_panel(state)
+
 
         # ── Reference Image ───────────────────────────────────────────────────
         draw_reference_image_panel(state, ref_tex)

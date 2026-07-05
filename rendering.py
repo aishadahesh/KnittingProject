@@ -2,7 +2,6 @@ import numpy as np
 import moderngl
 from PIL import Image
 from imgui_bundle import imgui
-from knitting_core import get_loop_color
 
 # %% GLSL SHADERS ─────────────────────────────────────────────────────────────
 
@@ -151,6 +150,28 @@ void main() {
 }
 """
 
+OUTLINE_VERT = """
+#version 330
+in vec3 in_pos;
+in vec3 in_norm;
+uniform mat4 mvp;
+uniform float outline_width;
+void main() {
+    vec3 p = in_pos + normalize(in_norm) * outline_width;
+    gl_Position = mvp * vec4(p, 1.0);
+}
+"""
+
+OUTLINE_FRAG = """
+#version 330
+uniform vec3 outline_color;
+out vec4 f_color;
+void main() {
+    if (gl_FrontFacing) discard;
+    f_color = vec4(outline_color, 1.0);
+}
+"""
+
 BG_VERT = """
 #version 330
 in vec2 in_pos;
@@ -218,6 +239,14 @@ def perspective(fov_rad, aspect, near=0.01, far=500.0):
         [0,        0, -1,                           0                          ],
     ], dtype=np.float32)
 
+def orthographic(left, right, bottom, top, near=0.01, far=500.0):
+    return np.array([
+        [2.0 / (right - left), 0, 0, -(right + left) / (right - left)],
+        [0, 2.0 / (top - bottom), 0, -(top + bottom) / (top - bottom)],
+        [0, 0, -2.0 / (far - near), -(far + near) / (far - near)],
+        [0, 0, 0, 1.0],
+    ], dtype=np.float32)
+
 def compute_normals(verts, tris):
     n = np.zeros_like(verts)
     e1 = verts[tris[:,1]] - verts[tris[:,0]]
@@ -278,7 +307,11 @@ class Camera:
 
     def proj(self, w, h):
         aspect = max(1.0, w) / max(1.0, h)
-        return perspective(np.radians(self.fov_deg), aspect)
+        # Match the perspective framing at the current distance, but with
+        # orthographic projection to remove perspective distortion.
+        half_h = max(1e-4, self.dist * np.tan(np.radians(self.fov_deg) * 0.5))
+        half_w = half_h * aspect
+        return orthographic(-half_w, half_w, -half_h, half_h)
 
     def mvp(self, w, h):
         return self.proj(w, h) @ self.view()
@@ -315,8 +348,9 @@ class Camera:
         self.dist = max(1.0, self.dist - delta)
 
     def zoom_factor(self):
-        # 1.0 at reference distance of 15.0
-        return self.dist / 15.0
+        # 1.0 at reference distance of 15.0.
+        # Lower distance means zoom-in, so this factor increases on zoom-in.
+        return 15.0 / max(self.dist, 1e-6)
 
     def pan(self, dx, dy):
         """Translate model camera target in screen-plane dimensions."""
@@ -358,6 +392,7 @@ class MeshRenderer:
     def __init__(self, ctx, vp_w, vp_h):
         self.ctx     = ctx
         self.prog    = ctx.program(vertex_shader=MESH_VERT, fragment_shader=MESH_FRAG)
+        self.outline_prog = ctx.program(vertex_shader=OUTLINE_VERT, fragment_shader=OUTLINE_FRAG)
         self.pt_prog = ctx.program(vertex_shader=PT_VERT,   fragment_shader=PT_FRAG)
         self.bg_prog = ctx.program(vertex_shader=BG_VERT,   fragment_shader=BG_FRAG)
         # Full-screen quad for background (triangle strip)
@@ -371,7 +406,7 @@ class MeshRenderer:
         self.color_tex = None
         self.depth_rb = None
         self.fbo = None
-        self.meshes = []      # list of (vao, n_indices, color, row_idx)
+        self.meshes = []      # list of (vao, outline_vao, n_indices, color, row_idx)
         self.mesh_pick_data = []
         self.pt_vao = None
         self.n_pts  = 0
@@ -403,8 +438,9 @@ class MeshRenderer:
         )
 
     def set_meshes(self, verts_list, faces_list, row_indices=None, colors=None, meta=None):
-        for vao, _, _, _ in self.meshes:
+        for vao, outline_vao, _, _, _ in self.meshes:
             vao.release()
+            outline_vao.release()
         self.meshes.clear()
         self.mesh_pick_data.clear()
         for i, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
@@ -415,12 +451,17 @@ class MeshRenderer:
             tris[0::2] = f[:, [0, 1, 2]]
             tris[1::2] = f[:, [0, 2, 3]]
             nm = compute_normals(v, tris).astype(np.float32)
-            uv = compute_tube_uvs(v, n_points)
+            pos_vbo = self.ctx.buffer(v.tobytes())
+            norm_vbo = self.ctx.buffer(nm.tobytes())
+            ibo = self.ctx.buffer(tris.astype(np.int32).tobytes())
             vao = self.ctx.vertex_array(self.prog, [
-                (self.ctx.buffer(v.tobytes()),  '3f', 'in_pos'),
-                (self.ctx.buffer(nm.tobytes()), '3f', 'in_norm'),
-                (self.ctx.buffer(uv.tobytes()), '2f', 'in_uv'),
-            ], self.ctx.buffer(tris.astype(np.int32).tobytes()))
+                (pos_vbo,  '3f', 'in_pos'),
+                (norm_vbo, '3f', 'in_norm'),
+            ], ibo)
+            outline_vao = self.ctx.vertex_array(self.outline_prog, [
+                (pos_vbo,  '3f', 'in_pos'),
+                (norm_vbo, '3f', 'in_norm'),
+            ], ibo)
             if meta is not None:
                 row_idx = meta[i].get('row', i)
             else:
@@ -428,8 +469,8 @@ class MeshRenderer:
             if colors is not None:
                 color = colors[row_idx % len(colors)]
             else:
-                color = get_loop_color(row_idx, 0)
-            self.meshes.append((vao, len(tris) * 3, color, row_idx))
+                color = [0.8, 0.2, 0.2]
+            self.meshes.append((vao, outline_vao, len(tris) * 3, color, row_idx))
             self.mesh_pick_data.append((v, row_idx))
 
     def pick_mesh_index(self, model_mat, camera, vp_w, vp_h, mouse_x, mouse_y, visible_rows=None, max_distance_px=16.0):
@@ -491,7 +532,7 @@ class MeshRenderer:
     def get_row_for_mesh_index(self, mesh_idx):
         if mesh_idx < 0 or mesh_idx >= len(self.meshes):
             return None
-        return int(self.meshes[mesh_idx][3])
+        return int(self.meshes[mesh_idx][4])
 
     def sample_color(self, x, y):
         ix = int(np.clip(x, 0, self.vp_w - 1))
@@ -552,18 +593,33 @@ class MeshRenderer:
         self.prog['mv'].write(mv.T.tobytes())
         self._set_program_uniforms(self.prog, material_uniforms)
 
-        for mesh_idx, (vao, n_idx, color, row_idx) in enumerate(self.meshes):
+        for mesh_idx, (vao, outline_vao, n_idx, color, row_idx) in enumerate(self.meshes):
             if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
                 continue
             base_color = np.asarray(color, dtype=np.float32)
-            if mesh_idx == selected_mesh_idx:
-                draw_color = np.clip(base_color * 0.35 + np.array([0.15, 1.0, 0.25], dtype=np.float32) * 0.65, 0.0, 1.0)
-            elif mesh_idx == hover_mesh_idx:
-                draw_color = np.clip(base_color * 0.45 + np.array([1.0, 0.95, 0.2], dtype=np.float32) * 0.55, 0.0, 1.0)
-            else:
-                draw_color = base_color
-            self.prog['color'].value = tuple(float(c) for c in draw_color)
+            self.prog['color'].value = tuple(float(c) for c in base_color)
             vao.render(moderngl.TRIANGLES)
+
+        # Silhouette highlight pass: draw expanded backfaces for hover/selection.
+        has_outline = selected_mesh_idx >= 0 or hover_mesh_idx >= 0
+        if has_outline:
+            self.outline_prog['mvp'].write(mvp.T.tobytes())
+            self.outline_prog['outline_width'].value = 0.02
+            self.ctx.disable(moderngl.CULL_FACE)
+
+            def draw_outline(mesh_idx, color):
+                if mesh_idx < 0 or mesh_idx >= len(self.meshes):
+                    return
+                _, outline_vao, _, _, row_idx = self.meshes[mesh_idx]
+                if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
+                    return
+                self.outline_prog['outline_color'].value = color
+                outline_vao.render(moderngl.TRIANGLES)
+
+            # Selected wins if both states point to the same yarn.
+            draw_outline(selected_mesh_idx, (0.15, 1.0, 0.25))
+            if hover_mesh_idx != selected_mesh_idx:
+                draw_outline(hover_mesh_idx, (1.0, 0.95, 0.2))
 
         if use_model_blend:
             self.ctx.disable(moderngl.BLEND)

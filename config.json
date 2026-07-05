@@ -1,14 +1,14 @@
 {
   "ui": {
-    "reference_image": "refImg.png",
+    "reference_image": "refImg.png"
+  },
+  "knit_parameters": {
     "yarn_colors": [
       [0.85, 0.12, 0.1],
       [0.95, 0.82, 0.2],
       [0.14, 0.45, 0.9],
       [0.35, 0.18, 0.08]
-    ]
-  },
-  "geometry": {
+    ],
     "bitmap_rows": 5,
     "bitmap_loops": 5,
     "loop_res": 32,
@@ -45,8 +45,32 @@
         "delta": 0.01
       },
       {
-        "name": "default_loop_height",
+        "name": "loop_height_1",
         "initial": 1.6,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_2",
+        "initial": 3.2,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_3",
+        "initial": 4.8,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_4",
+        "initial": 6.0,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_5",
+        "initial": 6.0,
         "range": [0.1, 6.0],
         "delta": 0.01
       }
