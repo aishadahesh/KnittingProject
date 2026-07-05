@@ -16,8 +16,9 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,7 +31,6 @@ from Robot_fabric_scanner import (
     DEFAULT_MAX_SPAN,
     TOOL_DOWN_ROTVEC,
     assess_plan_safety,
-    expand_stations_to_viewpoints,
     fit_path_to_workspace,
     generate_urscript,
     points_and_rotvecs_to_poses,
@@ -41,14 +41,22 @@ MUJOCO_DAMPING = 1e-2
 MUJOCO_KP = 0.28
 IK_SUBSTEPS = 3
 TARGET_TOL = 0.006
+TARGET_ROT_TOL = 0.08
 MAX_TRAIL_POINTS = 6000
 MARKER_RADIUS = 0.006
 PATH_WIDTH = 0.003
+POSE_AXIS_LENGTH = 0.035
 FABRIC_THICKNESS = 0.003
 CAMERA_MARKER_SIZE = np.array([0.018, 0.012, 0.010])
 CAMERA_IMAGE_SIZE = (640, 480)
 CAMERA_SAVE_EVERY_STATION = "station"
 CAMERA_SAVE_EVERY_VIEW = "view"
+NON_SCAN_VIEW_NAMES = {"approach", "retreat", "travel"}
+MODE_SIMULATION = "simulation"
+MODE_ROBOT = "robot"
+DEFAULT_ROBOT_IP = "132.74.121.230"
+DEFAULT_ROBOT_PORT = 30001
+ROBOT_MAX_CARTESIAN_STEP = 0.040
 
 SWATCH_PALETTE = [
     (0.86, 0.12, 0.18, 1.0),
@@ -97,16 +105,14 @@ def build_fabric_grid_stations(
     length: float,
     rows: int,
     cols: int,
-    samples_x: int,
-    samples_y: int,
     edge_margin: float,
     square_margin: float,
     surface_wave: float,
 ) -> tuple[np.ndarray, list[tuple[int, int]], list[tuple[float, float, float, float]]]:
     if min(width, length) <= 0:
         raise ValueError("fabric width and length must be positive")
-    if min(rows, cols, samples_x, samples_y) <= 0:
-        raise ValueError("grid and sample counts must be positive")
+    if min(rows, cols) <= 0:
+        raise ValueError("grid counts must be positive")
 
     cell_w = width / cols
     cell_l = length / rows
@@ -117,28 +123,49 @@ def build_fabric_grid_stations(
     for row, col in _serpentine_indices(rows, cols):
         x0 = -width / 2 + col * cell_w
         y0 = -length / 2 + row * cell_l
-        inner_x0 = x0 + max(edge_margin, square_margin)
-        inner_x1 = x0 + cell_w - max(edge_margin, square_margin)
-        inner_y0 = y0 + max(edge_margin, square_margin)
-        inner_y1 = y0 + cell_l - max(edge_margin, square_margin)
-        if inner_x1 <= inner_x0:
-            inner_x0, inner_x1 = x0 + cell_w * 0.35, x0 + cell_w * 0.65
-        if inner_y1 <= inner_y0:
-            inner_y0, inner_y1 = y0 + cell_l * 0.35, y0 + cell_l * 0.65
-
-        xs = np.linspace(inner_x0, inner_x1, samples_x)
-        ys = np.linspace(inner_y0, inner_y1, samples_y)
-        local_points = [(x, y) for y in ys for x in xs]
-        if (row + col) % 2:
-            local_points.reverse()
-        for x, y in local_points:
-            z = surface_wave * math.sin(2 * math.pi * (x / width + 0.5))
-            z += 0.5 * surface_wave * math.cos(2 * math.pi * (y / length + 0.5))
-            stations.append([float(x), float(y), float(z)])
-            cells.append((row, col))
-            colors.append(_cell_color(row, col))
+        x = x0 + cell_w * 0.5
+        y = y0 + cell_l * 0.5
+        z = surface_wave * math.sin(2 * math.pi * (x / width + 0.5))
+        z += 0.5 * surface_wave * math.cos(2 * math.pi * (y / length + 0.5))
+        stations.append([float(x), float(y), float(z)])
+        cells.append((row, col))
+        colors.append(_cell_color(row, col))
 
     return np.asarray(stations, dtype=float), cells, colors
+
+
+def expand_stations_to_angle_viewpoints(
+    stations: np.ndarray,
+    number_of_angles: int,
+    view_radius: float,
+    angle_lift: float,
+) -> tuple[np.ndarray, list[int], list[str], np.ndarray]:
+    """Create one fixed scanner position per square with multiple camera rotations."""
+    number_of_angles = max(1, int(number_of_angles))
+    points: list[np.ndarray] = []
+    station_ids: list[int] = []
+    view_names: list[str] = []
+    rotvecs: list[np.ndarray] = []
+    tilt = min(0.60, max(0.0, float(view_radius) / 0.060 * 0.45))
+
+    for station_id, station in enumerate(stations):
+        for angle_index in range(number_of_angles):
+            theta = 2.0 * math.pi * angle_index / number_of_angles
+            angle_deg = 360.0 * angle_index / number_of_angles
+            offset = np.array([0.0, 0.0, angle_lift], dtype=float)
+            rotvec = np.array(
+                [
+                    math.pi,
+                    tilt * math.sin(theta),
+                    tilt * math.cos(theta),
+                ],
+                dtype=float,
+            )
+            points.append(station + offset)
+            station_ids.append(station_id)
+            view_names.append(f"angle {angle_deg:.0f}")
+            rotvecs.append(rotvec)
+    return np.asarray(points), station_ids, view_names, np.asarray(rotvecs)
 
 
 def resolve_fabric_grid(args: argparse.Namespace) -> None:
@@ -155,14 +182,13 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         length=args.length,
         rows=args.rows,
         cols=args.cols,
-        samples_x=args.samples_x,
-        samples_y=args.samples_y,
         edge_margin=args.edge_margin,
         square_margin=args.square_margin,
         surface_wave=args.surface_wave,
     )
-    raw_points, station_ids, view_names, rotvecs = expand_stations_to_viewpoints(
+    raw_points, station_ids, view_names, rotvecs = expand_stations_to_angle_viewpoints(
         raw_stations,
+        number_of_angles=args.number_of_angles,
         view_radius=args.view_radius,
         angle_lift=args.angle_lift,
     )
@@ -200,6 +226,62 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         square_width=args.square_width,
         square_length=args.square_length,
     )
+
+
+def densify_plan_for_robot(plan: FabricPlan, max_step: float = ROBOT_MAX_CARTESIAN_STEP) -> FabricPlan:
+    if max_step <= 0 or len(plan.poses) < 2:
+        return plan
+
+    poses: list[np.ndarray] = [plan.poses[0].copy()]
+    station_ids: list[int] = [plan.station_ids[0]]
+    view_names: list[str] = [plan.view_names[0]]
+
+    for index in range(1, len(plan.poses)):
+        start = plan.poses[index - 1]
+        end = plan.poses[index]
+        distance = float(np.linalg.norm(end[:3] - start[:3]))
+        steps = max(1, int(math.ceil(distance / max_step)))
+
+        for step in range(1, steps + 1):
+            t = step / steps
+            pose = (1.0 - t) * start + t * end
+            poses.append(pose)
+            station_ids.append(plan.station_ids[index])
+            view_names.append(plan.view_names[index] if step == steps else "travel")
+
+    dense_poses = np.asarray(poses, dtype=float)
+    return replace(
+        plan,
+        mapped_points=dense_poses[:, :3].copy(),
+        poses=dense_poses,
+        station_ids=station_ids,
+        view_names=view_names,
+    )
+
+
+def is_scan_view(view_name: str) -> bool:
+    return view_name not in NON_SCAN_VIEW_NAMES
+
+
+def should_save_scan_image(
+    args: argparse.Namespace,
+    plan: FabricPlan,
+    target_index: int,
+    saved_targets: set[int],
+    saved_stations: set[int],
+    save_images: bool | None = None,
+) -> bool:
+    if save_images is None:
+        save_images = bool(args.save_images)
+    if not save_images or target_index in saved_targets:
+        return False
+    view_name = plan.view_names[target_index]
+    if not is_scan_view(view_name):
+        return False
+    station = plan.station_ids[target_index]
+    if args.image_every == CAMERA_SAVE_EVERY_STATION:
+        return station not in saved_stations
+    return True
 
 
 def rot_from_wxyz(q: np.ndarray) -> Rotation:
@@ -243,6 +325,15 @@ def step_ik(mujoco, model, data, site_id, target_pose: np.ndarray) -> None:
     dq = jac.T @ np.linalg.solve(jjt + (MUJOCO_DAMPING**2) * np.eye(jjt.shape[0]), err)
     data.qpos[:6] = np.clip(data.qpos[:6] + dq, model.jnt_range[:6, 0], model.jnt_range[:6, 1])
     mujoco.mj_forward(model, data)
+
+
+def pose_errors(current_pose: np.ndarray, target_pose: np.ndarray) -> tuple[float, float]:
+    pos_err = float(np.linalg.norm(current_pose[:3] - target_pose[:3]))
+    rot_err = (
+        Rotation.from_rotvec(target_pose[3:6])
+        * Rotation.from_rotvec(current_pose[3:6]).inv()
+    ).magnitude()
+    return pos_err, float(rot_err)
 
 
 def _add_sphere(mujoco, scn, pos, radius, rgba):
@@ -298,6 +389,28 @@ def _add_camera_marker(mujoco, scn, tcp_pos: np.ndarray, look_at: np.ndarray) ->
         _add_segment(mujoco, scn, tcp_pos, tip, (0.05, 0.55, 1.0, 0.95), 0.004)
 
 
+def _add_pose_axes(mujoco, scn, pose: np.ndarray, scale: float = POSE_AXIS_LENGTH, alpha: float = 0.85) -> None:
+    origin = np.asarray(pose[:3], dtype=float)
+    axes = Rotation.from_rotvec(pose[3:6]).as_matrix()
+    colors = (
+        (1.0, 0.15, 0.15, alpha),
+        (0.10, 0.85, 0.20, alpha),
+        (0.15, 0.45, 1.0, alpha),
+    )
+    for axis_index, color in enumerate(colors):
+        _add_segment(mujoco, scn, origin, origin + axes[:, axis_index] * scale, color, 0.0024)
+
+
+def _add_rotation_ring(mujoco, scn, center: np.ndarray, radius: float, rgba) -> None:
+    points = []
+    z = float(center[2]) + 0.010
+    for index in range(25):
+        theta = 2.0 * math.pi * index / 24
+        points.append(np.array([center[0] + radius * math.cos(theta), center[1] + radius * math.sin(theta), z]))
+    for a, b in zip(points, points[1:]):
+        _add_segment(mujoco, scn, a, b, rgba, 0.0015)
+
+
 def draw_scene(
     mujoco,
     handle,
@@ -305,6 +418,8 @@ def draw_scene(
     target_index: int,
     executed: list[np.ndarray],
     camera_enabled: bool = False,
+    current_pose: np.ndarray | None = None,
+    target_pose: np.ndarray | None = None,
 ) -> None:
     scn = handle.user_scn
     scn.ngeom = 0
@@ -336,6 +451,11 @@ def draw_scene(
     color = plan.cell_colors[station_id]
     _add_sphere(mujoco, scn, station, MARKER_RADIUS * 1.15, color)
     _add_sphere(mujoco, scn, target, MARKER_RADIUS * 1.45, (0.1, 1.0, 0.3, 1.0))
+    _add_rotation_ring(mujoco, scn, station, min(plan.square_width, plan.square_length) * 0.22, (0.1, 1.0, 0.3, 0.65))
+    if target_pose is not None:
+        _add_pose_axes(mujoco, scn, target_pose, scale=POSE_AXIS_LENGTH * 1.15, alpha=0.55)
+    if current_pose is not None:
+        _add_pose_axes(mujoco, scn, current_pose, scale=POSE_AXIS_LENGTH, alpha=0.95)
     if trail:
         _add_sphere(mujoco, scn, trail[-1], MARKER_RADIUS * 1.35, (1.0, 0.42, 0.08, 1.0))
         if camera_enabled:
@@ -359,15 +479,24 @@ def save_camera_image(
     cell_w = plan.fabric_size[0] / plan.grid_cols
     cell_l = plan.fabric_size[1] / plan.grid_rows
     view_span = max(cell_w * 2.4, cell_l * 2.4, 0.035)
-    center = station[:2] + 0.35 * (target[:2] - station[:2])
-    x_min, x_max = center[0] - view_span / 2, center[0] + view_span / 2
-    y_min, y_max = center[1] - view_span / 2, center[1] + view_span / 2
+    center = station[:2]
+    angle_deg = 0.0
+    if view_name.startswith("angle "):
+        try:
+            angle_deg = float(view_name.split(" ", 1)[1])
+        except ValueError:
+            angle_deg = 0.0
+    theta = math.radians(angle_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
 
     img = Image.new("RGB", (width_px, height_px), (19, 22, 28))
 
     def project_xy(point: np.ndarray) -> tuple[int, int]:
-        x = int((point[0] - x_min) / max(1e-9, x_max - x_min) * (width_px - 1))
-        y = int((y_max - point[1]) / max(1e-9, y_max - y_min) * (height_px - 1))
+        delta = np.asarray(point[:2], dtype=float) - center
+        camera_x = cos_t * delta[0] + sin_t * delta[1]
+        camera_y = -sin_t * delta[0] + cos_t * delta[1]
+        x = int((camera_x / view_span + 0.5) * (width_px - 1))
+        y = int((0.5 - camera_y / view_span) * (height_px - 1))
         return x, y
 
     from PIL import ImageDraw, ImageFilter
@@ -378,18 +507,19 @@ def save_camera_image(
             x0 = plan.fabric_origin[0] + col * cell_w
             y0 = plan.fabric_origin[1] + row * cell_l
             x1, y1 = x0 + cell_w, y0 + cell_l
-            if x1 < x_min or x0 > x_max or y1 < y_min or y0 > y_max:
-                continue
             rgba = _cell_color(row, col)
             color = tuple(int(255 * c) for c in rgba[:3])
-            p0 = project_xy(np.array([x0, y0]))
-            p1 = project_xy(np.array([x1, y1]))
-            rect = [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])]
-            draw.rectangle(rect, fill=color, outline=(245, 245, 240), width=2)
+            poly = [
+                project_xy(np.array([x0, y0])),
+                project_xy(np.array([x1, y0])),
+                project_xy(np.array([x1, y1])),
+                project_xy(np.array([x0, y1])),
+            ]
+            draw.polygon(poly, fill=color, outline=(245, 245, 240))
 
     for sid, point in enumerate(plan.mapped_stations):
-        if x_min <= point[0] <= x_max and y_min <= point[1] <= y_max:
-            px, py = project_xy(point[:2])
+        px, py = project_xy(point[:2])
+        if -12 <= px <= width_px + 12 and -12 <= py <= height_px + 12:
             r = 5 if sid == station_id else 3
             fill = (255, 255, 255) if sid == station_id else (30, 30, 30)
             draw.ellipse([px - r, py - r, px + r, py + r], fill=fill, outline=(0, 0, 0))
@@ -498,6 +628,7 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
     dwell_until = 0.0
     saved_count = 0
     saved_targets: set[int] = set()
+    saved_stations: set[int] = set()
     was_paused = False
     print("[mujoco] viewer open. Close the window to stop.")
     print("[legend] grey=planned full path, green=planned completed path, orange=executed TCP trail")
@@ -539,23 +670,40 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
                     )
                     saved_count += 1
                     saved_targets.add(target_index)
+                    if is_scan_view(plan.view_names[target_index]):
+                        saved_stations.add(station)
                     print(f"[camera] saved {path}")
             elif save_images:
                 image_dir.mkdir(parents=True, exist_ok=True)
-            draw_scene(mujoco, handle, plan, target_index, executed, camera_enabled=camera_enabled)
+            draw_scene(
+                mujoco,
+                handle,
+                plan,
+                target_index,
+                executed,
+                camera_enabled=camera_enabled,
+                current_pose=tcp,
+                target_pose=pose,
+            )
 
-            err = np.linalg.norm(tcp[:3] - pose[:3])
+            err_pos, err_rot = pose_errors(tcp, pose)
             now = time.monotonic()
-            if not paused and err < TARGET_TOL:
+            if not paused and err_pos < TARGET_TOL and err_rot < TARGET_ROT_TOL:
                 if dwell_until == 0.0:
                     dwell_until = now + max(args.dwell, 0.0)
                 elif now >= dwell_until:
                     station = plan.station_ids[target_index]
-                    should_save = save_images and target_index not in saved_targets
-                    if args.image_every == CAMERA_SAVE_EVERY_STATION:
-                        should_save = should_save and plan.view_names[target_index] == "top"
+                    should_save = should_save_scan_image(
+                        args,
+                        plan,
+                        target_index,
+                        saved_targets,
+                        saved_stations,
+                        save_images=save_images,
+                    )
                     if should_save:
                         saved_targets.add(target_index)
+                        saved_stations.add(station)
                         path = save_camera_image(
                             plan,
                             tcp[:3],
@@ -583,36 +731,88 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
         print(f"[done] saved camera images: {saved_count} in {image_dir}")
 
 
+def show_missing_mujoco_help(project_dir: Path) -> None:
+    message = (
+        "MuJoCo is not installed in the Python environment that launched this script.\n\n"
+        "To run the simulator, install the MuJoCo dependencies:\n"
+        f"  cd {project_dir}\n"
+        "  python -m pip install -r requirements-mujoco.txt\n\n"
+        "To move the real robot without MuJoCo, restart this script and click "
+        "'Run Real UR5' instead of 'Start Simulation'."
+    )
+    print(f"[mujoco] {message}")
+    try:
+        import tkinter.messagebox as messagebox
+
+        messagebox.showerror("MuJoCo is missing", message)
+    except Exception:
+        pass
+
+
+def run_robot_motion(plan: FabricPlan, args: argparse.Namespace) -> None:
+    script = generate_urscript(
+        plan.poses,
+        accel=args.robot_acc,
+        vel=args.robot_vel,
+        blend_r=0.0,
+        dwell=max(args.robot_dwell, 0.0),
+        station_ids=plan.station_ids,
+        view_names=plan.view_names,
+        prog_name="mujoco_fabric_scanner_real",
+    )
+    if not script.endswith("\n"):
+        script += "\n"
+
+    print(f"[robot] sending URScript to UR5 at {args.robot_ip}:{args.robot_port}")
+    print("[robot] robot must be in Remote Control mode before sending.")
+    print(f"[robot] poses={len(plan.poses)} vel={args.robot_vel:.3f} acc={args.robot_acc:.3f}")
+    try:
+        with socket.create_connection((args.robot_ip, args.robot_port), timeout=5.0) as sock:
+            sock.sendall(script.encode("utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Could not send URScript to {args.robot_ip}:{args.robot_port}: {exc}") from exc
+    print("[robot] program sent. Watch the teach pendant / robot motion for completion.")
+
+
 def run_setup_gui(args: argparse.Namespace):
     import tkinter as tk
     from tkinter import messagebox, ttk
 
     root = tk.Tk()
     root.title("Fabric Scanner Setup")
-    root.geometry("980x720")
-    root.minsize(820, 560)
+    root.geometry("1040x680")
+    root.minsize(760, 520)
     root.resizable(True, True)
     root.bind("<F11>", lambda _event: root.state("zoomed"))
     root.bind("<Escape>", lambda _event: root.state("normal"))
 
     values = {
+        "execution_mode": tk.StringVar(value=args.execution_mode),
         "width": tk.DoubleVar(value=args.width),
         "length": tk.DoubleVar(value=args.length),
         "rows": tk.IntVar(value=args.rows),
         "cols": tk.IntVar(value=args.cols),
-        "samples_x": tk.IntVar(value=args.samples_x),
-        "samples_y": tk.IntVar(value=args.samples_y),
+        "number_of_angles": tk.IntVar(value=args.number_of_angles),
         "view_radius": tk.DoubleVar(value=args.view_radius),
         "angle_lift": tk.DoubleVar(value=args.angle_lift),
         "speed": tk.DoubleVar(value=args.speed),
         "add_camera": tk.BooleanVar(value=args.add_camera),
         "save_images": tk.BooleanVar(value=args.save_images),
+        "image_every": tk.StringVar(value=args.image_every),
+        "robot_ip": tk.StringVar(value=args.robot_ip),
+        "robot_port": tk.IntVar(value=args.robot_port),
+        "robot_vel": tk.DoubleVar(value=args.robot_vel),
+        "robot_acc": tk.DoubleVar(value=args.robot_acc),
+        "robot_dwell": tk.DoubleVar(value=args.robot_dwell),
     }
     result = {"args": None}
     summary = tk.StringVar()
+    preview_after_id = {"id": None}
 
     shell = ttk.Frame(root)
     shell.pack(fill="both", expand=True)
+    buttons = ttk.Frame(shell, padding=(16, 10))
+    buttons.pack(fill="x", side="top")
     frame = ttk.Frame(shell, padding=16)
     frame.pack(fill="both", expand=True)
     frame.columnconfigure(0, weight=0)
@@ -624,24 +824,49 @@ def run_setup_gui(args: argparse.Namespace):
     right.grid(row=0, column=1, sticky="nsew")
     right.columnconfigure(0, weight=1)
     right.rowconfigure(1, weight=1)
-    ttk.Label(left, text="Fabric Scanner Setup", font=("Segoe UI", 15, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+    ttk.Label(buttons, text="Fabric Scanner Setup", font=("Segoe UI", 15, "bold")).pack(side="left")
+    ttk.Button(buttons, text="RUN REAL UR5", command=lambda: start(MODE_ROBOT)).pack(side="left", padx=(18, 0))
+    ttk.Button(buttons, text="Start Simulation", command=lambda: start(MODE_SIMULATION)).pack(side="left", padx=(8, 0))
+    ttk.Label(left, text="Fabric controls", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+    ttk.Label(left, text="Execution target").grid(row=1, column=0, sticky="w", pady=(0, 2))
+    mode_combo = ttk.Combobox(
+        left,
+        state="readonly",
+        width=24,
+        values=("MuJoCo simulation", "Real UR5 robot motion"),
+    )
+    mode_combo.grid(row=1, column=1, sticky="e", pady=(0, 2))
+    mode_combo.set("Real UR5 robot motion" if args.execution_mode == MODE_ROBOT else "MuJoCo simulation")
+
+    def sync_execution_mode(_event=None) -> None:
+        values["execution_mode"].set(MODE_ROBOT if mode_combo.get().startswith("Real UR5") else MODE_SIMULATION)
+
+    mode_combo.bind("<<ComboboxSelected>>", sync_execution_mode)
+    ttk.Label(
+        left,
+        text="Use Real UR5 robot motion to send the generated scan path to the controller.",
+        foreground="#6b7280",
+        wraplength=330,
+    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
     slider_specs = [
         ("Full fabric width", "width", 0.10, 0.80, 0.01, "m"),
         ("Full fabric length", "length", 0.10, 0.80, 0.01, "m"),
         ("Rows", "rows", 1, 12, 1, ""),
         ("Columns", "cols", 1, 12, 1, ""),
-        ("Scan locations X", "samples_x", 1, 5, 1, ""),
-        ("Scan locations Y", "samples_y", 1, 5, 1, ""),
-        ("Angled view radius", "view_radius", 0.0, 0.060, 0.001, "m"),
+        ("Number of angles", "number_of_angles", 1, 12, 1, ""),
+        ("Angle tilt strength", "view_radius", 0.0, 0.060, 0.001, ""),
         ("Angled view lift", "angle_lift", 0.0, 0.060, 0.001, "m"),
         ("Initial speed", "speed", 0.05, 2.0, 0.05, "x"),
+        ("Robot velocity", "robot_vel", 0.005, 0.080, 0.005, "m/s"),
+        ("Robot acceleration", "robot_acc", 0.020, 0.250, 0.010, "m/s2"),
+        ("Robot dwell", "robot_dwell", 0.0, 2.0, 0.05, "s"),
     ]
     value_labels = {}
 
     def format_value(key: str, unit: str) -> str:
         value = values[key].get()
-        if key in {"rows", "cols", "samples_x", "samples_y"}:
+        if key in {"rows", "cols", "number_of_angles"}:
             return f"{int(round(value))}{unit}"
         return f"{float(value):.3f}{unit}"
 
@@ -653,16 +878,38 @@ def run_setup_gui(args: argparse.Namespace):
             values[key].set(round(float(value) / step) * step)
 
     for index, (label, key, low, high, step, unit) in enumerate(slider_specs, start=1):
-        row = index * 2 - 1
+        row = index * 2 + 1
         ttk.Label(left, text=label).grid(row=row, column=0, sticky="w", pady=(5, 0))
         value_labels[key] = ttk.Label(left, width=9, anchor="e")
         value_labels[key].grid(row=row, column=1, sticky="e", pady=(5, 0))
         scale = ttk.Scale(left, from_=low, to=high, variable=values[key], length=300, command=lambda _v, k=key, s=step: snap_value(k, s))
         scale.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 3))
 
-    ttk.Checkbutton(left, text="Add camera on grabber", variable=values["add_camera"]).grid(row=20, column=0, columnspan=2, sticky="w", pady=(12, 4))
-    ttk.Checkbutton(left, text="Save scanner images", variable=values["save_images"]).grid(row=21, column=0, columnspan=2, sticky="w", pady=4)
-    ttk.Label(left, textvariable=summary, foreground="#355c7d", wraplength=330).grid(row=22, column=0, columnspan=2, sticky="w", pady=(14, 8))
+    ttk.Label(left, text="Robot IP").grid(row=28, column=0, sticky="w", pady=(12, 4))
+    ttk.Entry(left, textvariable=values["robot_ip"], width=18).grid(row=28, column=1, sticky="e", pady=(12, 4))
+    ttk.Label(left, text="Robot port").grid(row=29, column=0, sticky="w", pady=(2, 4))
+    ttk.Entry(left, textvariable=values["robot_port"], width=18).grid(row=29, column=1, sticky="e", pady=(2, 4))
+    ttk.Checkbutton(left, text="Add camera on grabber", variable=values["add_camera"]).grid(row=30, column=0, columnspan=2, sticky="w", pady=(12, 4))
+    ttk.Checkbutton(left, text="Save scanner images", variable=values["save_images"]).grid(row=31, column=0, columnspan=2, sticky="w", pady=4)
+    ttk.Label(left, text="Image saving mode").grid(row=32, column=0, sticky="w", pady=(2, 4))
+    image_mode_combo = ttk.Combobox(
+        left,
+        state="readonly",
+        width=18,
+        values=("Every angle view", "One per station"),
+    )
+    image_mode_combo.grid(row=32, column=1, sticky="e", pady=(2, 4))
+    image_mode_combo.set("Every angle view" if args.image_every == CAMERA_SAVE_EVERY_VIEW else "One per station")
+
+    def sync_image_every(_event=None) -> None:
+        values["image_every"].set(
+            CAMERA_SAVE_EVERY_VIEW
+            if image_mode_combo.get().startswith("Every")
+            else CAMERA_SAVE_EVERY_STATION
+        )
+
+    image_mode_combo.bind("<<ComboboxSelected>>", sync_image_every)
+    ttk.Label(left, textvariable=summary, foreground="#355c7d", wraplength=330).grid(row=33, column=0, columnspan=2, sticky="w", pady=(14, 8))
 
     ttk.Label(right, text="Live fabric preview", font=("Segoe UI", 13, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
     canvas = tk.Canvas(right, bg="#f7f7f2", highlightthickness=1, highlightbackground="#c8c8c0")
@@ -675,14 +922,13 @@ def run_setup_gui(args: argparse.Namespace):
         cols = max(1, int(values["cols"].get()))
         square_width = width / cols
         square_length = length / rows_count
-        samples_x = max(1, int(values["samples_x"].get()))
-        samples_y = max(1, int(values["samples_y"].get()))
-        return width, length, square_width, square_length, rows_count, cols, samples_x, samples_y
+        number_of_angles = max(1, int(values["number_of_angles"].get()))
+        return width, length, square_width, square_length, rows_count, cols, number_of_angles
 
     def draw_preview() -> None:
         canvas.delete("all")
         try:
-            width, length, square_width, square_length, rows_count, cols, samples_x, samples_y = current_grid()
+            width, length, square_width, square_length, rows_count, cols, number_of_angles = current_grid()
             canvas_w = max(240, canvas.winfo_width())
             canvas_h = max(240, canvas.winfo_height())
             pad = 36
@@ -697,27 +943,34 @@ def run_setup_gui(args: argparse.Namespace):
                     y1 = y0 + square_length * scale
                     color = "#%02x%02x%02x" % tuple(int(255 * c) for c in _cell_color(row, col)[:3])
                     canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#ffffff", width=2)
-                    for sy in range(samples_y):
-                        for sx in range(samples_x):
-                            px = x0 + (sx + 0.5) * (x1 - x0) / samples_x
-                            py = y0 + (sy + 0.5) * (y1 - y0) / samples_y
-                            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#111827", outline="#ffffff")
+                    px = (x0 + x1) * 0.5
+                    py = (y0 + y1) * 0.5
+                    ray = min(x1 - x0, y1 - y0) * 0.28
+                    for angle_index in range(number_of_angles):
+                        theta = 2.0 * math.pi * angle_index / number_of_angles
+                        canvas.create_line(px, py, px + ray * math.cos(theta), py - ray * math.sin(theta), fill="#111827", width=1)
+                    canvas.create_oval(px - 4, py - 4, px + 4, py + 4, fill="#111827", outline="#ffffff")
             canvas.create_rectangle(ox, oy, ox + width * scale, oy + length * scale, outline="#1f2937", width=3)
-            stations = rows_count * cols * samples_x * samples_y
+            stations = rows_count * cols
             summary.set(
                 f"Full fabric: {width:.3f} x {length:.3f} m | "
                 f"Grid: {rows_count} x {cols} | "
                 f"Square: {square_width:.3f} x {square_length:.3f} m | "
-                f"Scan stations: {stations} | Views: {stations * 5 + 2}"
+                f"Scan stations: {stations} | Angles: {number_of_angles} | Views: {stations * number_of_angles + 2}"
             )
             for label, key, _low, _high, _step, unit in slider_specs:
                 value_labels[key].configure(text=format_value(key, unit))
         except Exception:
             canvas.create_text(235, 235, text="Enter positive numbers to preview fabric", fill="#6b7280", font=("Segoe UI", 12))
             summary.set("Enter positive sizes to preview the grid.")
-        root.after(200, draw_preview)
+        preview_after_id["id"] = root.after(200, draw_preview)
 
-    def start() -> None:
+    def start(force_mode: str | None = None) -> None:
+        if force_mode is not None:
+            values["execution_mode"].set(force_mode)
+            mode_combo.set("Real UR5 robot motion" if force_mode == MODE_ROBOT else "MuJoCo simulation")
+        else:
+            sync_execution_mode()
         try:
             args.width = float(values["width"].get())
             args.length = float(values["length"].get())
@@ -725,29 +978,41 @@ def run_setup_gui(args: argparse.Namespace):
             args.cols = int(values["cols"].get())
             args.square_width = args.width / max(1, args.cols)
             args.square_length = args.length / max(1, args.rows)
-            args.samples_x = int(values["samples_x"].get())
-            args.samples_y = int(values["samples_y"].get())
+            args.number_of_angles = int(values["number_of_angles"].get())
             args.view_radius = float(values["view_radius"].get())
             args.angle_lift = float(values["angle_lift"].get())
             args.speed = float(values["speed"].get())
             args.add_camera = bool(values["add_camera"].get())
             args.save_images = bool(values["save_images"].get())
-            if min(args.width, args.length, args.rows, args.cols, args.samples_x, args.samples_y) <= 0:
+            sync_image_every()
+            args.image_every = values["image_every"].get()
+            args.execution_mode = values["execution_mode"].get()
+            args.robot_ip = values["robot_ip"].get().strip()
+            args.robot_port = int(values["robot_port"].get())
+            args.robot_vel = float(values["robot_vel"].get())
+            args.robot_acc = float(values["robot_acc"].get())
+            args.robot_dwell = float(values["robot_dwell"].get())
+            if min(args.width, args.length, args.rows, args.cols, args.number_of_angles) <= 0:
+                raise ValueError
+            if args.execution_mode == MODE_ROBOT and (not args.robot_ip or args.robot_port <= 0):
                 raise ValueError
         except Exception:
             messagebox.showerror("Check setup", "Use positive numeric values for fabric size, square size, and scan counts.")
             return
+        if preview_after_id["id"] is not None:
+            root.after_cancel(preview_after_id["id"])
+            preview_after_id["id"] = None
         result["args"] = args
         root.destroy()
 
     def cancel() -> None:
+        if preview_after_id["id"] is not None:
+            root.after_cancel(preview_after_id["id"])
+            preview_after_id["id"] = None
         result["args"] = None
         root.destroy()
 
-    buttons = ttk.Frame(shell, padding=(16, 10))
-    buttons.pack(fill="x", side="bottom")
     ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(8, 0))
-    ttk.Button(buttons, text="Next", command=start).pack(side="right")
     root.protocol("WM_DELETE_WINDOW", cancel)
     draw_preview()
     root.mainloop()
@@ -756,33 +1021,114 @@ def run_setup_gui(args: argparse.Namespace):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MuJoCo UR5e fabric-grid scanner with executed path trail")
+    parser.add_argument("--execution-mode", choices=[MODE_SIMULATION, MODE_ROBOT], default=MODE_SIMULATION, help="Run MuJoCo simulation or execute on the real UR5 robot")
     parser.add_argument("--rows", type=int, default=4, help="Number of fabric swatch rows")
     parser.add_argument("--cols", type=int, default=5, help="Number of fabric swatch columns")
-    parser.add_argument("--samples-x", type=int, default=2, help="Scan locations per square along X")
-    parser.add_argument("--samples-y", type=int, default=2, help="Scan locations per square along Y")
+    parser.add_argument("--number-of-angles", type=int, default=6, help="Scanner angles around each square center; step is 360 / N degrees")
     parser.add_argument("--width", type=float, default=0.34, help="Fabric width in local metres")
     parser.add_argument("--length", type=float, default=0.24, help="Fabric length in local metres")
     parser.add_argument("--edge-margin", type=float, default=0.004, help="Outer fabric margin before sampling")
     parser.add_argument("--square-margin", type=float, default=0.006, help="Margin inside each colored square")
     parser.add_argument("--surface-wave", type=float, default=0.003, help="Small Z wave to mimic fabric")
-    parser.add_argument("--view-radius", type=float, default=0.018, help="XY offset for angled views")
+    parser.add_argument("--view-radius", type=float, default=0.018, help="Tilt strength for angled views; scanner XY position stays fixed at the square center")
     parser.add_argument("--angle-lift", type=float, default=0.014, help="Z lift for angled views")
     parser.add_argument("--approach-lift", type=float, default=0.040, help="Lift for approach/retreat points")
     parser.add_argument("--center", nargs=3, type=float, default=DEFAULT_CENTER.tolist(), metavar=("X", "Y", "Z"))
     parser.add_argument("--max-span", nargs=3, type=float, default=DEFAULT_MAX_SPAN.tolist(), metavar=("X", "Y", "Z"))
     parser.add_argument("--speed", type=float, default=0.35, help="Viewer animation speed multiplier")
-    parser.add_argument("--dwell", type=float, default=0.03, help="Pause at each scan view in seconds")
+    parser.add_argument("--dwell", type=float, default=0.20, help="Pause at each scan view before capturing/advancing, in seconds")
     parser.add_argument("--no-setup-gui", action="store_true", help="Skip the setup window and use CLI/default values")
     parser.add_argument("--no-run-gui", action="store_true", help="Skip the live speed/camera control window")
     parser.add_argument("--add-camera", action="store_true", help="Show a camera marker mounted at the grabber/TCP")
     parser.add_argument("--save-images", action="store_true", help="Save simulated scanner camera images")
     parser.add_argument("--image-dir", default="scanner_images", help="Directory for saved camera images")
-    parser.add_argument("--image-every", choices=[CAMERA_SAVE_EVERY_STATION, CAMERA_SAVE_EVERY_VIEW], default=CAMERA_SAVE_EVERY_STATION, help="Save one image per station or every view")
+    parser.add_argument("--image-every", choices=[CAMERA_SAVE_EVERY_STATION, CAMERA_SAVE_EVERY_VIEW], default=CAMERA_SAVE_EVERY_VIEW, help="Save one image per station or every angle view")
+    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="Real UR5 robot IP address for URScript mode")
+    parser.add_argument("--robot-port", type=int, default=DEFAULT_ROBOT_PORT, help="Real UR5 primary interface port for URScript mode")
+    parser.add_argument("--robot-vel", type=float, default=0.015, help="Real robot Cartesian velocity for moveL (m/s)")
+    parser.add_argument("--robot-acc", type=float, default=0.08, help="Real robot Cartesian acceleration for moveL (m/s^2)")
+    parser.add_argument("--robot-dwell", type=float, default=0.20, help="Real robot dwell time at each scan pose (s)")
+    parser.add_argument("--allow-unsafe-real", action="store_true", help="Allow real robot execution even if the path safety check reports issues")
     parser.add_argument("--export-script", action="store_true", help="Also export a URScript path")
     parser.add_argument("--save-points", action="store_true", help="Save mapped scan points as CSV")
     parser.add_argument("--output", default="mujoco_fabric_scanner.script", help="URScript output filename")
     parser.add_argument("--csv-output", default="mujoco_fabric_scanner_points.csv", help="CSV output filename")
     return parser.parse_args()
+
+
+def confirm_simulation_capture_options(args: argparse.Namespace, plan: FabricPlan) -> bool:
+    import tkinter as tk
+    from tkinter import ttk
+
+    scan_view_count = sum(1 for name in plan.view_names if is_scan_view(name))
+    station_count = len(plan.mapped_stations)
+    expected_images = scan_view_count if args.image_every == CAMERA_SAVE_EVERY_VIEW else station_count
+
+    root = tk.Tk()
+    root.title("Confirm Scanner Capture")
+    root.geometry("520x360")
+    root.resizable(False, False)
+
+    add_camera = tk.BooleanVar(value=bool(args.add_camera))
+    save_images = tk.BooleanVar(value=bool(args.save_images))
+    image_every = tk.StringVar(value=args.image_every)
+    result = {"start": False}
+    summary = tk.StringVar()
+
+    frame = ttk.Frame(root, padding=18)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="Before Starting Simulation", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    ttk.Label(
+        frame,
+        text=(
+            "Choose the scanner camera workflow before the robot path starts. "
+            "Angle images are captured at the same scan views used by the path."
+        ),
+        wraplength=470,
+        foreground="#4b5563",
+    ).pack(anchor="w", pady=(6, 14))
+    ttk.Checkbutton(frame, text="Show camera on grabber", variable=add_camera).pack(anchor="w", pady=4)
+    ttk.Checkbutton(frame, text="Save scanner images", variable=save_images).pack(anchor="w", pady=4)
+    ttk.Label(frame, text="Save images").pack(anchor="w", pady=(12, 2))
+    mode = ttk.Combobox(frame, state="readonly", values=("Every angle view", "One per station"), width=22)
+    mode.pack(anchor="w")
+    mode.set("Every angle view" if args.image_every == CAMERA_SAVE_EVERY_VIEW else "One per station")
+
+    def sync_mode(_event=None) -> None:
+        image_every.set(CAMERA_SAVE_EVERY_VIEW if mode.get().startswith("Every") else CAMERA_SAVE_EVERY_STATION)
+        image_count = scan_view_count if image_every.get() == CAMERA_SAVE_EVERY_VIEW else station_count
+        enabled_text = "will be saved" if save_images.get() else "will not be saved"
+        summary.set(
+            f"Stations: {station_count} | Angles/station: {args.number_of_angles} | "
+            f"Expected images: {image_count if save_images.get() else 0} ({enabled_text})\n"
+            f"Output folder: {Path(args.image_dir).resolve()}"
+        )
+
+    mode.bind("<<ComboboxSelected>>", sync_mode)
+    add_camera.trace_add("write", lambda *_: sync_mode())
+    save_images.trace_add("write", lambda *_: sync_mode())
+    ttk.Label(frame, textvariable=summary, wraplength=470, foreground="#355c7d").pack(anchor="w", pady=(14, 12))
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill="x", side="bottom")
+
+    def start() -> None:
+        args.add_camera = bool(add_camera.get())
+        args.save_images = bool(save_images.get())
+        args.image_every = image_every.get()
+        result["start"] = True
+        root.destroy()
+
+    def cancel() -> None:
+        result["start"] = False
+        root.destroy()
+
+    ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(8, 0))
+    ttk.Button(buttons, text="Start Path", command=start).pack(side="right")
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    sync_mode()
+    root.mainloop()
+    return bool(result["start"])
 
 
 def main() -> None:
@@ -795,6 +1141,11 @@ def main() -> None:
     project_dir = Path(__file__).resolve().parent
     args.image_dir = str((project_dir / args.image_dir).resolve())
     plan = build_plan(args)
+    if args.execution_mode in {MODE_SIMULATION, MODE_ROBOT}:
+        original_pose_count = len(plan.poses)
+        plan = densify_plan_for_robot(plan)
+        if len(plan.poses) != original_pose_count:
+            print(f"[path] densified path: {original_pose_count} -> {len(plan.poses)} poses")
 
     print("=" * 64)
     print("  UR5e MuJoCo Fabric Scanner")
@@ -803,7 +1154,9 @@ def main() -> None:
     print(f"fabric size: {args.width:.3f} x {args.length:.3f} m")
     print(f"square size: {plan.square_width:.3f} x {plan.square_length:.3f} m")
     print(f"scan stations: {len(plan.mapped_stations)}")
+    print(f"angles per station: {args.number_of_angles} ({360.0 / max(1, args.number_of_angles):.1f} deg step)")
     print(f"scan views: {len(plan.mapped_points)}")
+    print(f"mode: {args.execution_mode}")
     if args.add_camera:
         print(f"camera: enabled | save images: {args.save_images} | output: {args.image_dir}")
 
@@ -811,6 +1164,9 @@ def main() -> None:
     print(f"safety: {'PASS' if safe else 'CHECK'}")
     for issue in issues:
         print(f"  - {issue}")
+    if args.execution_mode == MODE_ROBOT and not safe and not args.allow_unsafe_real:
+        print("[robot] refusing to run on real robot because the safety check failed")
+        return
 
     if args.save_points:
         csv_path = project_dir / args.csv_output
@@ -832,9 +1188,34 @@ def main() -> None:
         script_path.write_text(script + "\n", encoding="utf-8")
         print(f"urscript: {script_path}")
 
-    run_simulation(plan, args)
+    if args.execution_mode == MODE_SIMULATION:
+        if not args.no_setup_gui:
+            if not confirm_simulation_capture_options(args, plan):
+                print("[mujoco] canceled before starting simulation path")
+                return
+            image_scope = "every angle view" if args.image_every == CAMERA_SAVE_EVERY_VIEW else "one per station"
+            print(f"camera: {'enabled' if args.add_camera else 'hidden'} | save images: {args.save_images} ({image_scope}) | output: {args.image_dir}")
+        try:
+            run_simulation(plan, args)
+        except ModuleNotFoundError as exc:
+            if exc.name == "mujoco":
+                show_missing_mujoco_help(project_dir)
+                return
+            raise
+    else:
+        if not args.no_setup_gui:
+            import tkinter.messagebox as messagebox
+
+            ok = messagebox.askyesno(
+                "Run Real UR5 Robot",
+                f"This will connect to {args.robot_ip}:{args.robot_port} and move the real UR5 through {len(plan.poses)} Cartesian poses.\n\n"
+                "Confirm the robot is in Remote Control mode, the workspace is clear, and the emergency stop is reachable.",
+            )
+            if not ok:
+                print("[robot] canceled before connection")
+                return
+        run_robot_motion(plan, args)
 
 
 if __name__ == "__main__":
     main()
-
