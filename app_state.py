@@ -7,9 +7,10 @@ import jax.numpy as jnp
 from PIL import Image
 
 from knitting_core import (
-    CONFIG, PARAM_NAMES, INITIAL_PARAMS, PARAM_INDEX, PARAM_RANGES,
+    CONFIG,
     LOOP_HEIGHT_PARAM_INDICES, compute_knitting_vertices, compute_knitting_faces,
-    save_combined_obj, run_optimization_loop, PROJECT_ROOT
+    geometry_param_index, geometry_param_range, geometry_parameter_names,
+    initial_geometry_params, save_combined_obj, run_optimization_loop, PROJECT_ROOT
 )
 
 # %% STATE CONSTRAINTS ─────────────────────────────────────────────────────────
@@ -56,12 +57,23 @@ DEFAULT_STATE_CONFIG = {
     },
     # ── Geometry & Knitting Parameters ────────────────────────────────────────
     'geometry': {
-        'params': list(INITIAL_PARAMS),
+        'params': initial_geometry_params(),
         'bitmap': np.ones((3, CONFIG['geometry']['bitmap_loops']), dtype=np.float32),
         'bitmap_size': np.array([3, CONFIG['geometry']['bitmap_loops']], dtype=np.int32),
         'samples_per_loop': 5,
         'display_copies': np.array([0, 0], dtype=np.int32),
         'mesh_center': np.zeros(3, dtype=np.float32),
+        'auto_fix_spline_endpoints': True,
+        'spline_point_drag_active': False,
+        'spline_keyboard_edit_active': False,
+        'spline_keyboard_step': 0.025,
+        'fiber_geometry_enabled': False,
+        'fiber_geometry_count': 4,
+        'fiber_geometry_radius_scale': 0.18,
+        'fiber_geometry_lift': 0.0,
+        'fiber_geometry_surface_arc': 0.55,
+        'fiber_geometry_randomness': 0.18,
+        'fiber_geometry_twist': 0.0,
     },
     # ── Viewport, Camera & Interaction ────────────────────────────────────────
     'viewport': {
@@ -214,7 +226,7 @@ class AppState:
         if not verts_list:
             return [], [], []
         x_period = max(float(self.bitmap_size[1]), 1e-6)
-        y_period = max(float(self.bitmap_size[0]) * abs(float(self.params[PARAM_INDEX['dy']])), 1e-6)
+        y_period = max(float(self.bitmap_size[0]) * abs(float(self.params[geometry_param_index('dy')])), 1e-6)
         display_vl, display_fl, display_meta = [], [], []
         for y_tile in range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1):
             for x_tile in range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1):
@@ -225,8 +237,81 @@ class AppState:
                     display_meta.append(part_meta)
         return display_vl, display_fl, display_meta
 
+    def _build_surface_fiber_meshes(self, base_vl):
+        if not self.fiber_geometry_enabled:
+            return list(base_vl), [{'row': row_idx} for row_idx in range(len(base_vl))]
+
+        seg = int(CONFIG['geometry']['segments'])
+        count = max(1, int(round(float(self.fiber_geometry_count))))
+        radius = float(self.params[geometry_param_index('radius')])
+        fiber_radius = max(radius * float(self.fiber_geometry_radius_scale), 1e-5)
+        lift = max(float(self.fiber_geometry_lift), 0.0)
+        surface_arc = float(np.clip(self.fiber_geometry_surface_arc, 0.05, 1.0))
+        randomness = float(np.clip(self.fiber_geometry_randomness, 0.0, 1.0))
+        twist = float(self.fiber_geometry_twist)
+
+        out_vl = []
+        meta = []
+
+        for row_idx, (verts, n_points) in enumerate(base_vl):
+            verts = np.asarray(verts, dtype=np.float32)
+            n_points = int(n_points)
+            if n_points < 2 or len(verts) != n_points * seg:
+                continue
+
+            rings = verts.reshape(n_points, seg, 3)
+            centers = rings.mean(axis=1)
+            top_idx = int(np.argmax((rings - centers[:, None, :])[:, :, 2].mean(axis=0)))
+            offsets = (
+                np.zeros(1, dtype=np.float32)
+                if count == 1
+                else np.linspace(-0.5, 0.5, count, dtype=np.float32) * surface_arc * float(seg)
+            )
+
+            for fiber_idx, offset in enumerate(offsets):
+                rng = np.random.default_rng(row_idx * 1009 + fiber_idx * 9173)
+                phase_jitter = rng.normal(0.0, 0.35 * randomness)
+                lift_jitter = rng.normal(0.0, 0.20 * randomness)
+                radius_jitter = float(np.clip(1.0 + rng.normal(0.0, 0.18 * randomness), 0.55, 1.45))
+                local_radius = max(fiber_radius * radius_jitter, 1e-5)
+                sample_idx = np.mod(
+                    top_idx + offset + phase_jitter + twist * np.linspace(0.0, 1.0, n_points, dtype=np.float32) * seg,
+                    float(seg),
+                )
+                lo_float = np.floor(sample_idx)
+                lo = lo_float.astype(np.int32) % seg
+                hi = (lo + 1) % seg
+                frac = (sample_idx - lo_float).astype(np.float32)
+                surface = rings[np.arange(n_points), lo] * (1.0 - frac[:, None]) + rings[np.arange(n_points), hi] * frac[:, None]
+                radial = surface - centers
+                surface_radius = np.linalg.norm(radial, axis=1, keepdims=True)
+                radial /= surface_radius + 1e-8
+                center_radius = np.maximum(surface_radius - local_radius + local_radius * (lift + lift_jitter), local_radius)
+                line = centers + radial * center_radius
+
+                tangent = np.gradient(line, axis=0)
+                tangent /= np.linalg.norm(tangent, axis=1, keepdims=True) + 1e-8
+                side = np.cross(tangent, radial)
+                bad = np.linalg.norm(side, axis=1) < 1e-6
+                if np.any(bad):
+                    side[bad] = np.cross(tangent[bad], [1.0, 0.0, 0.0])
+                side /= np.linalg.norm(side, axis=1, keepdims=True) + 1e-8
+                normal = np.cross(side, tangent)
+                normal /= np.linalg.norm(normal, axis=1, keepdims=True) + 1e-8
+
+                angles = np.linspace(0.0, 2.0 * np.pi, seg, endpoint=False, dtype=np.float32)
+                offsets_ring = (
+                    normal[:, None, :] * np.cos(angles)[None, :, None]
+                    + side[:, None, :] * np.sin(angles)[None, :, None]
+                ) * local_radius
+                out_vl.append(((line[:, None, :] + offsets_ring).reshape(-1, 3).astype(np.float32), n_points))
+                meta.append({'row': row_idx})
+
+        return out_vl, meta
+
     def prepare_display_meshes(self, vl, fl):
-        meta = [{'row': row_idx} for row_idx in range(len(vl))]
+        vl, meta = self._build_surface_fiber_meshes(vl)
+        fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
         return self.build_display_meshes_precise(vl, fl, meta)
 
     def active_colors(self):
@@ -241,6 +326,8 @@ class AppState:
         self._recompute_center(display_vl)
 
     def rebuild_spline_mesh(self):
+        if self.auto_fix_spline_endpoints:
+            self.spline.fix_endpoints(self.params)
         vl = self.spline.build_mesh(self.params)
         fl = compute_knitting_faces(CONFIG['geometry']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
@@ -351,12 +438,15 @@ class AppState:
         return None
 
     def fit_loop_heights_to_rows(self):
-        dy = float(self.params[PARAM_INDEX['dy']])
+        dy = float(self.params[geometry_param_index('dy')])
         for span in range(1, self.bitmap_size[0] + 1):
             name = f"loop_height_{span}"
-            if name in PARAM_INDEX:
-                idx = PARAM_INDEX[name]
-                lo, hi = PARAM_RANGES[idx]
+            try:
+                idx = geometry_param_index(name)
+            except KeyError:
+                continue
+            else:
+                lo, hi = geometry_param_range(idx)
                 self.params[idx] = float(np.clip(span * dy, lo, hi))
         self.on_bitmap_change()
 
@@ -365,7 +455,7 @@ class AppState:
     def save_params(self, path, silent=False):
         params_to_save = {
             name: float(self.params[i])
-            for i, name in enumerate(PARAM_NAMES)
+            for i, name in enumerate(geometry_parameter_names())
             if (span := self.loop_height_span(name)) is None or span <= self.bitmap_size[0]
         }
         gui_state = {k: json_ready(self._data[k]) for k in SAVED_STATE_KEYS if k in self._data}
@@ -403,9 +493,9 @@ class AppState:
             with open(path, 'r') as f:
                 data = json.load(f)
             p_dict = data.get('params', {})
-            for i, name in enumerate(PARAM_NAMES):
+            for i, name in enumerate(geometry_parameter_names()):
                 if name in p_dict:
-                    lo, hi = PARAM_RANGES[i]
+                    lo, hi = geometry_param_range(i)
                     self.params[i] = float(np.clip(p_dict[name], lo, hi))
 
             if 'bitmap' in data:

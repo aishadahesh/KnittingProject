@@ -11,8 +11,8 @@
   "geometry": {
     "bitmap_rows": 5,
     "bitmap_loops": 5,
-    "loop_res": 16,
-    "segments": 16,
+    "loop_res": 32,
+    "segments": 32,
     "parameters": [
       {
         "name": "stitch_bulge",
@@ -55,6 +55,7 @@
   "rendering": {
     "mitsuba_variant": "cuda_ad_rgb",
     "mitsuba_variant_fallback": "llvm_ad_rgb",
+    "mitsuba_variant_fallback2": "scalar_rgb",
     "output_dir": "opt_outputs",
     "camera_dist_mult": 1.1,
     "camera_fov": 40.0,

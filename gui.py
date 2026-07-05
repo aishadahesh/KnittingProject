@@ -8,7 +8,7 @@ from imgui_bundle import imgui, imguizmo
 from rendering import draw_fitted_texture, transform_points
 from app_state import WORKFLOW_STAGES, TEXTURE_CONTROL_GROUPS, TEXTURE_PRESET_BUTTONS
 from knitting_core import (
-    PARAM_NAMES, PARAM_RANGES, PARAM_INDEX, CONFIG
+    CONFIG, geometry_param_index, geometry_param_range, geometry_parameter_names
 )
 
 # %% FILE PICKER HELPERS ───────────────────────────────────────────────────────
@@ -122,6 +122,42 @@ def draw_sidebar(state, renderer):
             state.rebuild_spline_mesh()
         else:
             state.rebuild_param_mesh()
+
+    def draw_surface_fiber_controls(context_label="Surface fibers"):
+        changed_enabled, enabled = imgui.checkbox(
+            "Use multi-fiber rows##fiber_geometry_enabled",
+            state.fiber_geometry_enabled,
+        )
+        fibers_changed = False
+        if changed_enabled:
+            state.push_undo(context_label)
+            state.fiber_geometry_enabled = enabled
+            fibers_changed = True
+
+        if not state.fiber_geometry_enabled:
+            imgui.text_disabled("Enable this to replace each row tube with separate fiber tubes.")
+        else:
+            controls = (
+                ('fiber_geometry_count', 'Fibers per row', 1, 12, 'int'),
+                ('fiber_geometry_radius_scale', 'Fiber radius scale', 0.04, 0.45, 'float'),
+                ('fiber_geometry_lift', 'Lift above surface', 0.0, 1.0, 'float'),
+                ('fiber_geometry_surface_arc', 'Surface spread', 0.05, 1.0, 'float'),
+                ('fiber_geometry_randomness', 'Randomness', 0.0, 1.0, 'float'),
+                ('fiber_geometry_twist', 'Fiber twist', -3.0, 3.0, 'float'),
+            )
+            for key, label, lo, hi, kind in controls:
+                if kind == 'int':
+                    changed, new_val = imgui.slider_int(f"{label}##{key}", int(state[key]), int(lo), int(hi))
+                else:
+                    changed, new_val = imgui.slider_float(f"{label}##{key}", float(state[key]), float(lo), float(hi), "%.2f")
+                if imgui.is_item_activated():
+                    state.push_undo(label)
+                if changed:
+                    state[key] = int(new_val) if kind == 'int' else float(new_val)
+                    fibers_changed = True
+
+        if fibers_changed:
+            rebuild_current_mesh()
 
     # Copies configuration (vectorized display_copies)
     changed_x, new_copies_x = imgui.slider_int("Copies X", int(state.display_copies[0]), 0, 5)
@@ -315,13 +351,57 @@ def draw_sidebar(state, renderer):
             state.on_bitmap_change()
 
     elif stage == 2:
-        imgui.text("Geometry Parameters")
+        imgui.text("Yarn Radius")
+        imgui.text_wrapped("Set the main yarn tube size before adding separate surface fibers.")
         params_changed = False
-        for i, name in enumerate(PARAM_NAMES):
+        for name, label in (('radius', 'Tube radius'), ('ellipse_ratio', 'Oval width ratio')):
+            idx = geometry_param_index(name)
+            lo, hi = geometry_param_range(idx)
+            changed, new_val = imgui.slider_float(f"{label}##{name}", state.params[idx], lo, hi, "%.4f")
+            if imgui.is_item_activated():
+                state.push_undo(label)
+            if changed:
+                state.params[idx] = new_val
+                params_changed = True
+        if params_changed:
+            rebuild_current_mesh()
+
+    elif stage == 3:
+        imgui.text("Surface Fibers")
+        draw_surface_fiber_controls("Surface fibers")
+
+    elif stage == 4:
+        imgui.text("Geometry Parameters")
+        quality_changed = False
+        changed_loop_res, new_loop_res = imgui.slider_int(
+            "Path smoothness##mesh_loop_res",
+            int(CONFIG['geometry']['loop_res']),
+            8,
+            96,
+        )
+        if changed_loop_res:
+            CONFIG['geometry']['loop_res'] = int(new_loop_res)
+            quality_changed = True
+        changed_segments, new_segments = imgui.slider_int(
+            "Fiber roundness##mesh_segments",
+            int(CONFIG['geometry']['segments']),
+            8,
+            64,
+        )
+        if changed_segments:
+            CONFIG['geometry']['segments'] = int(new_segments)
+            quality_changed = True
+        if quality_changed:
+            rebuild_current_mesh()
+
+        params_changed = False
+        for i, name in enumerate(geometry_parameter_names()):
+            if name in ('radius', 'ellipse_ratio'):
+                continue
             span = state.loop_height_span(name)
             if span is not None and span > state.bitmap_size[0]:
                 continue
-            lo, hi = PARAM_RANGES[i]
+            lo, hi = geometry_param_range(i)
             changed, new_val = imgui.slider_float(f"##p{i}", state.params[i], lo, hi, format=f"{name}: %.3f")
             if imgui.is_item_activated():
                 state.push_undo(name)
@@ -335,7 +415,7 @@ def draw_sidebar(state, renderer):
         if params_changed:
             rebuild_current_mesh()
 
-    elif stage == 3:
+    elif stage == 5:
         imgui.text("Material")
         _, state.model_alpha = imgui.slider_float("Opacity##mdl", state.model_alpha, 0.0, 1.0, "%.2f")
         changed_mode, use_row_colors = imgui.checkbox("Control colors per row##rowcolors", state.use_row_colors)
@@ -363,7 +443,7 @@ def draw_sidebar(state, renderer):
             if colors_changed:
                 rebuild_current_mesh()
 
-    elif stage == 4:
+    elif stage == 6:
         imgui.text("Texture")
         imgui.text_wrapped("Tune procedural yarn texture in the live viewport.")
         changed_tex, new_tex = imgui.color_edit3(
@@ -410,7 +490,7 @@ def draw_sidebar(state, renderer):
             if imgui.small_button(f"{preset['label']}##texture"):
                 state.apply_texture_preset(preset['preset'])
 
-    elif stage == 5:
+    elif stage == 7:
         imgui.text("Lighting")
         imgui.text_wrapped("Lighting changes are shown immediately in the viewport and used by the final render.")
         changed_light, new_light = imgui.color_edit3(
@@ -441,7 +521,7 @@ def draw_sidebar(state, renderer):
             state.render_light_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
             state.render_light_intensity = 0.9
 
-    elif stage == 6:
+    elif stage == 8:
         imgui.text("Spline Refinement")
         imgui.text("Mode")
         imgui.same_line()
@@ -464,17 +544,35 @@ def draw_sidebar(state, renderer):
             if state.mode == 'spline':
                 state.spline.init_from_params(state.params)
                 state.rebuild_spline_mesh()
+        changed_fix, new_fix = imgui.checkbox("Auto-fix endpoints for copies##spline_endpoint_fix", state.auto_fix_spline_endpoints)
+        if changed_fix:
+            state.push_undo("Spline endpoint fix")
+            state.auto_fix_spline_endpoints = new_fix
+            if state.mode == 'spline':
+                state.rebuild_spline_mesh()
         if state.mode == 'spline':
             imgui.text(f"Points: {len(state.spline.flat_pts)}")
             if state.hover_idx >= 0:
                 imgui.text(f"Hover: {state.hover_idx}")
             if state.selected_idx >= 0:
                 imgui.text(f"Selected: {state.selected_idx}")
-            imgui.text_wrapped("Select a white point in the viewport, then drag the gizmo arrows to refine it.")
+            changed_step, new_step = imgui.slider_float(
+                "Keyboard step##spline_keyboard_step",
+                float(state.spline_keyboard_step),
+                0.001,
+                0.2,
+                "%.3f",
+            )
+            if changed_step:
+                state.spline_keyboard_step = float(new_step)
+            imgui.text_wrapped("Select a white point, then drag it in the viewport or use the gizmo arrows.")
+            imgui.separator()
+            imgui.text("Fibers Follow Spline")
+            draw_surface_fiber_controls("Spline fibers")
         else:
             imgui.text_wrapped("Switch to Spline mode when the parameter model is already close.")
 
-    elif stage == 7:
+    elif stage == 9:
         imgui.text("Review and Render")
         _, state.mi_cam_dist_mult = imgui.slider_float("Render dist mult##mi", state.mi_cam_dist_mult, 0.3, 3.0, "%.2f")
         _, state.mi_cam_fov = imgui.slider_float("Render FoV##mi", state.mi_cam_fov, 10.0, 120.0, "%.1f")
@@ -670,8 +768,33 @@ def draw_viewport(state, renderer, ref_tex, window):
             rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
             mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE)== glfw.PRESS
             shift_down = imgui.get_io().key_shift
+            alt_down = imgui.get_io().key_alt
+            can_transform_model = False
+            direct_spline_drag = (
+                state.mode == 'spline'
+                and state.selected_idx >= 0
+                and lmb
+                and not shift_down
+                and not alt_down
+                and (state.spline_point_drag_active or state.hover_idx == state.selected_idx)
+            )
 
-            if shift_down and state.mode == 'spline' and state.selected_idx >= 0 and (
+            if direct_spline_drag:
+                if not state.spline_point_drag_active:
+                    state.push_undo("Spline point")
+                    state.spline_point_drag_active = True
+                view = state.camera.view()
+                right = view[0, :3]
+                up = view[1, :3]
+                drag_speed = state.camera.dist * 0.00045 / max(float(state.model_scale), 1e-6)
+                world_delta = (right * dx - up * dy) * drag_speed
+                local_delta = np.linalg.inv(model_mat)[:3, :3] @ world_delta
+                old_local = state.spline.flat_pts[state.selected_idx]
+                new_local = old_local + local_delta.astype(np.float32)
+                if np.linalg.norm(new_local - old_local) > 1e-6:
+                    state.spline.move(state.selected_idx, new_local)
+                    state.rebuild_spline_mesh()
+            elif shift_down and state.mode == 'spline' and state.selected_idx >= 0 and (
                     imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()):
                 can_transform_model = False
             elif shift_down and state.mode == 'spline' and state.hover_idx >= 0:
@@ -696,9 +819,55 @@ def draw_viewport(state, renderer, ref_tex, window):
                 elif mmb:
                     scale_factor = float(np.exp(-dy * 0.01))
                     state.model_scale = float(np.clip(float(state.model_scale) * scale_factor, 0.05, 20.0))
-            elif (lmb or mmb or rmb) and not shift_down:
+            elif (
+                (lmb or mmb or rmb)
+                and not shift_down
+                and not (state.mode == 'spline' and state.selected_idx >= 0)
+            ):
                 state.viewport_pan[0] += dx
                 state.viewport_pan[1] += dy
+
+            if not lmb:
+                state.spline_point_drag_active = False
+
+        if state.mode == 'spline' and state.selected_idx >= 0 and len(state.spline.flat_pts) > 0:
+            view = state.camera.view()
+            right = view[0, :3]
+            up = view[1, :3]
+            forward = -view[2, :3]
+            step = float(state.spline_keyboard_step)
+            if (
+                glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
+                or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+            ):
+                step *= 0.2
+
+            world_delta = np.zeros(3, dtype=np.float32)
+            if glfw.get_key(window, glfw.KEY_LEFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
+                world_delta -= right * step
+            if glfw.get_key(window, glfw.KEY_RIGHT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
+                world_delta += right * step
+            if glfw.get_key(window, glfw.KEY_UP) == glfw.PRESS or glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
+                world_delta += up * step
+            if glfw.get_key(window, glfw.KEY_DOWN) == glfw.PRESS or glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
+                world_delta -= up * step
+            if glfw.get_key(window, glfw.KEY_PAGE_UP) == glfw.PRESS or glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+                world_delta += forward * step
+            if glfw.get_key(window, glfw.KEY_PAGE_DOWN) == glfw.PRESS or glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
+                world_delta -= forward * step
+
+            if np.linalg.norm(world_delta) > 0.0:
+                if not state.spline_keyboard_edit_active:
+                    state.push_undo("Spline point")
+                    state.spline_keyboard_edit_active = True
+                local_delta = np.linalg.inv(model_mat)[:3, :3] @ world_delta
+                state.spline.move(
+                    state.selected_idx,
+                    state.spline.flat_pts[state.selected_idx] + local_delta.astype(np.float32),
+                )
+                state.rebuild_spline_mesh()
+            else:
+                state.spline_keyboard_edit_active = False
 
         if (
             not alignment_locked

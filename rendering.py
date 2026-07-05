@@ -10,16 +10,19 @@ MESH_VERT = """
 #version 330
 in vec3 in_pos;
 in vec3 in_norm;
+in vec2 in_uv;
 uniform mat4 mvp;
 uniform mat4 mv;
 out vec3 v_norm;
 out vec3 v_pos;
 out vec3 v_obj_norm;
+out vec2 v_uv;
 void main() {
     gl_Position = mvp * vec4(in_pos, 1.0);
     v_norm = normalize(mat3(mv) * in_norm);
     v_pos = in_pos;
     v_obj_norm = normalize(in_norm);
+    v_uv = in_uv;
 }
 """
 
@@ -28,6 +31,7 @@ MESH_FRAG = """
 in  vec3 v_norm;
 in  vec3 v_pos;
 in  vec3 v_obj_norm;
+in  vec2 v_uv;
 uniform vec3  color;
 uniform vec3  texture_tint;
 uniform float texture_ridge_strength;
@@ -48,6 +52,18 @@ uniform float texture_color_band_scale;
 uniform float texture_color_band_shift;
 uniform float texture_saturation;
 uniform float texture_contrast;
+uniform float texture_uv_blend;
+uniform float texture_fiber_rows;
+uniform float texture_fiber_row_width;
+uniform float texture_fiber_row_depth;
+uniform float texture_fiber_layer_count;
+uniform float texture_fiber_phase_jitter;
+uniform float texture_fibers_per_row;
+uniform float texture_sub_fiber_width;
+uniform float texture_sub_fiber_depth;
+uniform float texture_micro_fiber_strength;
+uniform float texture_micro_fiber_scale;
+uniform float texture_twist;
 uniform vec3  light_color;
 uniform float light_intensity;
 uniform float model_alpha;
@@ -73,7 +89,12 @@ vec3 apply_saturation(vec3 c, float saturation) {
 void main() {
     vec3  L    = normalize(vec3(0.5, 1.0, 0.8));
     float diff = clamp(dot(normalize(v_norm), L), 0.0, 1.0);
-    vec2 p = vec2(v_pos.x * texture_scale_x, v_pos.y * texture_scale_y);
+    vec2 uv_p = vec2(
+        (v_uv.x + texture_twist * (v_uv.y - 0.5)) * texture_scale_x,
+        v_uv.y * texture_scale_y
+    );
+    vec2 pos_p = vec2(v_pos.x * texture_scale_x, v_pos.y * texture_scale_y);
+    vec2 p = mix(pos_p, uv_p, texture_uv_blend);
     float ca = cos(texture_chevron_angle);
     float sa = sin(texture_chevron_angle);
     float diag_a = p.x * ca + p.y * sa;
@@ -85,6 +106,7 @@ void main() {
     float ridge = mix(1.0, 0.72 + 0.42 * pow(0.5 + 0.5 * row_wave, 2.0), texture_ridge_strength);
     float fiber_shape = pow(abs(cross_wave), max(texture_fiber_sharpness, 0.25)) * sign(cross_wave);
     float fiber = mix(1.0, 0.86 + 0.26 * fiber_shape, texture_fiber_strength);
+    fiber *= mix(1.0, 0.86 + 0.22 * sin(fiber_axis * texture_micro_fiber_scale + v_uv.y * 18.0), texture_micro_fiber_strength);
     float noise = mix(1.0, 0.82 + 0.36 * hash31(floor(v_pos * 18.0 + v_obj_norm * 9.0)), texture_noise_strength);
     float groove = 1.0 - texture_groove_darkness * pow(1.0 - abs(row_wave), 2.0);
     float center = 1.0 - texture_center_shadow * pow(1.0 - abs(sin(p.x * texture_ridge_scale)), 4.0);
@@ -205,6 +227,24 @@ def compute_normals(verts, tris):
     np.add.at(n, tris[:,1], fn)
     np.add.at(n, tris[:,2], fn)
     return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
+
+
+def compute_tube_uvs(verts, n_points):
+    """Create UVs for tube meshes: U follows the curve, V wraps the yarn cross-section."""
+    verts = np.asarray(verts, dtype=np.float32)
+    n_points = int(max(n_points, 1))
+    if len(verts) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    ring_count = max(len(verts) // n_points, 1)
+    u = np.repeat(
+        np.linspace(0.0, 1.0, n_points, dtype=np.float32),
+        ring_count,
+    )[:len(verts)]
+    v = np.tile(
+        np.linspace(0.0, 1.0, ring_count, endpoint=False, dtype=np.float32),
+        n_points,
+    )[:len(verts)]
+    return np.column_stack((u, v)).astype(np.float32)
 
 def rotation_matrix_xyz(rx, ry, rz):
     """4×4 rotation matrix from XYZ Euler angles (radians), applied as Rz @ Ry @ Rx."""
@@ -367,7 +407,7 @@ class MeshRenderer:
             vao.release()
         self.meshes.clear()
         self.mesh_pick_data.clear()
-        for i, ((verts, _), faces) in enumerate(zip(verts_list, faces_list)):
+        for i, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
             v  = np.array(verts, dtype=np.float32)
             f  = np.array(faces, dtype=np.int32)
             # quads → triangles
@@ -375,9 +415,11 @@ class MeshRenderer:
             tris[0::2] = f[:, [0, 1, 2]]
             tris[1::2] = f[:, [0, 2, 3]]
             nm = compute_normals(v, tris).astype(np.float32)
+            uv = compute_tube_uvs(v, n_points)
             vao = self.ctx.vertex_array(self.prog, [
                 (self.ctx.buffer(v.tobytes()),  '3f', 'in_pos'),
                 (self.ctx.buffer(nm.tobytes()), '3f', 'in_norm'),
+                (self.ctx.buffer(uv.tobytes()), '2f', 'in_uv'),
             ], self.ctx.buffer(tris.astype(np.int32).tobytes()))
             if meta is not None:
                 row_idx = meta[i].get('row', i)

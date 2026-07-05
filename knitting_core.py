@@ -1,4 +1,4 @@
-# %% IMPORTS
+# %% IMPORTS AND RUNTIME SETUP
 import os
 import sys
 import glob
@@ -31,7 +31,7 @@ from functools import partial
 from scipy.interpolate import CubicSpline
 
 
-# %% CONFIGURATION LOADING
+# %% CONFIGS
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -50,6 +50,28 @@ def load_config(config_path="config.json"):
 
 CONFIG = load_config()
 REFERENCE_IMAGE_PATH = resolve_project_path(CONFIG['ui']['reference_image'])
+
+
+# Set Mitsuba variant from configuration.
+if not mi.variant():
+    for _variant_key in ('mitsuba_variant', 'mitsuba_variant_fallback', 'mitsuba_variant_fallback2'):
+        _variant = CONFIG['rendering'].get(_variant_key)
+        if not _variant:
+            continue
+        try:
+            mi.set_variant(_variant)
+            break
+        except Exception:
+            pass
+
+
+# Initialize output directories.
+OUTPUT_DIR = resolve_project_path(CONFIG['rendering']['output_dir'])
+for sub_dir in ["meshes", "renders"]:
+    os.makedirs(os.path.join(OUTPUT_DIR, sub_dir), exist_ok=True)
+
+
+# %% PARAMETER REGISTRY
 
 def load_geometry_parameters():
     """Loads geometry parameter definitions from the required array-of-structs config."""
@@ -104,23 +126,50 @@ def load_geometry_parameters():
 
     return parameters
 
-GEOMETRY_PARAMETERS = load_geometry_parameters()
-PARAM_NAMES = [param['name'] for param in GEOMETRY_PARAMETERS]
-INITIAL_PARAMS = [param['initial'] for param in GEOMETRY_PARAMETERS]
-PARAM_RANGES = [param['range'] for param in GEOMETRY_PARAMETERS]
-PARAM_DELTAS = [param['delta'] for param in GEOMETRY_PARAMETERS]
-PARAM_INDEX = {name: index for index, name in enumerate(PARAM_NAMES)}
-PARAM_LOWER_BOUNDS = jnp.array([bounds[0] for bounds in PARAM_RANGES])
-PARAM_UPPER_BOUNDS = jnp.array([bounds[1] for bounds in PARAM_RANGES])
-LOOP_HEIGHT_PARAM_NAMES = [
+
+GEOMETRY_PARAMETERS = tuple(load_geometry_parameters())
+
+
+def geometry_parameter_names():
+    """Returns geometry parameter names in vector order."""
+    return tuple(param['name'] for param in GEOMETRY_PARAMETERS)
+
+
+def initial_geometry_params():
+    """Returns a mutable positional vector initialized from config."""
+    return [param['initial'] for param in GEOMETRY_PARAMETERS]
+
+
+def geometry_param_range(index_or_name):
+    """Returns the configured range for a parameter index or name."""
+    if isinstance(index_or_name, str):
+        index_or_name = geometry_param_index(index_or_name)
+    return GEOMETRY_PARAMETERS[int(index_or_name)]['range']
+
+
+def geometry_param_index(name):
+    """Returns the positional vector index for a configured parameter name."""
+    for index, param in enumerate(GEOMETRY_PARAMETERS):
+        if param['name'] == name:
+            return index
+    raise KeyError(f"Unknown geometry parameter: {name}")
+
+
+def geometry_param_bounds_jax():
+    """Returns lower/upper JAX arrays directly from config."""
+    ranges = jnp.array([param['range'] for param in GEOMETRY_PARAMETERS], dtype=jnp.float32)
+    return ranges[:, 0], ranges[:, 1]
+
+LOOP_HEIGHT_PARAM_NAMES = tuple(
     f"loop_height_{scale_factor}"
-    for scale_factor in range(1, CONFIG['geometry']['bitmap_rows'] + 1)
-]
-LOOP_HEIGHT_PARAM_INDICES = tuple(PARAM_INDEX[name] for name in LOOP_HEIGHT_PARAM_NAMES)
+    for scale_factor in range(1, int(CONFIG['geometry']['bitmap_rows']) + 1)
+)
+LOOP_HEIGHT_PARAM_INDICES = tuple(geometry_param_index(name) for name in LOOP_HEIGHT_PARAM_NAMES)
+LOOP_HEIGHT_PARAM_INDEX_ARRAY = jnp.array(LOOP_HEIGHT_PARAM_INDICES, dtype=jnp.int32)
 
 def get_param_value(params, name):
     """Returns a geometry parameter by name from a positional parameter vector."""
-    return params[PARAM_INDEX[name]]
+    return params[geometry_param_index(name)]
 
 def get_loop_height_lookup(params):
     """Builds a lookup table where index == discrete bitmap scale factor."""
@@ -131,9 +180,12 @@ def get_loop_height_lookup(params):
 def get_loop_height_lookup_jax(params):
     """JAX version of the discrete loop height lookup table."""
     return jnp.concatenate(
-        (jnp.array([0.0], dtype=jnp.float32), jnp.take(params, jnp.array(LOOP_HEIGHT_PARAM_INDICES))),
+        (jnp.array([0.0], dtype=jnp.float32), jnp.take(params, LOOP_HEIGHT_PARAM_INDEX_ARRAY)),
         axis=0,
     )
+
+
+# %% DISPLAY FUNCTIONS
 
 def get_display_periods(params, bitmap):
     """Returns the translational display periods for tiled unit-cell previews."""
@@ -152,33 +204,44 @@ def build_display_meshes(verts_list, faces_list, params, bitmap, horizontal_copi
         return verts_list, faces_list, row_indices
 
     x_period, y_period = get_display_periods(params, bitmap)
-    display_verts_list = []
-    display_faces_list = []
-    row_indices = []
+    x_tiles = np.arange(-horizontal_copies, horizontal_copies + 1, dtype=np.float32)
+    y_tiles = np.arange(-vertical_copies, vertical_copies + 1, dtype=np.float32)
+    tile_x, tile_y = np.meshgrid(x_tiles, y_tiles, indexing='xy')
+    translations = np.column_stack((
+        tile_x.ravel() * x_period,
+        tile_y.ravel() * y_period,
+        np.zeros(tile_x.size, dtype=np.float32),
+    )).astype(np.float32)
 
-    for y_tile in range(-vertical_copies, vertical_copies + 1):
-        for x_tile in range(-horizontal_copies, horizontal_copies + 1):
-            translation = np.array([x_tile * x_period, y_tile * y_period, 0.0], dtype=np.float32)
-            for row_index, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
-                display_verts_list.append((np.asarray(verts, dtype=np.float32) + translation, n_points))
-                display_faces_list.append(faces)
-                row_indices.append(row_index)
+    base_vertices = [np.asarray(verts, dtype=np.float32) for verts, _ in verts_list]
+    n_points = [n for _, n in verts_list]
+    translated_groups = [
+        verts[None, :, :] + translations[:, None, :]
+        for verts in base_vertices
+    ]
+    display_verts_list = [
+        (translated_groups[row_index][tile_index], n_points[row_index])
+        for tile_index in range(len(translations))
+        for row_index in range(len(base_vertices))
+    ]
+    display_faces_list = list(faces_list) * len(translations)
+    row_indices = np.tile(np.arange(len(verts_list), dtype=int), len(translations)).tolist()
 
     return display_verts_list, display_faces_list, row_indices
+
+
+# %% EQUATIONS OF MODEL
 
 def compute_bitmap_scale_factors(bitmap):
     """Computes per-stitch vertical span counts directly from the bitmap pattern."""
     bitmap_array = np.asarray(bitmap, dtype=np.float32) > 0.5
     n_rows, n_cols = bitmap_array.shape
-    scale_factors = np.zeros((n_rows, n_cols), dtype=np.float32)
-
-    for col_idx in range(n_cols):
-        active_rows = np.flatnonzero(bitmap_array[:, col_idx])
-        for active_index, row_idx in enumerate(active_rows):
-            next_row = active_rows[active_index + 1] if active_index + 1 < len(active_rows) else n_rows
-            scale_factors[row_idx, col_idx] = float(next_row - row_idx)
-
-    return scale_factors
+    row_indices = np.arange(n_rows, dtype=np.int32)
+    future_active = (row_indices[:, None, None] < row_indices[None, :, None]) & bitmap_array[None, :, :]
+    has_next = np.any(future_active, axis=1)
+    next_row = np.argmax(future_active.astype(np.int32), axis=1)
+    distance = np.where(has_next, next_row - row_indices[:, None], n_rows - row_indices[:, None])
+    return np.where(bitmap_array, distance, 0).astype(np.float32)
 
 def build_parametric_control_rows(params, bitmap, samples_per_loop=5):
     """Builds spline control rows from the same shared parameterization as the mesh path."""
@@ -188,44 +251,52 @@ def build_parametric_control_rows(params, bitmap, samples_per_loop=5):
     loop_height_lookup = get_loop_height_lookup(params)
     scale_factors = compute_bitmap_scale_factors(bitmap)
     n_rows, n_cols = scale_factors.shape
-    base_t_values = np.linspace(0.0, 2.0 * np.pi, samples_per_loop, endpoint=False)
-    rows = []
+    samples_per_loop = max(2, int(samples_per_loop))
 
-    for row_idx in range(n_rows):
-        row_points = []
-        col_indices = range(n_cols) if row_idx % 2 == 0 else range(n_cols - 1, -1, -1)
-        t_values = base_t_values if row_idx % 2 == 0 else base_t_values[::-1]
+    row_indices = np.arange(n_rows, dtype=np.float32)
+    forward_cols = np.arange(n_cols, dtype=np.float32)
+    reverse_cols = forward_cols[::-1]
+    serpentine_cols = np.where(
+        (row_indices[:, None].astype(np.int32) % 2) == 0,
+        forward_cols[None, :],
+        reverse_cols[None, :],
+    )
+    ordered_scales = np.take_along_axis(
+        scale_factors.astype(np.int32),
+        serpentine_cols.astype(np.int32),
+        axis=1,
+    )
 
-        for col_idx in col_indices:
-            loop_scale = int(scale_factors[row_idx, col_idx])
-            has_loop = 1.0 if loop_scale > 0.0 else 0.0
-            loop_height = float(loop_height_lookup[loop_scale])
-            for t in t_values:
-                x = col_idx + (stitch_bulge * np.sin(2.0 * t) if has_loop else 0.0) + t / (2.0 * np.pi)
-                y = row_idx * dy - loop_height * (np.cos(t) - 1.0) / 2.0
-                z = has_loop * stitch_z * (np.cos(2.0 * t) - 1.0) / 2.0
-                row_points.append([x, y, z])
+    base_t = np.linspace(0.0, 2.0 * np.pi, samples_per_loop, endpoint=False, dtype=np.float32)
+    t_values = np.where(
+        (row_indices[:, None].astype(np.int32) % 2) == 0,
+        base_t[None, :],
+        base_t[::-1][None, :],
+    )
 
-        row_points.append([n_cols if row_idx % 2 == 0 else 0.0, row_idx * dy, 0.0])
-        rows.append(np.array(row_points, dtype=float))
+    t_grid = np.broadcast_to(t_values[:, None, :], (n_rows, n_cols, samples_per_loop))
+    has_loop = (ordered_scales[:, :, None] > 0).astype(np.float32)
+    loop_height = loop_height_lookup[ordered_scales][:, :, None]
 
-    return rows
+    x = (
+        serpentine_cols[:, :, None]
+        + np.where(has_loop > 0.0, stitch_bulge * np.sin(2.0 * t_grid), 0.0)
+        + t_grid / (2.0 * np.pi)
+    )
+    y = row_indices[:, None, None] * dy - loop_height * (np.cos(t_grid) - 1.0) / 2.0
+    z = has_loop * stitch_z * (np.cos(2.0 * t_grid) - 1.0) / 2.0
 
-# Set Mitsuba variant from configuration
-if not mi.variant():
-    try:
-        mi.set_variant(CONFIG['rendering']['mitsuba_variant'])
-    except Exception:
-        mi.set_variant(CONFIG['rendering']['mitsuba_variant_fallback'])
+    path_points = np.stack((x, y, z), axis=-1).reshape(n_rows, n_cols * samples_per_loop, 3)
+    endpoints = np.column_stack((
+        np.where((row_indices.astype(np.int32) % 2) == 0, float(n_cols), 0.0),
+        row_indices * dy,
+        np.zeros(n_rows, dtype=np.float32),
+    ))[:, None, :]
+    rows = np.concatenate((path_points, endpoints), axis=1)
+    return [row.astype(float) for row in rows]
 
-# Initialize output directories
-OUTPUT_DIR = resolve_project_path(CONFIG['rendering']['output_dir'])
-for sub_dir in ["meshes", "renders"]:
-    os.makedirs(os.path.join(OUTPUT_DIR, sub_dir), exist_ok=True)
+# %% JAX GEOMETRY ENGINE
 
-# %% GEOMETRY ENGINE (JAX)
-
-@jax.jit
 def eval_curve_batch(t, has_loop, loop_height, stitch_bulge, stitch_z):
     """Vectorized evaluation of the knitting curve geometry."""
     x = stitch_bulge * jnp.sin(2 * t) + t / (2 * jnp.pi)
@@ -234,7 +305,6 @@ def eval_curve_batch(t, has_loop, loop_height, stitch_bulge, stitch_z):
     x = jnp.where(has_loop == 0.0, t / (2 * jnp.pi), x)
     return jnp.stack((jnp.asarray(x), jnp.asarray(y), jnp.asarray(z)), axis=-1)
 
-@jax.jit
 def eval_curve_derivative_batch(t, has_loop, loop_height, stitch_bulge, stitch_z):
     """Vectorized evaluation of the knitting curve derivatives."""
     d_x = 2 * stitch_bulge * jnp.cos(2 * t) + 1 / (2 * jnp.pi)
@@ -243,7 +313,6 @@ def eval_curve_derivative_batch(t, has_loop, loop_height, stitch_bulge, stitch_z
     d_x = jnp.where(has_loop == 0.0, 1 / (2 * jnp.pi), d_x)
     return jnp.stack((jnp.asarray(d_x), jnp.asarray(d_y), jnp.asarray(d_z)), axis=-1)
 
-@jax.jit
 def compute_orthonormal_frame_batch(tangent):
     """Computes orthonormal frames along the curve for tube generation."""
     tangent = tangent / (jnp.linalg.norm(tangent, axis=-1, keepdims=True) + 1e-8)
@@ -259,30 +328,29 @@ def compute_orthonormal_frame_batch(tangent):
     normal_v = jnp.cross(tangent, normal_u)
     return normal_u, normal_v
 
+
+def compute_bitmap_scale_factors_jax(bitmap):
+    """Vectorized JAX equivalent of compute_bitmap_scale_factors."""
+    active = bitmap > 0.5
+    n_rows = active.shape[0]
+    row_indices = jnp.arange(n_rows, dtype=jnp.int32)
+    future_active = (row_indices[:, None, None] < row_indices[None, :, None]) & active[None, :, :]
+    has_next = jnp.any(future_active, axis=1)
+    next_row = jnp.argmax(future_active.astype(jnp.int32), axis=1)
+    distance = jnp.where(has_next, next_row - row_indices[:, None], n_rows - row_indices[:, None])
+    return jnp.where(active, distance, 0).astype(jnp.float32)
+
+
 @partial(jax.jit, static_argnums=(2, 3))
 def compute_knitting_vertices_jit(geometry_params, bitmap, loop_res, segments):
     """JIT-compiled function to generate all mesh vertices for the pattern."""
-    stitch_bulge = geometry_params[PARAM_INDEX['stitch_bulge']]
-    stitch_z = geometry_params[PARAM_INDEX['stitch_z']]
-    dy = geometry_params[PARAM_INDEX['dy']]
-    radius = geometry_params[PARAM_INDEX['radius']]
-    ellipse_ratio = geometry_params[PARAM_INDEX['ellipse_ratio']]
+    stitch_bulge = geometry_params[geometry_param_index('stitch_bulge')]
+    stitch_z = geometry_params[geometry_param_index('stitch_z')]
+    dy = geometry_params[geometry_param_index('dy')]
+    radius = geometry_params[geometry_param_index('radius')]
+    ellipse_ratio = geometry_params[geometry_param_index('ellipse_ratio')]
     loop_height_lookup = get_loop_height_lookup_jax(geometry_params)
-    
-    def count_consecutive_zeros(row):
-        row = row > 0.5
-        n = len(row)
-        indices = jnp.arange(n)
-        future_active = (indices[:, None] < indices[None, :]) & row[None, :]
-        next_active = jnp.argmax(future_active.astype(jnp.int32), axis=1)
-        counts = jnp.where(
-            jnp.any(future_active, axis=1),
-            next_active - indices,
-            n - indices,
-        )
-        return jnp.where(row, counts, 0).astype(jnp.float32)
-    
-    scale_factor = jax.vmap(count_consecutive_zeros)(bitmap.T).T
+    scale_factor = compute_bitmap_scale_factors_jax(bitmap)
     
     n_rows, n_loops = bitmap.shape
     t_vals = jnp.linspace(0.0, 2 * jnp.pi * n_loops, loop_res * n_loops + 1)
@@ -314,18 +382,22 @@ def compute_knitting_vertices(geometry_params, bitmap):
     )
     return [(v, len(v) // seg) for v in vertices]
 
+
+# %% MESH TOPOLOGY
+
 def compute_knitting_faces(segments, verts_list):
     """Computes mesh faces based on vertex counts for each row."""
-    faces_list = []
-    for _, n_points in verts_list:
-        i_grid, j_grid = np.meshgrid(np.arange(n_points - 1), 
-                                     np.arange(segments), indexing='ij')
-        v0 = i_grid * segments + j_grid
-        v1 = i_grid * segments + (j_grid + 1) % segments
-        v2 = (i_grid + 1) * segments + (j_grid + 1) % segments
-        v3 = (i_grid + 1) * segments + j_grid
-        faces_list.append(np.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4))
-    return faces_list
+    return [build_tube_faces(n_points, segments) for _, n_points in verts_list]
+
+
+def build_tube_faces(n_points, segments):
+    """Build quad faces for a tube sampled as n_points rings with segments vertices each."""
+    i_grid, j_grid = np.meshgrid(np.arange(n_points - 1), np.arange(segments), indexing='ij')
+    v0 = i_grid * segments + j_grid
+    v1 = i_grid * segments + (j_grid + 1) % segments
+    v2 = (i_grid + 1) * segments + (j_grid + 1) % segments
+    v3 = (i_grid + 1) * segments + j_grid
+    return np.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4)
 
 def compute_geometry_jacobian(geometry_params, bitmap):
     """Computes the Jacobian of vertex positions using JAX autodiff."""
@@ -354,29 +426,30 @@ def save_combined_obj(mesh_data_list, base_filename="knitting_model"):
 
 def save_per_loop_objs(mesh_data_list, base_filename, loop_res, segments):
     """Saves each stitch loop as a separate OBJ for pattern analysis."""
+    loop_vertex_count = (loop_res + 1) * segments
+    loop_faces = build_tube_faces(loop_res + 1, segments)
+    loop_specs = [
+        (
+            row_idx,
+            loop_idx,
+            verts[loop_idx * loop_res * segments:loop_idx * loop_res * segments + loop_vertex_count],
+            f"{base_filename}_r{row_idx:02d}_l{loop_idx:02d}.obj",
+        )
+        for row_idx, (verts, _, _, n_points) in enumerate(mesh_data_list)
+        for loop_idx in range((n_points - 1) // loop_res)
+    ]
+
     obj_info = []
-    for row_idx, (verts, _, _, n_points) in enumerate(mesh_data_list):
-        n_loops = (n_points - 1) // loop_res
-        for loop_idx in range(n_loops):
-            v_start = loop_idx * loop_res * segments
-            v_end = (loop_idx + 1) * loop_res * segments + segments
-            l_verts = verts[v_start:v_end]
-            n_l_pts = (v_end - v_start) // segments
-            i_g, j_g = np.meshgrid(np.arange(n_l_pts - 1), 
-                                   np.arange(segments), indexing='ij')
-            v0, v1 = i_g * segments + j_g, i_g * segments + (j_g + 1) % segments
-            v2, v3 = ((i_g + 1) * segments + (j_g + 1) % segments, 
-                      (i_g + 1) * segments + j_g)
-            l_faces = np.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4)
-            path = f"{base_filename}_r{row_idx:02d}_l{loop_idx:02d}.obj"
-            with open(path, 'w') as f:
-                for v in l_verts: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
-                for fa in l_faces: 
-                    f.write(f"f {' '.join([str(int(x)+1) for x in fa])}")
-            obj_info.append((row_idx, loop_idx, path))
+    for row_idx, loop_idx, loop_verts, path in loop_specs:
+        vertex_lines = ''.join(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n" for v in loop_verts)
+        face_lines = ''.join(f"f {' '.join(str(int(x) + 1) for x in face)}\n" for face in loop_faces)
+        with open(path, 'w') as f:
+            f.write(vertex_lines)
+            f.write(face_lines)
+        obj_info.append((row_idx, loop_idx, path))
     return obj_info
 
-# %% OPTIMIZATION ENGINE
+# %% OPTIMIZATION
 
 def get_loop_color(row_idx, loop_idx):
     """Returns discrete colors for loops from config.json."""
@@ -474,10 +547,11 @@ class KnittingOptimizer:
         if self.opt_state is None:
             self.opt_state = self.optimizer.init(jnp.array(params))
         updates, self.opt_state = self.optimizer.update(jnp.array(grads), self.opt_state)
+        lower_bounds, upper_bounds = geometry_param_bounds_jax()
         new_params = jnp.clip(
             optax.apply_updates(jnp.array(params), updates),
-            PARAM_LOWER_BOUNDS,
-            PARAM_UPPER_BOUNDS,
+            lower_bounds,
+            upper_bounds,
         )
         self.loss_history.append(current_loss)
         self.param_history.append(new_params)
@@ -495,24 +569,43 @@ def run_optimization_loop(optimizer, params):
         elif (count := count + 1) >= cfg['patience']: break
     return best_p, best_l
 
-# %% SPLINE INTERPOLATION ───────────────────────────────────────────────────────
+# %% SPLINE EDITING AND CONTROL-POINT MESHES
 
-def _interp_spline(ctrl_pts, n_out):
-    ctrl_pts = np.asarray(ctrl_pts, dtype=float)
-    if len(ctrl_pts) <= 1:
-        return np.repeat(ctrl_pts, n_out, axis=0)
+def _interp_spline_rows(ctrl_rows, n_out):
+    """Interpolates equal-length spline control rows in one vectorized call."""
+    rows = np.asarray(ctrl_rows, dtype=float)
+    if rows.ndim != 3 or rows.shape[1] < 2:
+        return np.empty((0, n_out, 3), dtype=np.float32)
 
-    seg_len = np.linalg.norm(np.diff(ctrl_pts, axis=0), axis=1)
-    t = np.concatenate(([0.0], np.cumsum(np.maximum(seg_len, 1e-6))))
-    t_out = np.linspace(t[0], t[-1], n_out)
-    if len(ctrl_pts) == 2:
-        return np.column_stack([
-            np.interp(t_out, t, ctrl_pts[:, i]) for i in range(3)
-        ])
-    return np.column_stack([
-        CubicSpline(t, ctrl_pts[:, i], bc_type="natural")(t_out)
-        for i in range(3)
-    ])
+    t = np.linspace(0.0, 1.0, rows.shape[1])
+    t_out = np.linspace(0.0, 1.0, n_out)
+    if rows.shape[1] == 2:
+        alpha = t_out[None, :, None]
+        return ((1.0 - alpha) * rows[:, :1, :] + alpha * rows[:, 1:2, :]).astype(np.float32)
+
+    return CubicSpline(t, rows, axis=1, bc_type="natural")(t_out).astype(np.float32)
+
+
+def build_tube_vertices_from_paths(paths, radius, ellipse_ratio, segments):
+    """Vectorized tube mesh construction for paths shaped (rows, points, 3)."""
+    paths = np.asarray(paths, dtype=np.float32)
+    if paths.size == 0:
+        return np.empty((0, 0, 3), dtype=np.float32)
+
+    tangent = np.gradient(paths, axis=1)
+    tangent /= np.linalg.norm(tangent, axis=2, keepdims=True) + 1e-8
+    u_frame = np.cross(tangent, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    bad = np.linalg.norm(u_frame, axis=2) < 1e-6
+    u_frame[bad] = np.cross(tangent[bad], np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    u_frame /= np.linalg.norm(u_frame, axis=2, keepdims=True) + 1e-8
+    v_frame = np.cross(tangent, u_frame)
+
+    angles = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False, dtype=np.float32)
+    offsets = (
+        u_frame[:, :, None, :] * np.cos(angles)[None, None, :, None] * radius * ellipse_ratio
+        + v_frame[:, :, None, :] * np.sin(angles)[None, None, :, None] * radius
+    )
+    return (paths[:, :, None, :] + offsets).reshape(paths.shape[0], -1, 3)
 
 
 class SplineManager:
@@ -539,32 +632,38 @@ class SplineManager:
         )
 
     def move(self, flat_idx, pos):
-        for r in range(len(self.ctrl_rows)):
-            s, e = self._row_starts[r], self._row_starts[r + 1]
-            if s <= flat_idx < e:
-                self.ctrl_rows[r][flat_idx - s] = pos
-                break
+        row_idx = int(np.searchsorted(self._row_starts, flat_idx, side='right') - 1)
+        if 0 <= row_idx < len(self.ctrl_rows):
+            local_idx = flat_idx - self._row_starts[row_idx]
+            if 0 <= local_idx < len(self.ctrl_rows[row_idx]):
+                self.ctrl_rows[row_idx][local_idx] = pos
+        self._rebuild()
+
+    def fix_endpoints(self, params):
+        """Locks row endpoints to tile boundaries so spline edits still duplicate cleanly."""
+        if not self.ctrl_rows:
+            return
+        width = float(self.bitmap.shape[1])
+        dy = float(params[geometry_param_index('dy')])
+        for row_idx, row in enumerate(self.ctrl_rows):
+            if len(row) < 2:
+                continue
+            if row[0, 0] <= row[-1, 0]:
+                left_idx, right_idx = 0, -1
+            else:
+                left_idx, right_idx = -1, 0
+            baseline_y = float(row_idx) * dy
+            row[left_idx] = np.array([0.0, baseline_y, 0.0], dtype=row.dtype)
+            row[right_idx] = np.array([width, baseline_y, 0.0], dtype=row.dtype)
         self._rebuild()
 
     def build_mesh(self, params):
-        radius = params[PARAM_INDEX['radius']]
-        ratio  = params[PARAM_INDEX['ellipse_ratio']]
+        radius = params[geometry_param_index('radius')]
+        ratio  = params[geometry_param_index('ellipse_ratio')]
         seg    = self.config['geometry']['segments']
         res    = self.config['geometry']['loop_res']
         n_out  = res * self.bitmap.shape[1] + 1
-        verts_list = []
-        for row in self.ctrl_rows:
-            pts = _interp_spline(row, n_out)
-            T   = np.gradient(pts, axis=0)
-            T  /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
-            U   = np.cross(T, [0, 0, 1])
-            bad = np.linalg.norm(U, axis=1) < 1e-6
-            U[bad] = np.cross(T[bad], [1, 0, 0])
-            U  /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-8
-            V   = np.cross(T, U)
-            angles  = np.linspace(0, 2*np.pi, seg, endpoint=False)
-            offsets = (U[:,None,:] * np.cos(angles)[None,:,None] * radius * ratio
-                     + V[:,None,:] * np.sin(angles)[None,:,None] * radius)
-            verts_list.append(((pts[:,None,:] + offsets).reshape(-1, 3), n_out))
-        return verts_list
+        paths = _interp_spline_rows(self.ctrl_rows, n_out)
+        vertices = build_tube_vertices_from_paths(paths, radius, ratio, seg)
+        return list(zip(vertices, np.full(len(vertices), n_out, dtype=int)))
 

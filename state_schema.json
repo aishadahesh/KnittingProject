@@ -9,8 +9,16 @@
       "subtitle": "Set bitmap size, row visibility, and stitch pattern."
     },
     {
+      "title": "Yarn Radius",
+      "subtitle": "Set the main yarn tube radius before adding surface fibers."
+    },
+    {
+      "title": "Surface Fibers",
+      "subtitle": "Add separate fiber meshes above the yarn surface."
+    },
+    {
       "title": "Geometry",
-      "subtitle": "Tune physical knitting parameters manually."
+      "subtitle": "Tune the remaining knitting path parameters manually."
     },
     {
       "title": "Material",
@@ -51,7 +59,19 @@
     "texture_color_band_scale",
     "texture_color_band_shift",
     "texture_saturation",
-    "texture_contrast"
+    "texture_contrast",
+    "texture_uv_blend",
+    "texture_fiber_rows",
+    "texture_fiber_row_width",
+    "texture_fiber_row_depth",
+    "texture_fiber_layer_count",
+    "texture_fiber_phase_jitter",
+    "texture_fibers_per_row",
+    "texture_sub_fiber_width",
+    "texture_sub_fiber_depth",
+    "texture_micro_fiber_strength",
+    "texture_micro_fiber_scale",
+    "texture_twist"
   ],
   "material_uniform_aliases": {
     "render_texture_color": "texture_tint",
@@ -97,6 +117,18 @@
     "texture_color_band_shift",
     "texture_saturation",
     "texture_contrast",
+    "texture_uv_blend",
+    "texture_fiber_rows",
+    "texture_fiber_row_width",
+    "texture_fiber_row_depth",
+    "texture_fiber_layer_count",
+    "texture_fiber_phase_jitter",
+    "texture_fibers_per_row",
+    "texture_sub_fiber_width",
+    "texture_sub_fiber_depth",
+    "texture_micro_fiber_strength",
+    "texture_micro_fiber_scale",
+    "texture_twist",
     "render_light_intensity",
     "mi_cam_dist_mult",
     "mi_cam_fov",
@@ -105,6 +137,15 @@
     "viewport_pan",
     "samples_per_loop",
     "display_copies",
+    "auto_fix_spline_endpoints",
+    "spline_keyboard_step",
+    "fiber_geometry_enabled",
+    "fiber_geometry_count",
+    "fiber_geometry_radius_scale",
+    "fiber_geometry_lift",
+    "fiber_geometry_surface_arc",
+    "fiber_geometry_randomness",
+    "fiber_geometry_twist",
     "ref_bg_scale",
     "ref_bg_offset",
     "model_rot",
@@ -139,6 +180,20 @@
           "min": -1.57,
           "max": 1.57,
           "format": "%.2f rad"
+        },
+        {
+          "key": "texture_uv_blend",
+          "label": "Use UV mapping",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_twist",
+          "label": "Yarn twist",
+          "min": -2.0,
+          "max": 2.0,
+          "format": "%.2f"
         }
       ]
     },
@@ -179,6 +234,20 @@
           "min": 0.35,
           "max": 4.0,
           "format": "%.2f"
+        },
+        {
+          "key": "texture_micro_fiber_strength",
+          "label": "Fine fiber strength",
+          "min": 0.0,
+          "max": 1.0,
+          "format": "%.2f"
+        },
+        {
+          "key": "texture_micro_fiber_scale",
+          "label": "Fine fiber density",
+          "min": 20.0,
+          "max": 180.0,
+          "format": "%.1f"
         },
         {
           "key": "texture_noise_strength",
@@ -301,7 +370,19 @@
       "texture_groove_darkness": 0.14,
       "texture_center_shadow": 0.08,
       "texture_gloss_strength": 0.14,
-      "texture_highlight_width": 0.38
+      "texture_highlight_width": 0.38,
+      "texture_uv_blend": 1.0,
+      "texture_fiber_rows": 9.0,
+      "texture_fiber_row_width": 0.34,
+      "texture_fiber_row_depth": 0.0,
+      "texture_fiber_layer_count": 4.0,
+      "texture_fiber_phase_jitter": 0.08,
+      "texture_fibers_per_row": 5.0,
+      "texture_sub_fiber_width": 0.3,
+      "texture_sub_fiber_depth": 0.0,
+      "texture_micro_fiber_strength": 0.12,
+      "texture_micro_fiber_scale": 95.0,
+      "texture_twist": 0.18
     },
     "strong_fibers": {
       "texture_ridge_strength": 0.65,
@@ -313,7 +394,19 @@
       "texture_groove_darkness": 0.36,
       "texture_center_shadow": 0.22,
       "texture_gloss_strength": 0.45,
-      "texture_highlight_width": 0.2
+      "texture_highlight_width": 0.2,
+      "texture_uv_blend": 1.0,
+      "texture_fiber_rows": 14.0,
+      "texture_fiber_row_width": 0.22,
+      "texture_fiber_row_depth": 0.0,
+      "texture_fiber_layer_count": 6.0,
+      "texture_fiber_phase_jitter": 0.16,
+      "texture_fibers_per_row": 7.0,
+      "texture_sub_fiber_width": 0.2,
+      "texture_sub_fiber_depth": 0.0,
+      "texture_micro_fiber_strength": 0.18,
+      "texture_micro_fiber_scale": 130.0,
+      "texture_twist": 0.28
     },
     "reference_like": {
       "texture_scale_x": 1.25,
@@ -333,7 +426,19 @@
       "texture_color_band_scale": 1.15,
       "texture_color_band_shift": 0.0,
       "texture_saturation": 1.35,
-      "texture_contrast": 1.35
+      "texture_contrast": 1.35,
+      "texture_uv_blend": 1.0,
+      "texture_fiber_rows": 12.0,
+      "texture_fiber_row_width": 0.28,
+      "texture_fiber_row_depth": 0.0,
+      "texture_fiber_layer_count": 4.0,
+      "texture_fiber_phase_jitter": 0.18,
+      "texture_fibers_per_row": 9.0,
+      "texture_sub_fiber_width": 0.18,
+      "texture_sub_fiber_depth": 0.0,
+      "texture_micro_fiber_strength": 0.16,
+      "texture_micro_fiber_scale": 125.0,
+      "texture_twist": 0.32
     },
     "clear": {
       "render_texture_color": [
@@ -358,7 +463,19 @@
       "texture_color_band_scale": 1.0,
       "texture_color_band_shift": 0.0,
       "texture_saturation": 1.0,
-      "texture_contrast": 1.0
+      "texture_contrast": 1.0,
+      "texture_uv_blend": 1.0,
+      "texture_fiber_rows": 8.0,
+      "texture_fiber_row_width": 0.35,
+      "texture_fiber_row_depth": 0.0,
+      "texture_fiber_layer_count": 1.0,
+      "texture_fiber_phase_jitter": 0.0,
+      "texture_fibers_per_row": 4.0,
+      "texture_sub_fiber_width": 0.35,
+      "texture_sub_fiber_depth": 0.0,
+      "texture_micro_fiber_strength": 0.0,
+      "texture_micro_fiber_scale": 80.0,
+      "texture_twist": 0.0
     }
   }
 }
