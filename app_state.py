@@ -327,9 +327,11 @@ class AppState:
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts(self.flat_pts)
-        self._recompute_center(display_vl)
         if preserve_model_placement:
-            self.model_t = old_model_t + old_center - np.asarray(self.mesh_center, dtype=np.float32)
+            self.mesh_center = old_center
+            self.model_t = old_model_t
+        else:
+            self._recompute_center(display_vl)
 
     def _recompute_center(self, display_vl):
         if not display_vl:
