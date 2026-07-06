@@ -677,6 +677,41 @@ def draw_viewport(state, renderer, ref_tex, window):
         'img_aspect':  ref_tex.width / ref_tex.height if ref_tex is not None else 1.0,
     }
 
+    def sample_reference_color(view_x, view_y):
+        ref_pixels = state.get('reference_image_pixels', None)
+        if ref_pixels is None:
+            return None
+        pixels = np.asarray(ref_pixels, dtype=np.float32)
+        if pixels.ndim != 3 or pixels.shape[0] <= 0 or pixels.shape[1] <= 0:
+            return None
+
+        vp_aspect = float(bg_uniforms.get('vp_aspect', 1.0))
+        img_aspect = float(bg_uniforms.get('img_aspect', 1.0))
+        scale_x = max(float(bg_uniforms.get('bg_scale_x', 1.0)), 0.01)
+        scale_y = max(float(bg_uniforms.get('bg_scale_y', 1.0)), 0.01)
+        rotation = float(bg_uniforms.get('bg_rotation', 0.0))
+        offset_x = float(bg_uniforms.get('bg_offset_x', 0.0))
+        offset_y = float(bg_uniforms.get('bg_offset_y', 0.0))
+
+        c = np.array([
+            float(view_x) / max(float(disp_w), 1.0) - 0.5,
+            0.5 - float(view_y) / max(float(disp_h), 1.0),
+        ], dtype=np.float32)
+        iso = np.array([c[0] * vp_aspect, c[1]], dtype=np.float32)
+        cr, sr = np.cos(rotation), np.sin(rotation)
+        rot = np.array([cr * iso[0] - sr * iso[1], sr * iso[0] + cr * iso[1]], dtype=np.float32)
+        uv = np.array([
+            rot[0] / (img_aspect * scale_x) - offset_x + 0.5,
+            rot[1] / scale_y - offset_y + 0.5,
+        ], dtype=np.float32)
+        if np.any(uv < 0.0) or np.any(uv > 1.0):
+            return None
+
+        h, w = pixels.shape[:2]
+        px = int(np.clip(round(float(uv[0]) * (w - 1)), 0, w - 1))
+        py = int(np.clip(round((1.0 - float(uv[1])) * (h - 1)), 0, h - 1))
+        return pixels[py, px, :3].astype(np.float32)
+
     renderer.render(
         mvp, mv,
         state.get_material_uniforms(),
@@ -1018,40 +1053,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         lo, hi = state.config["knit_parameters"]["parameters"][radius_idx]["range"]
         return radius_idx, float(lo), float(hi)
 
-    def sample_reference_color(view_x, view_y):
-        ref_pixels = state.get('reference_image_pixels', None)
-        if ref_pixels is None:
-            return None
-        pixels = np.asarray(ref_pixels, dtype=np.float32)
-        if pixels.ndim != 3 or pixels.shape[0] <= 0 or pixels.shape[1] <= 0:
-            return None
 
-        vp_aspect = float(bg_uniforms.get('vp_aspect', 1.0))
-        img_aspect = float(bg_uniforms.get('img_aspect', 1.0))
-        scale_x = max(float(bg_uniforms.get('bg_scale_x', 1.0)), 0.01)
-        scale_y = max(float(bg_uniforms.get('bg_scale_y', 1.0)), 0.01)
-        rotation = float(bg_uniforms.get('bg_rotation', 0.0))
-        offset_x = float(bg_uniforms.get('bg_offset_x', 0.0))
-        offset_y = float(bg_uniforms.get('bg_offset_y', 0.0))
-
-        c = np.array([
-            float(view_x) / max(float(disp_w), 1.0) - 0.5,
-            0.5 - float(view_y) / max(float(disp_h), 1.0),
-        ], dtype=np.float32)
-        iso = np.array([c[0] * vp_aspect, c[1]], dtype=np.float32)
-        cr, sr = np.cos(rotation), np.sin(rotation)
-        rot = np.array([cr * iso[0] - sr * iso[1], sr * iso[0] + cr * iso[1]], dtype=np.float32)
-        uv = np.array([
-            rot[0] / (img_aspect * scale_x) - offset_x + 0.5,
-            rot[1] / scale_y - offset_y + 0.5,
-        ], dtype=np.float32)
-        if np.any(uv < 0.0) or np.any(uv > 1.0):
-            return None
-
-        h, w = pixels.shape[:2]
-        px = int(np.clip(round(float(uv[0]) * (w - 1)), 0, w - 1))
-        py = int(np.clip(round((1.0 - float(uv[1])) * (h - 1)), 0, h - 1))
-        return pixels[py, px, :3].astype(np.float32)
 
     def local_radius_edit_index():
         if state.mode != 'spline':
