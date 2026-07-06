@@ -909,7 +909,10 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_bounds = np.array(gizmo_bounds, dtype=np.float32)
             state.bbox_start_mouse = np.array([lx, ly], dtype=np.float32)
             state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
-            state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
+            if state.mode == 'spline':
+                state.bbox_start_ctrl_rows = [row.copy() for row in state.ctrl_rows]
+            else:
+                state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
             suppress_mesh_click = True
 
         active_handle = int(state.get('bbox_active_handle', -1))
@@ -939,10 +942,27 @@ def draw_viewport(state, renderer, ref_tex, window):
                 scale_vec = np.array([sx, 1.0, 1.0], dtype=np.float32)
             else:
                 scale_vec = np.array([sx, sy, 1.0], dtype=np.float32)
-            start_scale = np.array(state.get('bbox_start_model_scale', state.model_scale), dtype=np.float32)
-            if start_scale.size == 1:
-                start_scale = np.repeat(start_scale, 3)
-            state.model_scale = np.maximum(start_scale[:3] * scale_vec, 1e-4).astype(np.float32)
+
+            if state.mode == 'spline':
+                base_rows = state.get('bbox_start_ctrl_rows')
+                if base_rows:
+                    visible_rows_local = [
+                        row for row_idx, row in enumerate(base_rows)
+                        if state.row_visible is None or len(state.row_visible) == 0 or bool(state.row_visible[row_idx % len(state.row_visible)])
+                    ]
+                    if visible_rows_local:
+                        pts = np.concatenate(visible_rows_local, axis=0)
+                        pivot = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32)
+                    else:
+                        pivot = np.asarray(state.mesh_center, dtype=np.float32)
+                    state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
+                    state._rebuild_spline_points()
+                    state.rebuild_spline_mesh()
+            else:
+                start_scale = np.array(state.get('bbox_start_model_scale', state.model_scale), dtype=np.float32)
+                if start_scale.size == 1:
+                    start_scale = np.repeat(start_scale, 3)
+                state.model_scale = np.maximum(start_scale[:3] * scale_vec, 1e-4).astype(np.float32)
 
             start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
             old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
@@ -956,6 +976,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_mouse = None
             state.bbox_start_t = None
             state.bbox_start_model_scale = None
+            state.bbox_start_ctrl_rows = None
 
         state.hover_mesh_idx = renderer.pick_mesh_index(model_mat, state.camera, disp_w, disp_h, lx, ly, visible_rows=state.row_visible)
 
