@@ -362,6 +362,7 @@ class AppState:
             np.full(len(row), base_radius, dtype=np.float32)
             for row in self.ctrl_rows
         ]
+        self.param_ref_radius = base_radius
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
         self.rebuild_spline_mesh()
@@ -369,10 +370,12 @@ class AppState:
     def nudge_spline_from_params(self):
         target_rows = self._fresh_rebuild_rows()
         ref_rows = self.get('param_ref_ctrl_rows')
+        current_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+        ref_radius = getattr(self, 'param_ref_radius', current_radius)
         if not ref_rows or len(self.ctrl_rows) != len(target_rows) or any(c.shape != t.shape for c, t in zip(self.ctrl_rows, target_rows)):
             self.ctrl_rows = [row.copy() for row in target_rows]
             self.spline_radius_rows = [
-                np.full(len(row), max(float(self.params[self._pidx['radius']]), 1e-6), dtype=np.float32)
+                np.full(len(row), current_radius, dtype=np.float32)
                 for row in self.ctrl_rows
             ]
         else:
@@ -381,6 +384,12 @@ class AppState:
                 nudged_rows.append(current_row + (target_row - ref_row))
             self.ctrl_rows = nudged_rows
             self._ensure_spline_radius_rows()
+            if abs(current_radius - ref_radius) > 1e-7:
+                ratio = current_radius / ref_radius
+                for r_idx, row in enumerate(self.spline_radius_rows):
+                    self.spline_radius_rows[r_idx] = row * ratio
+
+        self.param_ref_radius = current_radius
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
         self.rebuild_spline_mesh()
@@ -462,6 +471,7 @@ class AppState:
         self.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
         self.spline_radius_rows = [row.copy() for row in snap.get('spline_radius_rows', [])]
         self._ensure_spline_radius_rows()
+        self.param_ref_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
 
