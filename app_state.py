@@ -202,15 +202,24 @@ class AppState:
         for y_tile in y_tiles:
             y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
             for part_idx, ((verts, n_points), _faces, part_meta) in enumerate(zip(verts_list, faces_list, meta)):
-                stitched_rings = []
                 rings = np.asarray(verts, dtype=np.float32).reshape(int(n_points), seg, 3)
+                base_faces = compute_knitting_faces(seg, [(rings.reshape(-1, 3), int(n_points))])[0]
+                
+                stitched_rings = []
+                stitched_faces = []
                 for tile_i, x_tile in enumerate(x_tiles):
                     translated = rings + np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
                     stitched_rings.append(translated)
+                    
+                    tile_faces = base_faces + tile_i * int(n_points) * seg
+                    stitched_faces.append(tile_faces)
+                    
                 stitched = np.concatenate(stitched_rings, axis=0) + y_translation
                 stitched_n_points = int(stitched.shape[0])
                 display_vl.append((stitched.reshape(-1, 3), stitched_n_points))
-                display_fl.extend(compute_knitting_faces(seg, [(stitched.reshape(-1, 3), stitched_n_points)]))
+                
+                combined_faces = np.concatenate(stitched_faces, axis=0)
+                display_fl.append(combined_faces)
                 copied_meta = dict(part_meta)
                 copied_meta['row'] = int(copied_meta.get('row', 0)) + y_tile * row_count
                 copied_meta['base_row'] = int(part_meta.get('row', 0))
