@@ -144,3 +144,49 @@ def test_spline_construction(config_fixture, params_fixture):
     for pts, nout in spline_mesh:
         assert pts.shape[1] == 3
         assert isinstance(nout, int)
+
+
+from knitting_core import build_surface_fiber_meshes
+
+def test_fiber_meshes():
+    # Mock base vertices: List of (verts, count)
+    # Each row contains (n_points * segments) vertices. Let n_points = 2, segments = 6
+    segments = 6
+    n_points = 2
+    verts_row = np.arange(n_points * segments * 3, dtype=np.float32).reshape(-1, 3)
+    base_vl = [(verts_row, n_points)]
+    
+    # 1. Disabled case
+    out_vl, meta = build_surface_fiber_meshes(
+        base_vl=base_vl,
+        segments=segments,
+        enabled=False,
+        count=3,
+        radius=0.1,
+        radius_scale=1.0,
+        lift=0.0,
+        surface_arc=0.5,
+        randomness=0.0,
+        twist=0.0
+    )
+    assert len(out_vl) == len(base_vl)
+    assert meta[0]["row"] == 0
+    
+    # 2. Enabled case
+    out_vl, meta = build_surface_fiber_meshes(
+        base_vl=base_vl,
+        segments=segments,
+        enabled=True,
+        count=3,
+        radius=0.1,
+        radius_scale=1.0,
+        lift=0.0,
+        surface_arc=0.5,
+        randomness=0.0,
+        twist=0.0
+    )
+    # We expect count=3 fiber meshes produced
+    assert len(out_vl) == 3
+    assert len(meta) == 3
+    for entry in meta:
+        assert entry["row"] == 0
