@@ -65,110 +65,69 @@ class AppState:
         with open(schema_path, 'r') as handle:
             schema = json.load(handle)
 
-        super().__setattr__('workflow_stages', tuple(
-            (item['title'], item['subtitle'])
-            for item in schema['workflow_stages']
-        ))
-        super().__setattr__('texture_control_groups', tuple(schema['texture_control_groups']))
-        super().__setattr__('texture_preset_buttons', tuple(schema['texture_preset_buttons']))
-        super().__setattr__('texture_presets', dict(schema['texture_presets']))
-        super().__setattr__('texture_param_keys', tuple(schema['texture_param_keys']))
-        super().__setattr__('material_uniform_aliases', dict(schema['material_uniform_aliases']))
-        super().__setattr__('saved_state_keys', tuple(schema['saved_state_keys']))
-        super().__setattr__('camera_attributes', ('dist', 'az', 'el', 'target'))
+        app_config = schema['app_config']
 
-        overlay_defaults = dict(schema.get('overlay_defaults', {}))
-
-        default_state_config = {
-            'ui': {
-                'workflow_step': 0,
-                'mode': 'spline',
-                'hover_idx': -1,
-                'selected_idx': -1,
-                'status_msg': '',
-                'save_path': os.path.join(project_root, 'params.json'),
-                'load_path': os.path.join(project_root, 'params.json'),
-                'autosave_enabled': True,
-                'autosave_interval_sec': 1.0,
-                'autosave_last_time': 0.0,
-                'undo_stack': [],
-                'max_undo': 40,
-            },
-            'geometry': {
-                'params': [p['initial'] for p in config_data['knit_parameters']['parameters']],
-                'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
-                'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
-                'samples_per_loop': 5,
-                'display_copies': np.array([0, 0], dtype=np.int32),
-                'mesh_center': np.zeros(3, dtype=np.float32),
-                'ctrl_rows': [],
-                'flat_pts': np.empty((0, 3), np.float32),
-                '_row_starts': [0],
-                'auto_fix_spline_endpoints': True,
-                'spline_point_drag_active': False,
-                'spline_keyboard_edit_active': False,
-                'spline_keyboard_step': 0.025,
-                'fiber_geometry_enabled': False,
-                'fiber_geometry_count': 4,
-                'fiber_geometry_radius_scale': 0.18,
-                'fiber_geometry_lift': 0.0,
-                'fiber_geometry_surface_arc': 0.55,
-                'fiber_geometry_randomness': 0.18,
-                'fiber_geometry_twist': 0.0,
-            },
-            'viewport': {
-                'mouse_in_vp': False,
-                'vp_origin': np.array([0.0, 0.0], dtype=np.float32),
-                'vp_scale': 1.0,
-                'viewport_zoom': 1.0,
-                'viewport_pan': np.array([0.0, 0.0], dtype=np.float32),
-                'hover_mesh_idx': -1,
-                'selected_mesh_idx': -1,
-                'view_fov': 45.0,
-                'model_rot': np.array([0.0, 0.0, 0.0], dtype=np.float32),
-                'model_scale': np.array([1.0, 1.0, 1.0], dtype=np.float32),
-                'model_rot_dragging': False,
-                'model_t': np.array([0.0, 0.0, 0.0], dtype=np.float32),
-                'model_drag_undo_active': False,
-                'gizmo_edit_active': False,
-            },
-            'overlay': {
-                'show_ref_bg': bool(overlay_defaults.get('show_ref_bg', False)),
-                'ref_bg_alpha': float(overlay_defaults.get('ref_bg_alpha', 0.5)),
-                'ref_bg_scale': np.array(overlay_defaults.get('ref_bg_scale', [1.0, 1.0]), dtype=np.float32),
-                'ref_bg_lock_dimensions': bool(overlay_defaults.get('ref_bg_lock_dimensions', True)),
-                'ref_bg_lock_zoom': bool(overlay_defaults.get('ref_bg_lock_zoom', False)),
-                'ref_bg_rotation': float(overlay_defaults.get('ref_bg_rotation', 0.0)),
-                'ref_bg_offset': np.array(overlay_defaults.get('ref_bg_offset', [0.0, 0.0]), dtype=np.float32),
-            },
-            'material': {
-                'model_alpha': 1.0,
-                'single_model_color': np.array([0.85, 0.12, 0.10], dtype=np.float32),
-                'use_row_colors': False,
-                'row_colors': [
-                    list(config_data['knit_parameters']['yarn_colors'][i % len(config_data['knit_parameters']['yarn_colors'])])
-                    for i in range(3)
-                ],
-                'row_visible': np.ones(3, dtype=bool),
-                'render_texture_color': np.array([0.8, 0.4, 0.3], dtype=np.float32),
-                **{k: v for k, v in self.texture_presets['clear'].items() if k != 'render_texture_color'},
-                **self.texture_presets['soft_yarn'],
-            },
-            'rendering': {
-                'render_light_color': np.array([1.0, 1.0, 1.0], dtype=np.float32),
-                'render_light_intensity': 0.9,
-                'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
-                'mi_cam_fov': float(config_data['rendering']['camera_fov']),
-            }
+        # 1. Dynamically load config attributes driven by a cast mapping
+        _SCHEMA_CASTS = {
+            'workflow_stages': lambda v: tuple((item['title'], item['subtitle']) for item in v),
+            'texture_control_groups': tuple,
+            'texture_preset_buttons': tuple,
+            'texture_presets': dict,
+            'texture_param_keys': tuple,
+            'material_uniform_aliases': dict,
+            'saved_state_keys': tuple,
+            'camera_attributes': tuple,
         }
+        for attr, cast_fn in _SCHEMA_CASTS.items():
+            super().__setattr__(attr, cast_fn(app_config[attr]))
 
-        state_defaults = {
-            key: value
-            for section in default_state_config.values()
-            for key, value in section.items()
+        # Helper to auto-coerce flat numeric lists to np.float32 arrays, leaving other structures intact
+        def _coerce(k, val):
+            if k == '_row_starts':
+                return list(val)
+            if isinstance(val, list) and val and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in val):
+                return np.array(val, dtype=np.float32)
+            return val
+
+        # 2. Extract and coerce static defaults from schema
+        state_defaults = {}
+        for section, keys_dict in schema['state_defaults'].items():
+            for key, val in keys_dict.items():
+                state_defaults[key] = AppState._clone(_coerce(key, val))
+
+        # 3. Add static defaults that need special empty array dimensions
+        state_defaults['flat_pts'] = np.empty((0, 3), dtype=np.float32)
+
+        # 4. Integrate texture presets defaults (clear + soft_yarn chain)
+        preset_clear = self.texture_presets['clear']
+        preset_soft = self.texture_presets['soft_yarn']
+        for k, v in preset_clear.items():
+            if k != 'render_texture_color':
+                state_defaults[k] = AppState._clone(_coerce(k, v))
+        for k, v in preset_soft.items():
+            state_defaults[k] = AppState._clone(_coerce(k, v))
+
+        # 5. Overlay computed defaults depending on config.json or runtime pathing
+        computed_defaults = {
+            'save_path': os.path.join(project_root, 'params.json'),
+            'load_path': os.path.join(project_root, 'params.json'),
+            'params': [p['initial'] for p in config_data['knit_parameters']['parameters']],
+            'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
+            'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
+            'display_copies': np.array([0, 0], dtype=np.int32),
+            'mesh_center': np.zeros(3, dtype=np.float32),
+            'row_colors': [
+                list(config_data['knit_parameters']['yarn_colors'][i % len(config_data['knit_parameters']['yarn_colors'])])
+                for i in range(3)
+            ],
+            'row_visible': np.ones(3, dtype=bool),
+            'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
+            'mi_cam_fov': float(config_data['rendering']['camera_fov']),
         }
+        for k, v in computed_defaults.items():
+            state_defaults[k] = AppState._clone(_coerce(k, v))
+
         super().__setattr__('_state_defaults', state_defaults)
-
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}
 
     # ── DICTIONARY INTERFACE ──────────────────────────────────────────────────
