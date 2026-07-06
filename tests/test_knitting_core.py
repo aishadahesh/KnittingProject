@@ -190,3 +190,34 @@ def test_fiber_meshes():
     assert len(meta) == 3
     for entry in meta:
         assert entry["row"] == 0
+
+
+def test_spline_mesh_with_variable_radius(config_fixture, params_fixture):
+    params_dict = params_fixture["params"]
+    config_params = config_fixture["knit_parameters"]["parameters"]
+    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
+    pidx = {p["name"]: i for i, p in enumerate(config_params)}
+    lh_params = sorted(
+        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
+        key=lambda name: int(name.split("_")[-1])
+    )
+    lh_idx = tuple(pidx[name] for name in lh_params)
+    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
+
+    ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
+    
+    # Define variable radius rows matching ctrl_rows shapes
+    radius_ctrl_rows = [
+        np.full(len(row), 0.35, dtype=np.float32)
+        for row in ctrl_rows
+    ]
+    
+    spline_mesh = build_spline_mesh(
+        ctrl_rows, params_list, config_fixture, pidx, bitmap.shape[1],
+        radius_ctrl_rows=radius_ctrl_rows
+    )
+    assert len(spline_mesh) == len(ctrl_rows)
+    for pts, nout in spline_mesh:
+        assert pts.shape[1] == 3
+        assert isinstance(nout, int)
+

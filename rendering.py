@@ -278,7 +278,7 @@ def perspective(fov_rad, aspect, near=0.01, far=500.0):
         [0,        0, -1,                           0                          ],
     ], dtype=np.float32)
 
-def orthographic(left, right, bottom, top, near=0.01, far=500.0):
+def orthographic(left, right, bottom, top, near=-1000.0, far=1000.0):
     return np.array([
         [2.0 / (right - left), 0, 0, -(right + left) / (right - left)],
         [0, 2.0 / (top - bottom), 0, -(top + bottom) / (top - bottom)],
@@ -350,7 +350,7 @@ class Camera:
         # orthographic projection to remove perspective distortion.
         half_h = max(1e-4, self.dist * np.tan(np.radians(self.fov_deg) * 0.5))
         half_w = half_h * aspect
-        return orthographic(-half_w, half_w, -half_h, half_h)
+        return orthographic(-half_w, half_w, -half_h, half_h, near=-1000.0, far=1000.0)
 
     def mvp(self, w, h):
         return self.proj(w, h) @ self.view()
@@ -518,6 +518,13 @@ class MeshRenderer:
             self.meshes.append((vao, outline_vao, depth_vao, len(tris) * 3, color, row_idx))
             self.mesh_pick_data.append((v, row_idx))
 
+    @staticmethod
+    def _row_visible(row_idx, visible_rows):
+        if visible_rows is None or len(visible_rows) == 0:
+            return True
+        base_idx = int(row_idx) % len(visible_rows)
+        return bool(visible_rows[base_idx])
+
     def pick_mesh_index(self, model_mat, camera, vp_w, vp_h, mouse_x, mouse_y, visible_rows=None, max_distance_px=16.0):
         if not self.mesh_pick_data:
             return -1
@@ -527,7 +534,7 @@ class MeshRenderer:
         best_d2 = float(max_distance_px * max_distance_px)
 
         for mesh_idx, (verts, row_idx) in enumerate(self.mesh_pick_data):
-            if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
+            if not self._row_visible(row_idx, visible_rows):
                 continue
             if len(verts) == 0:
                 continue
@@ -683,7 +690,7 @@ class MeshRenderer:
         self._set_program_uniforms(self.prog, material_uniforms)
 
         for mesh_idx, (vao, outline_vao, depth_vao, n_idx, color, row_idx) in enumerate(self.meshes):
-            if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
+            if not self._row_visible(row_idx, visible_rows):
                 continue
             base_color = np.asarray(color, dtype=np.float32)
             self.prog['color'].value = tuple(float(c) for c in base_color)
@@ -697,14 +704,14 @@ class MeshRenderer:
         has_outline = selected_mesh_idx >= 0 or hover_mesh_idx >= 0
         if has_outline:
             self.outline_prog['mvp'].write(mvp.T.tobytes())
-            self.outline_prog['outline_width'].value = 0.02
+            self.outline_prog['outline_width'].value = 0.006
             self.ctx.disable(moderngl.CULL_FACE)
 
             def draw_outline(mesh_idx, color):
                 if mesh_idx < 0 or mesh_idx >= len(self.meshes):
                     return
                 _, outline_vao, _, _, _, row_idx = self.meshes[mesh_idx]
-                if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
+                if not self._row_visible(row_idx, visible_rows):
                     return
                 self.outline_prog['outline_color'].value = color
                 outline_vao.render(moderngl.TRIANGLES)

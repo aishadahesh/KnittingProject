@@ -111,6 +111,10 @@ def draw_sidebar(state, renderer):
     imgui.text_disabled(last_undo)
     imgui.separator()
 
+    if imgui.button("Reset initial model##reset_unit_model_global", (-1, 0)):
+        state.reset_to_unit_model()
+    imgui.separator()
+
     stage = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
 
     def rebuild_current_mesh():
@@ -153,13 +157,12 @@ def draw_sidebar(state, renderer):
             rebuild_current_mesh()
 
     # Copies configuration (vectorized display_copies)
-    changed_x, new_copies_x = imgui.slider_int("Copies X", int(state.display_copies[0]), 0, 5)
-    changed_y, new_copies_y = imgui.slider_int("Copies Y", int(state.display_copies[1]), 0, 5)
+    changed_x, new_copies_x = imgui.slider_int("Copies X", int(state.display_copies[0]), 0, 20)
+    changed_y, new_copies_y = imgui.slider_int("Copies Y", int(state.display_copies[1]), 0, 20)
     if changed_x or changed_y:
         state.push_undo("Display copies")
-        state.display_copies[0] = new_copies_x
-        state.display_copies[1] = new_copies_y
-        rebuild_current_mesh()
+        state.display_copies = np.array([new_copies_x, new_copies_y], dtype=np.int32)
+        state.rebuild_spline_mesh(preserve_model_placement=True)
     imgui.separator()
 
     if stage == 0:
@@ -424,6 +427,12 @@ def draw_sidebar(state, renderer):
             state.push_undo("Color mode")
             state.use_row_colors = use_row_colors
             rebuild_current_mesh()
+        if imgui.small_button("Pick row color from image##pick_ref_row_color"):
+            state.reference_color_pick_active = True
+            state.use_row_colors = True
+            state.status_msg = "Pick mode: click a row over the reference image"
+        imgui.same_line()
+        imgui.text_disabled("or hold Alt and click a row")
         if not state.use_row_colors:
             changed_c, new_col = imgui.color_edit3("One color for all##single_color", (float(state.single_model_color[0]), float(state.single_model_color[1]), float(state.single_model_color[2])))
             if imgui.is_item_activated():
@@ -594,6 +603,11 @@ def draw_sidebar(state, renderer):
             path = _pick_file('load', state.load_path)
             if path:
                 state.load_params(path)
+        if imgui.button("Reset all to initial##reset_all", (half_w, 0)):
+            state.reset_to_initial()
+        imgui.same_line()
+        if imgui.button("Reset initial model##reset_unit_model", (half_w, 0)):
+            state.reset_to_unit_model()
         changed_auto, new_auto = imgui.checkbox("Autosave", state.autosave_enabled)
         if changed_auto:
             state.autosave_enabled = new_auto
@@ -746,7 +760,11 @@ def draw_viewport(state, renderer, ref_tex, window):
         view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
         pts_2d = []
         for verts, row_idx in renderer.mesh_pick_data:
-            if state.row_visible is not None and row_idx < len(state.row_visible) and not bool(state.row_visible[row_idx]):
+            if state.row_visible is not None and len(state.row_visible) > 0:
+                base_row_idx = int(row_idx) % len(state.row_visible)
+                if not bool(state.row_visible[base_row_idx]):
+                    continue
+            elif state.row_visible is not None:
                 continue
             if len(verts) == 0:
                 continue
@@ -891,8 +909,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_bounds = np.array(gizmo_bounds, dtype=np.float32)
             state.bbox_start_mouse = np.array([lx, ly], dtype=np.float32)
             state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
-            if state.mode == 'spline':
-                state.bbox_start_ctrl_rows = [row.copy() for row in state.ctrl_rows]
+            state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
             suppress_mesh_click = True
 
         active_handle = int(state.get('bbox_active_handle', -1))
@@ -916,27 +933,16 @@ def draw_viewport(state, renderer, ref_tex, window):
             new_h = max(1e-4, y_max - y_min)
             sx = new_w / old_w
             sy = new_h / old_h
-            if state.mode == 'spline':
-                if active_handle in (1, 5):
-                    scale_vec = np.array([1.0, sy, 1.0], dtype=np.float32)
-                elif active_handle in (3, 7):
-                    scale_vec = np.array([sx, 1.0, 1.0], dtype=np.float32)
-                else:
-                    scale_vec = np.array([sx, sy, 1.0], dtype=np.float32)
-                base_rows = state.get('bbox_start_ctrl_rows')
-                if base_rows:
-                    visible_rows_local = [
-                        row for row_idx, row in enumerate(base_rows)
-                        if row_idx < len(state.row_visible) and bool(state.row_visible[row_idx])
-                    ]
-                    if visible_rows_local:
-                        pts = np.concatenate(visible_rows_local, axis=0)
-                        pivot = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32)
-                    else:
-                        pivot = np.asarray(state.mesh_center, dtype=np.float32)
-                    state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
-                    state._rebuild_spline_points()
-                    state.rebuild_spline_mesh()
+            if active_handle in (1, 5):
+                scale_vec = np.array([1.0, sy, 1.0], dtype=np.float32)
+            elif active_handle in (3, 7):
+                scale_vec = np.array([sx, 1.0, 1.0], dtype=np.float32)
+            else:
+                scale_vec = np.array([sx, sy, 1.0], dtype=np.float32)
+            start_scale = np.array(state.get('bbox_start_model_scale', state.model_scale), dtype=np.float32)
+            if start_scale.size == 1:
+                start_scale = np.repeat(start_scale, 3)
+            state.model_scale = np.maximum(start_scale[:3] * scale_vec, 1e-4).astype(np.float32)
 
             start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
             old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
@@ -949,26 +955,32 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_bounds = None
             state.bbox_start_mouse = None
             state.bbox_start_t = None
-            state.bbox_start_ctrl_rows = None
+            state.bbox_start_model_scale = None
 
         state.hover_mesh_idx = renderer.pick_mesh_index(model_mat, state.camera, disp_w, disp_h, lx, ly, visible_rows=state.row_visible)
 
-        if state.selected_mesh_idx >= 0 and io.key_alt:
-            # Closest cursor available in Dear ImGui; used as eyedropper cue.
+        color_pick_active = bool(state.reference_color_pick_active or io.key_alt)
+        if color_pick_active:
             imgui.set_mouse_cursor(imgui.MouseCursor_.hand)
 
-        if imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt and not suppress_mesh_click:
+        if imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not color_pick_active and not suppress_mesh_click:
             state.selected_mesh_idx = state.hover_mesh_idx
 
-        if state.selected_mesh_idx >= 0 and io.key_alt and imgui.is_mouse_clicked(imgui.MouseButton_.left):
-            sampled = renderer.sample_color(lx, ly)
-            row_idx = renderer.get_row_for_mesh_index(state.selected_mesh_idx)
+        if color_pick_active and imgui.is_mouse_clicked(imgui.MouseButton_.left):
+            mesh_idx = state.hover_mesh_idx if state.hover_mesh_idx >= 0 else state.selected_mesh_idx
+            sampled = sample_reference_color(lx, ly)
+            if sampled is None:
+                sampled = renderer.sample_color(lx, ly)
+            row_idx = renderer.get_row_for_mesh_index(mesh_idx)
             if sampled is not None and row_idx is not None and int(state.bitmap_size[0]) > 0:
                 row_idx = int(row_idx) % int(state.bitmap_size[0])
                 state.push_undo("Pick yarn color")
                 state.use_row_colors = True
                 state.row_colors[row_idx] = sampled.tolist()
                 state.rebuild_spline_mesh()
+                state.selected_mesh_idx = mesh_idx
+                state.reference_color_pick_active = False
+                state.status_msg = f"Picked row {row_idx + 1} color from reference"
     else:
         state.hover_mesh_idx = -1
         active_handle = int(state.get('bbox_active_handle', -1))
@@ -978,7 +990,70 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_bounds = None
             state.bbox_start_mouse = None
             state.bbox_start_t = None
-            state.bbox_start_ctrl_rows = None
+            state.bbox_start_model_scale = None
+
+    def radius_range():
+        radius_idx = state._pidx['radius']
+        lo, hi = state.config["knit_parameters"]["parameters"][radius_idx]["range"]
+        return radius_idx, float(lo), float(hi)
+
+    def sample_reference_color(view_x, view_y):
+        ref_pixels = state.get('reference_image_pixels', None)
+        if ref_pixels is None:
+            return None
+        pixels = np.asarray(ref_pixels, dtype=np.float32)
+        if pixels.ndim != 3 or pixels.shape[0] <= 0 or pixels.shape[1] <= 0:
+            return None
+
+        vp_aspect = float(bg_uniforms.get('vp_aspect', 1.0))
+        img_aspect = float(bg_uniforms.get('img_aspect', 1.0))
+        scale_x = max(float(bg_uniforms.get('bg_scale_x', 1.0)), 0.01)
+        scale_y = max(float(bg_uniforms.get('bg_scale_y', 1.0)), 0.01)
+        rotation = float(bg_uniforms.get('bg_rotation', 0.0))
+        offset_x = float(bg_uniforms.get('bg_offset_x', 0.0))
+        offset_y = float(bg_uniforms.get('bg_offset_y', 0.0))
+
+        c = np.array([
+            float(view_x) / max(float(disp_w), 1.0) - 0.5,
+            0.5 - float(view_y) / max(float(disp_h), 1.0),
+        ], dtype=np.float32)
+        iso = np.array([c[0] * vp_aspect, c[1]], dtype=np.float32)
+        cr, sr = np.cos(rotation), np.sin(rotation)
+        rot = np.array([cr * iso[0] - sr * iso[1], sr * iso[0] + cr * iso[1]], dtype=np.float32)
+        uv = np.array([
+            rot[0] / (img_aspect * scale_x) - offset_x + 0.5,
+            rot[1] / scale_y - offset_y + 0.5,
+        ], dtype=np.float32)
+        if np.any(uv < 0.0) or np.any(uv > 1.0):
+            return None
+
+        h, w = pixels.shape[:2]
+        px = int(np.clip(round(float(uv[0]) * (w - 1)), 0, w - 1))
+        py = int(np.clip(round((1.0 - float(uv[1])) * (h - 1)), 0, h - 1))
+        return pixels[py, px, :3].astype(np.float32)
+
+    def local_radius_edit_index():
+        if state.mode != 'spline':
+            return -1
+        hover_idx = int(state.hover_idx)
+        selected_idx = int(state.selected_idx)
+        if hover_idx >= 0 and hover_idx in visible_ctrl_index_map:
+            return hover_idx
+        if selected_idx >= 0 and selected_idx in visible_ctrl_index_map:
+            return selected_idx
+        return -1
+
+    def local_radius_value(flat_idx):
+        state._ensure_spline_radius_rows()
+        row_idx = np.searchsorted(state._row_starts, flat_idx, side="right") - 1
+        if not (0 <= row_idx < len(state.spline_radius_rows)):
+            return float(state.params[state._pidx['radius']])
+        local_idx = int(flat_idx - state._row_starts[row_idx])
+        return float(state.spline_radius_rows[row_idx][local_idx])
+
+    def set_local_radius_from_viewport(flat_idx, value, start_rows=None):
+        state.set_local_radius(flat_idx, value, start_rows=start_rows)
+        state.rebuild_spline_mesh()
 
     if is_hovered:
         curr = (mx, my)
@@ -1016,6 +1091,9 @@ def draw_viewport(state, renderer, ref_tex, window):
             else:
                 can_transform_model = shift_down and not alignment_locked
 
+            if bool(state.spline_grab_active) or bool(state.radius_grab_active):
+                can_transform_model = False
+
             if can_transform_model and (lmb or rmb or mmb):
                 if not state.model_drag_undo_active:
                     state.push_undo("Model transform")
@@ -1028,13 +1106,128 @@ def draw_viewport(state, renderer, ref_tex, window):
                     state.model_t += pixel_drag_to_world_delta(dx, dy)
                 elif mmb:
                     pass
-            elif lmb and not shift_down and not bbox_drag_active and not spline_drag_active:
+            elif lmb and not shift_down and not bbox_drag_active and not spline_drag_active and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
                 if not state.model_drag_undo_active:
                     state.push_undo("Model translate")
                     state.model_drag_undo_active = True
                 state.model_t += pixel_drag_to_world_delta(dx, dy)
 
-        if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map:
+        r_down = glfw.get_key(window, glfw.KEY_R) == glfw.PRESS
+        r_pressed = r_down and not bool(state.radius_grab_key_was_down)
+        state.radius_grab_key_was_down = r_down
+        if r_pressed and not bool(state.radius_grab_active):
+            edit_idx = local_radius_edit_index()
+            if edit_idx >= 0:
+                state.push_undo("Local tube radius")
+                state.selected_idx = edit_idx
+                state.radius_grab_active = True
+                state.radius_grab_point_idx = edit_idx
+                state.radius_grab_start_mouse = np.array([mx, my], dtype=np.float32)
+                state.radius_grab_start_value = local_radius_value(edit_idx)
+                state.radius_grab_start_rows = [row.copy() for row in state.spline_radius_rows]
+
+        if bool(state.radius_grab_active):
+            start_mouse = np.asarray(state.radius_grab_start_mouse, dtype=np.float32)
+            start_radius = float(state.radius_grab_start_value)
+            _, lo, hi = radius_range()
+            drag_px = mx - start_mouse[0]
+            if (
+                glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
+                or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+            ):
+                drag_px *= 0.25
+            if glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS:
+                drag_px *= 2.5
+            new_radius = np.clip(start_radius + drag_px * ((hi - lo) / 500.0), lo, hi)
+            set_local_radius_from_viewport(
+                int(state.radius_grab_point_idx),
+                new_radius,
+                start_rows=state.radius_grab_start_rows,
+            )
+            if (
+                imgui.is_mouse_clicked(imgui.MouseButton_.left)
+                or glfw.get_key(window, glfw.KEY_ENTER) == glfw.PRESS
+                or glfw.get_key(window, glfw.KEY_KP_ENTER) == glfw.PRESS
+            ):
+                state.radius_grab_active = False
+                state.radius_grab_start_rows = []
+            elif (
+                imgui.is_mouse_clicked(imgui.MouseButton_.right)
+                or glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS
+            ):
+                state.spline_radius_rows = [row.copy() for row in state.radius_grab_start_rows]
+                state.rebuild_spline_mesh()
+                state.radius_grab_active = False
+                state.radius_grab_start_rows = []
+
+        if not bool(state.radius_grab_active):
+            radius_delta = 0.0
+            edit_idx = local_radius_edit_index()
+            current_radius = local_radius_value(edit_idx) if edit_idx >= 0 else 0.0
+            radius_step = max(0.001, current_radius * 0.04)
+            if (
+                glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
+                or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+            ):
+                radius_step *= 0.25
+            if glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS:
+                radius_step *= 2.5
+            if glfw.get_key(window, glfw.KEY_RIGHT_BRACKET) == glfw.PRESS or glfw.get_key(window, glfw.KEY_EQUAL) == glfw.PRESS:
+                radius_delta += radius_step
+            if glfw.get_key(window, glfw.KEY_LEFT_BRACKET) == glfw.PRESS or glfw.get_key(window, glfw.KEY_MINUS) == glfw.PRESS:
+                radius_delta -= radius_step
+
+            if abs(radius_delta) > 0.0 and edit_idx >= 0:
+                if not bool(state.radius_keyboard_edit_active):
+                    state.push_undo("Local tube radius")
+                    state.radius_keyboard_edit_active = True
+                state.selected_idx = edit_idx
+                set_local_radius_from_viewport(edit_idx, current_radius + radius_delta)
+            else:
+                state.radius_keyboard_edit_active = False
+
+        if state.mode == 'spline' and len(visible_ctrl_indices) > 0 and not bool(state.radius_grab_active):
+            g_down = glfw.get_key(window, glfw.KEY_G) == glfw.PRESS
+            g_pressed = g_down and not bool(state.spline_grab_key_was_down)
+            state.spline_grab_key_was_down = g_down
+
+            if g_pressed and not bool(state.spline_grab_active):
+                grab_idx = int(state.hover_idx) if int(state.hover_idx) >= 0 else int(state.selected_idx)
+                if grab_idx >= 0 and grab_idx in visible_ctrl_index_map:
+                    state.push_undo("Spline point")
+                    state.selected_idx = grab_idx
+                    state.spline_grab_active = True
+                    state.spline_grab_start_mouse = np.array([mx, my], dtype=np.float32)
+                    state.spline_grab_start_pos = state.flat_pts[grab_idx].astype(np.float32).copy()
+
+            if bool(state.spline_grab_active):
+                if state.selected_idx < 0 or int(state.selected_idx) not in visible_ctrl_index_map:
+                    state.spline_grab_active = False
+                else:
+                    start_mouse = np.asarray(state.spline_grab_start_mouse, dtype=np.float32)
+                    start_pos = np.asarray(state.spline_grab_start_pos, dtype=np.float32)
+                    world_delta = pixel_drag_to_world_delta(mx - start_mouse[0], my - start_mouse[1])
+                    local_delta = np.linalg.inv(model_mat)[:3, :3] @ world_delta
+                    state.move_ctrl_pt(
+                        state.selected_idx,
+                        start_pos + local_delta.astype(np.float32),
+                    )
+                    state.rebuild_spline_mesh()
+                    if (
+                        imgui.is_mouse_clicked(imgui.MouseButton_.left)
+                        or glfw.get_key(window, glfw.KEY_ENTER) == glfw.PRESS
+                        or glfw.get_key(window, glfw.KEY_KP_ENTER) == glfw.PRESS
+                    ):
+                        state.spline_grab_active = False
+                    elif (
+                        imgui.is_mouse_clicked(imgui.MouseButton_.right)
+                        or glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS
+                    ):
+                        state.move_ctrl_pt(state.selected_idx, start_pos)
+                        state.rebuild_spline_mesh()
+                        state.spline_grab_active = False
+
+        if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map and not bool(state.radius_grab_active):
             view = state.camera.view()
             right = view[0, :3]
             up = view[1, :3]

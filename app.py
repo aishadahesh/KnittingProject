@@ -89,6 +89,7 @@ def main():
 
     # ── App state ─────────────────────────────────────────────────────────────
     state = AppState(camera, renderer)
+    state.reference_image_pixels = np.asarray(ref_pil, dtype=np.float32) / 255.0
 
     # Initial state load/build
     if os.path.exists(state.load_path):
