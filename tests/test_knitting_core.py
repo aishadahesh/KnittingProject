@@ -79,3 +79,68 @@ def test_compute_orthonormal_frame():
         assert np.abs(np.dot(u_val, v_val)) < 1e-5
         assert np.abs(np.linalg.norm(u_val) - 1.0) < 1e-5
         assert np.abs(np.linalg.norm(v_val) - 1.0) < 1e-5
+
+
+from knitting_core import (
+    compute_knitting_vertices, compute_knitting_faces,
+    build_parametric_control_rows, build_spline_mesh
+)
+
+def test_mesh_generation(config_fixture, params_fixture):
+    params_dict = params_fixture["params"]
+    config_params = config_fixture["knit_parameters"]["parameters"]
+    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
+    
+    pidx = {p["name"]: i for i, p in enumerate(config_params)}
+    lh_params = sorted(
+        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
+        key=lambda name: int(name.split("_")[-1])
+    )
+    lh_idx = tuple(pidx[name] for name in lh_params)
+    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
+    
+    # 1. Compute vertices
+    vl = compute_knitting_vertices(params_list, bitmap, config_fixture, pidx, lh_idx)
+    assert isinstance(vl, list)
+    assert len(vl) == bitmap.shape[0]
+    for verts, pt_count in vl:
+        assert isinstance(verts, np.ndarray)
+        assert verts.ndim == 2
+        assert verts.shape[1] == 3
+        assert isinstance(pt_count, int)
+        
+    # 2. Compute faces
+    seg = config_fixture["knit_parameters"]["segments"]
+    fl = compute_knitting_faces(seg, vl)
+    assert len(fl) == len(vl)
+    for faces in fl:
+        assert isinstance(faces, np.ndarray)
+        assert faces.ndim == 2
+        assert faces.shape[1] == 4  # quads
+
+def test_spline_construction(config_fixture, params_fixture):
+    params_dict = params_fixture["params"]
+    config_params = config_fixture["knit_parameters"]["parameters"]
+    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
+    
+    pidx = {p["name"]: i for i, p in enumerate(config_params)}
+    lh_params = sorted(
+        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
+        key=lambda name: int(name.split("_")[-1])
+    )
+    lh_idx = tuple(pidx[name] for name in lh_params)
+    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
+    
+    # Build parametric control rows
+    ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
+    assert len(ctrl_rows) == bitmap.shape[0]
+    for row in ctrl_rows:
+        assert isinstance(row, np.ndarray)
+        assert row.shape[1] == 3
+        
+    # Build spline mesh
+    spline_mesh = build_spline_mesh(ctrl_rows, params_list, config_fixture, pidx, bitmap.shape[1])
+    assert len(spline_mesh) == len(ctrl_rows)
+    for pts, nout in spline_mesh:
+        assert pts.shape[1] == 3
+        assert isinstance(nout, int)
