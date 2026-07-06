@@ -627,7 +627,7 @@ class MeshRenderer:
         
         self.depth_prog['mvp'].write(mvp.T.tobytes())
         for mesh_idx, (_, _, depth_vao, n_idx, _, row_idx) in enumerate(self.meshes):
-            if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
+            if not self._row_visible(row_idx, visible_rows):
                 continue
             depth_vao.render(moderngl.TRIANGLES)
 
