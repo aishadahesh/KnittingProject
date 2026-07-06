@@ -517,10 +517,39 @@ def draw_sidebar(state, renderer):
             state.push_undo("Light intensity")
         if changed_intensity:
             state.render_light_intensity = new_intensity
+
+        imgui.separator()
+        imgui.text("Ambient Occlusion (AO)")
+        changed_ao_s, new_ao_s = imgui.slider_float(
+            "AO Strength##render_ao",
+            state.render_ao_strength,
+            0.0,
+            2.0,
+            "%.2f",
+        )
+        if imgui.is_item_activated():
+            state.push_undo("AO Strength")
+        if changed_ao_s:
+            state.render_ao_strength = new_ao_s
+
+        changed_ao_r, new_ao_r = imgui.slider_float(
+            "AO Radius##render_ao",
+            state.render_ao_radius,
+            0.01,
+            1.0,
+            "%.2f",
+        )
+        if imgui.is_item_activated():
+            state.push_undo("AO Radius")
+        if changed_ao_r:
+            state.render_ao_radius = new_ao_r
+
         if imgui.small_button("Reset lighting##render_light"):
             state.push_undo("Lighting")
             state.render_light_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
             state.render_light_intensity = 0.9
+            state.render_ao_strength = 0.5
+            state.render_ao_radius = 0.15
 
     elif stage == 8:
         imgui.text("Spline Refinement")
@@ -643,7 +672,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         visible_rows=state.row_visible,
         bg_tex      = ref_tex if state.show_ref_bg else None,
         bg_alpha    = state.ref_bg_alpha,
-        bg_uniforms = bg_uniforms
+        bg_uniforms = bg_uniforms,
+        camera      = state.camera
     )
 
     # Display FBO

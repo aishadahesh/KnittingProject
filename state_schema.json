@@ -78,7 +78,9 @@
       "render_texture_color": "texture_tint",
       "render_light_color": "light_color",
       "render_light_intensity": "light_intensity",
-      "model_alpha": "model_alpha"
+      "model_alpha": "model_alpha",
+      "render_ao_strength": "ao_strength",
+      "render_ao_radius": "ao_radius"
     },
     "saved_state_keys": [
       "workflow_step",
@@ -122,6 +124,8 @@
       "texture_micro_fiber_scale",
       "texture_twist",
       "render_light_intensity",
+      "render_ao_strength",
+      "render_ao_radius",
       "mi_cam_dist_mult",
       "mi_cam_fov",
       "view_fov",
@@ -538,7 +542,9 @@
     },
     "rendering": {
       "render_light_color": [1.0, 1.0, 1.0],
-      "render_light_intensity": 0.9
+      "render_light_intensity": 0.9,
+      "render_ao_strength": 0.5,
+      "render_ao_radius": 0.15
     }
   }
 }

@@ -66,6 +66,13 @@ uniform float texture_twist;
 uniform vec3  light_color;
 uniform float light_intensity;
 uniform float model_alpha;
+
+uniform sampler2D depth_tex;
+uniform vec2  viewport_size;
+uniform vec2  ao_uv_scale;
+uniform float ao_strength;
+uniform float ao_radius;
+
 out vec4 f_color;
 
 float hash31(vec3 p) {
@@ -118,7 +125,24 @@ void main() {
     float gloss_power = mix(96.0, 8.0, texture_highlight_width);
     float spec = pow(clamp(dot(normalize(v_norm), normalize(vec3(-0.25, 0.35, 1.0))), 0.0, 1.0), gloss_power);
     lit += vec3(spec * texture_gloss_strength) * light_color;
-    f_color = vec4(clamp(lit * (0.25 + 0.75 * diff), 0.0, 1.0), model_alpha);
+    
+    float occlusion = 0.0;
+    float current_depth = gl_FragCoord.z;
+    vec2 screen_uv = gl_FragCoord.xy / viewport_size;
+    for (int i = 0; i < 16; i++) {
+        float angle = float(i) * 2.39996;
+        float r = sqrt(float(i) + 0.5) / 4.0;
+        vec2 offset = vec2(cos(angle), sin(angle)) * r * ao_uv_scale;
+        float sampled_depth = texture(depth_tex, screen_uv + offset).r;
+        float world_depth_diff = (current_depth - sampled_depth) * 500.0;
+        if (world_depth_diff > 0.001 && world_depth_diff < ao_radius) {
+            occlusion += (1.0 - world_depth_diff / ao_radius);
+        }
+    }
+    occlusion = occlusion / 16.0;
+    float ao_factor = clamp(1.0 - occlusion * ao_strength, 0.0, 1.0);
+
+    f_color = vec4(clamp(lit * (0.25 + 0.75 * diff) * ao_factor, 0.0, 1.0), model_alpha);
 }
 """
 
@@ -212,6 +236,21 @@ void main() {
     if (distance(clamped, v_uv) > 0.001) discard;
     vec4 col = texture(bg_tex, clamped);
     f_color = vec4(col.rgb, bg_alpha);
+}
+"""
+
+DEPTH_VERT = """
+#version 330
+in vec3 in_pos;
+uniform mat4 mvp;
+void main() {
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+DEPTH_FRAG = """
+#version 330
+void main() {
 }
 """
 
@@ -395,6 +434,7 @@ class MeshRenderer:
         self.outline_prog = ctx.program(vertex_shader=OUTLINE_VERT, fragment_shader=OUTLINE_FRAG)
         self.pt_prog = ctx.program(vertex_shader=PT_VERT,   fragment_shader=PT_FRAG)
         self.bg_prog = ctx.program(vertex_shader=BG_VERT,   fragment_shader=BG_FRAG)
+        self.depth_prog = ctx.program(vertex_shader=DEPTH_VERT, fragment_shader=DEPTH_FRAG)
         # Full-screen quad for background (triangle strip)
         quad = np.array([[-1,-1],[1,-1],[-1,1],[1,1]], dtype=np.float32)
         self.bg_vao = ctx.vertex_array(
@@ -404,9 +444,9 @@ class MeshRenderer:
         self.vp_w    = 1
         self.vp_h    = 1
         self.color_tex = None
-        self.depth_rb = None
+        self.depth_tex = None
         self.fbo = None
-        self.meshes = []      # list of (vao, outline_vao, n_indices, color, row_idx)
+        self.meshes = []      # list of (vao, outline_vao, depth_vao, n_indices, color, row_idx)
         self.mesh_pick_data = []
         self.pt_vao = None
         self.n_pts  = 0
@@ -425,22 +465,24 @@ class MeshRenderer:
         if self.fbo is not None:
             self.fbo.release()
             self.color_tex.release()
-            self.depth_rb.release()
+            if self.depth_tex is not None:
+                self.depth_tex.release()
 
         self.vp_w = vp_w
         self.vp_h = vp_h
         self.color_tex = self.ctx.texture((vp_w, vp_h), 4)
         self.color_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.depth_rb = self.ctx.depth_renderbuffer((vp_w, vp_h))
+        self.depth_tex = self.ctx.depth_texture((vp_w, vp_h))
         self.fbo = self.ctx.framebuffer(
             color_attachments=[self.color_tex],
-            depth_attachment=self.depth_rb,
+            depth_attachment=self.depth_tex,
         )
 
     def set_meshes(self, verts_list, faces_list, row_indices=None, colors=None, meta=None):
-        for vao, outline_vao, _, _, _ in self.meshes:
+        for vao, outline_vao, depth_vao, _, _, _ in self.meshes:
             vao.release()
             outline_vao.release()
+            depth_vao.release()
         self.meshes.clear()
         self.mesh_pick_data.clear()
         for i, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
@@ -462,6 +504,9 @@ class MeshRenderer:
                 (pos_vbo,  '3f', 'in_pos'),
                 (norm_vbo, '3f', 'in_norm'),
             ], ibo)
+            depth_vao = self.ctx.vertex_array(self.depth_prog, [
+                (pos_vbo,  '3f', 'in_pos'),
+            ], ibo)
             if meta is not None:
                 row_idx = meta[i].get('row', i)
             else:
@@ -470,7 +515,7 @@ class MeshRenderer:
                 color = colors[row_idx % len(colors)]
             else:
                 color = [0.8, 0.2, 0.2]
-            self.meshes.append((vao, outline_vao, len(tris) * 3, color, row_idx))
+            self.meshes.append((vao, outline_vao, depth_vao, len(tris) * 3, color, row_idx))
             self.mesh_pick_data.append((v, row_idx))
 
     def pick_mesh_index(self, model_mat, camera, vp_w, vp_h, mouse_x, mouse_y, visible_rows=None, max_distance_px=16.0):
@@ -532,7 +577,7 @@ class MeshRenderer:
     def get_row_for_mesh_index(self, mesh_idx):
         if mesh_idx < 0 or mesh_idx >= len(self.meshes):
             return None
-        return int(self.meshes[mesh_idx][4])
+        return int(self.meshes[mesh_idx][5])
 
     def sample_color(self, x, y):
         ix = int(np.clip(x, 0, self.vp_w - 1))
@@ -559,10 +604,30 @@ class MeshRenderer:
     def render(self, mvp, mv, material_uniforms, hover_idx=-1, selected_idx=-1,
                hover_mesh_idx=-1, selected_mesh_idx=-1,
                visible_rows=None,
-               bg_tex=None, bg_alpha=0.5, bg_uniforms=None):
+               bg_tex=None, bg_alpha=0.5, bg_uniforms=None,
+               camera=None):
         self.fbo.use()
         self.ctx.viewport = (0, 0, self.vp_w, self.vp_h)
+        
+        # 1. Clear color and depth with depth writes enabled
+        self.fbo.depth_mask = True
         self.ctx.clear(0.12, 0.12, 0.12, 1.0)
+
+        # 2. Depth pre-pass
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.ctx.color_mask = (False, False, False, False)
+        
+        self.depth_prog['mvp'].write(mvp.T.tobytes())
+        for mesh_idx, (_, _, depth_vao, n_idx, _, row_idx) in enumerate(self.meshes):
+            if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
+                continue
+            depth_vao.render(moderngl.TRIANGLES)
+
+        # 3. Restore color writes and disable depth writes
+        self.ctx.color_mask = (True, True, True, True)
+        self.fbo.depth_mask = False
+        self.ctx.depth_func = '<='
 
         # ── Draw reference-image background quad ──────────────────────────────
         if bg_tex is not None:
@@ -588,17 +653,45 @@ class MeshRenderer:
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
+        # Bind depth texture to unit 1
+        self.depth_tex.use(location=1)
+        if 'depth_tex' in self.prog:
+            self.prog['depth_tex'].value = 1
+        if 'viewport_size' in self.prog:
+            self.prog['viewport_size'].value = (float(self.vp_w), float(self.vp_h))
+
+        # Calculate ao_uv_scale
+        if camera is not None:
+            dist = camera.dist
+            fov = camera.fov_deg
+        else:
+            dist = 15.0
+            fov = 45.0
+        half_h = max(1e-4, dist * np.tan(np.radians(fov) * 0.5))
+        half_w = half_h * (self.vp_w / self.vp_h)
+        ao_radius = material_uniforms.get('ao_radius', 0.15)
+        ao_uv_scale = (
+            float(ao_radius / (2.0 * half_w)),
+            float(ao_radius / (2.0 * half_h))
+        )
+        if 'ao_uv_scale' in self.prog:
+            self.prog['ao_uv_scale'].value = ao_uv_scale
+
         # Write matrices and common uniforms once per pass
         self.prog['mvp'].write(mvp.T.tobytes())
         self.prog['mv'].write(mv.T.tobytes())
         self._set_program_uniforms(self.prog, material_uniforms)
 
-        for mesh_idx, (vao, outline_vao, n_idx, color, row_idx) in enumerate(self.meshes):
+        for mesh_idx, (vao, outline_vao, depth_vao, n_idx, color, row_idx) in enumerate(self.meshes):
             if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
                 continue
             base_color = np.asarray(color, dtype=np.float32)
             self.prog['color'].value = tuple(float(c) for c in base_color)
             vao.render(moderngl.TRIANGLES)
+
+        # Restore default depth settings for outline & points
+        self.ctx.depth_func = '<'
+        self.fbo.depth_mask = True
 
         # Silhouette highlight pass: draw expanded backfaces for hover/selection.
         has_outline = selected_mesh_idx >= 0 or hover_mesh_idx >= 0
@@ -610,7 +703,7 @@ class MeshRenderer:
             def draw_outline(mesh_idx, color):
                 if mesh_idx < 0 or mesh_idx >= len(self.meshes):
                     return
-                _, outline_vao, _, _, row_idx = self.meshes[mesh_idx]
+                _, outline_vao, _, _, _, row_idx = self.meshes[mesh_idx]
                 if visible_rows is not None and row_idx < len(visible_rows) and not bool(visible_rows[row_idx]):
                     return
                 self.outline_prog['outline_color'].value = color
