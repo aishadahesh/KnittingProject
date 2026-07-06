@@ -78,7 +78,7 @@ def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx
     bulge_idx, stz_idx, dy_idx, rad_idx, rat_idx = indices
     bulge, stz = params[bulge_idx], params[stz_idx]
     dy, rad, rat = params[dy_idx], params[rad_idx], params[rat_idx]
-    x_pitch = jnp.maximum(1.0, 2.8 * rad)
+    x_pitch = 1.0
     row_heights = params[jnp.array(lh_idx)]
 
     rows, loops = bitmap.shape
@@ -135,7 +135,7 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     p = np.asarray(params, dtype=np.float32)
     idx = pidx
     bulge, stz, dy = float(p[idx["stitch_bulge"]]), float(p[idx["stitch_z"]]), float(p[idx["dy"]])
-    x_pitch = max(1.0, 2.8 * float(p[idx["radius"]]))
+    x_pitch = 1.0
     row_heights = p[np.array(lh_idx)]
     rows, cols = bitmap.shape
     base_t = np.linspace(0.0, 2 * np.pi, spl, endpoint=False, dtype=np.float32)
