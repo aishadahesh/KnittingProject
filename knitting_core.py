@@ -78,19 +78,19 @@ def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx
     bulge_idx, stz_idx, dy_idx, rad_idx, rat_idx = indices
     bulge, stz = params[bulge_idx], params[stz_idx]
     dy, rad, rat = params[dy_idx], params[rad_idx], params[rat_idx]
+    lut = jnp.concatenate((jnp.zeros(1), params[jnp.array(lh_idx)]))
+    scale = _scale_factors_jax(bitmap)
     x_pitch = 1.0
-    row_heights = params[jnp.array(lh_idx)]
 
     rows, loops = bitmap.shape
     t = jnp.linspace(0.0, 2 * jnp.pi * loops, loop_res * loops + 1)
     a = jnp.linspace(0, 2 * jnp.pi, seg, endpoint=False)
     ca, sa = jnp.cos(a)[None, :, None], jnp.sin(a)[None, :, None]
 
-    def row_fn(i, bitmap_row):
-        row_height = jnp.take(row_heights, jnp.minimum(i, len(lh_idx) - 1))
-        active = bitmap_row > 0.5
-        has = jnp.append(jnp.repeat(active, loop_res), active[-1]).astype(jnp.float32)
-        h = has * row_height
+    def row_fn(i, srow):
+        ls = jnp.append(jnp.repeat(srow, loop_res), 1.0).astype(jnp.int32)
+        h = jnp.take(lut, ls)
+        has = (ls > 0).astype(jnp.float32)
         p = eval_curve(t, has, h, bulge, stz).at[:, 1].add(i * dy)
         d = eval_curve_derivative(t, has, h, bulge, stz)
         p = p.at[:, 0].multiply(x_pitch)
@@ -99,7 +99,7 @@ def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx
         off = u[:, None, :] * ca * rad * rat + v[:, None, :] * sa * rad
         return (p[:, None, :] + off).reshape(-1, 3)
 
-    return jax.vmap(row_fn)(jnp.arange(rows), bitmap)
+    return jax.vmap(row_fn)(jnp.arange(rows), scale)
 
 
 def compute_knitting_vertices(params, bitmap, config, pidx, lh_idx):
@@ -135,16 +135,16 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     p = np.asarray(params, dtype=np.float32)
     idx = pidx
     bulge, stz, dy = float(p[idx["stitch_bulge"]]), float(p[idx["stitch_z"]]), float(p[idx["dy"]])
+    lut = np.concatenate((np.zeros(1), p[np.array(lh_idx)]))
+    sf = np.asarray(_scale_factors_jax(jnp.asarray(bitmap))).astype(np.int32)
+    rows, cols = sf.shape
     x_pitch = 1.0
-    row_heights = p[np.array(lh_idx)]
-    rows, cols = bitmap.shape
     base_t = np.linspace(0.0, 2 * np.pi, spl, endpoint=False, dtype=np.float32)
     t = np.tile(base_t, cols)
     xoff = np.repeat(np.arange(cols, dtype=np.float32), spl)
-    active = np.asarray(bitmap > 0.5, dtype=np.float32)
-    has = np.repeat(active, spl, axis=1)
-    row_height = row_heights[np.minimum(np.arange(rows), len(row_heights) - 1)]
-    h = has * np.repeat(row_height[:, None], has.shape[1], axis=1)
+    s = np.repeat(sf, spl, axis=1)
+    has = (s > 0).astype(np.float32)
+    h = lut[s]
     c = np.array(eval_curve(
         jnp.asarray(t[None, :]), jnp.asarray(has), jnp.asarray(h), bulge, stz
     ), dtype=np.float32, copy=True)
