@@ -310,7 +310,7 @@ class AppState:
         updated = base * (1.0 - weights) + target * weights
         self.spline_radius_rows[row_idx] = updated.astype(np.float32)
 
-    def rebuild_spline_mesh(self, preserve_model_placement=False):
+    def rebuild_spline_mesh(self, preserve_model_placement=True):
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
         self._ensure_spline_radius_rows()
@@ -365,7 +365,7 @@ class AppState:
         self.param_ref_radius = base_radius
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
-        self.rebuild_spline_mesh()
+        self.rebuild_spline_mesh(preserve_model_placement=False)
 
     def nudge_spline_from_params(self):
         target_rows = self._fresh_rebuild_rows()
@@ -703,6 +703,6 @@ class AppState:
                 self._ensure_spline_radius_rows()
                 self._rebuild_spline_points()
                 self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
-                self.rebuild_spline_mesh()
+                self.rebuild_spline_mesh(preserve_model_placement=False)
         except Exception as e:
             self.status_msg = f"Load error: {e}"
