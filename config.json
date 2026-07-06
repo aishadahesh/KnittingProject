@@ -28,13 +28,13 @@
       },
       {
         "name": "dy",
-        "initial": 1.0,
+        "initial": 3.0,
         "range": [0.2, 3.0],
         "delta": 0.01
       },
       {
         "name": "radius",
-        "initial": 0.08,
+        "initial": 0.5,
         "range": [0.01, 0.5],
         "delta": 0.005
       },
@@ -46,31 +46,31 @@
       },
       {
         "name": "loop_height_1",
-        "initial": 1.6,
+        "initial": 3.0,
         "range": [0.1, 6.0],
         "delta": 0.01
       },
       {
         "name": "loop_height_2",
-        "initial": 3.2,
+        "initial": 3.0,
         "range": [0.1, 6.0],
         "delta": 0.01
       },
       {
         "name": "loop_height_3",
-        "initial": 4.8,
+        "initial": 3.0,
         "range": [0.1, 6.0],
         "delta": 0.01
       },
       {
         "name": "loop_height_4",
-        "initial": 6.0,
+        "initial": 3.0,
         "range": [0.1, 6.0],
         "delta": 0.01
       },
       {
         "name": "loop_height_5",
-        "initial": 6.0,
+        "initial": 3.0,
         "range": [0.1, 6.0],
         "delta": 0.01
       }
