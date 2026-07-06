@@ -81,10 +81,8 @@ class AppState:
         for attr, cast_fn in _SCHEMA_CASTS.items():
             super().__setattr__(attr, cast_fn(app_config[attr]))
 
-        # Helper to auto-coerce flat numeric lists to np.float32 arrays, leaving other structures intact
-        def _coerce(k, val):
-            if k == '_row_starts':
-                return list(val)
+        # Auto-coerce flat numeric lists to np.float32 arrays, leaving other structures intact
+        def _coerce(val):
             if isinstance(val, list) and val and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in val):
                 return np.array(val, dtype=np.float32)
             return val
@@ -93,7 +91,7 @@ class AppState:
         state_defaults = {}
         for section, keys_dict in schema['state_defaults'].items():
             for key, val in keys_dict.items():
-                state_defaults[key] = AppState._clone(_coerce(key, val))
+                state_defaults[key] = AppState._clone(_coerce(val))
 
         # 3. Add static defaults that need special empty array dimensions
         state_defaults['flat_pts'] = np.empty((0, 3), dtype=np.float32)
@@ -103,9 +101,9 @@ class AppState:
         preset_soft = self.texture_presets['soft_yarn']
         for k, v in preset_clear.items():
             if k != 'render_texture_color':
-                state_defaults[k] = AppState._clone(_coerce(k, v))
+                state_defaults[k] = AppState._clone(_coerce(v))
         for k, v in preset_soft.items():
-            state_defaults[k] = AppState._clone(_coerce(k, v))
+            state_defaults[k] = AppState._clone(_coerce(v))
 
         # 5. Overlay computed defaults depending on config.json or runtime pathing
         computed_defaults = {
@@ -125,7 +123,10 @@ class AppState:
             'mi_cam_fov': float(config_data['rendering']['camera_fov']),
         }
         for k, v in computed_defaults.items():
-            state_defaults[k] = AppState._clone(_coerce(k, v))
+            state_defaults[k] = AppState._clone(_coerce(v))
+
+        # 6. Direct assignments for types that _coerce would get wrong
+        state_defaults['_row_starts'] = [0]
 
         super().__setattr__('_state_defaults', state_defaults)
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}

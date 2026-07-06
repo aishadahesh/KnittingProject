@@ -493,7 +493,6 @@
     "geometry": {
       "samples_per_loop": 5,
       "ctrl_rows": [],
-      "_row_starts": [0],
       "auto_fix_spline_endpoints": true,
       "spline_point_drag_active": false,
       "spline_keyboard_edit_active": false,
