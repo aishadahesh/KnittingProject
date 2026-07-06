@@ -437,8 +437,6 @@ class AppState:
         }
 
     def current_model_matrix(self):
-        from rendering import rotation_matrix_xyz
-        model_rot = rotation_matrix_xyz(*self.model_rot)
         model_s = np.eye(4, dtype=np.float32)
         model_s[0, 0] = 1.0
         model_s[1, 1] = 1.0
@@ -447,7 +445,7 @@ class AppState:
         tneg[:3, 3] = -self.mesh_center
         tpos[:3, 3] = self.mesh_center
         tuser[:3, 3] = self.model_t
-        return (tuser @ tpos @ model_rot @ model_s @ tneg).astype(np.float32)
+        return (tuser @ tpos @ model_s @ tneg).astype(np.float32)
 
     # ── UNDO / REDO ───────────────────────────────────────────────────────────
 

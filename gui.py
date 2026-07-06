@@ -243,20 +243,9 @@ def draw_sidebar(state, renderer):
 
         if alignment_locked:
             imgui.begin_disabled()
-        imgui.text_wrapped("Viewport controls: Shift+LMB rotate, Shift+RMB translate.")
+        imgui.text_wrapped("Viewport controls: Shift+RMB translate.")
         imgui.text_wrapped("Camera controls: Mouse wheel zoom camera. Drag in the viewport to move the model.")
-        pi = float(np.pi)
-        imgui.text_colored((0.8, 0.8, 0.4, 1.0), "Rotation")
-        
-        # Vectorized model rotation
         labels = ["X", "Y", "Z"]
-        for idx in range(3):
-            changed, val = imgui.slider_float(f"{labels[idx]}##align_rot_{idx}", float(state.model_rot[idx]), -pi, pi, f"{labels[idx]}: %.2f rad")
-            if imgui.is_item_activated():
-                state.push_undo("Model rotation")
-            if changed:
-                state.model_rot[idx] = val
-
         imgui.text_colored((0.4, 0.8, 0.8, 1.0), "Position")
         # Vectorized model translation
         for idx in range(3):
@@ -274,7 +263,6 @@ def draw_sidebar(state, renderer):
         imgui.same_line()
         if imgui.small_button("Reset transform##align"):
             state.push_undo("Reset transform")
-            state.model_rot[:] = 0.0
             state.center_model_on_view()
         if alignment_locked:
             imgui.end_disabled()
@@ -1117,18 +1105,11 @@ def draw_viewport(state, renderer, ref_tex, window):
             if bool(state.spline_grab_active) or bool(state.radius_grab_active):
                 can_transform_model = False
 
-            if can_transform_model and (lmb or rmb or mmb):
+            if can_transform_model and rmb:
                 if not state.model_drag_undo_active:
                     state.push_undo("Model transform")
                     state.model_drag_undo_active = True
-                if lmb:
-                    sens = 0.005
-                    state.model_rot[1] += dx * sens
-                    state.model_rot[0] += dy * sens
-                elif rmb:
-                    state.model_t += pixel_drag_to_world_delta(dx, dy)
-                elif mmb:
-                    pass
+                state.model_t += pixel_drag_to_world_delta(dx, dy)
             elif lmb and not shift_down and not bbox_drag_active and not spline_drag_active and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
                 if not state.model_drag_undo_active:
                     state.push_undo("Model translate")
@@ -1289,18 +1270,12 @@ def draw_viewport(state, renderer, ref_tex, window):
             else:
                 state.spline_keyboard_edit_active = False
 
-        if (
+        state.model_rot_dragging = False
+        if not (
             not alignment_locked
             and imgui.get_io().key_shift
-            and (
-                glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
-                or glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-                or glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
-            )
+            and glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
         ):
-            state.model_rot_dragging = True
-        else:
-            state.model_rot_dragging = False
             state.model_drag_undo_active = False
 
         # Spline handle hover + select
