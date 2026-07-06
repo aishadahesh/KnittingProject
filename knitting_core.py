@@ -78,25 +78,28 @@ def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx
     bulge_idx, stz_idx, dy_idx, rad_idx, rat_idx = indices
     bulge, stz = params[bulge_idx], params[stz_idx]
     dy, rad, rat = params[dy_idx], params[rad_idx], params[rat_idx]
-    lut = jnp.concatenate((jnp.zeros(1), params[jnp.array(lh_idx)]))
-    scale = _scale_factors_jax(bitmap)
+    x_pitch = jnp.maximum(1.0, 2.8 * rad)
+    row_heights = params[jnp.array(lh_idx)]
 
     rows, loops = bitmap.shape
     t = jnp.linspace(0.0, 2 * jnp.pi * loops, loop_res * loops + 1)
     a = jnp.linspace(0, 2 * jnp.pi, seg, endpoint=False)
     ca, sa = jnp.cos(a)[None, :, None], jnp.sin(a)[None, :, None]
 
-    def row_fn(i, srow):
-        ls = jnp.append(jnp.repeat(srow, loop_res), 1.0).astype(jnp.int32)
-        h = jnp.take(lut, ls)
-        has = (ls > 0).astype(jnp.float32)
+    def row_fn(i, bitmap_row):
+        row_height = jnp.take(row_heights, jnp.minimum(i, len(lh_idx) - 1))
+        active = bitmap_row > 0.5
+        has = jnp.append(jnp.repeat(active, loop_res), active[-1]).astype(jnp.float32)
+        h = has * row_height
         p = eval_curve(t, has, h, bulge, stz).at[:, 1].add(i * dy)
         d = eval_curve_derivative(t, has, h, bulge, stz)
+        p = p.at[:, 0].multiply(x_pitch)
+        d = d.at[:, 0].multiply(x_pitch)
         u, v = compute_orthonormal_frame(d)
         off = u[:, None, :] * ca * rad * rat + v[:, None, :] * sa * rad
         return (p[:, None, :] + off).reshape(-1, 3)
 
-    return jax.vmap(row_fn)(jnp.arange(rows), scale)
+    return jax.vmap(row_fn)(jnp.arange(rows), bitmap)
 
 
 def compute_knitting_vertices(params, bitmap, config, pidx, lh_idx):
@@ -132,23 +135,24 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     p = np.asarray(params, dtype=np.float32)
     idx = pidx
     bulge, stz, dy = float(p[idx["stitch_bulge"]]), float(p[idx["stitch_z"]]), float(p[idx["dy"]])
-    lut = np.concatenate((np.zeros(1), p[np.array(lh_idx)]))
-    sf = np.asarray(_scale_factors_jax(jnp.asarray(bitmap))).astype(np.int32)
-    rows, cols = sf.shape
+    x_pitch = max(1.0, 2.8 * float(p[idx["radius"]]))
+    row_heights = p[np.array(lh_idx)]
+    rows, cols = bitmap.shape
     base_t = np.linspace(0.0, 2 * np.pi, spl, endpoint=False, dtype=np.float32)
     t = np.tile(base_t, cols)
     xoff = np.repeat(np.arange(cols, dtype=np.float32), spl)
-    s = np.repeat(sf, spl, axis=1)
-    has = (s > 0).astype(np.float32)
-    h = lut[s]
+    active = np.asarray(bitmap > 0.5, dtype=np.float32)
+    has = np.repeat(active, spl, axis=1)
+    row_height = row_heights[np.minimum(np.arange(rows), len(row_heights) - 1)]
+    h = has * np.repeat(row_height[:, None], has.shape[1], axis=1)
     c = np.array(eval_curve(
         jnp.asarray(t[None, :]), jnp.asarray(has), jnp.asarray(h), bulge, stz
     ), dtype=np.float32, copy=True)
-    c[:, :, 0] += xoff[None, :]
+    c[:, :, 0] = (c[:, :, 0] + xoff[None, :]) * x_pitch
     c[:, :, 1] += np.arange(rows, dtype=np.float32)[:, None] * dy
 
     end = np.zeros((rows, 1, 3), dtype=np.float32)
-    end[:, 0, 0] = float(cols)
+    end[:, 0, 0] = float(cols) * x_pitch
     end[:, 0, 1] = np.arange(rows, dtype=np.float32) * dy
     return [np.concatenate((c[r], end[r]), axis=0).astype(float) for r in range(rows)]
 
@@ -234,7 +238,7 @@ def build_surface_fiber_meshes(
     return out_vl, meta
 
 
-def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width):
+def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width, radius_ctrl_rows=None):
     p = np.asarray(params)
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
     seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
@@ -242,14 +246,30 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width):
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
     out = []
-    for r in ctrl_rows:
+    for row_idx, r in enumerate(ctrl_rows):
         cp = np.asarray(r, dtype=float)
         if len(cp) <= 1:
             pts = np.repeat(cp, nout, axis=0)
+            ctrl_sample_idx = np.zeros(nout, dtype=float)
         else:
             t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp, axis=0), axis=1), 1e-6))))
             to = np.linspace(t[0], t[-1], nout)
             pts = np.column_stack([np.interp(to, t, cp[:, i]) for i in range(3)]) if len(cp) == 2 else np.column_stack([CubicSpline(t, cp[:, i], bc_type="natural")(to) for i in range(3)])
+            ctrl_sample_idx = np.linspace(0.0, len(cp) - 1, nout, dtype=float)
+
+        if radius_ctrl_rows is not None and row_idx < len(radius_ctrl_rows):
+            radius_cp = np.asarray(radius_ctrl_rows[row_idx], dtype=float)
+            if radius_cp.shape[0] == len(cp):
+                if len(cp) <= 1:
+                    radius_line = np.full(nout, float(radius_cp[0]) if len(radius_cp) else float(rad), dtype=float)
+                else:
+                    radius_line = np.interp(ctrl_sample_idx, np.arange(len(radius_cp), dtype=float), radius_cp)
+            else:
+                radius_line = np.full(nout, float(rad), dtype=float)
+        else:
+            radius_line = np.full(nout, float(rad), dtype=float)
+        radius_line = np.maximum(radius_line, 1e-6)
+
         T = np.gradient(pts, axis=0)
         T /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
         U = np.cross(T, [0, 0, 1])
@@ -257,5 +277,6 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width):
         U[b] = np.cross(T[b], [1, 0, 0])
         U /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-8
         V = np.cross(T, U)
-        out.append(((pts[:, None, :] + U[:, None, :] * ca * rad * rat + V[:, None, :] * sa * rad).reshape(-1, 3), nout))
+        rline = radius_line[:, None, None]
+        out.append(((pts[:, None, :] + U[:, None, :] * ca * rline * rat + V[:, None, :] * sa * rline).reshape(-1, 3), nout))
     return out
