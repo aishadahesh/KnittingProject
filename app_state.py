@@ -440,13 +440,9 @@ class AppState:
         from rendering import rotation_matrix_xyz
         model_rot = rotation_matrix_xyz(*self.model_rot)
         model_s = np.eye(4, dtype=np.float32)
-        scale = np.asarray(self.model_scale, dtype=np.float32)
-        if scale.size == 1:
-            scale = np.repeat(scale, 3)
-        scale = np.maximum(scale[:3], 1e-4)
-        model_s[0, 0] = scale[0]
-        model_s[1, 1] = scale[1]
-        model_s[2, 2] = scale[2]
+        model_s[0, 0] = 1.0
+        model_s[1, 1] = 1.0
+        model_s[2, 2] = 1.0
         tneg, tpos, tuser = np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32)
         tneg[:3, 3] = -self.mesh_center
         tpos[:3, 3] = self.mesh_center
