@@ -17,3 +17,23 @@ def test_core_module_imports():
     assert "imgui_bundle" not in sys.modules
     assert "gui" not in sys.modules
     assert "app_state" not in sys.modules
+
+
+import json
+import pytest
+import numpy as np
+
+@pytest.fixture
+def config_fixture():
+    with open("config.json", "r") as f:
+        return json.load(f)
+
+@pytest.fixture
+def params_fixture():
+    with open("params.json", "r") as f:
+        return json.load(f)
+
+def test_fixtures_load(config_fixture, params_fixture):
+    assert "knit_parameters" in config_fixture
+    assert "params" in params_fixture
+    assert "bitmap" in params_fixture
