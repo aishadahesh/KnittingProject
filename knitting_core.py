@@ -153,40 +153,85 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     return [np.concatenate((c[r], end[r]), axis=0).astype(float) for r in range(rows)]
 
 
-def save_combined_obj(mesh_data_list, base_filename="knitting_model"):
-    path = f"{base_filename}_combined.obj"
-    off = 0
-    with open(path, "w") as h:
-        h.write("# Knitting Model\n")
-        for i, (v, _, f, _) in enumerate(mesh_data_list):
-            h.write(f"o mesh_{i}\n")
-            np.savetxt(h, v, fmt="v %.6f %.6f %.6f")
-            np.savetxt(h, f + off + 1, fmt="f %d %d %d %d")
-            off += len(v)
+def build_surface_fiber_meshes(
+    base_vl,
+    segments,
+    enabled,
+    count,
+    radius,
+    radius_scale,
+    lift,
+    surface_arc,
+    randomness,
+    twist,
+):
+    if not enabled:
+        return list(base_vl), [{"row": row_idx} for row_idx in range(len(base_vl))]
 
+    fiber_radius = max(radius * radius_scale, 1e-5)
+    lift_val = max(lift, 0.0)
+    surface_arc_val = float(np.clip(surface_arc, 0.05, 1.0))
+    randomness_val = float(np.clip(randomness, 0.0, 1.0))
 
-def save_per_loop_objs(mesh_data_list, base_filename, loop_res, segments):
-    """Save each stitch loop as a separate OBJ file."""
-    loop_vertex_count = (loop_res + 1) * segments
-    loop_faces = compute_knitting_faces(segments, [(np.empty((loop_vertex_count, 3)), loop_res + 1)])[0]
-    loop_specs = [
-        (
-            row_idx,
-            loop_idx,
-            verts[loop_idx * loop_res * segments:loop_idx * loop_res * segments + loop_vertex_count],
-            f"{base_filename}_r{row_idx:02d}_l{loop_idx:02d}.obj",
+    out_vl = []
+    meta = []
+
+    for row_idx, (verts, n_points) in enumerate(base_vl):
+        verts = np.asarray(verts, dtype=np.float32)
+        n_points = int(n_points)
+        if n_points < 2 or len(verts) != n_points * segments:
+            continue
+
+        rings = verts.reshape(n_points, segments, 3)
+        centers = rings.mean(axis=1)
+        top_idx = int(np.argmax((rings - centers[:, None, :])[:, :, 2].mean(axis=0)))
+        offsets = (
+            np.zeros(1, dtype=np.float32)
+            if count == 1
+            else np.linspace(-0.5, 0.5, count, dtype=np.float32) * surface_arc_val * float(segments)
         )
-        for row_idx, (verts, _, _, n_points) in enumerate(mesh_data_list)
-        for loop_idx in range((n_points - 1) // loop_res)
-    ]
 
-    obj_info = []
-    for row_idx, loop_idx, loop_verts, path in loop_specs:
-        with open(path, "w") as handle:
-            np.savetxt(handle, loop_verts, fmt="v %.6f %.6f %.6f")
-            np.savetxt(handle, loop_faces + 1, fmt="f %d %d %d %d")
-        obj_info.append((row_idx, loop_idx, path))
-    return obj_info
+        for fiber_idx, offset in enumerate(offsets):
+            rng = np.random.default_rng(row_idx * 1009 + fiber_idx * 9173)
+            phase_jitter = rng.normal(0.0, 0.35 * randomness_val)
+            lift_jitter = rng.normal(0.0, 0.20 * randomness_val)
+            radius_jitter = float(np.clip(1.0 + rng.normal(0.0, 0.18 * randomness_val), 0.55, 1.45))
+            local_radius = max(fiber_radius * radius_jitter, 1e-5)
+
+            sample_idx = np.mod(
+                top_idx + offset + phase_jitter + twist * np.linspace(0.0, 1.0, n_points, dtype=np.float32) * segments,
+                float(segments),
+            )
+            lo_float = np.floor(sample_idx)
+            lo = lo_float.astype(np.int32) % segments
+            hi = (lo + 1) % segments
+            frac = (sample_idx - lo_float).astype(np.float32)
+            surface = rings[np.arange(n_points), lo] * (1.0 - frac[:, None]) + rings[np.arange(n_points), hi] * frac[:, None]
+            radial = surface - centers
+            surface_radius = np.linalg.norm(radial, axis=1, keepdims=True)
+            radial /= surface_radius + 1e-8
+            center_radius = np.maximum(surface_radius - local_radius + local_radius * (lift_val + lift_jitter), local_radius)
+            line = centers + radial * center_radius
+
+            tangent = np.gradient(line, axis=0)
+            tangent /= np.linalg.norm(tangent, axis=1, keepdims=True) + 1e-8
+            side = np.cross(tangent, radial)
+            bad = np.linalg.norm(side, axis=1) < 1e-6
+            if np.any(bad):
+                side[bad] = np.cross(tangent[bad], [1.0, 0.0, 0.0])
+            side /= np.linalg.norm(side, axis=1, keepdims=True) + 1e-8
+            normal = np.cross(side, tangent)
+            normal /= np.linalg.norm(normal, axis=1, keepdims=True) + 1e-8
+
+            angles = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False, dtype=np.float32)
+            offsets_ring = (
+                normal[:, None, :] * np.cos(angles)[None, :, None]
+                + side[:, None, :] * np.sin(angles)[None, :, None]
+            ) * local_radius
+            out_vl.append(((line[:, None, :] + offsets_ring).reshape(-1, 3).astype(np.float32), n_points))
+            meta.append({'row': row_idx})
+
+    return out_vl, meta
 
 
 def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width):

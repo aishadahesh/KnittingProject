@@ -526,6 +526,7 @@ dependencies = [
     { name = "pyopengl" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "ur-rtde" },
     { name = "vedo" },
     { name = "vtk" },
 ]
@@ -550,6 +551,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pyopengl", specifier = ">=3.1.10" },
     { name = "scipy", specifier = ">=1.17.1" },
+    { name = "ur-rtde", specifier = ">=1.6.0" },
     { name = "vedo", specifier = ">=2026.6.1" },
     { name = "vtk", specifier = ">=9.6.2" },
 ]
@@ -1435,6 +1437,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/55/e3/70399cb7dd41c10ac53367ae42139cf4b1ca5f36bb3dc6c9d33acdb43655/typing_inspection-0.4.2.tar.gz", hash = "sha256:ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464", size = 75949, upload-time = "2025-10-01T02:14:41.687Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl", hash = "sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7", size = 14611, upload-time = "2025-10-01T02:14:40.154Z" },
+]
+
+[[package]]
+name = "ur-rtde"
+version = "1.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/97/b14f774cfd63a46ca80cfadd2c24704a7eae2b4d26fc18cc7c8783c4ca8e/ur_rtde-1.6.3.tar.gz", hash = "sha256:30bbbb5b9c98c49a3b53be2819b80f00c1f76dc08b99e3ed064e6a190d29bf81", size = 2820425, upload-time = "2026-03-13T13:41:04.05Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/9f/bb7331de3cd73f401daa74c55111f44b22f1c58de865bfa644b304ce6c96/ur_rtde-1.6.3-cp311-cp311-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:c70e599ec8daca390b7a4efdb9ad9b15b641e360b6a1ae713167110f2c7aae51", size = 4999586, upload-time = "2026-03-13T13:40:01.38Z" },
+    { url = "https://files.pythonhosted.org/packages/58/48/0d3123909ff73a7d23b1af4e81b64ea837dbacd8d4bfa0fddca2cb8a28fa/ur_rtde-1.6.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e78e284d6dee1c7813c911967df86c23af07a83fab42ed704fca3cbcfd4cfab9", size = 4924730, upload-time = "2026-03-13T13:40:04.041Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/47/9450167046d16cd3ebfadabcccabc7493a4562a92ced056164915b784130/ur_rtde-1.6.3-cp311-cp311-win_amd64.whl", hash = "sha256:0bd15c1d64c15f97a14319579c8d42fc4b03381e79f43d80f11d1030d79552d1", size = 2570684, upload-time = "2026-03-13T13:40:06.628Z" },
+    { url = "https://files.pythonhosted.org/packages/67/ed/b6ee131f29a12d6a4b49d7a14f69905fb81dbae1fc9fe4b48f860c214f08/ur_rtde-1.6.3-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:d6985014db08e0c43d7b64db95bdad14349dd39b9bdbcaf88f3b40596c549544", size = 4992312, upload-time = "2026-03-13T13:40:09.316Z" },
+    { url = "https://files.pythonhosted.org/packages/55/3c/18013fc90305c3aad66db84db97736fc9af5603589948049a75137ec9c59/ur_rtde-1.6.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b075ae3cb4aae5c93d7a1ba2d31890dfad5ed2da7458a3e78037e4bb88bc23e8", size = 4920152, upload-time = "2026-03-13T13:40:11.97Z" },
+    { url = "https://files.pythonhosted.org/packages/82/d8/f66f030d0487e1221580ac969be20d3aa1b182fee15502cacd4e0a59e6e0/ur_rtde-1.6.3-cp312-cp312-win_amd64.whl", hash = "sha256:b19a2d4564290398673f5040bd0e84e5f4de96920577dbe4cea02bf7351896ff", size = 2570841, upload-time = "2026-03-13T13:40:14.382Z" },
 ]
 
 [[package]]

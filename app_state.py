@@ -8,7 +8,7 @@ from PIL import Image
 
 from knitting_core import (
     compute_knitting_vertices, compute_knitting_faces,
-    save_combined_obj, build_parametric_control_rows, build_spline_mesh
+    build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes
 )
 
 # %% APP STATE ─────────────────────────────────────────────────────────────────
@@ -239,81 +239,19 @@ class AppState:
                     display_meta.append(part_meta)
         return display_vl, display_fl, display_meta
 
-    def _build_surface_fiber_meshes(self, base_vl):
-        if not self.fiber_geometry_enabled:
-            return list(base_vl), [{'row': row_idx} for row_idx in range(len(base_vl))]
-
-        seg = int(self.config['knit_parameters']['segments'])
-        count = max(1, int(round(float(self.fiber_geometry_count))))
-        radius = float(self.params[self._pidx['radius']])
-        fiber_radius = max(radius * float(self.fiber_geometry_radius_scale), 1e-5)
-        lift = max(float(self.fiber_geometry_lift), 0.0)
-        surface_arc = float(np.clip(self.fiber_geometry_surface_arc, 0.05, 1.0))
-        randomness = float(np.clip(self.fiber_geometry_randomness, 0.0, 1.0))
-        twist = float(self.fiber_geometry_twist)
-
-        out_vl = []
-        meta = []
-
-        for row_idx, (verts, n_points) in enumerate(base_vl):
-            verts = np.asarray(verts, dtype=np.float32)
-            n_points = int(n_points)
-            if n_points < 2 or len(verts) != n_points * seg:
-                continue
-
-            rings = verts.reshape(n_points, seg, 3)
-            centers = rings.mean(axis=1)
-            top_idx = int(np.argmax((rings - centers[:, None, :])[:, :, 2].mean(axis=0)))
-            offsets = (
-                np.zeros(1, dtype=np.float32)
-                if count == 1
-                else np.linspace(-0.5, 0.5, count, dtype=np.float32) * surface_arc * float(seg)
-            )
-
-            for fiber_idx, offset in enumerate(offsets):
-                rng = np.random.default_rng(row_idx * 1009 + fiber_idx * 9173)
-                phase_jitter = rng.normal(0.0, 0.35 * randomness)
-                lift_jitter = rng.normal(0.0, 0.20 * randomness)
-                radius_jitter = float(np.clip(1.0 + rng.normal(0.0, 0.18 * randomness), 0.55, 1.45))
-                local_radius = max(fiber_radius * radius_jitter, 1e-5)
-
-                sample_idx = np.mod(
-                    top_idx + offset + phase_jitter + twist * np.linspace(0.0, 1.0, n_points, dtype=np.float32) * seg,
-                    float(seg),
-                )
-                lo_float = np.floor(sample_idx)
-                lo = lo_float.astype(np.int32) % seg
-                hi = (lo + 1) % seg
-                frac = (sample_idx - lo_float).astype(np.float32)
-                surface = rings[np.arange(n_points), lo] * (1.0 - frac[:, None]) + rings[np.arange(n_points), hi] * frac[:, None]
-                radial = surface - centers
-                surface_radius = np.linalg.norm(radial, axis=1, keepdims=True)
-                radial /= surface_radius + 1e-8
-                center_radius = np.maximum(surface_radius - local_radius + local_radius * (lift + lift_jitter), local_radius)
-                line = centers + radial * center_radius
-
-                tangent = np.gradient(line, axis=0)
-                tangent /= np.linalg.norm(tangent, axis=1, keepdims=True) + 1e-8
-                side = np.cross(tangent, radial)
-                bad = np.linalg.norm(side, axis=1) < 1e-6
-                if np.any(bad):
-                    side[bad] = np.cross(tangent[bad], [1.0, 0.0, 0.0])
-                side /= np.linalg.norm(side, axis=1, keepdims=True) + 1e-8
-                normal = np.cross(side, tangent)
-                normal /= np.linalg.norm(normal, axis=1, keepdims=True) + 1e-8
-
-                angles = np.linspace(0.0, 2.0 * np.pi, seg, endpoint=False, dtype=np.float32)
-                offsets_ring = (
-                    normal[:, None, :] * np.cos(angles)[None, :, None]
-                    + side[:, None, :] * np.sin(angles)[None, :, None]
-                ) * local_radius
-                out_vl.append(((line[:, None, :] + offsets_ring).reshape(-1, 3).astype(np.float32), n_points))
-                meta.append({'row': row_idx})
-
-        return out_vl, meta
-
     def prepare_display_meshes(self, vl, fl):
-        vl, meta = self._build_surface_fiber_meshes(vl)
+        vl, meta = build_surface_fiber_meshes(
+            vl,
+            segments=int(self.config['knit_parameters']['segments']),
+            enabled=self.fiber_geometry_enabled,
+            count=max(1, int(round(float(self.fiber_geometry_count)))),
+            radius=float(self.params[self._pidx['radius']]),
+            radius_scale=float(self.fiber_geometry_radius_scale),
+            lift=float(self.fiber_geometry_lift),
+            surface_arc=float(self.fiber_geometry_surface_arc),
+            randomness=float(self.fiber_geometry_randomness),
+            twist=float(self.fiber_geometry_twist),
+        )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
         return self.build_display_meshes_precise(vl, fl, meta)
 
