@@ -235,12 +235,7 @@ class AppState:
         return max(z_span + float(depth_gap), float(depth_gap))
 
     def _display_copy_x_period(self, verts_list, radius):
-        if self.ctrl_rows:
-            x_min = min(float(np.min(row[:, 0])) for row in self.ctrl_rows if len(row))
-            x_max = max(float(np.max(row[:, 0])) for row in self.ctrl_rows if len(row))
-            return max(x_max - x_min, radius)
-        base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
-        return max(float(base_bounds[:, 0].max() - base_bounds[:, 0].min()) - radius * 2.0, radius)
+        return max(float(self.bitmap_size[1]), radius)
 
     def _display_copy_y_period(self, verts_list, radius):
         if self.ctrl_rows:

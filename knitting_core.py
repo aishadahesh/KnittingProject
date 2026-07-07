@@ -90,10 +90,8 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     c[:, :, 0] = (c[:, :, 0] + xoff[None, :]) * x_pitch
     c[:, :, 1] += np.arange(rows, dtype=np.float32)[:, None] * dy
 
-    end = np.zeros((rows, 1, 3), dtype=np.float32)
-    end[:, 0, 0] = float(cols) * x_pitch
-    end[:, 0, 1] = np.arange(rows, dtype=np.float32) * dy
-    return [np.concatenate((c[r], end[r]), axis=0).astype(float) for r in range(rows)]
+    return [c[r].astype(float) for r in range(rows)]
+
 
 
 def build_surface_fiber_meshes(
@@ -184,6 +182,7 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width, radius_ctrl
     nout = res * bitmap_width + 1
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
+    D = np.array([float(bitmap_width), 0.0, 0.0], dtype=float)
     out = []
     for row_idx, r in enumerate(ctrl_rows):
         cp = np.asarray(r, dtype=float)
@@ -191,10 +190,16 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width, radius_ctrl
             pts = np.repeat(cp, nout, axis=0)
             ctrl_sample_idx = np.zeros(nout, dtype=float)
         else:
-            t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp, axis=0), axis=1), 1e-6))))
+            cp_aug = np.concatenate((cp, (cp[0] + D)[None, :]), axis=0)
+            t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6))))
             to = np.linspace(t[0], t[-1], nout)
-            pts = np.column_stack([np.interp(to, t, cp[:, i]) for i in range(3)]) if len(cp) == 2 else np.column_stack([CubicSpline(t, cp[:, i], bc_type="natural")(to) for i in range(3)])
-            ctrl_sample_idx = np.linspace(0.0, len(cp) - 1, nout, dtype=float)
+            cp_detrended = cp_aug - D[None, :] * (t / t[-1])[:, None]
+            if len(cp) == 2:
+                pts_detrended = np.column_stack([np.interp(to, t, cp_detrended[:, i]) for i in range(3)])
+            else:
+                pts_detrended = np.column_stack([CubicSpline(t, cp_detrended[:, i], bc_type="periodic")(to) for i in range(3)])
+            pts = pts_detrended + D[None, :] * (to / t[-1])[:, None]
+            ctrl_sample_idx = np.linspace(0.0, len(cp), nout, dtype=float)
 
         if radius_ctrl_rows is not None and row_idx < len(radius_ctrl_rows):
             radius_cp = np.asarray(radius_ctrl_rows[row_idx], dtype=float)
@@ -202,14 +207,22 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width, radius_ctrl
                 if len(cp) <= 1:
                     radius_line = np.full(nout, float(radius_cp[0]) if len(radius_cp) else float(rad), dtype=float)
                 else:
-                    radius_line = np.interp(ctrl_sample_idx, np.arange(len(radius_cp), dtype=float), radius_cp)
+                    radius_cp_aug = np.append(radius_cp, radius_cp[0])
+                    radius_line = np.interp(ctrl_sample_idx, np.arange(len(radius_cp_aug), dtype=float), radius_cp_aug)
             else:
                 radius_line = np.full(nout, float(rad), dtype=float)
         else:
             radius_line = np.full(nout, float(rad), dtype=float)
         radius_line = np.maximum(radius_line, 1e-6)
 
-        T = np.gradient(pts, axis=0)
+
+        if len(cp) <= 1:
+            T = np.gradient(pts, axis=0)
+        else:
+            T = np.zeros_like(pts)
+            T[1:-1] = (pts[2:] - pts[:-2]) / 2.0
+            T[0] = (pts[1] - (pts[-2] - D)) / 2.0
+            T[-1] = ((pts[1] + D) - pts[-2]) / 2.0
         T /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
         U = np.cross(T, [0, 0, 1])
         b = np.linalg.norm(U, axis=1) < 1e-6

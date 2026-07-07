@@ -181,3 +181,32 @@ def test_spline_mesh_with_variable_radius(config_fixture, params_fixture):
         assert pts.shape[1] == 3
         assert isinstance(nout, int)
 
+
+def test_periodic_spline_continuity(config_fixture, params_fixture):
+    from knitting_core import build_parametric_control_rows, build_spline_mesh
+    params_dict = params_fixture["params"]
+    config_params = config_fixture["knit_parameters"]["parameters"]
+    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
+    pidx = {p["name"]: i for i, p in enumerate(config_params)}
+    lh_params = sorted(
+        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
+        key=lambda name: int(name.split("_")[-1])
+    )
+    lh_idx = tuple(pidx[name] for name in lh_params)
+    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
+    
+    # 1. Verify control point lengths are cols * spl (10)
+    ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
+    assert ctrl_rows[0].shape[0] == 10
+    
+    # 2. Build mesh and check periodic boundary alignment
+    spline_mesh = build_spline_mesh(ctrl_rows, params_list, config_fixture, pidx, bitmap.shape[1])
+    seg = config_fixture["knit_parameters"]["segments"]
+    D = np.array([float(bitmap.shape[1]), 0.0, 0.0])
+    for pts, nout in spline_mesh:
+        # First ring of vertices (start) + period translation must match the last ring (end) exactly
+        np.testing.assert_allclose(pts[:seg] + D, pts[-seg:], atol=1e-4)
+
+
+
+
