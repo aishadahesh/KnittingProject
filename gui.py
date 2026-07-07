@@ -752,25 +752,18 @@ def draw_viewport(state, renderer, ref_tex, window):
                 return None
             ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
             ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
-            in_view = (
-                valid
-                & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0)
-                & (ndc[:, 1] >= -1.0) & (ndc[:, 1] <= 1.0)
-            )
-            if not np.any(in_view):
-                return None
             screen = np.column_stack((
                 (ndc[:, 0] * 0.5 + 0.5) * disp_w,
                 (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
             ))
-            all_pts = screen[in_view]
+            all_pts = screen[valid]
             x_min, y_min = np.min(all_pts, axis=0)
             x_max, y_max = np.max(all_pts, axis=0)
             pad = float(state.config.get("ui", {}).get("bbox_padding", 20.0))
-            x_min = float(np.clip(x_min - pad, 0.0, disp_w - 1.0))
-            y_min = float(np.clip(y_min - pad, 0.0, disp_h - 1.0))
-            x_max = float(np.clip(x_max + pad, 0.0, disp_w - 1.0))
-            y_max = float(np.clip(y_max + pad, 0.0, disp_h - 1.0))
+            x_min = float(x_min - pad)
+            y_min = float(y_min - pad)
+            x_max = float(x_max + pad)
+            y_max = float(y_max + pad)
             if x_max - x_min < 12.0 or y_max - y_min < 12.0:
                 return None
             return x_min, y_min, x_max, y_max
@@ -798,28 +791,21 @@ def draw_viewport(state, renderer, ref_tex, window):
                 continue
             ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
             ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
-            in_view = (
-                valid
-                & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0)
-                & (ndc[:, 1] >= -1.0) & (ndc[:, 1] <= 1.0)
-            )
-            if not np.any(in_view):
-                continue
             screen = np.column_stack((
                 (ndc[:, 0] * 0.5 + 0.5) * disp_w,
                 (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
             ))
-            pts_2d.append(screen[in_view])
+            pts_2d.append(screen[valid])
         if not pts_2d:
             return None
         all_pts = np.concatenate(pts_2d, axis=0)
         x_min, y_min = np.min(all_pts, axis=0)
         x_max, y_max = np.max(all_pts, axis=0)
         pad = 6.0
-        x_min = float(np.clip(x_min - pad, 0.0, disp_w - 1.0))
-        y_min = float(np.clip(y_min - pad, 0.0, disp_h - 1.0))
-        x_max = float(np.clip(x_max + pad, 0.0, disp_w - 1.0))
-        y_max = float(np.clip(y_max + pad, 0.0, disp_h - 1.0))
+        x_min = float(x_min - pad)
+        y_min = float(y_min - pad)
+        x_max = float(x_max + pad)
+        y_max = float(y_max + pad)
         if x_max - x_min < 12.0 or y_max - y_min < 12.0:
             return None
         return x_min, y_min, x_max, y_max
