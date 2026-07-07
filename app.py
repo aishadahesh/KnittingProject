@@ -36,6 +36,7 @@ from gui import (
      draw_menu_bar,
      draw_sidebar,
      draw_viewport,
+     draw_orbit_viewport,
      draw_reference_image_panel,
 )
 
@@ -83,12 +84,14 @@ def main():
     # ── Scene objects ─────────────────────────────────────────────────────────
     camera   = Camera()
     renderer = MeshRenderer(ctx, 960, 720)
+    orbit_camera = Camera()
+    orbit_renderer = MeshRenderer(ctx, 960, 720)
     # Create meshes/renders output directories
     for d in ("meshes", "renders"):
         os.makedirs(os.path.join(resolve_project_path(config["rendering"]["output_dir"]), d), exist_ok=True)
 
     # ── App state ─────────────────────────────────────────────────────────────
-    state = AppState(camera, renderer)
+    state = AppState(camera, renderer, orbit_camera=orbit_camera, orbit_renderer=orbit_renderer)
     state.reference_image_pixels = np.asarray(ref_pil, dtype=np.float32) / 255.0
 
     # Initial state load/build
@@ -199,7 +202,8 @@ def main():
         # ── 3D Viewport ───────────────────────────────────────────────────────
         draw_viewport(state, renderer, ref_tex, window)
 
-
+        # ── 3D Orbit Viewport ──────────────────────────────────────────────────
+        draw_orbit_viewport(state, window)
 
         # ── Reference Image ───────────────────────────────────────────────────
         draw_reference_image_panel(state, ref_tex)

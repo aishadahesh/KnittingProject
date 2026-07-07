@@ -54,8 +54,11 @@ def test_run_simulation_step():
     D = np.array([3.0, 3.0, 0.0])
     config = {"knit_parameters": {"loop_res": 5, "segments": 4}}
     
+    res = config["knit_parameters"]["loop_res"]
+    bitmap_width = float(np.linalg.norm(D))
+    nout = res * int(round(bitmap_width)) + 1
     # Build cached Jacobian
-    J_base = build_row_spline_jacobian(ctrl_rows[0], D, 16) # loop_res*3 + 1 = 16
+    J_base = build_row_spline_jacobian(ctrl_rows[0], D, nout)
     J_cached = scipy.sparse.kron(J_base, scipy.sparse.identity(3), format="csr")
     
     updated = run_simulation_step(ctrl_rows, D, config, J_cached, k_s=100.0, k_b=10.0, k_c=1.0, dhat=0.05)
@@ -68,7 +71,11 @@ def test_check_gradients_and_hessians_fd():
     ctrl_rows = [np.array([[0.0, 0.0, 0.0], [1.0, 0.1, 0.0], [2.0, 0.0, 0.0]])]
     D = np.array([3.0, 3.0, 0.0])
     config = {"knit_parameters": {"loop_res": 5, "segments": 4}}
-    J_base = build_row_spline_jacobian(ctrl_rows[0], D, 16)
+    
+    res = config["knit_parameters"]["loop_res"]
+    bitmap_width = float(np.linalg.norm(D))
+    nout = res * int(round(bitmap_width)) + 1
+    J_base = build_row_spline_jacobian(ctrl_rows[0], D, nout)
     J_cached = scipy.sparse.kron(J_base, scipy.sparse.identity(3), format="csr")
     
     res = check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s=10.0, k_b=1.0, k_c=1.0, dhat=0.05, eps=1e-5)

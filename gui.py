@@ -179,7 +179,7 @@ def draw_sidebar(state, renderer):
         changed_kc, val_kc = imgui.slider_float("Collision Stiffness##kc", float(state.sim_k_c), 0.0, 100.0, "%.1f")
         if changed_kc: state.sim_k_c = val_kc
         
-        changed_dhat, val_dhat = imgui.slider_float("Yarn Thickness##dhat", float(state.sim_dhat), 0.005, 0.1, "%.3f")
+        changed_dhat, val_dhat = imgui.slider_float("Yarn Thickness##dhat", float(state.sim_dhat), 0.005, 1.0, "%.3f")
         if changed_dhat: state.sim_dhat = val_dhat
         
         if imgui.button("Reset to Rest State##reset_rest"):
@@ -1380,4 +1380,73 @@ def draw_reference_image_panel(state, ref_tex):
         avail_x,
         avail_y,
     )
+    imgui.end()
+
+
+def draw_orbit_viewport(state, window):
+    imgui.set_next_window_pos((1220, 20), cond=imgui.Cond_.first_use_ever)
+    imgui.set_next_window_size((360, 370), cond=imgui.Cond_.first_use_ever)
+    imgui.begin("3D Orbit View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
+    imgui.text("3D Orbit Viewport")
+
+    avail_x, avail_y = imgui.get_content_region_avail()
+    disp_w = max(1, int(avail_x))
+    disp_h = max(1, int(avail_y))
+
+    if state.orbit_renderer is not None:
+        state.orbit_renderer.resize(disp_w, disp_h)
+        
+        # Position target at mesh center + translation offsets
+        state.orbit_camera.target = (state.mesh_center + state.model_t).astype(np.float32)
+        
+        # Render model meshes
+        model_mat = state.current_model_matrix()
+        mvp = (state.orbit_camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
+        mv  = (state.orbit_camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
+        
+        state.orbit_renderer.render(
+            mvp, mv,
+            state.get_material_uniforms(),
+            camera=state.orbit_camera,
+            visible_rows=state.row_visible,
+            model_mat=model_mat,
+            show_grid=True
+        )
+        
+        # Draw FBO texture to window
+        drawn_rect = draw_fitted_texture(
+            state.orbit_renderer.texture_id,
+            disp_w,
+            disp_h,
+            avail_x,
+            avail_y,
+            flip_y=True,
+        )
+        
+        is_hovered = imgui.is_item_hovered()
+        mx, my = imgui.get_mouse_pos()
+        
+        # Orbit and zoom camera controls
+        if is_hovered:
+            io = imgui.get_io()
+            if io.mouse_wheel != 0:
+                zoom_factor = float(np.exp(io.mouse_wheel * 0.12))
+                state.orbit_camera.dist = float(np.clip(float(state.orbit_camera.dist) / zoom_factor, 1.0, 200.0))
+                
+        lmb_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+        if lmb_down:
+            if state.get('orbit_dragging', False):
+                if state.get('prev_orbit_mouse') is not None:
+                    prev = state.prev_orbit_mouse
+                    dx = mx - prev[0]
+                    dy = my - prev[1]
+                    state.orbit_camera.orbit(dx, dy)
+                state.prev_orbit_mouse = (mx, my)
+            elif is_hovered:
+                state.orbit_dragging = True
+                state.prev_orbit_mouse = (mx, my)
+        else:
+            state.orbit_dragging = False
+            state.prev_orbit_mouse = None
+            
     imgui.end()

@@ -37,9 +37,11 @@ class AppState:
             return {k: AppState._clone(x) for k, x in v.items()}
         return v
 
-    def __init__(self, camera, renderer):
+    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None):
         self.camera = camera
         self.renderer = renderer
+        self.orbit_camera = orbit_camera
+        self.orbit_renderer = orbit_renderer
 
         # Project root and configurations
         project_root = os.path.dirname(os.path.abspath(__file__))
@@ -162,7 +164,7 @@ class AppState:
             raise AttributeError(f"'AppState' object has no attribute '{name}'") from None
 
     def __setattr__(self, name, value):
-        if name in ('camera', 'optimizer', 'renderer', '_data') or name in self.__dict__:
+        if name in ('camera', 'optimizer', 'renderer', 'orbit_camera', 'orbit_renderer', '_data') or name in self.__dict__:
             super().__setattr__(name, value)
         else:
             self._data[name] = value
@@ -199,8 +201,6 @@ class AppState:
         row_count = max(1, int(self.bitmap_size[0]))
         x_period = self._display_copy_x_period(verts_list, radius)
         y_period = self._display_copy_y_period(verts_list, radius)
-        depth_gap = max(float(radius) * 2.4, 1e-6)
-        z_period = self._display_copy_z_period(verts_list, depth_gap)
         
         seg = int(self.config['knit_parameters']['segments'])
         x_tiles = list(range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1))
@@ -208,7 +208,7 @@ class AppState:
 
         display_vl, display_fl, display_meta = [], [], []
         for y_tile in y_tiles:
-            y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+            y_translation = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
             for part_idx, ((verts, n_points), _faces, part_meta) in enumerate(zip(verts_list, faces_list, meta)):
                 rings = np.asarray(verts, dtype=np.float32).reshape(int(n_points), seg, 3)
                 base_faces = compute_knitting_faces(seg, [(rings.reshape(-1, 3), int(n_points))])[0]
@@ -236,11 +236,6 @@ class AppState:
                 copied_meta['stitched_x_copies'] = len(x_tiles)
                 display_meta.append(copied_meta)
         return display_vl, display_fl, display_meta
-
-    def _display_copy_z_period(self, verts_list, depth_gap):
-        base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
-        z_span = float(base_bounds[:, 2].max() - base_bounds[:, 2].min())
-        return max(z_span + float(depth_gap), float(depth_gap))
 
     def _display_copy_x_period(self, verts_list, radius):
         return max(float(self.bitmap_size[1]), radius)
@@ -322,7 +317,7 @@ class AppState:
         import scipy.sparse
         J_blocks = []
         res = self.config["knit_parameters"]["loop_res"]
-        bitmap_width = float(self.period_offset[0])
+        bitmap_width = float(np.linalg.norm(self.period_offset))
         nout = res * int(round(bitmap_width)) + 1
         for cp in self.ctrl_rows:
             J_r = build_row_spline_jacobian(cp, self.period_offset, nout)
@@ -348,6 +343,8 @@ class AppState:
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts(self.flat_pts)
+        if self.orbit_renderer is not None:
+            self.orbit_renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         if preserve_model_placement:
             self.mesh_center = old_center
             self.model_t = old_model_t

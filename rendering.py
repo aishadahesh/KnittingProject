@@ -244,6 +244,42 @@ void main() {
 }
 """
 
+GRID_VERT = """
+#version 330
+in vec3 in_pos;
+uniform mat4 mvp;
+out vec3 v_world_pos;
+void main() {
+    v_world_pos = in_pos;
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+GRID_FRAG = """
+#version 330
+in vec3 v_world_pos;
+out vec4 f_color;
+void main() {
+    vec2 coord = v_world_pos.xy;
+    vec2 grid = abs(fract(coord - 0.5) - 0.5) / fwidth(coord);
+    float line = min(grid.x, grid.y);
+    float color_intensity = 1.0 - min(line, 1.0);
+    
+    vec2 major_grid = abs(fract(coord * 0.1 - 0.5) - 0.5) / fwidth(coord * 0.1);
+    float major_line = min(major_grid.x, major_grid.y);
+    float major_intensity = 1.0 - min(major_line, 1.0);
+    
+    vec4 final_color = vec4(0.32, 0.32, 0.32, 0.28) * color_intensity + vec4(0.48, 0.48, 0.48, 0.6) * major_intensity;
+    
+    float dist = length(coord);
+    float fade = clamp(1.0 - dist / 80.0, 0.0, 1.0);
+    final_color.a *= fade;
+    
+    if (final_color.a < 0.01) discard;
+    f_color = final_color;
+}
+"""
+
 DEPTH_VERT = """
 #version 330
 in vec3 in_pos;
@@ -446,6 +482,25 @@ class MeshRenderer:
             self.bg_prog,
             [(ctx.buffer(quad.tobytes()), '2f', 'in_pos')],
         )
+        # Grid program setup
+        self.grid_prog = ctx.program(vertex_shader=GRID_VERT, fragment_shader=GRID_FRAG)
+        grid_vertices = np.array([
+            [-150.0, -150.0, 0.0],
+            [150.0, -150.0, 0.0],
+            [-150.0, 150.0, 0.0],
+            [150.0, 150.0, 0.0],
+        ], dtype=np.float32)
+        grid_indices = np.array([
+            0, 2, 1, 1, 2, 3
+        ], dtype=np.int32)
+        self.grid_vbo = ctx.buffer(grid_vertices.tobytes())
+        self.grid_ibo = ctx.buffer(grid_indices.tobytes())
+        self.grid_vao = ctx.vertex_array(
+            self.grid_prog,
+            [(self.grid_vbo, '3f', 'in_pos')],
+            self.grid_ibo
+        )
+
         self.vp_w    = 1
         self.vp_h    = 1
         self.color_tex = None
@@ -617,7 +672,7 @@ class MeshRenderer:
                hover_mesh_idx=-1, selected_mesh_idx=-1,
                visible_rows=None,
                bg_tex=None, bg_alpha=0.5, bg_uniforms=None,
-               camera=None, n_real_pts=-1):
+               camera=None, n_real_pts=-1, model_mat=None, show_grid=False):
         self.fbo.use()
         self.ctx.viewport = (0, 0, self.vp_w, self.vp_h)
         
@@ -727,6 +782,23 @@ class MeshRenderer:
                 draw_outline(hover_mesh_idx, (1.0, 0.95, 0.2))
 
         if use_model_blend:
+            self.ctx.disable(moderngl.BLEND)
+
+        # ── Render grid plane (transparent wall) ─────────────────────────────
+        if show_grid and camera is not None and model_mat is not None:
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            self.fbo.depth_mask = False
+            self.ctx.disable(moderngl.CULL_FACE)
+
+            view_proj = camera.proj(self.vp_w, self.vp_h) @ camera.view()
+            grid_mvp = view_proj @ model_mat
+
+            self.grid_prog['mvp'].write(grid_mvp.astype(np.float32).T.tobytes())
+            self.grid_vao.render(moderngl.TRIANGLES)
+
+            self.fbo.depth_mask = True
             self.ctx.disable(moderngl.BLEND)
 
         if self.pt_vao:

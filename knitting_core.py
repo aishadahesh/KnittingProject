@@ -344,6 +344,8 @@ def compute_collision_forces_and_hessian(V, D, edges, dhat, k_c, psd_projection=
     if psd_projection is None:
         psd_projection = ipctk.PSDProjectionMethod.CLAMP
     M = len(V)
+    if k_c <= 0.0:
+        return 0.0, np.zeros(3 * M), scipy.sparse.coo_matrix((3 * M, 3 * M)).tocsr()
     
     # 1. Tile vertices dynamically to 3x3 copies
     # Copies indices: c_x, c_y from -1 to 1
@@ -400,7 +402,7 @@ def compute_collision_forces_and_hessian(V, D, edges, dhat, k_c, psd_projection=
 def run_simulation_step(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat):
     import scipy.sparse.linalg
     res = config["knit_parameters"]["loop_res"]
-    bitmap_width = float(D[0])
+    bitmap_width = float(np.linalg.norm(D))
     nout = res * int(round(bitmap_width)) + 1
     
     # Assemble P
@@ -551,7 +553,7 @@ def eval_energy(flat_P, ctrl_rows, D, config, k_s, k_b, k_c, dhat):
         ctrl_offset += n_c
         
     res = config["knit_parameters"]["loop_res"]
-    bitmap_width = float(D[0])
+    bitmap_width = float(np.linalg.norm(D))
     nout = res * int(round(bitmap_width)) + 1
     
     V_list = []
@@ -581,20 +583,23 @@ def eval_energy(flat_P, ctrl_rows, D, config, k_s, k_b, k_c, dhat):
         v_next = (i + 1) % M
         e_el += 0.5 * k_b * np.sum((V[v_prev] - 2.0 * V[v_curr] + V[v_next])**2)
         
-    offsets = []
-    for c_x in [-1, 0, 1]:
-        for c_y in [-1, 0, 1]:
-            offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D[1], 0.0]))
-    V_tiled = np.vstack([V + offset[None, :] for offset in offsets])
-    edges_tiled = np.vstack([edges + c * M for c in range(9)])
-    mesh_tiled = ipctk.CollisionMesh(V_tiled, edges_tiled, np.empty((0, 3), dtype=np.int32))
-    mesh_tiled.can_collide = build_can_collide(M, edges, D)
-    
-    collisions = ipctk.NormalCollisions()
-    collisions.build(mesh_tiled, V_tiled, dhat)
-    barrier = ipctk.BarrierPotential(dhat)
-    e_col = barrier(collisions, mesh_tiled, V_tiled) * k_c
-    
+    if k_c > 0.0:
+        offsets = []
+        for c_x in [-1, 0, 1]:
+            for c_y in [-1, 0, 1]:
+                offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D[1], 0.0]))
+        V_tiled = np.vstack([V + offset[None, :] for offset in offsets])
+        edges_tiled = np.vstack([edges + c * M for c in range(9)])
+        mesh_tiled = ipctk.CollisionMesh(V_tiled, edges_tiled, np.empty((0, 3), dtype=np.int32))
+        mesh_tiled.can_collide = build_can_collide(M, edges, D)
+        
+        collisions = ipctk.NormalCollisions()
+        collisions.build(mesh_tiled, V_tiled, dhat)
+        barrier = ipctk.BarrierPotential(dhat)
+        e_col = barrier(collisions, mesh_tiled, V_tiled) * k_c
+    else:
+        e_col = 0.0
+        
     return e_el + e_col
 
 
@@ -603,7 +608,7 @@ def check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s, k_b, k_
     N = flat_P.size
     
     res = config["knit_parameters"]["loop_res"]
-    bitmap_width = float(D[0])
+    bitmap_width = float(np.linalg.norm(D))
     nout = res * int(round(bitmap_width)) + 1
     
     V_list = []
@@ -649,8 +654,8 @@ def check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s, k_b, k_
             V_new_list.append(pts)
         V_new = np.vstack(V_new_list)
         
-        _, g_el_new, _ = compute_elastic_forces_and_hessian(V_new, edges, L0, k_s, k_b)
-        _, g_col_new, _ = compute_collision_forces_and_hessian(V_new, D, edges, dhat, k_c)
+        _, g_el_new, _ = compute_elastic_forces_and_hessian(V_new, edges, L0, k_s, k_b, project_psd=False)
+        _, g_col_new, _ = compute_collision_forces_and_hessian(V_new, D, edges, dhat, k_c, psd_projection=ipctk.PSDProjectionMethod.NONE)
         
         g_V_new = g_el_new + g_col_new
         return J_cached.T @ g_V_new
@@ -706,8 +711,6 @@ def build_can_collide(M, edges, D):
     num_rows = M - len(edges)
     nout = M // num_rows
     
-    row_starts = [r * nout for r in range(num_rows + 1)]
-    
     grid = []
     for c_x in [-1, 0, 1]:
         for c_y in [-1, 0, 1]:
@@ -725,16 +728,20 @@ def build_can_collide(M, edges, D):
             return (r + c_y, i, c_x)
             
     keys = [get_lattice_coords(v) for v in range(9 * M)]
+    by_grid = {}
+    for v, (r, i, px) in enumerate(keys):
+        by_grid.setdefault((r, px), []).append((i, v))
+        
     explicit_values = {}
-    for v1 in range(9 * M):
-        k1 = keys[v1]
-        r1, i1, px1 = k1
-        for v2 in range(v1 + 1, 9 * M):
-            k2 = keys[v2]
-            r2, i2, px2 = k2
-            if k1 == k2:
-                explicit_values[(v1, v2)] = False
-            elif r1 == r2 and px1 == px2 and abs(i1 - i2) <= 1:
-                explicit_values[(v1, v2)] = False
-                
+    for (r, px), items in by_grid.items():
+        n_items = len(items)
+        for idx1 in range(n_items):
+            i1, v1 = items[idx1]
+            for idx2 in range(idx1 + 1, n_items):
+                i2, v2 = items[idx2]
+                if i1 == i2:
+                    explicit_values[(min(v1, v2), max(v1, v2))] = False
+                elif abs(i1 - i2) <= 1:
+                    explicit_values[(min(v1, v2), max(v1, v2))] = False
+                    
     return ipctk.SparseCanCollide(explicit_values, True)
