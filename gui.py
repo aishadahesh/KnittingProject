@@ -972,7 +972,24 @@ def draw_viewport(state, renderer, ref_tex, window):
                     ]
                     if visible_rows_local:
                         pts = np.concatenate(visible_rows_local, axis=0)
-                        pivot = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32)
+                        pts_min = pts.min(axis=0)
+                        pts_max = pts.max(axis=0)
+                        pts_mid = (pts_min + pts_max) * 0.5
+                        
+                        # Determine pivot based on the opposite side of the dragged handle
+                        px = pts_mid[0]
+                        if active_handle in (0, 6, 7): # dragging left, pivot is right
+                            px = pts_max[0]
+                        elif active_handle in (2, 3, 4): # dragging right, pivot is left
+                            px = pts_min[0]
+                            
+                        py = pts_mid[1]
+                        if active_handle in (0, 1, 2): # dragging top, pivot is bottom
+                            py = pts_min[1]
+                        elif active_handle in (4, 5, 6): # dragging bottom, pivot is top
+                            py = pts_max[1]
+                            
+                        pivot = np.array([px, py, pts_mid[2]], dtype=np.float32)
                     else:
                         pivot = np.asarray(state.mesh_center, dtype=np.float32)
                     state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
@@ -984,11 +1001,11 @@ def draw_viewport(state, renderer, ref_tex, window):
                     start_scale = np.repeat(start_scale, 3)
                 state.model_scale = np.maximum(start_scale[:3] * scale_vec, 1e-4).astype(np.float32)
 
-            start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
-            old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
-            new_cx, new_cy = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
-            correction = viewport_pixel_delta_to_world(new_cx - old_cx, new_cy - old_cy)
-            state.model_t = (start_t + correction).astype(np.float32)
+                start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
+                old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
+                new_cx, new_cy = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
+                correction = viewport_pixel_delta_to_world(new_cx - old_cx, new_cy - old_cy)
+                state.model_t = (start_t + correction).astype(np.float32)
             suppress_mesh_click = True
         elif active_handle >= 0 and not lmb_down:
             state.bbox_active_handle = -1
