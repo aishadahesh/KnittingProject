@@ -766,14 +766,11 @@ def draw_viewport(state, renderer, ref_tex, window):
             all_pts = screen[in_view]
             x_min, y_min = np.min(all_pts, axis=0)
             x_max, y_max = np.max(all_pts, axis=0)
-            w = max(1.0, float(x_max - x_min))
-            h = max(1.0, float(y_max - y_min))
-            pad_x = 0.10 * w
-            pad_y = 0.10 * h
-            x_min = float(np.clip(x_min - pad_x, 0.0, disp_w - 1.0))
-            y_min = float(np.clip(y_min - pad_y, 0.0, disp_h - 1.0))
-            x_max = float(np.clip(x_max + pad_x, 0.0, disp_w - 1.0))
-            y_max = float(np.clip(y_max + pad_y, 0.0, disp_h - 1.0))
+            pad = float(state.config.get("ui", {}).get("bbox_padding", 20.0))
+            x_min = float(np.clip(x_min - pad, 0.0, disp_w - 1.0))
+            y_min = float(np.clip(y_min - pad, 0.0, disp_h - 1.0))
+            x_max = float(np.clip(x_max + pad, 0.0, disp_w - 1.0))
+            y_max = float(np.clip(y_max + pad, 0.0, disp_h - 1.0))
             if x_max - x_min < 12.0 or y_max - y_min < 12.0:
                 return None
             return x_min, y_min, x_max, y_max

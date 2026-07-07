@@ -1,6 +1,7 @@
 {
   "ui": {
-    "reference_image": "refImg.png"
+    "reference_image": "refImg.png",
+    "bbox_padding": 20.0
   },
   "knit_parameters": {
     "yarn_colors": [
