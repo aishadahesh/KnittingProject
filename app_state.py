@@ -122,6 +122,12 @@ class AppState:
             'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
             'mi_cam_fov': float(config_data['rendering']['camera_fov']),
             'period_offset': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
+            'sim_active': False,
+            'sim_k_s': 1000.0,
+            'sim_k_b': 10.0,
+            'sim_k_c': 1.0,
+            'sim_dhat': 0.02,
+            'sim_needs_jacobian_rebuild': True,
         }
         for k, v in computed_defaults.items():
             state_defaults[k] = AppState._clone(_coerce(v))
@@ -130,6 +136,7 @@ class AppState:
         state_defaults['_row_starts'] = [0]
 
         super().__setattr__('_state_defaults', state_defaults)
+        super().__setattr__('sim_lock', threading.Lock())
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}
 
     # ── DICTIONARY INTERFACE ──────────────────────────────────────────────────
@@ -308,6 +315,22 @@ class AppState:
         updated = base * (1.0 - weights) + target * weights
         self.spline_radius_rows[row_idx] = updated.astype(np.float32)
 
+    def rebuild_cached_jacobian(self):
+        if not self.ctrl_rows:
+            return
+        from knitting_core import build_row_spline_jacobian
+        import scipy.sparse
+        J_blocks = []
+        res = self.config["knit_parameters"]["loop_res"]
+        bitmap_width = float(self.period_offset[0])
+        nout = res * int(round(bitmap_width)) + 1
+        for cp in self.ctrl_rows:
+            J_r = build_row_spline_jacobian(cp, self.period_offset, nout)
+            J_blocks.append(J_r)
+        J_base = scipy.sparse.block_diag(J_blocks, format="csr")
+        super().__setattr__('J_cached', scipy.sparse.kron(J_base, scipy.sparse.identity(3), format="csr"))
+        self.sim_needs_jacobian_rebuild = False
+
     def rebuild_spline_mesh(self, preserve_model_placement=True):
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
@@ -351,17 +374,19 @@ class AppState:
         return np.concatenate((self.flat_pts, virtual_pts), axis=0)
 
     def move_ctrl_pt(self, flat_idx, pos):
-        n_real = len(self.flat_pts)
-        if flat_idx >= n_real:
-            row_idx = flat_idx - n_real
-            if 0 <= row_idx < len(self.ctrl_rows):
-                self.period_offset = pos - self.ctrl_rows[row_idx][0]
-                self.rebuild_spline_mesh()
-        else:
-            r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
-            if 0 <= r < len(self.ctrl_rows):
-                self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
-                self._rebuild_spline_points()
+        with self.sim_lock:
+            self.sim_needs_jacobian_rebuild = True
+            n_real = len(self.flat_pts)
+            if flat_idx >= n_real:
+                row_idx = flat_idx - n_real
+                if 0 <= row_idx < len(self.ctrl_rows):
+                    self.period_offset = pos - self.ctrl_rows[row_idx][0]
+                    self.rebuild_spline_mesh()
+            else:
+                r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
+                if 0 <= r < len(self.ctrl_rows):
+                    self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
+                    self._rebuild_spline_points()
 
     def center_model_on_view(self):
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
@@ -370,43 +395,47 @@ class AppState:
         return build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
 
     def rebuild_spline_from_params(self):
-        self.ctrl_rows = self._fresh_rebuild_rows()
-        base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        self.spline_radius_rows = [
-            np.full(len(row), base_radius, dtype=np.float32)
-            for row in self.ctrl_rows
-        ]
-        self.param_ref_radius = base_radius
-        self._rebuild_spline_points()
-        self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
-        self.rebuild_spline_mesh(preserve_model_placement=True)
-
-    def nudge_spline_from_params(self):
-        target_rows = self._fresh_rebuild_rows()
-        ref_rows = self.get('param_ref_ctrl_rows')
-        current_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        ref_radius = getattr(self, 'param_ref_radius', current_radius)
-        if not ref_rows or len(self.ctrl_rows) != len(target_rows) or any(c.shape != t.shape for c, t in zip(self.ctrl_rows, target_rows)):
-            self.ctrl_rows = [row.copy() for row in target_rows]
+        with self.sim_lock:
+            self.sim_needs_jacobian_rebuild = True
+            self.ctrl_rows = self._fresh_rebuild_rows()
+            base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
             self.spline_radius_rows = [
-                np.full(len(row), current_radius, dtype=np.float32)
+                np.full(len(row), base_radius, dtype=np.float32)
                 for row in self.ctrl_rows
             ]
-        else:
-            nudged_rows = []
-            for current_row, ref_row, target_row in zip(self.ctrl_rows, ref_rows, target_rows):
-                nudged_rows.append(current_row + (target_row - ref_row))
-            self.ctrl_rows = nudged_rows
-            self._ensure_spline_radius_rows()
-            if abs(current_radius - ref_radius) > 1e-7:
-                ratio = current_radius / ref_radius
-                for r_idx, row in enumerate(self.spline_radius_rows):
-                    self.spline_radius_rows[r_idx] = row * ratio
+            self.param_ref_radius = base_radius
+            self._rebuild_spline_points()
+            self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
+            self.rebuild_spline_mesh(preserve_model_placement=True)
 
-        self.param_ref_radius = current_radius
-        self._rebuild_spline_points()
-        self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
-        self.rebuild_spline_mesh()
+    def nudge_spline_from_params(self):
+        with self.sim_lock:
+            self.sim_needs_jacobian_rebuild = True
+            target_rows = self._fresh_rebuild_rows()
+            ref_rows = self.get('param_ref_ctrl_rows')
+            current_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+            ref_radius = getattr(self, 'param_ref_radius', current_radius)
+            if not ref_rows or len(self.ctrl_rows) != len(target_rows) or any(c.shape != t.shape for c, t in zip(self.ctrl_rows, target_rows)):
+                self.ctrl_rows = [row.copy() for row in target_rows]
+                self.spline_radius_rows = [
+                    np.full(len(row), current_radius, dtype=np.float32)
+                    for row in self.ctrl_rows
+                ]
+            else:
+                nudged_rows = []
+                for current_row, ref_row, target_row in zip(self.ctrl_rows, ref_rows, target_rows):
+                    nudged_rows.append(current_row + (target_row - ref_row))
+                self.ctrl_rows = nudged_rows
+                self._ensure_spline_radius_rows()
+                if abs(current_radius - ref_radius) > 1e-7:
+                    ratio = current_radius / ref_radius
+                    for r_idx, row in enumerate(self.spline_radius_rows):
+                        self.spline_radius_rows[r_idx] = row * ratio
+
+            self.param_ref_radius = current_radius
+            self._rebuild_spline_points()
+            self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
+            self.rebuild_spline_mesh()
 
     def debug_compare_to_fresh_rebuild(self):
         fresh_rows = self._fresh_rebuild_rows()

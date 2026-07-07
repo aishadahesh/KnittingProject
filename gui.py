@@ -165,6 +165,46 @@ def draw_sidebar(state, renderer):
         state.rebuild_spline_mesh(preserve_model_placement=True)
     imgui.separator()
 
+    if imgui.collapsing_header("Yarn Simulation##sim_header"):
+        changed_active, active = imgui.checkbox("Run Simulation##run_sim", state.sim_active)
+        if changed_active:
+            state.sim_active = active
+        
+        changed_ks, val_ks = imgui.slider_float("Stretch Stiffness##ks", float(state.sim_k_s), 0.0, 5000.0, "%.1f")
+        if changed_ks: state.sim_k_s = val_ks
+        
+        changed_kb, val_kb = imgui.slider_float("Bending Stiffness##kb", float(state.sim_k_b), 0.0, 500.0, "%.1f")
+        if changed_kb: state.sim_k_b = val_kb
+        
+        changed_kc, val_kc = imgui.slider_float("Collision Stiffness##kc", float(state.sim_k_c), 0.0, 100.0, "%.1f")
+        if changed_kc: state.sim_k_c = val_kc
+        
+        changed_dhat, val_dhat = imgui.slider_float("Yarn Thickness##dhat", float(state.sim_dhat), 0.005, 0.1, "%.3f")
+        if changed_dhat: state.sim_dhat = val_dhat
+        
+        if imgui.button("Reset to Rest State##reset_rest"):
+            state.sim_active = False
+            state.rebuild_spline_from_params()
+        imgui.same_line()
+        if imgui.button("FD Verify Derivatives##verify_fd"):
+            from knitting_core import check_gradients_and_hessians_fd
+            with state.sim_lock:
+                if state.sim_needs_jacobian_rebuild:
+                    state.rebuild_cached_jacobian()
+                res_str = check_gradients_and_hessians_fd(
+                    state.ctrl_rows,
+                    state.period_offset,
+                    state.config,
+                    state.J_cached,
+                    state.sim_k_s,
+                    state.sim_k_b,
+                    state.sim_k_c,
+                    state.sim_dhat
+                )
+                state.status_msg = res_str.replace("\n", " | ")
+
+    imgui.separator()
+
     if stage == 0:
         imgui.text("Viewport Alignment")
         imgui.spacing()

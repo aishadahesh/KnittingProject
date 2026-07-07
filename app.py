@@ -99,6 +99,44 @@ def main():
     else:
         state.rebuild_spline_from_params()
 
+    # ── Background Simulation Thread ──────────────────────────────────────────
+    def start_simulation_thread(state):
+        import time
+        import threading
+        from knitting_core import run_simulation_step
+        
+        def run_loop():
+            while True:
+                if state.sim_active:
+                    with state.sim_lock:
+                        if state.sim_needs_jacobian_rebuild:
+                            state.rebuild_cached_jacobian()
+                        if state.J_cached is None:
+                            time.sleep(0.01)
+                            continue
+                        ctrl_rows = [cp.copy() for cp in state.ctrl_rows]
+                        D = state.period_offset.copy()
+                        config = state.config.copy()
+                        J_cached = state.J_cached
+                        ks = state.sim_k_s
+                        kb = state.sim_k_b
+                        kc = state.sim_k_c
+                        dhat = state.sim_dhat
+                    
+                    new_ctrl_rows = run_simulation_step(ctrl_rows, D, config, J_cached, ks, kb, kc, dhat)
+                    
+                    with state.sim_lock:
+                        if not state.sim_needs_jacobian_rebuild:
+                            state.ctrl_rows = new_ctrl_rows
+                            state.flat_pts = np.concatenate(new_ctrl_rows).astype(np.float32) if new_ctrl_rows else np.empty((0, 3), np.float32)
+                            state.sim_needs_jacobian_rebuild = True  # Trigger mesh rebuild in main loop
+                time.sleep(0.01)
+
+        thread = threading.Thread(target=run_loop, daemon=True)
+        thread.start()
+
+    start_simulation_thread(state)
+
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
 
@@ -107,6 +145,10 @@ def main():
     while not glfw.window_should_close(window):
         glfw.poll_events()
         impl.process_inputs()
+        with state.sim_lock:
+            if state.sim_needs_jacobian_rebuild and state.sim_active:
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+                state.sim_needs_jacobian_rebuild = False
         imgui.new_frame()
         imguizmo.im_guizmo.begin_frame()
 
