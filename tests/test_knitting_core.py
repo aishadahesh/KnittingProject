@@ -12,11 +12,21 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 def test_core_module_imports():
     # Verify that importing knitting_core does not pull in GUI-related libraries
-    import knitting_core
-    assert "moderngl" not in sys.modules
-    assert "imgui_bundle" not in sys.modules
-    assert "gui" not in sys.modules
-    assert "app_state" not in sys.modules
+    # Temporarily remove them from sys.modules if they were imported by other tests
+    modules_to_check = ["moderngl", "imgui_bundle", "gui", "app_state"]
+    saved_modules = {}
+    for m in modules_to_check:
+        if m in sys.modules:
+            saved_modules[m] = sys.modules.pop(m)
+            
+    try:
+        import knitting_core
+        for m in modules_to_check:
+            assert m not in sys.modules
+    finally:
+        # Restore them
+        for m, mod in saved_modules.items():
+            sys.modules[m] = mod
 
 
 import json

@@ -673,6 +673,17 @@ class AppState:
     def maybe_autosave(self):
         if not self.autosave_enabled:
             return
+
+        # Defer autosaving during active user interactions to prevent micro-stutters
+        if (self.get('gizmo_edit_active', False) or
+            self.get('spline_grab_active', False) or
+            self.get('radius_grab_active', False) or
+            self.get('model_drag_undo_active', False) or
+            self.get('spline_keyboard_edit_active', False) or
+            self.get('radius_keyboard_edit_active', False) or
+            int(self.get('bbox_active_handle', -1)) >= 0):
+            return
+
         now = time.monotonic()
         if now - float(self.autosave_last_time) < float(self.autosave_interval_sec):
             return
