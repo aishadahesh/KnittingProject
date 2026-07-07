@@ -91,13 +91,25 @@ def main():
     state = AppState(camera, renderer)
     state.reference_image_pixels = np.asarray(ref_pil, dtype=np.float32) / 255.0
 
-    # Initial state load/build
-    if os.path.exists(state.load_path):
-        state.load_params(state.load_path)
+    # initial_params.json is the frozen reset baseline.
+    # params.json is the working autosave and is loaded for normal resume.
+    work_params_path = state.load_path
+    initial_params_path = os.path.join(project_root, "initial_params.json")
+
+    if os.path.exists(initial_params_path):
+        state.load_params(initial_params_path)
         if state.status_msg.startswith('Load error:'):
             state.rebuild_spline_from_params()
     else:
         state.rebuild_spline_from_params()
+    state.capture_initial_state()
+
+    if os.path.exists(work_params_path):
+        state.load_params(work_params_path)
+        if state.status_msg.startswith('Load error:'):
+            state.restore_snapshot(state._initial_snapshot)
+    state.load_path = work_params_path
+    state.save_path = work_params_path
 
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)

@@ -204,23 +204,18 @@ class AppState:
             y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
             for part_idx, ((verts, n_points), _faces, part_meta) in enumerate(zip(verts_list, faces_list, meta)):
                 rings = np.asarray(verts, dtype=np.float32).reshape(int(n_points), seg, 3)
-                base_faces = compute_knitting_faces(seg, [(rings.reshape(-1, 3), int(n_points))])[0]
-                
                 stitched_rings = []
-                stitched_faces = []
+                period = self._display_copy_x_period_for_rings(rings, x_period, radius)
                 for tile_i, x_tile in enumerate(x_tiles):
-                    translated = rings + x_tile * self.period_offset[None, None, :]
+                    translated = rings + x_tile * period
+                    if tile_i > 0:
+                        translated = translated[1:]
                     stitched_rings.append(translated)
-                    
-                    tile_faces = base_faces + tile_i * int(n_points) * seg
-                    stitched_faces.append(tile_faces)
-                    
+
                 stitched = np.concatenate(stitched_rings, axis=0) + y_translation
                 stitched_n_points = int(stitched.shape[0])
                 display_vl.append((stitched.reshape(-1, 3), stitched_n_points))
-                
-                combined_faces = np.concatenate(stitched_faces, axis=0)
-                display_fl.append(combined_faces)
+                display_fl.extend(compute_knitting_faces(seg, [(stitched.reshape(-1, 3), stitched_n_points)]))
                 copied_meta = dict(part_meta)
                 copied_meta['row'] = int(copied_meta.get('row', 0)) + y_tile * row_count
                 copied_meta['base_row'] = int(part_meta.get('row', 0))
@@ -230,13 +225,73 @@ class AppState:
                 display_meta.append(copied_meta)
         return display_vl, display_fl, display_meta
 
+    def _x_copy_period_for_ctrl_row(self, row, radius):
+        row = np.asarray(row, dtype=np.float32)
+        if len(row) > 1:
+            period = row[-1] - row[0]
+            if abs(float(period[0])) > max(float(radius), 1e-6) * 0.25:
+                return period.astype(np.float32)
+        return np.array([self._display_copy_x_period([], radius), 0.0, 0.0], dtype=np.float32)
+
+    def _extended_x_copy_rows(self, radius_profiles):
+        copies_x = int(self.display_copies[0])
+        if copies_x <= 0 or not self.ctrl_rows:
+            return self.ctrl_rows, radius_profiles, 0
+
+        radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+        x_tiles = list(range(-copies_x, copies_x + 1))
+        extended_rows = []
+        extended_radius_rows = []
+        for row_idx, row in enumerate(self.ctrl_rows):
+            row = np.asarray(row, dtype=np.float32)
+            if len(row) == 0:
+                extended_rows.append(row)
+                extended_radius_rows.append(np.asarray(radius_profiles[row_idx], dtype=np.float32))
+                continue
+            row_parts = []
+            rad_parts = []
+            radius_row = np.asarray(radius_profiles[row_idx], dtype=np.float32)
+            period = self._x_copy_period_for_ctrl_row(row, radius)
+            for tile_i, tile in enumerate(x_tiles):
+                row_tile = row + tile * period
+                rad_tile = radius_row
+                if tile_i > 0 and len(row_tile) > 1:
+                    row_tile = row_tile[1:]
+                    rad_tile = rad_tile[1:]
+                row_parts.append(row_tile)
+                rad_parts.append(rad_tile)
+            extended_rows.append(np.concatenate(row_parts, axis=0).astype(np.float32))
+            extended_radius_rows.append(np.concatenate(rad_parts, axis=0).astype(np.float32))
+        return extended_rows, extended_radius_rows, copies_x
+
     def _display_copy_z_period(self, verts_list, depth_gap):
         base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
         z_span = float(base_bounds[:, 2].max() - base_bounds[:, 2].min())
         return max(z_span + float(depth_gap), float(depth_gap))
 
     def _display_copy_x_period(self, verts_list, radius):
-        return max(float(self.bitmap_size[1]), radius)
+        if self.ctrl_rows:
+            x_min = min(float(np.min(row[:, 0])) for row in self.ctrl_rows if len(row))
+            x_max = max(float(np.max(row[:, 0])) for row in self.ctrl_rows if len(row))
+            return max(x_max - x_min, radius)
+        if not verts_list:
+            return radius
+        base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
+        return max(float(base_bounds[:, 0].max() - base_bounds[:, 0].min()) - radius * 2.0, radius)
+
+    def _display_copy_x_period_for_rings(self, rings, fallback_period, radius):
+        centers = np.asarray(rings, dtype=np.float32).mean(axis=1)
+        if len(centers) < 2:
+            return np.array([fallback_period, 0.0, 0.0], dtype=np.float32)
+
+        period = centers[-1] - centers[0]
+        if abs(float(period[0])) < max(float(radius), 1e-6) * 0.25:
+            period = np.array([fallback_period, 0.0, 0.0], dtype=np.float32)
+        else:
+            # X copies should continue the curve horizontally; keep Y/Z fixed so
+            # edited or twisted rows do not drift upward/downward between tiles.
+            period = np.array([period[0], 0.0, 0.0], dtype=np.float32)
+        return period.astype(np.float32)
 
     def _display_copy_y_period(self, verts_list, radius):
         if self.ctrl_rows:
@@ -313,16 +368,23 @@ class AppState:
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
         self._ensure_spline_radius_rows()
         radius_profiles = [np.asarray(row, dtype=np.float32) for row in self.spline_radius_rows]
+        ctrl_rows_for_mesh, radius_profiles_for_mesh, x_copies_baked = self._extended_x_copy_rows(radius_profiles)
+        original_copies = np.asarray(self.display_copies, dtype=np.int32).copy()
         vl = build_spline_mesh(
-            self.ctrl_rows,
+            ctrl_rows_for_mesh,
             self.params,
             self.config,
             self._pidx,
-            self.period_offset,
-            radius_ctrl_rows=radius_profiles,
+            np.asarray(self.period_offset, dtype=np.float32) * (2 * int(x_copies_baked) + 1),
+            radius_ctrl_rows=radius_profiles_for_mesh,
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
-        display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
+        try:
+            if x_copies_baked:
+                self.display_copies = np.array([0, int(original_copies[1])], dtype=np.int32)
+            display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
+        finally:
+            self.display_copies = original_copies
         self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
         self.renderer.set_ctrl_pts(self.flat_pts)
         if preserve_model_placement:
@@ -381,7 +443,31 @@ class AppState:
         self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
         self.rebuild_spline_mesh(preserve_model_placement=True)
 
-    def nudge_spline_from_params(self):
+    def _ctrl_rows_bounds(self, rows):
+        valid = [np.asarray(row, dtype=np.float32) for row in rows if len(row)]
+        if not valid:
+            return None
+        pts = np.vstack(valid)
+        return pts.min(axis=0), pts.max(axis=0)
+
+    def _fit_ctrl_rows_to_bounds(self, rows, target_bounds):
+        source_bounds = self._ctrl_rows_bounds(rows)
+        if source_bounds is None or target_bounds is None:
+            return rows
+        src_min, src_max = source_bounds
+        dst_min, dst_max = target_bounds
+        src_center = (src_min + src_max) * 0.5
+        dst_center = (dst_min + dst_max) * 0.5
+        src_span = np.maximum(src_max - src_min, 1e-6)
+        dst_span = np.maximum(dst_max - dst_min, 1e-6)
+        scale = np.array([dst_span[0] / src_span[0], dst_span[1] / src_span[1], 1.0], dtype=np.float32)
+        return [
+            (dst_center + (np.asarray(row, dtype=np.float32) - src_center) * scale).astype(np.float32)
+            for row in rows
+        ]
+
+    def nudge_spline_from_params(self, preserve_bounds=False):
+        old_bounds = self._ctrl_rows_bounds(self.ctrl_rows) if preserve_bounds else None
         target_rows = self._fresh_rebuild_rows()
         ref_rows = self.get('param_ref_ctrl_rows')
         current_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
@@ -403,10 +489,13 @@ class AppState:
                 for r_idx, row in enumerate(self.spline_radius_rows):
                     self.spline_radius_rows[r_idx] = row * ratio
 
+        if preserve_bounds:
+            self.ctrl_rows = self._fit_ctrl_rows_to_bounds(self.ctrl_rows, old_bounds)
+
         self.param_ref_radius = current_radius
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
-        self.rebuild_spline_mesh()
+        self.rebuild_spline_mesh(preserve_model_placement=True)
 
     def debug_compare_to_fresh_rebuild(self):
         fresh_rows = self._fresh_rebuild_rows()
@@ -491,7 +580,17 @@ class AppState:
         self.restore_snapshot(self.undo_stack.pop())
         self.status_msg = 'Undid last change'
 
+    def capture_initial_state(self):
+        super().__setattr__('_initial_snapshot', self.snapshot_state())
+
     def reset_to_initial(self):
+        initial_snapshot = getattr(self, '_initial_snapshot', None)
+        if initial_snapshot is not None:
+            self.push_undo("Reset all")
+            self.restore_snapshot(initial_snapshot)
+            self.status_msg = 'Reset to saved initial model'
+            return
+
         self.push_undo("Reset all")
         defaults = self._state_defaults
 
@@ -579,7 +678,7 @@ class AppState:
     # ── BITMAP / WORKFLOW UPDATES ─────────────────────────────────────────────
 
     def on_bitmap_change(self):
-        self.rebuild_spline_from_params()
+        self.nudge_spline_from_params(preserve_bounds=True)
 
     def on_bitmap_resize(self, new_rows, new_cols):
         new_rows = max(1, min(int(new_rows), int(self.config['knit_parameters']['bitmap_rows'])))

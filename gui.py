@@ -111,11 +111,27 @@ def draw_sidebar(state, renderer):
     imgui.text_disabled(last_undo)
     imgui.separator()
 
-    if imgui.button("Reset initial model##reset_unit_model_global", (-1, 0)):
-        state.reset_to_unit_model()
+    if imgui.button("Reset to saved initial##reset_saved_initial_global", (-1, 0)):
+        state.reset_to_initial()
     imgui.separator()
 
     stage = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
+
+    quick_open = imgui.collapsing_header("Quick jump", imgui.TreeNodeFlags_.default_open)
+    if isinstance(quick_open, tuple):
+        quick_open = quick_open[0]
+    if quick_open:
+        quick_targets = ("Pattern", "Geometry", "Surface Fibers", "Material", "Texture", "Display", "Lighting", "Spline", "Review")
+        button_w = max(92, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
+        for idx, title in enumerate(quick_targets):
+            target_idx = next((i for i, item in enumerate(state.workflow_stages) if item[0] == title), None)
+            if target_idx is None:
+                continue
+            if idx % 2 == 1:
+                imgui.same_line()
+            if imgui.button(f"{title}##quick_{title}", (button_w, 0)):
+                state.workflow_step = target_idx
+        imgui.separator()
 
     def rebuild_current_mesh():
         state.rebuild_spline_mesh()
@@ -156,14 +172,19 @@ def draw_sidebar(state, renderer):
         if fibers_changed:
             rebuild_current_mesh()
 
-    # Copies configuration (vectorized display_copies)
-    changed_x, new_copies_x = imgui.slider_int("Copies X", int(state.display_copies[0]), 0, 20)
-    changed_y, new_copies_y = imgui.slider_int("Copies Y", int(state.display_copies[1]), 0, 20)
-    if changed_x or changed_y:
-        state.push_undo("Display copies")
-        state.display_copies = np.array([new_copies_x, new_copies_y], dtype=np.int32)
-        state.rebuild_spline_mesh(preserve_model_placement=True)
-    imgui.separator()
+    def draw_display_controls():
+        imgui.text("Repeated Display")
+        imgui.text_disabled("Only affects viewport preview; it does not change the base spline.")
+        changed_x, new_copies_x = imgui.slider_int("Copies X##display_copies", int(state.display_copies[0]), 0, 20)
+        changed_y, new_copies_y = imgui.slider_int("Copies Y##display_copies", int(state.display_copies[1]), 0, 20)
+        if changed_x or changed_y:
+            state.push_undo("Display copies")
+            state.display_copies = np.array([new_copies_x, new_copies_y], dtype=np.int32)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
+        if imgui.small_button("Single model##display_copies"):
+            state.push_undo("Display copies")
+            state.display_copies = np.array([0, 0], dtype=np.int32)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
 
     if stage == 0:
         imgui.text("Viewport Alignment")
@@ -330,26 +351,6 @@ def draw_sidebar(state, renderer):
             state.on_bitmap_change()
 
     elif stage == 2:
-        imgui.text("Yarn Radius")
-        imgui.text_wrapped("Set the main yarn tube size before adding separate surface fibers.")
-        params_changed = False
-        for name, label in (('radius', 'Tube radius'), ('ellipse_ratio', 'Oval width ratio')):
-            idx = state._pidx[name]
-            lo, hi = state.config["knit_parameters"]["parameters"][idx]["range"]
-            changed, new_val = imgui.slider_float(f"{label}##{name}", state.params[idx], lo, hi, "%.4f")
-            if imgui.is_item_activated():
-                state.push_undo(label)
-            if changed:
-                state.params[idx] = new_val
-                params_changed = True
-        if params_changed:
-            state.nudge_spline_from_params()
-
-    elif stage == 3:
-        imgui.text("Surface Fibers")
-        draw_surface_fiber_controls("Surface fibers")
-
-    elif stage == 4:
         imgui.text("Geometry Parameters")
         quality_changed = False
         changed_loop_res, new_loop_res = imgui.slider_int(
@@ -375,8 +376,6 @@ def draw_sidebar(state, renderer):
 
         params_changed = False
         for i, pd in enumerate(state.config["knit_parameters"]["parameters"]):
-            if pd["name"] in ('radius', 'ellipse_ratio'):
-                continue
             span = state.loop_height_span(pd["name"])
             if span is not None and span > state.bitmap_size[0]:
                 continue
@@ -407,7 +406,11 @@ def draw_sidebar(state, renderer):
         if params_changed:
             state.nudge_spline_from_params()
 
-    elif stage == 5:
+    elif stage == 3:
+        imgui.text("Surface Fibers")
+        draw_surface_fiber_controls("Surface fibers")
+
+    elif stage == 4:
         imgui.text("Material")
         _, state.model_alpha = imgui.slider_float("Opacity##mdl", state.model_alpha, 0.0, 1.0, "%.2f")
         changed_mode, use_row_colors = imgui.checkbox("Control colors per row##rowcolors", state.use_row_colors)
@@ -441,7 +444,7 @@ def draw_sidebar(state, renderer):
             if colors_changed:
                 rebuild_current_mesh()
 
-    elif stage == 6:
+    elif stage == 5:
         imgui.text("Texture")
         imgui.text_wrapped("Tune procedural yarn texture in the live viewport.")
         changed_tex, new_tex = imgui.color_edit3(
@@ -487,6 +490,9 @@ def draw_sidebar(state, renderer):
                 imgui.same_line()
             if imgui.small_button(f"{preset['label']}##texture"):
                 state.apply_texture_preset(preset['preset'])
+
+    elif stage == 6:
+        draw_display_controls()
 
     elif stage == 7:
         imgui.text("Lighting")
@@ -574,9 +580,7 @@ def draw_sidebar(state, renderer):
         if state.selected_idx >= 0:
             imgui.text(f"Selected: {state.selected_idx}")
         imgui.text_wrapped("Select a white point, then drag the gizmo arrows or use Arrow/WASD/Q/E keys to refine it.")
-        imgui.separator()
-        imgui.text("Fibers Follow Spline")
-        draw_surface_fiber_controls("Spline fibers")
+        imgui.text_disabled("Fiber controls are only in the Surface Fibers step.")
 
     elif stage == 9:
         imgui.text("Review parameters")
@@ -591,10 +595,10 @@ def draw_sidebar(state, renderer):
             path = _pick_file('load', state.load_path)
             if path:
                 state.load_params(path)
-        if imgui.button("Reset all to initial##reset_all", (half_w, 0)):
+        if imgui.button("Reset to saved initial##reset_all", (half_w, 0)):
             state.reset_to_initial()
         imgui.same_line()
-        if imgui.button("Reset initial model##reset_unit_model", (half_w, 0)):
+        if imgui.button("Reset simple model##reset_unit_model", (half_w, 0)):
             state.reset_to_unit_model()
         changed_auto, new_auto = imgui.checkbox("Autosave", state.autosave_enabled)
         if changed_auto:
@@ -919,11 +923,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_bounds = np.array(gizmo_bounds, dtype=np.float32)
             state.bbox_start_mouse = np.array([lx, ly], dtype=np.float32)
             state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
-            if state.mode == 'spline':
-                state.bbox_start_ctrl_rows = [row.copy() for row in state.ctrl_rows]
-                state.bbox_start_period_offset = np.array(state.period_offset, dtype=np.float32).copy()
-            else:
-                state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
+            state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
             suppress_mesh_click = True
 
         active_handle = int(state.get('bbox_active_handle', -1))
@@ -954,51 +954,16 @@ def draw_viewport(state, renderer, ref_tex, window):
             else:
                 scale_vec = np.array([sx, sy, 1.0], dtype=np.float32)
 
-            if state.mode == 'spline':
-                base_rows = state.get('bbox_start_ctrl_rows')
-                if base_rows:
-                    visible_rows_local = [
-                        row for row_idx, row in enumerate(base_rows)
-                        if state.row_visible is None or len(state.row_visible) == 0 or bool(state.row_visible[row_idx % len(state.row_visible)])
-                    ]
-                    if visible_rows_local:
-                        pts = np.concatenate(visible_rows_local, axis=0)
-                        pts_min = pts.min(axis=0)
-                        pts_max = pts.max(axis=0)
-                        pts_mid = (pts_min + pts_max) * 0.5
-                        
-                        # Determine pivot based on the opposite side of the dragged handle
-                        px = pts_mid[0]
-                        if active_handle in (0, 6, 7): # dragging left, pivot is right
-                            px = pts_max[0]
-                        elif active_handle in (2, 3, 4): # dragging right, pivot is left
-                            px = pts_min[0]
-                            
-                        py = pts_mid[1]
-                        if active_handle in (0, 1, 2): # dragging top, pivot is bottom
-                            py = pts_min[1]
-                        elif active_handle in (4, 5, 6): # dragging bottom, pivot is top
-                            py = pts_max[1]
-                            
-                        pivot = np.array([px, py, pts_mid[2]], dtype=np.float32)
-                    else:
-                        pivot = np.asarray(state.mesh_center, dtype=np.float32)
-                    state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
-                    if state.get('bbox_start_period_offset') is not None:
-                        state.period_offset = (state.bbox_start_period_offset * scale_vec).astype(np.float32)
-                    state._rebuild_spline_points()
-                    state.rebuild_spline_mesh()
-            else:
-                start_scale = np.array(state.get('bbox_start_model_scale', state.model_scale), dtype=np.float32)
-                if start_scale.size == 1:
-                    start_scale = np.repeat(start_scale, 3)
-                state.model_scale = np.maximum(start_scale[:3] * scale_vec, 1e-4).astype(np.float32)
+            start_scale = np.array(state.get('bbox_start_model_scale', state.model_scale), dtype=np.float32)
+            if start_scale.size == 1:
+                start_scale = np.repeat(start_scale, 3)
+            state.model_scale = np.maximum(start_scale[:3] * scale_vec, 1e-4).astype(np.float32)
 
-                start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
-                old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
-                new_cx, new_cy = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
-                correction = viewport_pixel_delta_to_world(new_cx - old_cx, new_cy - old_cy)
-                state.model_t = (start_t + correction).astype(np.float32)
+            start_t = np.array(state.get('bbox_start_t', state.model_t), dtype=np.float32)
+            old_cx, old_cy = 0.5 * (x0_min + x0_max), 0.5 * (y0_min + y0_max)
+            new_cx, new_cy = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
+            correction = viewport_pixel_delta_to_world(new_cx - old_cx, new_cy - old_cy)
+            state.model_t = (start_t + correction).astype(np.float32)
             suppress_mesh_click = True
         elif active_handle >= 0 and not lmb_down:
             state.bbox_active_handle = -1
@@ -1006,8 +971,6 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_mouse = None
             state.bbox_start_t = None
             state.bbox_start_model_scale = None
-            state.bbox_start_ctrl_rows = None
-            state.bbox_start_period_offset = None
 
         state.hover_mesh_idx = renderer.pick_mesh_index(model_mat, state.camera, disp_w, disp_h, lx, ly, visible_rows=state.row_visible)
 

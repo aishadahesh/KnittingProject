@@ -223,13 +223,13 @@
         0.34549158811569214
       ],
       [
-        -0.6330156326293945,
-        4.7690887451171875,
+        -2.1252670288085938,
+        3.998894453048706,
         0.9045084714889526
       ],
       [
-        -0.8307968378067017,
-        3.8777036666870117,
+        -0.7634048461914062,
+        3.319312810897827,
         0.0
       ],
       [
@@ -314,7 +314,7 @@
     ]
   ],
   "gui_state": {
-    "workflow_step": 4,
+    "workflow_step": 1,
     "mode": "spline",
     "show_ref_bg": true,
     "ref_bg_alpha": 1.0,
@@ -393,18 +393,18 @@
     ],
     "samples_per_loop": 5,
     "display_copies": [
-      7,
-      2
+      0,
+      0
     ],
     "auto_fix_spline_endpoints": true,
     "spline_keyboard_step": 0.025,
-    "fiber_geometry_enabled": true,
+    "fiber_geometry_enabled": false,
     "fiber_geometry_count": 7,
     "fiber_geometry_radius_scale": 0.1899999976158142,
     "fiber_geometry_lift": 0.0,
     "fiber_geometry_surface_arc": 0.55,
     "fiber_geometry_randomness": 0.18,
-    "fiber_geometry_twist": 1.5399999618530273,
+    "fiber_geometry_twist": 0.0,
     "ref_bg_scale": [
       2.6500000953674316,
       2.6500000953674316
@@ -424,9 +424,9 @@
       3.2765116691589355
     ],
     "model_t": [
-      2.992652177810669,
-      -3.2517080307006836,
-      -0.4719562530517578
+      0.28308582305908203,
+      -2.7774951457977295,
+      -0.46238791942596436
     ],
     "bitmap_size": [
       4,
@@ -447,7 +447,7 @@
       1.0,
       1.0
     ],
-    "camera_dist": 13.096137888965057,
+    "camera_dist": 11.226952566826782,
     "camera_az": 0.0,
     "camera_el": 0.0,
     "camera_target": [

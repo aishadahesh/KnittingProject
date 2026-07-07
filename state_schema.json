@@ -10,16 +10,12 @@
         "subtitle": "Set bitmap size, row visibility, and stitch pattern."
       },
       {
-        "title": "Yarn Radius",
-        "subtitle": "Set the main yarn tube radius before adding surface fibers."
+        "title": "Geometry",
+        "subtitle": "Tune yarn radius and knitting path parameters."
       },
       {
         "title": "Surface Fibers",
         "subtitle": "Add separate fiber meshes above the yarn surface."
-      },
-      {
-        "title": "Geometry",
-        "subtitle": "Tune the remaining knitting path parameters manually."
       },
       {
         "title": "Material",
@@ -28,6 +24,10 @@
       {
         "title": "Texture",
         "subtitle": "Tune the yarn texture tint and see it live."
+      },
+      {
+        "title": "Display",
+        "subtitle": "Set viewport copies and repeated model preview."
       },
       {
         "title": "Lighting",
