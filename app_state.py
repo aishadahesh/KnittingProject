@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from PIL import Image
 
 from knitting_core import (
-    compute_knitting_vertices, compute_knitting_faces,
+    compute_knitting_faces,
     build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes
 )
 
@@ -274,13 +274,6 @@ class AppState:
     def active_colors(self):
         return self.row_colors if self.use_row_colors else [self.single_model_color]
 
-    def rebuild_param_mesh(self):
-        vl = compute_knitting_vertices(self.params, self.bitmap, self.config, self._pidx, self._lh_idx)
-        fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
-        display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
-        self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
-        self.renderer.set_ctrl_pts([])
-        self._recompute_center(display_vl)
 
     def _ensure_spline_radius_rows(self):
         base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)

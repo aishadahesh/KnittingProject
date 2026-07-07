@@ -3,7 +3,6 @@ import glob
 import os
 import sys
 import json
-from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -55,66 +54,6 @@ def eval_curve(t, hl, lh, sb, sz):
     return jnp.stack((x, y, z), axis=-1)
 
 
-@jax.jit
-def eval_curve_derivative(t, hl, lh, sb, sz):
-    dx = 2 * sb * jnp.cos(2 * t) + 1 / (2 * jnp.pi)
-    dy = 0.5 * jnp.sin(t) * lh
-    dz = -sz * jnp.sin(2 * t) * hl
-    dx = jnp.where(hl == 0.0, 1 / (2 * jnp.pi), dx)
-    return jnp.stack((dx, dy, dz), axis=-1)
-
-
-@jax.jit
-def compute_orthonormal_frame(tan):
-    t = tan / (jnp.linalg.norm(tan, axis=-1, keepdims=True) + 1e-8)
-    u = jnp.cross(t, jnp.array([0.0, 0.0, 1.0]))
-    u = jnp.where(jnp.linalg.norm(u, axis=-1, keepdims=True) < 1e-6, jnp.cross(t, jnp.array([1.0, 0.0, 0.0])), u)
-    u = u / (jnp.linalg.norm(u, axis=-1, keepdims=True) + 1e-8)
-    return u, jnp.cross(t, u)
-
-
-@partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def compute_knitting_vertices_jit(params, bitmap, loop_res, seg, indices, lh_idx):
-    bulge_idx, stz_idx, dy_idx, rad_idx, rat_idx = indices
-    bulge, stz = params[bulge_idx], params[stz_idx]
-    dy, rad, rat = params[dy_idx], params[rad_idx], params[rat_idx]
-    lut = jnp.concatenate((jnp.zeros(1), params[jnp.array(lh_idx)]))
-    scale = _scale_factors_jax(bitmap)
-    x_pitch = 1.0
-
-    rows, loops = bitmap.shape
-    t = jnp.linspace(0.0, 2 * jnp.pi * loops, loop_res * loops + 1)
-    a = jnp.linspace(0, 2 * jnp.pi, seg, endpoint=False)
-    ca, sa = jnp.cos(a)[None, :, None], jnp.sin(a)[None, :, None]
-
-    def row_fn(i, srow):
-        ls = jnp.append(jnp.repeat(srow, loop_res), 1.0).astype(jnp.int32)
-        h = jnp.take(lut, ls)
-        has = (ls > 0).astype(jnp.float32)
-        p = eval_curve(t, has, h, bulge, stz).at[:, 1].add(i * dy)
-        d = eval_curve_derivative(t, has, h, bulge, stz)
-        p = p.at[:, 0].multiply(x_pitch)
-        d = d.at[:, 0].multiply(x_pitch)
-        u, v = compute_orthonormal_frame(d)
-        off = u[:, None, :] * ca * rad * rat + v[:, None, :] * sa * rad
-        return (p[:, None, :] + off).reshape(-1, 3)
-
-    return jax.vmap(row_fn)(jnp.arange(rows), scale)
-
-
-def compute_knitting_vertices(params, bitmap, config, pidx, lh_idx):
-    seg = config["knit_parameters"]["segments"]
-    res = config["knit_parameters"]["loop_res"]
-    indices = (pidx["stitch_bulge"], pidx["stitch_z"], pidx["dy"], pidx["radius"], pidx["ellipse_ratio"])
-    v = compute_knitting_vertices_jit(
-        jnp.asarray(params, dtype=jnp.float32),
-        jnp.asarray(bitmap, dtype=jnp.float32),
-        res,
-        seg,
-        indices,
-        lh_idx
-    )
-    return [(np.asarray(r), len(r) // seg) for r in v]
 
 
 def compute_knitting_faces(seg, vl):
