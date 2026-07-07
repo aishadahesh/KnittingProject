@@ -121,6 +121,7 @@ class AppState:
             'row_visible': np.ones(3, dtype=bool),
             'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
             'mi_cam_fov': float(config_data['rendering']['camera_fov']),
+            'period_offset': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
         }
         for k, v in computed_defaults.items():
             state_defaults[k] = AppState._clone(_coerce(v))
@@ -208,7 +209,7 @@ class AppState:
                 stitched_rings = []
                 stitched_faces = []
                 for tile_i, x_tile in enumerate(x_tiles):
-                    translated = rings + np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
+                    translated = rings + x_tile * self.period_offset[None, None, :]
                     stitched_rings.append(translated)
                     
                     tile_faces = base_faces + tile_i * int(n_points) * seg
@@ -317,7 +318,7 @@ class AppState:
             self.params,
             self.config,
             self._pidx,
-            self.bitmap_size[1],
+            self.period_offset,
             radius_ctrl_rows=radius_profiles,
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
@@ -342,11 +343,25 @@ class AppState:
         self._row_starts = np.concatenate(([0], np.cumsum([len(r) for r in self.ctrl_rows]))).tolist()
         self.flat_pts = np.concatenate(self.ctrl_rows).astype(np.float32) if self.ctrl_rows else np.empty((0, 3), np.float32)
 
+    @property
+    def flat_pts_all(self):
+        if not self.ctrl_rows:
+            return np.empty((0, 3), dtype=np.float32)
+        virtual_pts = np.array([row[0] + self.period_offset for row in self.ctrl_rows], dtype=np.float32)
+        return np.concatenate((self.flat_pts, virtual_pts), axis=0)
+
     def move_ctrl_pt(self, flat_idx, pos):
-        r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
-        if 0 <= r < len(self.ctrl_rows):
-            self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
-            self._rebuild_spline_points()
+        n_real = len(self.flat_pts)
+        if flat_idx >= n_real:
+            row_idx = flat_idx - n_real
+            if 0 <= row_idx < len(self.ctrl_rows):
+                self.period_offset = pos - self.ctrl_rows[row_idx][0]
+                self.rebuild_spline_mesh()
+        else:
+            r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
+            if 0 <= r < len(self.ctrl_rows):
+                self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
+                self._rebuild_spline_points()
 
     def center_model_on_view(self):
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
@@ -364,7 +379,7 @@ class AppState:
         self.param_ref_radius = base_radius
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
-        self.rebuild_spline_mesh(preserve_model_placement=False)
+        self.rebuild_spline_mesh(preserve_model_placement=True)
 
     def nudge_spline_from_params(self):
         target_rows = self._fresh_rebuild_rows()
@@ -498,6 +513,7 @@ class AppState:
             'fiber_geometry_twist', 'spline_keyboard_step',
             'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
+            'period_offset',
         )
         for key in reset_keys:
             if key in defaults:
@@ -538,6 +554,7 @@ class AppState:
             'fiber_geometry_surface_arc', 'fiber_geometry_randomness',
             'fiber_geometry_twist', 'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
+            'period_offset',
         ):
             if key in defaults:
                 self._data[key] = self._clone(defaults[key])
@@ -568,10 +585,12 @@ class AppState:
         new_rows = max(1, min(int(new_rows), int(self.config['knit_parameters']['bitmap_rows'])))
         new_cols = max(1, min(int(new_cols), 16))
         old = self.bitmap
+        old_cols = max(1, old.shape[1])
         new_bm = np.ones((new_rows, new_cols), dtype=np.float32)
         new_bm[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)] = old[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)]
         self.bitmap = new_bm
         self.bitmap_size = np.array([new_rows, new_cols], dtype=np.int32)
+        self.period_offset = (self.period_offset * (float(new_cols) / float(old_cols))).astype(np.float32)
         self._sync_row_colors(new_rows)
         self._sync_row_visibility(new_rows)
         self.on_bitmap_change()
@@ -610,6 +629,7 @@ class AppState:
             'format_version': 2,
             'params': params_to_save,
             'bitmap': self.bitmap.tolist(),
+            'period_offset': self.period_offset.tolist(),
             'spline_control_rows': [row.tolist() for row in self.ctrl_rows],
             'spline_radius_rows': [row.tolist() for row in self.spline_radius_rows],
             'gui_state': gui_state,
@@ -682,7 +702,7 @@ class AppState:
             self.camera.fov_deg = self.view_fov
             self.load_path = path
             self.status_msg = f'Loaded ← {os.path.basename(path)}'
-
+            self.period_offset = np.array(data.get('period_offset', [float(self.bitmap_size[1]), 0.0, 0.0]), dtype=np.float32)
             self.rebuild_spline_from_params()
             if loaded_spline_rows:
                 self.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]

@@ -195,12 +195,12 @@ def test_periodic_spline_continuity(config_fixture, params_fixture):
     lh_idx = tuple(pidx[name] for name in lh_params)
     bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
     
-    # 1. Verify control point lengths are cols * spl (10)
+    # 1. Verify control point lengths are cols * spl (bitmap.shape[1] * 5)
     ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
-    assert ctrl_rows[0].shape[0] == 10
+    assert ctrl_rows[0].shape[0] == bitmap.shape[1] * 5
     
     # 2. Build mesh and check periodic boundary alignment
-    spline_mesh = build_spline_mesh(ctrl_rows, params_list, config_fixture, pidx, bitmap.shape[1])
+    spline_mesh = build_spline_mesh(ctrl_rows, params_list, config_fixture, pidx, [float(bitmap.shape[1]), 0.0, 0.0])
     seg = config_fixture["knit_parameters"]["segments"]
     D = np.array([float(bitmap.shape[1]), 0.0, 0.0])
     for pts, nout in spline_mesh:

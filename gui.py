@@ -635,16 +635,19 @@ def draw_viewport(state, renderer, ref_tex, window):
     visible_ctrl_indices = np.empty((0,), dtype=np.int32)
     visible_ctrl_index_map = {}
     if state.mode == 'spline':
-        visible_chunks = []
+        n_real_total = len(state.flat_pts)
+        real_chunks = []
+        virtual_indices = []
         for row_idx, row in enumerate(state.ctrl_rows):
             if not state.row_visible[row_idx]:
                 continue
             start = state._row_starts[row_idx]
             end = start + len(row)
-            visible_chunks.append(np.arange(start, end, dtype=np.int32))
-        if visible_chunks:
-            visible_ctrl_indices = np.concatenate(visible_chunks)
-            visible_ctrl_pts = state.flat_pts[visible_ctrl_indices]
+            real_chunks.append(np.arange(start, end, dtype=np.int32))
+            virtual_indices.append(n_real_total + row_idx)
+        if real_chunks:
+            visible_ctrl_indices = np.concatenate(real_chunks + [np.array(virtual_indices, dtype=np.int32)])
+            visible_ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
         else:
             visible_ctrl_pts = np.empty((0, 3), dtype=np.float32)
         renderer.set_ctrl_pts(visible_ctrl_pts)
@@ -710,7 +713,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         bg_tex      = ref_tex if state.show_ref_bg else None,
         bg_alpha    = state.ref_bg_alpha,
         bg_uniforms = bg_uniforms,
-        camera      = state.camera
+        camera      = state.camera,
+        n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx])
     )
 
     # Display FBO
@@ -742,7 +746,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         # In spline mode, derive the bbox from visible control points for stable,
         # predictable resize behavior.
         if state.mode == 'spline' and len(visible_ctrl_indices) > 0:
-            ctrl_pts = state.flat_pts[visible_ctrl_indices]
+            ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
             world_pts = transform_points(ctrl_pts, model_matrix)
             view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
             homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
@@ -848,7 +852,7 @@ def draw_viewport(state, renderer, ref_tex, window):
 
     # ImGuizmo
     if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map:
-        local_pos = state.flat_pts[state.selected_idx].astype(np.float32)
+        local_pos = state.flat_pts_all[state.selected_idx].astype(np.float32)
         pos = transform_points([local_pos], model_mat)[0].astype(np.float32)
         M16 = imguizmo.im_guizmo.Matrix16
 
@@ -917,6 +921,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
             if state.mode == 'spline':
                 state.bbox_start_ctrl_rows = [row.copy() for row in state.ctrl_rows]
+                state.bbox_start_period_offset = np.array(state.period_offset, dtype=np.float32).copy()
             else:
                 state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
             suppress_mesh_click = True
@@ -979,6 +984,8 @@ def draw_viewport(state, renderer, ref_tex, window):
                     else:
                         pivot = np.asarray(state.mesh_center, dtype=np.float32)
                     state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
+                    if state.get('bbox_start_period_offset') is not None:
+                        state.period_offset = (state.bbox_start_period_offset * scale_vec).astype(np.float32)
                     state._rebuild_spline_points()
                     state.rebuild_spline_mesh()
             else:
@@ -1000,6 +1007,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_t = None
             state.bbox_start_model_scale = None
             state.bbox_start_ctrl_rows = None
+            state.bbox_start_period_offset = None
 
         state.hover_mesh_idx = renderer.pick_mesh_index(model_mat, state.camera, disp_w, disp_h, lx, ly, visible_rows=state.row_visible)
 
@@ -1202,7 +1210,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                     state.selected_idx = grab_idx
                     state.spline_grab_active = True
                     state.spline_grab_start_mouse = np.array([mx, my], dtype=np.float32)
-                    state.spline_grab_start_pos = state.flat_pts[grab_idx].astype(np.float32).copy()
+                    state.spline_grab_start_pos = state.flat_pts_all[grab_idx].astype(np.float32).copy()
 
             if bool(state.spline_grab_active):
                 if state.selected_idx < 0 or int(state.selected_idx) not in visible_ctrl_index_map:
@@ -1264,7 +1272,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 local_delta = np.linalg.inv(model_mat)[:3, :3] @ world_delta
                 state.move_ctrl_pt(
                     state.selected_idx,
-                    state.flat_pts[state.selected_idx] + local_delta.astype(np.float32),
+                    state.flat_pts_all[state.selected_idx] + local_delta.astype(np.float32),
                 )
                 state.rebuild_spline_mesh()
             else:
@@ -1284,7 +1292,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()
             )
             if not gizmo_active:
-                visible_ctrl_pts = state.flat_pts[visible_ctrl_indices]
+                visible_ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
                 world_pts = transform_points(visible_ctrl_pts, model_mat)
                 homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
                 view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()

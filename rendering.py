@@ -152,11 +152,14 @@ in  vec3 in_pos;
 uniform mat4 mvp;
 uniform int  hover_idx;
 uniform int  selected_idx;
+uniform int  n_real;
 flat out int state;   // 0=normal 1=hover 2=selected
+flat out int is_virtual;
 void main() {
     gl_Position = mvp * vec4(in_pos, 1.0);
     int vid = gl_VertexID;
     state = (vid == selected_idx) ? 2 : (vid == hover_idx ? 1 : 0);
+    is_virtual = (vid >= n_real) ? 1 : 0;
     gl_PointSize = (state > 0) ? 16.0 : 10.0;
 }
 """
@@ -164,12 +167,14 @@ void main() {
 PT_FRAG = """
 #version 330
 flat in int state;
+flat in int is_virtual;
 out vec4 f_color;
 void main() {
     vec2 c = gl_PointCoord * 2.0 - 1.0;
     if (dot(c, c) > 1.0) discard;
     if      (state == 2) f_color = vec4(1.0, 1.0, 0.0, 1.0);  // drag  → yellow
     else if (state == 1) f_color = vec4(1.0, 0.5, 0.0, 1.0);  // hover → orange
+    else if (is_virtual == 1) f_color = vec4(0.0, 0.8, 1.0, 0.9); // virtual -> cyan
     else                 f_color = vec4(1.0, 1.0, 1.0, 0.9);  // normal → white
 }
 """
@@ -612,7 +617,7 @@ class MeshRenderer:
                hover_mesh_idx=-1, selected_mesh_idx=-1,
                visible_rows=None,
                bg_tex=None, bg_alpha=0.5, bg_uniforms=None,
-               camera=None):
+               camera=None, n_real_pts=-1):
         self.fbo.use()
         self.ctx.viewport = (0, 0, self.vp_w, self.vp_h)
         
@@ -731,6 +736,8 @@ class MeshRenderer:
             self.pt_prog['mvp'].write(mvp.T.tobytes())
             self.pt_prog['hover_idx'].value    = hover_idx
             self.pt_prog['selected_idx'].value = selected_idx
+            if 'n_real' in self.pt_prog:
+                self.pt_prog['n_real'].value   = n_real_pts if n_real_pts >= 0 else self.n_pts
             self.pt_vao.render(moderngl.POINTS, vertices=self.n_pts)
 
         self.ctx.screen.use()

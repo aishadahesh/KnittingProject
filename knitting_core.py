@@ -175,14 +175,21 @@ def build_surface_fiber_meshes(
     return out_vl, meta
 
 
-def build_spline_mesh(ctrl_rows, params, config, pidx, bitmap_width, radius_ctrl_rows=None):
+def build_spline_mesh(ctrl_rows, params, config, pidx, period_offset, radius_ctrl_rows=None):
     p = np.asarray(params)
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
     seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
-    nout = res * bitmap_width + 1
+    
+    if isinstance(period_offset, (int, float, np.integer, np.floating)):
+        D = np.array([float(period_offset), 0.0, 0.0], dtype=float)
+        bitmap_width = float(period_offset)
+    else:
+        D = np.asarray(period_offset, dtype=float)
+        bitmap_width = float(np.linalg.norm(D))
+        
+    nout = res * int(round(bitmap_width)) + 1
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
-    D = np.array([float(bitmap_width), 0.0, 0.0], dtype=float)
     out = []
     for row_idx, r in enumerate(ctrl_rows):
         cp = np.asarray(r, dtype=float)
