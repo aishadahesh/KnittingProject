@@ -1,3 +1,4 @@
+# %% PRELOAD & IMPORTS ──────────────────────────────────────────────────────────────
 import ctypes
 import glob
 import os
@@ -31,6 +32,7 @@ def _preload_linux_nvidia_libs():
 
 _preload_linux_nvidia_libs()
 
+# %% PARAMETRIC GENERATION & GEOMETRY ─────────────────────────────────────────────────
 @jax.jit
 def _scale_factors_jax(bitmap):
     a = bitmap > 0.5
@@ -176,6 +178,7 @@ def build_surface_fiber_meshes(
     return out_vl, meta
 
 
+# %% SPLINE CENTERLINE REPRESENTATION ──────────────────────────────────────────────────
 def eval_centerline(cp, D, nout, t=None, to=None):
     cp = np.asarray(cp, dtype=float)
     if len(cp) <= 1:
@@ -263,6 +266,7 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, period_offset, radius_ctr
     return out
 
 
+# %% YARN SIMULATION PIPELINE ─────────────────────────────────────────────────────────
 def compute_elastic_forces_and_hessian(V, edges, L0, k_s, k_b, project_psd=True):
     import scipy.sparse
     M = len(V)
@@ -603,6 +607,7 @@ def eval_energy(flat_P, ctrl_rows, D, config, k_s, k_b, k_c, dhat):
     return e_el + e_col
 
 
+# %% HEADLESS FINITE DIFFERENCE VERIFICATION ──────────────────────────────────────────
 def check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat, eps=1e-5):
     flat_P = np.concatenate(ctrl_rows).astype(float).flatten()
     N = flat_P.size
