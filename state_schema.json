@@ -38,6 +38,10 @@
         "subtitle": "Refine control points when the coarse shape is close."
       },
       {
+        "title": "Scanner",
+        "subtitle": "Build the scan fabric and launch the UR5 scanner visualization."
+      },
+      {
         "title": "Review",
         "subtitle": "Render, save, load, and run the existing optimizer."
       }
@@ -150,7 +154,23 @@
       "bitmap_size",
       "single_model_color",
       "render_texture_color",
-      "render_light_color"
+      "render_light_color",
+      "scanner_fabric_width",
+      "scanner_fabric_length",
+      "scanner_rows",
+      "scanner_cols",
+      "scanner_angles",
+      "scanner_speed",
+      "scanner_dwell",
+      "scanner_add_camera",
+      "scanner_save_images",
+      "scanner_image_every",
+      "scanner_execution_mode",
+      "scanner_robot_ip",
+      "scanner_robot_port",
+      "scanner_color_variants",
+      "scanner_cell_color_sets",
+      "scanner_selected_cell"
     ],
     "texture_control_groups": [
       {
@@ -559,6 +579,29 @@
       "render_light_intensity": 0.9,
       "render_ao_strength": 0.5,
       "render_ao_radius": 0.15
+    },
+    "scanner": {
+      "scanner_fabric_width": 0.34,
+      "scanner_fabric_length": 0.24,
+      "scanner_rows": 4,
+      "scanner_cols": 5,
+      "scanner_angles": 6,
+      "scanner_speed": 0.35,
+      "scanner_dwell": 0.2,
+      "scanner_add_camera": true,
+      "scanner_save_images": false,
+      "scanner_image_every": "view",
+      "scanner_execution_mode": "simulation",
+      "scanner_robot_ip": "132.74.121.230",
+      "scanner_robot_port": 30001,
+      "scanner_color_variants": [
+        [0.85, 0.12, 0.10],
+        [0.10, 0.39, 0.82],
+        [0.98, 0.78, 0.16],
+        [0.16, 0.10, 0.04]
+      ],
+      "scanner_cell_color_sets": [],
+      "scanner_selected_cell": [0, 0]
     }
   }
 }

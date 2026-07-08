@@ -1,6 +1,10 @@
 import os
+import json
 import numpy as np
 import glfw
+import subprocess
+import sys
+import time
 import tkinter as tk
 from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
@@ -35,6 +39,30 @@ def _pick_file(mode, initial_path):
 
 # %% GUI DRAWING PANELS ────────────────────────────────────────────────────────
 
+def _workflow_stage_title(state, step=None):
+    index = int(np.clip(state.workflow_step if step is None else step, 0, len(state.workflow_stages) - 1))
+    return str(state.workflow_stages[index][0])
+
+
+def _set_workflow_step(state, step):
+    step = int(np.clip(step, 0, len(state.workflow_stages) - 1))
+    old_scanner = _workflow_stage_title(state) == "Scanner"
+    new_scanner = _workflow_stage_title(state, step) == "Scanner"
+    if step == int(state.workflow_step) and old_scanner == new_scanner:
+        return
+
+    state.workflow_step = step
+    if new_scanner:
+        state.scanner_preview_grid_enabled = True
+        state.scanner_preview_rows = max(1, int(state.scanner_rows))
+        state.scanner_preview_cols = max(1, int(state.scanner_cols))
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+    elif old_scanner or bool(state.get('scanner_preview_grid_enabled', False)):
+        state.scanner_preview_grid_enabled = False
+        state.display_copies = np.array([0, 0], dtype=np.int32)
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+
+
 def draw_menu_bar(state):
     if imgui.begin_menu_bar():
         if imgui.begin_menu("Window"):
@@ -66,7 +94,7 @@ def draw_workflow_header(state):
         imgui.push_style_color(imgui.Col_.button, color)
         imgui.push_style_color(imgui.Col_.button_hovered, hover)
         if imgui.button(f"{i + 1}##stage_{i}", imgui.ImVec2(dot_w, 22)):
-            state.workflow_step = i
+            _set_workflow_step(state, i)
         imgui.pop_style_color(2)
         if i < len(state.workflow_stages) - 1:
             imgui.same_line()
@@ -79,14 +107,14 @@ def draw_workflow_header(state):
     if back_disabled:
         imgui.begin_disabled()
     if imgui.button("Back##workflow", (nav_w, 0)):
-        state.workflow_step = max(0, stage_idx - 1)
+        _set_workflow_step(state, max(0, stage_idx - 1))
     if back_disabled:
         imgui.end_disabled()
     imgui.same_line()
     if next_disabled:
         imgui.begin_disabled()
     if imgui.button("Next##workflow", (nav_w, 0)):
-        state.workflow_step = min(len(state.workflow_stages) - 1, stage_idx + 1)
+        _set_workflow_step(state, min(len(state.workflow_stages) - 1, stage_idx + 1))
     if next_disabled:
         imgui.end_disabled()
     imgui.separator()
@@ -116,12 +144,16 @@ def draw_sidebar(state, renderer):
     imgui.separator()
 
     stage = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
+    if _workflow_stage_title(state, stage) != "Scanner" and bool(state.get('scanner_preview_grid_enabled', False)):
+        state.scanner_preview_grid_enabled = False
+        state.display_copies = np.array([0, 0], dtype=np.int32)
+        state.rebuild_spline_mesh(preserve_model_placement=False)
 
     quick_open = imgui.collapsing_header("Quick jump", imgui.TreeNodeFlags_.default_open)
     if isinstance(quick_open, tuple):
         quick_open = quick_open[0]
     if quick_open:
-        quick_targets = ("Pattern", "Geometry", "Surface Fibers", "Material", "Texture", "Display", "Lighting", "Spline", "Review")
+        quick_targets = ("Pattern", "Geometry", "Surface Fibers", "Material", "Texture", "Display", "Lighting", "Spline", "Scanner", "Review")
         button_w = max(92, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
         for idx, title in enumerate(quick_targets):
             target_idx = next((i for i, item in enumerate(state.workflow_stages) if item[0] == title), None)
@@ -130,7 +162,7 @@ def draw_sidebar(state, renderer):
             if idx % 2 == 1:
                 imgui.same_line()
             if imgui.button(f"{title}##quick_{title}", (button_w, 0)):
-                state.workflow_step = target_idx
+                _set_workflow_step(state, target_idx)
         imgui.separator()
 
     def rebuild_current_mesh():
@@ -178,13 +210,296 @@ def draw_sidebar(state, renderer):
         changed_x, new_copies_x = imgui.slider_int("Copies X##display_copies", int(state.display_copies[0]), 0, 20)
         changed_y, new_copies_y = imgui.slider_int("Copies Y##display_copies", int(state.display_copies[1]), 0, 20)
         if changed_x or changed_y:
+            state.scanner_preview_grid_enabled = False
             state.push_undo("Display copies")
             state.display_copies = np.array([new_copies_x, new_copies_y], dtype=np.int32)
             state.rebuild_spline_mesh(preserve_model_placement=True)
         if imgui.small_button("Single model##display_copies"):
+            state.scanner_preview_grid_enabled = False
             state.push_undo("Display copies")
             state.display_copies = np.array([0, 0], dtype=np.int32)
             state.rebuild_spline_mesh(preserve_model_placement=True)
+
+    def scanner_process_running():
+        proc = getattr(state, 'scanner_process', None)
+        return proc is not None and proc.poll() is None
+
+    def update_scanner_process_status():
+        proc = getattr(state, 'scanner_process', None)
+        if proc is None:
+            return
+        code = proc.poll()
+        if code is None:
+            elapsed = max(0.0, time.time() - float(getattr(state, 'scanner_started_at', 0.0)))
+            state.scanner_status = f"Scanner running ({elapsed:.0f}s)"
+        else:
+            state.scanner_status = "Scanner finished" if code == 0 else f"Scanner stopped/error ({code})"
+            state.scanner_process = None
+
+    def scanner_palette():
+        variants = state.scanner_color_variants
+        if isinstance(variants, np.ndarray):
+            variants = variants.tolist()
+        colors = []
+        for color in variants:
+            if len(color) >= 3:
+                colors.append([float(color[0]), float(color[1]), float(color[2])])
+        return colors or [[0.85, 0.12, 0.10], [0.10, 0.39, 0.82], [0.98, 0.78, 0.16]]
+
+    def default_cell_color_set(row, col):
+        colors = scanner_palette()
+        start = (row * 3 + col * 5 + row * col) % len(colors)
+        return [colors[(start + i) % len(colors)][:3] for i in range(4)]
+
+    def ensure_scanner_cell_color_sets(rows=None, cols=None):
+        rows = max(1, int(state.scanner_rows if rows is None else rows))
+        cols = max(1, int(state.scanner_cols if cols is None else cols))
+        existing = state.scanner_cell_color_sets
+        if isinstance(existing, np.ndarray):
+            existing = existing.tolist()
+        new_grid = []
+        changed = False
+        for r in range(rows):
+            row_items = []
+            for c in range(cols):
+                cell = None
+                try:
+                    cell = existing[r][c]
+                except Exception:
+                    cell = None
+                if not cell or len(cell) < 4:
+                    cell = default_cell_color_set(r, c)
+                    changed = True
+                row_items.append([[float(v) for v in color[:3]] for color in cell[:4]])
+            new_grid.append(row_items)
+        if changed or existing != new_grid:
+            state.scanner_cell_color_sets = new_grid
+        return new_grid
+
+    def apply_scanner_layout_preview():
+        rows = max(1, int(state.scanner_rows))
+        cols = max(1, int(state.scanner_cols))
+        state.scanner_preview_grid_enabled = True
+        state.scanner_preview_rows = rows
+        state.scanner_preview_cols = cols
+        state.display_copies = np.array([0, 0], dtype=np.int32)
+        state.show_ref_bg = False
+        state.center_model_on_view()
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+
+    def build_scanner_command():
+        mode = str(state.scanner_execution_mode)
+        cmd = [
+            sys.executable,
+            os.path.join(state.project_root, "mujoco_fabric_scanner.py"),
+            "--no-setup-gui",
+            "--execution-mode", mode,
+            "--rows", str(int(state.scanner_rows)),
+            "--cols", str(int(state.scanner_cols)),
+            "--width", f"{float(state.scanner_fabric_width):.6f}",
+            "--length", f"{float(state.scanner_fabric_length):.6f}",
+            "--number-of-angles", str(int(state.scanner_angles)),
+            "--speed", f"{float(state.scanner_speed):.3f}",
+            "--dwell", f"{float(state.scanner_dwell):.3f}",
+            "--model-json", state.save_path,
+            "--palette-json", json.dumps(scanner_palette()),
+            "--cell-colors-json", json.dumps(ensure_scanner_cell_color_sets()),
+        ]
+        if bool(state.scanner_add_camera):
+            cmd.append("--add-camera")
+        if bool(state.scanner_save_images):
+            cmd.extend(["--save-images", "--image-every", str(state.scanner_image_every)])
+        if mode == "robot":
+            cmd.extend([
+                "--robot-ip", str(state.scanner_robot_ip),
+                "--robot-port", str(int(state.scanner_robot_port)),
+            ])
+        else:
+            cmd.append("--no-run-gui")
+        return cmd
+
+    def start_scanner_process():
+        if scanner_process_running():
+            state.scanner_status = "Scanner already running"
+            return
+        state.save_params(state.save_path, silent=True)
+        cmd = build_scanner_command()
+        try:
+            state.scanner_process = subprocess.Popen(cmd, cwd=state.project_root)
+            state.scanner_started_at = time.time()
+            state.scanner_status = "Scanner starting"
+        except Exception as exc:
+            state.scanner_process = None
+            state.scanner_status = f"Could not start scanner: {exc}"
+
+    def stop_scanner_process():
+        proc = getattr(state, 'scanner_process', None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            state.scanner_status = "Stopping scanner"
+        else:
+            state.scanner_process = None
+            state.scanner_status = "Scanner idle"
+
+    def draw_scanner_preview(rows, cols):
+        cell_sets = ensure_scanner_cell_color_sets(rows, cols)
+        selected = np.asarray(state.scanner_selected_cell, dtype=np.int32).reshape(-1)
+        selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+        selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+        avail = imgui.get_content_region_avail().x
+        cell_w = max(20.0, min(42.0, (avail - (cols - 1) * 3.0) / max(1, cols)))
+        cell_h = max(16.0, cell_w * 0.62)
+        imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(3, 3))
+        for r in range(rows):
+            for c in range(cols):
+                color_set = cell_sets[r][c]
+                col = np.mean(np.asarray(color_set, dtype=np.float32), axis=0).tolist()
+                if r == selected_r and c == selected_c:
+                    col = [min(1.0, col[0] + 0.18), min(1.0, col[1] + 0.18), min(1.0, col[2] + 0.18)]
+                imgui.push_style_color(imgui.Col_.button, (col[0], col[1], col[2], 1.0))
+                imgui.push_style_color(imgui.Col_.button_hovered, (min(col[0] + 0.1, 1.0), min(col[1] + 0.1, 1.0), min(col[2] + 0.1, 1.0), 1.0))
+                if imgui.button(f"##scanner_cell_{r}_{c}", imgui.ImVec2(cell_w, cell_h)):
+                    state.scanner_selected_cell = [r, c]
+                imgui.pop_style_color(2)
+                if c < cols - 1:
+                    imgui.same_line()
+        imgui.pop_style_var()
+
+    def draw_scanner_controls():
+        update_scanner_process_status()
+        rows = max(1, int(state.scanner_rows))
+        cols = max(1, int(state.scanner_cols))
+        max_rows = 12
+        max_cols = 32
+        imgui.text("Scanner Fabric")
+        changed_r, new_r = imgui.slider_int("Mini-fabric rows##scanner_rows", rows, 1, max_rows)
+        changed_c, new_c = imgui.slider_int("Mini-fabric cols##scanner_cols", cols, 1, max_cols)
+        changed_a, new_a = imgui.slider_int("Angles per mini-fabric##scanner_angles", int(state.scanner_angles), 1, 16)
+        if changed_r:
+            state.scanner_rows = int(new_r)
+        if changed_c:
+            state.scanner_cols = int(new_c)
+        if changed_a:
+            state.scanner_angles = int(new_a)
+
+        rows = max(1, int(state.scanner_rows))
+        cols = max(1, int(state.scanner_cols))
+        base_cols = max(1, int(state.bitmap_size[1]))
+        base_rows = max(1, int(state.bitmap_size[0]))
+        state.scanner_fabric_width = float(max(0.06, cols * base_cols * 0.045))
+        state.scanner_fabric_length = float(max(0.06, rows * base_rows * 0.040))
+        ensure_scanner_cell_color_sets(rows, cols)
+        preview_synced = (
+            bool(state.get('scanner_preview_grid_enabled', False))
+            and int(state.get('scanner_preview_rows', 0)) == rows
+            and int(state.get('scanner_preview_cols', 0)) == cols
+        )
+        if changed_r or changed_c or not preview_synced:
+            apply_scanner_layout_preview()
+        imgui.text_disabled(
+            f"Each scanner cell copies the full {base_rows} x {base_cols} edited model | physical size: "
+            f"{float(state.scanner_fabric_width):.3f} x {float(state.scanner_fabric_length):.3f} m | stations: {rows * cols}"
+        )
+        if imgui.button("Move current model to scanner layout##scanner_apply_layout", (-1, 0)):
+            state.push_undo("Scanner layout preview")
+            apply_scanner_layout_preview()
+            state.scanner_status = "Model preview moved to scanner layout"
+        draw_scanner_preview(rows, cols)
+
+        imgui.separator()
+        selected = np.asarray(state.scanner_selected_cell, dtype=np.int32).reshape(-1)
+        selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+        selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+        cell_sets = ensure_scanner_cell_color_sets(rows, cols)
+        imgui.text(f"Mini-fabric colors: row {selected_r + 1}, col {selected_c + 1}")
+        cell_changed = False
+        for idx, color in enumerate(cell_sets[selected_r][selected_c]):
+            changed_col, new_col = imgui.color_edit3(
+                f"Yarn {idx + 1}##scanner_cell_{selected_r}_{selected_c}_{idx}",
+                (float(color[0]), float(color[1]), float(color[2])),
+            )
+            if changed_col:
+                cell_sets[selected_r][selected_c][idx] = [float(new_col[0]), float(new_col[1]), float(new_col[2])]
+                cell_changed = True
+        if imgui.small_button("Copy row colors from model##scanner_copy_model_colors"):
+            source = state.row_colors if state.use_row_colors else [state.single_model_color]
+            copied = []
+            for idx in range(4):
+                src = source[idx % len(source)]
+                copied.append([float(src[0]), float(src[1]), float(src[2])])
+            cell_sets[selected_r][selected_c] = copied
+            cell_changed = True
+        imgui.same_line()
+        if imgui.small_button("Apply to all mini-fabrics##scanner_apply_all_colors"):
+            template = [color[:] for color in cell_sets[selected_r][selected_c]]
+            for r in range(rows):
+                for c in range(cols):
+                    cell_sets[r][c] = [color[:] for color in template]
+            cell_changed = True
+        if cell_changed:
+            state.scanner_cell_color_sets = cell_sets
+            if bool(state.get('scanner_preview_grid_enabled', False)):
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+
+        imgui.separator()
+        imgui.text("UR5 Scanner")
+        mode_is_robot = str(state.scanner_execution_mode) == "robot"
+        changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
+        if changed_mode:
+            state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
+        changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 2.0, "%.2f")
+        changed_dwell, new_dwell = imgui.slider_float("Dwell per view (s)##scanner_dwell", float(state.scanner_dwell), 0.0, 2.0, "%.2f")
+        if changed_speed:
+            state.scanner_speed = float(new_speed)
+        if changed_dwell:
+            state.scanner_dwell = float(new_dwell)
+        _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
+        _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
+        if bool(state.scanner_save_images):
+            every_view = str(state.scanner_image_every) == "view"
+            changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
+            if changed_every:
+                state.scanner_image_every = "view" if every_view else "station"
+
+        if str(state.scanner_execution_mode) == "robot":
+            changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip), 64)
+            changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
+            if changed_ip:
+                state.scanner_robot_ip = ip
+            if changed_port:
+                state.scanner_robot_port = int(port)
+
+        running = scanner_process_running()
+        if running:
+            imgui.begin_disabled()
+        if imgui.button("Start UR5 Scanner Visualization##scanner_start", (-1, 0)):
+            start_scanner_process()
+        if running:
+            imgui.end_disabled()
+        if not running:
+            imgui.begin_disabled()
+        if imgui.button("Stop Scanner##scanner_stop", (-1, 0)):
+            stop_scanner_process()
+        if not running:
+            imgui.end_disabled()
+        if imgui.button("Reset scanner scene##scanner_reset", (-1, 0)):
+            state.scanner_rows = 4
+            state.scanner_cols = 5
+            state.scanner_angles = 6
+            state.scanner_fabric_width = 0.34
+            state.scanner_fabric_length = 0.24
+            state.scanner_color_variants = [
+                [0.85, 0.12, 0.10],
+                [0.10, 0.39, 0.82],
+                [0.98, 0.78, 0.16],
+                [0.16, 0.10, 0.04],
+            ]
+            state.scanner_cell_color_sets = []
+            state.scanner_selected_cell = [0, 0]
+            ensure_scanner_cell_color_sets()
+            apply_scanner_layout_preview()
+            state.scanner_status = "Scanner settings reset"
+        imgui.text_wrapped(str(state.scanner_status))
 
     if stage == 0:
         imgui.text("Viewport Alignment")
@@ -292,7 +607,7 @@ def draw_sidebar(state, renderer):
         imgui.text("Pattern and Rows")
         max_rows = int(state.config['knit_parameters']['bitmap_rows'])
         ch_r, new_rows = imgui.slider_int("Rows##bres", int(state.bitmap_size[0]), 1, max_rows)
-        ch_c, new_cols = imgui.slider_int("Columns##bres", int(state.bitmap_size[1]), 1, 16)
+        ch_c, new_cols = imgui.slider_int("Columns##bres", int(state.bitmap_size[1]), 1, 32)
         if ch_r or ch_c:
             state.push_undo("Bitmap size")
             state.on_bitmap_resize(new_rows, new_cols)
@@ -583,6 +898,9 @@ def draw_sidebar(state, renderer):
         imgui.text_disabled("Fiber controls are only in the Surface Fibers step.")
 
     elif stage == 9:
+        draw_scanner_controls()
+
+    elif stage == 10:
         imgui.text("Review parameters")
         imgui.separator()
         half_w = max(100, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
@@ -742,6 +1060,12 @@ def draw_viewport(state, renderer, ref_tex, window):
     viewport_scale = max(float(state.vp_scale), 1e-6)
     lx = (mx - state.vp_origin[0]) / viewport_scale
     ly = (my - state.vp_origin[1]) / viewport_scale
+    stage_name = ""
+    try:
+        stage_name = str(state.workflow_stages[int(state.workflow_step)][0])
+    except Exception:
+        stage_name = ""
+    scanner_stage_active = stage_name == "Scanner"
 
     def projected_mesh_bounds(model_matrix=None):
         if model_matrix is None:
@@ -749,7 +1073,7 @@ def draw_viewport(state, renderer, ref_tex, window):
 
         # In spline mode, derive the bbox from visible control points for stable,
         # predictable resize behavior.
-        if state.mode == 'spline' and len(visible_ctrl_indices) > 0:
+        if state.mode == 'spline' and len(visible_ctrl_indices) > 0 and not scanner_stage_active:
             ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
             world_pts = transform_points(ctrl_pts, model_matrix)
             view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
@@ -818,6 +1142,54 @@ def draw_viewport(state, renderer, ref_tex, window):
             return None
         return x_min, y_min, x_max, y_max
 
+    def projected_scanner_cell_bounds(model_matrix=None):
+        if model_matrix is None:
+            model_matrix = model_mat
+        rows = max(1, int(getattr(state, 'scanner_rows', 1)))
+        cols = max(1, int(getattr(state, 'scanner_cols', 1)))
+        base_rows = max(1, int(state.bitmap_size[0]))
+        if not renderer.mesh_pick_data:
+            return None
+
+        view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+        cell_pts = [[] for _ in range(rows * cols)]
+        for verts, row_idx in renderer.mesh_pick_data:
+            cell_index = int(row_idx) // base_rows
+            if not (0 <= cell_index < rows * cols):
+                continue
+            base_row_idx = int(row_idx) % base_rows
+            if state.row_visible is not None and len(state.row_visible) > 0 and not bool(state.row_visible[base_row_idx]):
+                continue
+            if len(verts) == 0:
+                continue
+            stride = max(1, len(verts) // 300)
+            sample = verts[::stride]
+            world_pts = transform_points(sample, model_matrix)
+            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
+            clip = homo @ view_proj.T
+            valid = clip[:, 3] > 1e-6
+            if not np.any(valid):
+                continue
+            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
+            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
+            screen = np.column_stack((
+                (ndc[:, 0] * 0.5 + 0.5) * disp_w,
+                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
+            ))
+            cell_pts[cell_index].append(screen[valid])
+
+        bounds = []
+        for chunks in cell_pts:
+            if not chunks:
+                bounds.append(None)
+                continue
+            pts = np.concatenate(chunks, axis=0)
+            x_min, y_min = np.min(pts, axis=0)
+            x_max, y_max = np.max(pts, axis=0)
+            pad = 8.0
+            bounds.append((float(x_min - pad), float(y_min - pad), float(x_max + pad), float(y_max + pad)))
+        return bounds
+
     def bounds_handles(bounds):
         x_min, y_min, x_max, y_max = bounds
         x_mid = 0.5 * (x_min + x_max)
@@ -833,6 +1205,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     handle_radius = 6.0
     active_handle = int(state.get('bbox_active_handle', -1))
     hover_handle = -1
+    scanner_cell_bounds = projected_scanner_cell_bounds() if scanner_stage_active else None
     if gizmo_bounds is not None and is_hovered:
         handles = bounds_handles(gizmo_bounds)
         d2 = [((lx - hx) ** 2 + (ly - hy) ** 2) for hx, hy in handles]
@@ -847,6 +1220,36 @@ def draw_viewport(state, renderer, ref_tex, window):
         x_min, y_min, x_max, y_max = gizmo_bounds
         rect_col = imgui.get_color_u32((0.95, 0.95, 0.95, 0.92))
         dl.add_rect((ox + x_min, oy + y_min), (ox + x_max, oy + y_max), rect_col, 0.0, 2.0, 0)
+        if scanner_stage_active and scanner_cell_bounds:
+            rows = max(1, int(getattr(state, 'scanner_rows', state.bitmap_size[0])))
+            cols = max(1, int(getattr(state, 'scanner_cols', state.bitmap_size[1])))
+            selected = np.asarray(getattr(state, 'scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
+            selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+            selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+            grid_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.34))
+            fill_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.055))
+            selected_fill = imgui.get_color_u32((1.0, 0.78, 0.18, 0.18))
+            selected_line = imgui.get_color_u32((1.0, 0.78, 0.18, 0.92))
+            for r in range(rows):
+                for c in range(cols):
+                    cell_bounds = scanner_cell_bounds[r * cols + c]
+                    if cell_bounds is None:
+                        continue
+                    cx0, cy0, cx1, cy1 = cell_bounds
+                    selected_cell = r == selected_r and c == selected_c
+                    dl.add_rect_filled(
+                        (ox + cx0, oy + cy0),
+                        (ox + cx1, oy + cy1),
+                        selected_fill if selected_cell else fill_col,
+                    )
+                    dl.add_rect(
+                        (ox + cx0, oy + cy0),
+                        (ox + cx1, oy + cy1),
+                        selected_line if selected_cell else grid_col,
+                        0.0,
+                        2.0 if selected_cell else 1.0,
+                        0,
+                    )
         for i, (hx, hy) in enumerate(bounds_handles(gizmo_bounds)):
             is_hot = (i == hover_handle or i == active_handle)
             fill = imgui.get_color_u32((0.95, 0.65, 0.10, 1.0) if is_hot else (0.96, 0.96, 0.96, 0.95))
@@ -915,6 +1318,20 @@ def draw_viewport(state, renderer, ref_tex, window):
     if is_hovered:
         io = imgui.get_io()
         lmb_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+        if scanner_stage_active and scanner_cell_bounds and hover_handle < 0 and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:
+            rows = max(1, int(getattr(state, 'scanner_rows', state.bitmap_size[0])))
+            cols = max(1, int(getattr(state, 'scanner_cols', state.bitmap_size[1])))
+            for cell_index, cell_bounds in enumerate(scanner_cell_bounds):
+                if cell_bounds is None:
+                    continue
+                x_min, y_min, x_max, y_max = cell_bounds
+                if x_min <= lx <= x_max and y_min <= ly <= y_max:
+                    cell_r = cell_index // cols
+                    cell_c = cell_index % cols
+                    state.scanner_selected_cell = [cell_r, cell_c]
+                    state.scanner_status = f"Selected mini-fabric R{cell_r + 1} C{cell_c + 1}"
+                    suppress_mesh_click = True
+                    break
 
         # Bounding-box resize handles (window-like scaling in screen space).
         if gizmo_bounds is not None and hover_handle >= 0 and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:

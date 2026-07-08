@@ -14,6 +14,7 @@ Run after installing the extra simulator deps:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import socket
@@ -81,12 +82,14 @@ class FabricPlan:
     view_names: list[str]
     station_cells: list[tuple[int, int]]
     cell_colors: list[tuple[float, float, float, float]]
+    cell_color_sets: list[list[tuple[float, float, float, float]]]
     fabric_origin: np.ndarray
     fabric_size: np.ndarray
     grid_rows: int
     grid_cols: int
     square_width: float
     square_length: float
+    model_curves: list[np.ndarray]
 
 
 def _serpentine_indices(rows: int, cols: int):
@@ -96,8 +99,124 @@ def _serpentine_indices(rows: int, cols: int):
             yield row, col
 
 
-def _cell_color(row: int, col: int) -> tuple[float, float, float, float]:
-    return SWATCH_PALETTE[(row * 3 + col * 5 + row * col) % len(SWATCH_PALETTE)]
+def _normalize_palette(palette) -> list[tuple[float, float, float, float]]:
+    colors = []
+    for color in palette or []:
+        if len(color) < 3:
+            continue
+        r, g, b = [float(v) for v in color[:3]]
+        a = float(color[3]) if len(color) > 3 else 1.0
+        colors.append((r, g, b, a))
+    return colors or list(SWATCH_PALETTE)
+
+
+def _fallback_model_curves() -> list[np.ndarray]:
+    return [
+        np.asarray(curve, dtype=np.float32)
+        for curve in _knit_cell_curves()
+    ]
+
+
+def _load_saved_model_curves(model_json: str | None) -> list[np.ndarray]:
+    if not model_json:
+        return _fallback_model_curves()
+
+    path = Path(model_json)
+    if not path.exists():
+        return _fallback_model_curves()
+
+    try:
+        with path.open("r") as handle:
+            saved = json.load(handle)
+
+        ctrl_rows = [
+            np.asarray(row, dtype=np.float32)
+            for row in saved.get("spline_control_rows", [])
+            if len(row) > 1
+        ]
+        if not ctrl_rows:
+            return _fallback_model_curves()
+
+        bitmap = np.asarray(saved.get("bitmap", np.ones((len(ctrl_rows), 1))), dtype=np.float32)
+        period = np.asarray(saved.get("period_offset", [float(max(1, bitmap.shape[1])), 0.0, 0.0]), dtype=np.float32)
+
+        curves = []
+        for row_idx, row in enumerate(ctrl_rows):
+            cp = np.asarray(row[:, :2], dtype=np.float32)
+            cp_aug = np.vstack((cp, cp[0] + period[:2]))
+            seg_lens = np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6)
+            t = np.concatenate(([0.0], np.cumsum(seg_lens)))
+            samples = max(80, len(cp) * 8)
+            to = np.linspace(t[0], t[-1], samples, dtype=np.float32)
+            detrended = cp_aug - period[:2][None, :] * (t / t[-1])[:, None]
+            if len(cp) == 2:
+                pts = np.column_stack([np.interp(to, t, detrended[:, i]) for i in range(2)])
+            else:
+                from scipy.interpolate import CubicSpline
+                pts = np.column_stack([CubicSpline(t, detrended[:, i], bc_type="periodic")(to) for i in range(2)])
+            pts = pts + period[:2][None, :] * (to / t[-1])[:, None]
+
+            if row_idx < bitmap.shape[0]:
+                straight_cols = np.flatnonzero(np.asarray(bitmap[row_idx], dtype=np.float32) <= 0.5)
+                if len(straight_cols):
+                    samples_per_col = max(1, len(cp) // max(1, bitmap.shape[1]))
+                    for col_idx in straight_cols:
+                        start = int(col_idx) * samples_per_col
+                        end = min((int(col_idx) + 1) * samples_per_col, len(cp_aug) - 1)
+                        if end <= start:
+                            continue
+                        t0, t1 = float(t[start]), float(t[end])
+                        span = (to >= t0) & (to <= t1)
+                        if np.any(span):
+                            alpha = ((to[span] - t0) / max(t1 - t0, 1e-6))[:, None]
+                            pts[span] = cp_aug[start] * (1.0 - alpha) + cp_aug[end] * alpha
+
+            curves.append(pts.astype(np.float32))
+
+        if not curves:
+            return _fallback_model_curves()
+
+        all_pts = np.vstack(curves)
+        min_xy = all_pts.min(axis=0)
+        max_xy = all_pts.max(axis=0)
+        span = np.maximum(max_xy - min_xy, 1e-6)
+        scale = 0.92 / float(max(span[0], span[1]))
+        center = (min_xy + max_xy) * 0.5
+        normalized = [
+            ((curve - center) * scale).astype(np.float32)
+            for curve in curves
+        ]
+        return normalized
+    except Exception as exc:
+        print(f"[scanner] could not load edited model from {model_json}: {exc}")
+        return _fallback_model_curves()
+
+
+def _cell_color(row: int, col: int, palette=None) -> tuple[float, float, float, float]:
+    colors = _normalize_palette(palette)
+    return colors[(row * 3 + col * 5 + row * col) % len(colors)]
+
+
+def _default_cell_color_set(row: int, col: int, palette=None) -> list[tuple[float, float, float, float]]:
+    colors = _normalize_palette(palette)
+    start = (row * 3 + col * 5 + row * col) % len(colors)
+    return [colors[(start + i) % len(colors)] for i in range(4)]
+
+
+def _normalize_cell_color_sets(raw_sets, rows: int, cols: int, palette=None) -> list[list[tuple[float, float, float, float]]]:
+    normalized: list[list[tuple[float, float, float, float]]] = []
+    for row in range(rows):
+        for col in range(cols):
+            raw_cell = None
+            try:
+                raw_cell = raw_sets[row][col]
+            except Exception:
+                raw_cell = None
+            color_set = _normalize_palette(raw_cell)
+            if not raw_cell or len(color_set) < 4:
+                color_set = _default_cell_color_set(row, col, palette)
+            normalized.append(color_set[:4])
+    return normalized
 
 
 def build_fabric_grid_stations(
@@ -108,7 +227,9 @@ def build_fabric_grid_stations(
     edge_margin: float,
     square_margin: float,
     surface_wave: float,
-) -> tuple[np.ndarray, list[tuple[int, int]], list[tuple[float, float, float, float]]]:
+    palette=None,
+    cell_color_sets=None,
+) -> tuple[np.ndarray, list[tuple[int, int]], list[tuple[float, float, float, float]], list[list[tuple[float, float, float, float]]]]:
     if min(width, length) <= 0:
         raise ValueError("fabric width and length must be positive")
     if min(rows, cols) <= 0:
@@ -119,6 +240,7 @@ def build_fabric_grid_stations(
     stations: list[list[float]] = []
     cells: list[tuple[int, int]] = []
     colors: list[tuple[float, float, float, float]] = []
+    all_cell_color_sets = _normalize_cell_color_sets(cell_color_sets, rows, cols, palette)
 
     for row, col in _serpentine_indices(rows, cols):
         x0 = -width / 2 + col * cell_w
@@ -129,9 +251,9 @@ def build_fabric_grid_stations(
         z += 0.5 * surface_wave * math.cos(2 * math.pi * (y / length + 0.5))
         stations.append([float(x), float(y), float(z)])
         cells.append((row, col))
-        colors.append(_cell_color(row, col))
+        colors.append(all_cell_color_sets[row * cols + col][0])
 
-    return np.asarray(stations, dtype=float), cells, colors
+    return np.asarray(stations, dtype=float), cells, colors, all_cell_color_sets
 
 
 def expand_stations_to_angle_viewpoints(
@@ -177,7 +299,8 @@ def resolve_fabric_grid(args: argparse.Namespace) -> None:
 
 def build_plan(args: argparse.Namespace) -> FabricPlan:
     resolve_fabric_grid(args)
-    raw_stations, station_cells, station_colors = build_fabric_grid_stations(
+    model_curves = _load_saved_model_curves(getattr(args, "model_json", ""))
+    raw_stations, station_cells, station_colors, cell_color_sets = build_fabric_grid_stations(
         width=args.width,
         length=args.length,
         rows=args.rows,
@@ -185,6 +308,8 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         edge_margin=args.edge_margin,
         square_margin=args.square_margin,
         surface_wave=args.surface_wave,
+        palette=getattr(args, "palette", None),
+        cell_color_sets=getattr(args, "cell_color_sets", None),
     )
     raw_points, station_ids, view_names, rotvecs = expand_stations_to_angle_viewpoints(
         raw_stations,
@@ -219,12 +344,14 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         view_names=view_names,
         station_cells=station_cells,
         cell_colors=station_colors,
+        cell_color_sets=cell_color_sets,
         fabric_origin=fabric_origin,
         fabric_size=fabric_size,
         grid_rows=args.rows,
         grid_cols=args.cols,
         square_width=args.square_width,
         square_length=args.square_length,
+        model_curves=model_curves,
     )
 
 
@@ -364,6 +491,93 @@ def _add_box(mujoco, scn, pos, size, rgba):
     scn.ngeom += 1
 
 
+def _cell_color_set(plan: FabricPlan, row: int, col: int) -> list[tuple[float, float, float, float]]:
+    idx = row * plan.grid_cols + col
+    if 0 <= idx < len(plan.cell_color_sets):
+        return plan.cell_color_sets[idx]
+    return _default_cell_color_set(row, col)
+
+
+def _knit_cell_curves() -> list[list[tuple[float, float]]]:
+    return [
+        [(-0.48, 0.16), (-0.33, 0.38), (-0.08, 0.47), (0.18, 0.43), (0.40, 0.24), (0.30, 0.08), (0.06, -0.02), (-0.20, 0.02), (-0.40, 0.14)],
+        [(-0.48, -0.02), (-0.26, 0.06), (-0.05, 0.22), (0.18, 0.08), (0.46, -0.02), (0.22, -0.16), (0.02, -0.31), (-0.20, -0.16), (-0.42, -0.03)],
+        [(-0.50, -0.18), (-0.24, -0.14), (0.00, -0.10), (0.24, -0.14), (0.50, -0.18)],
+        [(-0.42, -0.30), (-0.25, -0.45), (0.02, -0.48), (0.28, -0.42), (0.44, -0.25), (0.27, -0.09), (0.02, 0.00), (-0.22, -0.10), (-0.44, -0.26)],
+    ]
+
+
+def _add_cell_fabric_model(mujoco, scn, center_x: float, center_y: float, z: float, cell_w: float, cell_l: float, colors, highlight=False) -> None:
+    _add_box(
+        mujoco,
+        scn,
+        [center_x, center_y, z - FABRIC_THICKNESS * 0.25],
+        [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.30],
+        (0.025, 0.030, 0.038, 1.0),
+    )
+    yarn_width = max(min(cell_w, cell_l) * 0.030, 0.0015)
+    z_step = max(FABRIC_THICKNESS * 0.35, yarn_width * 0.45)
+    for idx, curve in enumerate(_knit_cell_curves()):
+        color = colors[idx % len(colors)]
+        rgba = (color[0], color[1], color[2], 1.0)
+        pts = [
+            np.array([
+                center_x + px * cell_w,
+                center_y + py * cell_l,
+                z + FABRIC_THICKNESS * 0.65 + idx * z_step,
+            ])
+            for px, py in curve
+        ]
+        for a, b in zip(pts, pts[1:]):
+            _add_segment(mujoco, scn, a, b, rgba, yarn_width)
+    if highlight:
+        _add_box(
+            mujoco,
+            scn,
+            [center_x, center_y, z + FABRIC_THICKNESS * 0.20],
+            [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.15],
+            (0.1, 1.0, 0.3, 0.22),
+        )
+
+
+def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z: float, highlight=False) -> None:
+    cell_w = plan.fabric_size[0] / plan.grid_cols
+    cell_l = plan.fabric_size[1] / plan.grid_rows
+    center_x = plan.fabric_origin[0] + cell_w * (col + 0.5)
+    center_y = plan.fabric_origin[1] + cell_l * (row + 0.5)
+    colors = _cell_color_set(plan, row, col)
+    _add_box(
+        mujoco,
+        scn,
+        [center_x, center_y, z - FABRIC_THICKNESS * 0.25],
+        [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.25],
+        (0.018, 0.022, 0.030, 1.0),
+    )
+    yarn_width = max(min(cell_w, cell_l) * 0.025, 0.0014)
+    z_step = max(FABRIC_THICKNESS * 0.25, yarn_width * 0.35)
+    for curve_idx, curve in enumerate(plan.model_curves):
+        color = colors[curve_idx % len(colors)]
+        rgba = (color[0], color[1], color[2], 1.0)
+        pts = [
+            np.array([
+                center_x + float(p[0]) * cell_w,
+                center_y + float(p[1]) * cell_l,
+                z + FABRIC_THICKNESS * 0.65 + (curve_idx % len(colors)) * z_step,
+            ])
+            for p in curve
+        ]
+        for a, b in zip(pts, pts[1:]):
+            _add_segment(mujoco, scn, a, b, rgba, yarn_width)
+    if highlight:
+        _add_box(
+            mujoco,
+            scn,
+            [center_x, center_y, z + FABRIC_THICKNESS * 0.12],
+            [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.12],
+            (0.1, 1.0, 0.3, 0.20),
+        )
+
+
 def _add_segment(mujoco, scn, a, b, rgba, width=PATH_WIDTH):
     if scn.ngeom >= scn.maxgeom:
         return
@@ -427,12 +641,11 @@ def draw_scene(
     cell_w = plan.fabric_size[0] / plan.grid_cols
     cell_l = plan.fabric_size[1] / plan.grid_rows
     z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.5
+    station_id = plan.station_ids[min(target_index, len(plan.station_ids) - 1)]
+    active_cell = plan.station_cells[station_id]
     for row in range(plan.grid_rows):
         for col in range(plan.grid_cols):
-            x = plan.fabric_origin[0] + cell_w * (col + 0.5)
-            y = plan.fabric_origin[1] + cell_l * (row + 0.5)
-            rgba = _cell_color(row, col)
-            _add_box(mujoco, scn, [x, y, z], [cell_w * 0.48, cell_l * 0.48, FABRIC_THICKNESS], rgba)
+            _add_model_cell_fabric(mujoco, scn, plan, row, col, z, highlight=(row, col) == active_cell)
 
     for i in range(len(plan.mapped_points) - 1):
         _add_segment(mujoco, scn, plan.mapped_points[i], plan.mapped_points[i + 1], (0.20, 0.24, 0.30, 0.28), 0.0018)
@@ -446,7 +659,6 @@ def draw_scene(
         _add_segment(mujoco, scn, a, b, (1.00, 0.42, 0.08, 0.90), 0.0032)
 
     target = plan.mapped_points[min(target_index, len(plan.mapped_points) - 1)]
-    station_id = plan.station_ids[min(target_index, len(plan.station_ids) - 1)]
     station = plan.mapped_stations[station_id]
     color = plan.cell_colors[station_id]
     _add_sphere(mujoco, scn, station, MARKER_RADIUS * 1.15, color)
@@ -502,20 +714,44 @@ def save_camera_image(
     from PIL import ImageDraw, ImageFilter
 
     draw = ImageDraw.Draw(img)
+    active_row, active_col = plan.station_cells[station_id]
     for row in range(plan.grid_rows):
         for col in range(plan.grid_cols):
             x0 = plan.fabric_origin[0] + col * cell_w
             y0 = plan.fabric_origin[1] + row * cell_l
             x1, y1 = x0 + cell_w, y0 + cell_l
-            rgba = _cell_color(row, col)
-            color = tuple(int(255 * c) for c in rgba[:3])
+            colors = _cell_color_set(plan, row, col)
+            cell_poly = [
+                project_xy(np.array([x0, y0])),
+                project_xy(np.array([x1, y0])),
+                project_xy(np.array([x1, y1])),
+                project_xy(np.array([x0, y1])),
+            ]
+            draw.polygon(cell_poly, fill=(18, 23, 31))
+            yarn_px = max(5, int(min(width_px, height_px) * min(cell_w, cell_l) / max(view_span, 1e-6) * 0.045))
+            for curve_idx, curve in enumerate(plan.model_curves):
+                rgba = colors[curve_idx % len(colors)]
+                color = tuple(int(255 * c) for c in rgba[:3])
+                shade = tuple(max(0, int(channel * 0.45)) for channel in color)
+                pts = [
+                    project_xy(np.array([
+                        x0 + (float(p[0]) + 0.5) * cell_w,
+                        y0 + (float(p[1]) + 0.5) * cell_l,
+                    ]))
+                    for p in curve
+                ]
+                if len(pts) >= 2:
+                    draw.line(pts, fill=shade, width=yarn_px + 3, joint="curve")
+                    draw.line(pts, fill=color, width=yarn_px, joint="curve")
+            outline = (60, 255, 120) if (row, col) == (active_row, active_col) else (245, 245, 240)
+            width = 4 if (row, col) == (active_row, active_col) else 1
             poly = [
                 project_xy(np.array([x0, y0])),
                 project_xy(np.array([x1, y0])),
                 project_xy(np.array([x1, y1])),
                 project_xy(np.array([x0, y1])),
             ]
-            draw.polygon(poly, fill=color, outline=(245, 245, 240))
+            draw.line(poly + [poly[0]], fill=outline, width=width)
 
     for sid, point in enumerate(plan.mapped_stations):
         px, py = project_xy(point[:2])
@@ -536,11 +772,11 @@ def save_camera_image(
     dark = Image.new("RGB", (width_px, height_px), (0, 0, 0))
     img = Image.composite(img, dark, mask)
     draw = ImageDraw.Draw(img)
-    draw.text((14, 12), f"station {station_id + 1} | {view_name}", fill=(255, 255, 255))
-    draw.text((14, 32), f"tcp z {tcp_pos[2]:.3f} m", fill=(210, 230, 255))
+    draw.text((14, 12), f"station {station_id + 1} | row {active_row + 1}, col {active_col + 1} | {view_name}", fill=(255, 255, 255))
+    draw.text((14, 32), f"captured mini-fabric: R{active_row + 1} C{active_col + 1} | tcp z {tcp_pos[2]:.3f} m", fill=(210, 230, 255))
 
     clean_view = view_name.replace(" ", "_")
-    path = output_dir / f"scan_{target_index + 1:04d}_station_{station_id + 1:03d}_{clean_view}.png"
+    path = output_dir / f"scan_{target_index + 1:04d}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_station_{station_id + 1:03d}_{clean_view}.png"
     img.save(path)
     return path
 
@@ -1053,7 +1289,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-points", action="store_true", help="Save mapped scan points as CSV")
     parser.add_argument("--output", default="mujoco_fabric_scanner.script", help="URScript output filename")
     parser.add_argument("--csv-output", default="mujoco_fabric_scanner_points.csv", help="CSV output filename")
-    return parser.parse_args()
+    parser.add_argument("--model-json", default="", help="Saved app params.json containing the edited knitted model")
+    parser.add_argument("--palette-json", default="", help="JSON list of RGB/RGBA colors for fabric mini-squares")
+    parser.add_argument("--cell-colors-json", default="", help="JSON rows x cols x 4 x RGB/RGBA colors for each mini-fabric")
+    args = parser.parse_args()
+    if args.palette_json:
+        try:
+            args.palette = json.loads(args.palette_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid --palette-json: {exc}") from exc
+    else:
+        args.palette = None
+    if args.cell_colors_json:
+        try:
+            args.cell_color_sets = json.loads(args.cell_colors_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid --cell-colors-json: {exc}") from exc
+    else:
+        args.cell_color_sets = None
+    return args
 
 
 def confirm_simulation_capture_options(args: argparse.Namespace, plan: FabricPlan) -> bool:

@@ -131,6 +131,9 @@ class AppState:
 
         super().__setattr__('_state_defaults', state_defaults)
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}
+        super().__setattr__('scanner_process', None)
+        super().__setattr__('scanner_status', 'Scanner idle')
+        super().__setattr__('scanner_started_at', 0.0)
 
     # ── DICTIONARY INTERFACE ──────────────────────────────────────────────────
 
@@ -194,12 +197,47 @@ class AppState:
         y_period = self._display_copy_y_period(verts_list, radius)
         depth_gap = max(float(radius) * 2.4, 1e-6)
         z_period = self._display_copy_z_period(verts_list, depth_gap)
+        scanner_preview = bool(self.get('scanner_preview_grid_enabled', False))
+        if scanner_preview:
+            bounds = self._display_mesh_bounds(verts_list)
+            if bounds is not None:
+                min_v, max_v = bounds
+                model_w = float(max_v[0] - min_v[0])
+                model_h = float(max_v[1] - min_v[1])
+                x_period = max(model_w - radius * 1.15, radius)
+                y_period = max(model_h - radius * 5.7, radius)
         
         seg = int(self.config['knit_parameters']['segments'])
-        x_tiles = list(range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1))
-        y_tiles = list(range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1))
+        if scanner_preview:
+            x_tiles = list(range(max(1, int(self.get('scanner_preview_cols', 1)))))
+            y_tiles = list(range(max(1, int(self.get('scanner_preview_rows', 1)))))
+        else:
+            x_tiles = list(range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1))
+            y_tiles = list(range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1))
 
         display_vl, display_fl, display_meta = [], [], []
+        if scanner_preview:
+            scanner_cols = max(1, int(self.get('scanner_preview_cols', 1)))
+            scanner_rows = max(1, int(self.get('scanner_preview_rows', 1)))
+            for y_tile in range(scanner_rows):
+                y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+                for x_tile in range(scanner_cols):
+                    cell_index = y_tile * scanner_cols + x_tile
+                    x_translation = np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
+                    for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
+                        base_row = int(part_meta.get('row', 0))
+                        translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation
+                        display_vl.append((translated.astype(np.float32), int(n_points)))
+                        display_fl.extend(compute_knitting_faces(seg, [(translated, int(n_points))]))
+                        copied_meta = dict(part_meta)
+                        copied_meta['row'] = cell_index * row_count + base_row
+                        copied_meta['base_row'] = base_row
+                        copied_meta['tile_x'] = x_tile
+                        copied_meta['tile_y'] = y_tile
+                        copied_meta['scanner_cell'] = cell_index
+                        display_meta.append(copied_meta)
+            return display_vl, display_fl, display_meta
+
         for y_tile in y_tiles:
             y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
             for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
@@ -346,6 +384,27 @@ class AppState:
         return self.build_display_meshes_precise(vl, fl, meta)
 
     def active_colors(self):
+        if bool(self.get('scanner_preview_grid_enabled', False)):
+            rows = max(1, int(self.get('scanner_preview_rows', 1)))
+            cols = max(1, int(self.get('scanner_preview_cols', 1)))
+            base_rows = max(1, int(self.bitmap_size[0]))
+            cell_sets = self.get('scanner_cell_color_sets', [])
+            if isinstance(cell_sets, np.ndarray):
+                cell_sets = cell_sets.tolist()
+            colors = []
+            fallback = self.row_colors if self.use_row_colors else [self.single_model_color]
+            for r in range(rows):
+                for c in range(cols):
+                    try:
+                        cell = cell_sets[r][c]
+                    except Exception:
+                        cell = fallback
+                    if not cell:
+                        cell = fallback
+                    for base_row in range(base_rows):
+                        src = cell[base_row % len(cell)]
+                        colors.append([float(src[0]), float(src[1]), float(src[2])])
+            return colors or fallback
         return self.row_colors if self.use_row_colors else [self.single_model_color]
 
 
@@ -733,7 +792,7 @@ class AppState:
 
     def on_bitmap_resize(self, new_rows, new_cols):
         new_rows = max(1, min(int(new_rows), int(self.config['knit_parameters']['bitmap_rows'])))
-        new_cols = max(1, min(int(new_cols), 16))
+        new_cols = max(1, min(int(new_cols), 32))
         old = self.bitmap
         new_bm = np.ones((new_rows, new_cols), dtype=np.float32)
         new_bm[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)] = old[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)]
