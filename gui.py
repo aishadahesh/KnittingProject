@@ -151,7 +151,7 @@ def draw_sidebar(state, renderer):
             imgui.text_disabled("Enable this to replace each row tube with separate fiber tubes.")
         else:
             controls = (
-                ('fiber_geometry_count', 'Fibers per row', 1, 12, 'int'),
+                ('fiber_geometry_count', 'Fibers per row', 1, 32, 'int'),
                 ('fiber_geometry_radius_scale', 'Fiber radius scale', 0.04, 0.45, 'float'),
                 ('fiber_geometry_lift', 'Lift above surface', 0.0, 1.0, 'float'),
                 ('fiber_geometry_surface_arc', 'Surface spread', 0.05, 1.0, 'float'),

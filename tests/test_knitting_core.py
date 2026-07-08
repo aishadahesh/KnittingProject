@@ -106,6 +106,56 @@ def test_spline_construction(config_fixture, params_fixture):
         assert isinstance(nout, int)
 
 
+def test_zero_pattern_segments_ignore_loop_height(config_fixture, params_fixture):
+    params_dict = params_fixture["params"]
+    config_params = config_fixture["knit_parameters"]["parameters"]
+    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
+    pidx = {p["name"]: i for i, p in enumerate(config_params)}
+    lh_params = sorted(
+        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
+        key=lambda name: int(name.split("_")[-1])
+    )
+    lh_idx = tuple(pidx[name] for name in lh_params)
+    spl = 5
+    bitmap = np.ones((3, 4), dtype=np.float32)
+    bitmap[1, 2] = 0.0
+
+    low_params = list(params_list)
+    high_params = list(params_list)
+    for idx in lh_idx:
+        low_params[idx] = 0.5
+        high_params[idx] = 8.0
+
+    low_rows = build_parametric_control_rows(low_params, bitmap, pidx, lh_idx, spl=spl)
+    high_rows = build_parametric_control_rows(high_params, bitmap, pidx, lh_idx, spl=spl)
+    lo, hi = 2 * spl, 3 * spl
+    low_segment = low_rows[1][lo:hi]
+    high_segment = high_rows[1][lo:hi]
+
+    np.testing.assert_allclose(low_segment, high_segment, atol=1e-6)
+    np.testing.assert_allclose(low_segment[:, 1], params_list[pidx["dy"]], atol=1e-6)
+    np.testing.assert_allclose(low_segment[:, 2], 0.0, atol=1e-6)
+
+    mesh = build_spline_mesh(
+        high_rows,
+        high_params,
+        config_fixture,
+        pidx,
+        [float(bitmap.shape[1]), 0.0, 0.0],
+        pattern_bitmap=bitmap,
+        samples_per_loop=spl,
+    )
+    segments = config_fixture["knit_parameters"]["segments"]
+    centers = mesh[1][0].reshape(mesh[1][1], segments, 3).mean(axis=1)
+    cp = np.asarray(high_rows[1], dtype=float)
+    cp_aug = np.concatenate((cp, (cp[0] + np.array([float(bitmap.shape[1]), 0.0, 0.0]))[None, :]), axis=0)
+    t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6))))
+    to = np.linspace(t[0], t[-1], mesh[1][1])
+    in_zero_span = (to >= t[2 * spl]) & (to <= t[3 * spl])
+    assert np.ptp(centers[in_zero_span, 1]) < 1e-4
+    assert np.ptp(centers[in_zero_span, 2]) < 1e-4
+
+
 from knitting_core import build_surface_fiber_meshes
 
 def test_fiber_meshes():

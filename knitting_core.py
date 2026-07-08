@@ -51,6 +51,8 @@ def eval_curve(t, hl, lh, sb, sz):
     y = lh * (-(jnp.cos(t) - 1) / 2)
     z = sz * (jnp.cos(2 * t) - 1) / 2 * hl
     x = jnp.where(hl == 0.0, t / (2 * jnp.pi), x)
+    y = jnp.where(hl == 0.0, 0.0, y)
+    z = jnp.where(hl == 0.0, 0.0, z)
     return jnp.stack((x, y, z), axis=-1)
 
 
@@ -79,13 +81,13 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
     rows, cols = sf.shape
     x_pitch = 1.0
     base_t = np.linspace(0.0, 2 * np.pi, spl, endpoint=False, dtype=np.float32)
-    t = np.tile(base_t, cols)
+    t = np.tile(base_t, (rows, cols))
     xoff = np.repeat(np.arange(cols, dtype=np.float32), spl)
     s = np.repeat(sf, spl, axis=1)
     has = (s > 0).astype(np.float32)
     h = lut[s]
     c = np.array(eval_curve(
-        jnp.asarray(t[None, :]), jnp.asarray(has), jnp.asarray(h), bulge, stz
+        jnp.asarray(t), jnp.asarray(has), jnp.asarray(h), bulge, stz
     ), dtype=np.float32, copy=True)
     c[:, :, 0] = (c[:, :, 0] + xoff[None, :]) * x_pitch
     c[:, :, 1] += np.arange(rows, dtype=np.float32)[:, None] * dy
@@ -175,7 +177,48 @@ def build_surface_fiber_meshes(
     return out_vl, meta
 
 
-def build_spline_mesh(ctrl_rows, params, config, pidx, period_offset, radius_ctrl_rows=None):
+def _apply_straight_bitmap_spans(pts, cp_aug, t, to, straight_mask, samples_per_loop):
+    if straight_mask is None or samples_per_loop <= 1:
+        return pts
+
+    mask = np.asarray(straight_mask, dtype=bool).reshape(-1)
+    if not np.any(mask):
+        return pts
+
+    out = pts.copy()
+    for col_idx, is_straight in enumerate(mask):
+        if not is_straight:
+            continue
+
+        start_idx = col_idx * samples_per_loop
+        end_idx = (col_idx + 1) * samples_per_loop
+        if end_idx >= len(cp_aug) or end_idx >= len(t):
+            continue
+
+        t0, t1 = float(t[start_idx]), float(t[end_idx])
+        if t1 <= t0:
+            continue
+
+        span_mask = (to >= t0) & (to <= t1)
+        if not np.any(span_mask):
+            continue
+
+        alpha = ((to[span_mask] - t0) / (t1 - t0))[:, None]
+        out[span_mask] = cp_aug[start_idx] * (1.0 - alpha) + cp_aug[end_idx] * alpha
+
+    return out
+
+
+def build_spline_mesh(
+    ctrl_rows,
+    params,
+    config,
+    pidx,
+    period_offset,
+    radius_ctrl_rows=None,
+    pattern_bitmap=None,
+    samples_per_loop=5,
+):
     p = np.asarray(params)
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
     seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
@@ -206,6 +249,16 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, period_offset, radius_ctr
             else:
                 pts_detrended = np.column_stack([CubicSpline(t, cp_detrended[:, i], bc_type="periodic")(to) for i in range(3)])
             pts = pts_detrended + D[None, :] * (to / t[-1])[:, None]
+            if pattern_bitmap is not None and row_idx < len(pattern_bitmap):
+                row_pattern = np.asarray(pattern_bitmap[row_idx], dtype=np.float32) <= 0.5
+                pts = _apply_straight_bitmap_spans(
+                    pts,
+                    cp_aug,
+                    t,
+                    to,
+                    row_pattern,
+                    int(samples_per_loop),
+                )
             ctrl_sample_idx = np.linspace(0.0, len(cp), nout, dtype=float)
 
         if radius_ctrl_rows is not None and row_idx < len(radius_ctrl_rows):
