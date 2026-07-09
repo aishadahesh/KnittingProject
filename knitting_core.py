@@ -195,6 +195,41 @@ def eval_centerline(cp, D, nout, t=None, to=None):
     return pts_detrended + D[None, :] * (to / t[-1])[:, None]
 
 
+def evaluate_centerlines(ctrl_rows, period_offset, config):
+    seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
+    
+    if isinstance(period_offset, (int, float, np.integer, np.floating)):
+        D = np.array([float(period_offset), 0.0, 0.0], dtype=float)
+        bitmap_width = float(period_offset)
+    else:
+        D = np.asarray(period_offset, dtype=float)
+        bitmap_width = float(np.linalg.norm(D))
+        
+    nout = res * int(round(bitmap_width)) + 1
+    
+    V_list = []
+    for r in ctrl_rows:
+        cp = np.asarray(r, dtype=float)
+        pts = eval_centerline(cp, D, nout)
+        V_list.append(pts)
+        
+    if not V_list:
+        return np.empty((0, 3)), np.empty((0, 2), dtype=np.int32), D, nout
+        
+    V = np.vstack(V_list)
+    num_ctrl_rows = len(ctrl_rows)
+    
+    edges_list = []
+    row_offset = 0
+    for r in range(num_ctrl_rows):
+        row_edges = np.array([[i, i+1] for i in range(nout - 1)], dtype=np.int32) + row_offset
+        edges_list.append(row_edges)
+        row_offset += nout
+    edges = np.vstack(edges_list) if edges_list else np.empty((0, 2), dtype=np.int32)
+    
+    return V, edges, D, nout
+
+
 def build_row_spline_jacobian(cp, D, nout):
     cp = np.asarray(cp, dtype=float)
     num_ctrl = len(cp)
@@ -217,20 +252,13 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, period_offset, radius_ctr
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
     seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
     
-    if isinstance(period_offset, (int, float, np.integer, np.floating)):
-        D = np.array([float(period_offset), 0.0, 0.0], dtype=float)
-        bitmap_width = float(period_offset)
-    else:
-        D = np.asarray(period_offset, dtype=float)
-        bitmap_width = float(np.linalg.norm(D))
-        
-    nout = res * int(round(bitmap_width)) + 1
+    V, edges, D, nout = evaluate_centerlines(ctrl_rows, period_offset, config)
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
     out = []
     for row_idx, r in enumerate(ctrl_rows):
         cp = np.asarray(r, dtype=float)
-        pts = eval_centerline(cp, D, nout)
+        pts = V[row_idx * nout : (row_idx + 1) * nout]
         ctrl_sample_idx = np.linspace(0.0, len(cp), nout, dtype=float) if len(cp) > 1 else np.zeros(nout, dtype=float)
 
         if radius_ctrl_rows is not None and row_idx < len(radius_ctrl_rows):
@@ -260,14 +288,14 @@ def build_spline_mesh(ctrl_rows, params, config, pidx, period_offset, radius_ctr
         b = np.linalg.norm(U, axis=1) < 1e-6
         U[b] = np.cross(T[b], [1, 0, 0])
         U /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-8
-        V = np.cross(T, U)
+        V_vec = np.cross(T, U)
         rline = radius_line[:, None, None]
-        out.append(((pts[:, None, :] + U[:, None, :] * ca * rline * rat + V[:, None, :] * sa * rline).reshape(-1, 3), nout))
+        out.append(((pts[:, None, :] + U[:, None, :] * ca * rline * rat + V_vec[:, None, :] * sa * rline).reshape(-1, 3), nout))
     return out
 
 
 # %% YARN SIMULATION PIPELINE ─────────────────────────────────────────────────────────
-def compute_elastic_forces_and_hessian(V, edges, L0, k_s, k_b, project_psd=True):
+def compute_elastic_forces_and_hessian(V, edges, L0_array, k_s, k_b, D, nout, project_psd=True):
     import scipy.sparse
     M = len(V)
     grad_V = np.zeros_like(V)
@@ -279,8 +307,9 @@ def compute_elastic_forces_and_hessian(V, edges, L0, k_s, k_b, project_psd=True)
     vals = []
 
     # 1. Stretch potential
-    for edge in edges:
+    for edge_idx, edge in enumerate(edges):
         v0, v1 = edge
+        L0 = L0_array[edge_idx]
         diff = V[v1] - V[v0]
         l = np.linalg.norm(diff)
         if l < 1e-8:
@@ -311,32 +340,41 @@ def compute_elastic_forces_and_hessian(V, edges, L0, k_s, k_b, project_psd=True)
                 # v1-v0
                 rows.append(3 * v1 + r); cols.append(3 * v0 + c); vals.append(-val)
 
-    # 2. Bending potential (wrapped periodically)
-    # Triplets: (V_{i-1}, V_i, V_{i+1})
-    for i in range(M):
-        # Wrapping for closed periodic loop
-        v_prev = (i - 1) % M
-        v_curr = i
-        v_next = (i + 1) % M
+    # 2. Bending potential
+    num_ctrl_rows = M // nout
+    for r in range(num_ctrl_rows):
+        start = r * nout
+        end = (r + 1) * nout
+        
+        # Interior and boundary points
+        for i in range(start, end - 1):
+            if i == start:
+                v_prev_pt = V[end - 2] - D
+                v_curr = i
+                v_next = i + 1
+                lap = v_prev_pt - 2.0 * V[v_curr] + V[v_next]
+                v_prev_idx = end - 2
+            else:
+                v_prev_idx = i - 1
+                v_curr = i
+                v_next = i + 1
+                lap = V[v_prev_idx] - 2.0 * V[v_curr] + V[v_next]
 
-        lap = V[v_prev] - 2.0 * V[v_curr] + V[v_next]
-        energy += 0.5 * k_b * np.sum(lap**2)
+            energy += 0.5 * k_b * np.sum(lap**2)
+            g = k_b * lap
+            
+            grad_V[v_prev_idx] += g
+            grad_V[v_curr] -= 2.0 * g
+            grad_V[v_next] += g
 
-        g = k_b * lap
-        grad_V[v_prev] += g
-        grad_V[v_curr] -= 2.0 * g
-        grad_V[v_next] += g
-
-        # Bending Hessian is k_b * A A^T (always PSD)
-        # A = [1, -2, 1]^T \otimes I_3
-        stencil = [(v_prev, 1.0), (v_curr, -2.0), (v_next, 1.0)]
-        for idx1, c1 in stencil:
-            for idx2, c2 in stencil:
-                val = k_b * c1 * c2
-                for d in range(3):
-                    rows.append(3 * idx1 + d)
-                    cols.append(3 * idx2 + d)
-                    vals.append(val)
+            stencil = [(v_prev_idx, 1.0), (v_curr, -2.0), (v_next, 1.0)]
+            for idx1, c1 in stencil:
+                for idx2, c2 in stencil:
+                    val = k_b * c1 * c2
+                    for d in range(3):
+                        rows.append(3 * idx1 + d)
+                        cols.append(3 * idx2 + d)
+                        vals.append(val)
 
     H_V = scipy.sparse.coo_matrix((vals, (rows, cols)), shape=(3*M, 3*M)).tocsr()
     return energy, grad_V.flatten(), H_V
@@ -353,10 +391,11 @@ def compute_collision_forces_and_hessian(V, D, edges, dhat, k_c, psd_projection=
     
     # 1. Tile vertices dynamically to 3x3 copies
     # Copies indices: c_x, c_y from -1 to 1
+    D_Y = D[1] if D[1] > 1e-6 else float(np.linalg.norm(D))
     offsets = []
     for c_x in [-1, 0, 1]:
         for c_y in [-1, 0, 1]:
-            offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D[1], 0.0]))
+            offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D_Y, 0.0]))
     
     V_tiled = []
     for offset in offsets:
@@ -403,7 +442,7 @@ def compute_collision_forces_and_hessian(V, D, edges, dhat, k_c, psd_projection=
     return barrier_E, grad_V.flatten(), H_V
 
 
-def run_simulation_step(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat):
+def run_simulation_step(ctrl_rows, D, config, J_cached, L0_array, k_s, k_b, k_c, dhat):
     import scipy.sparse.linalg
     res = config["knit_parameters"]["loop_res"]
     bitmap_width = float(np.linalg.norm(D))
@@ -414,27 +453,11 @@ def run_simulation_step(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat):
     num_ctrl_rows = len(ctrl_rows)
     N = len(flat_P) // 3
     
-    # Evaluate centerline vertices V
-    V_list = []
-    for row_idx, cp in enumerate(ctrl_rows):
-        pts = eval_centerline(cp, D, nout)
-        V_list.append(pts)
-    V = np.vstack(V_list)
+    V, edges, D, nout = evaluate_centerlines(ctrl_rows, D, config)
     M = len(V)
     
-    # Setup edges topology (local segments per row)
-    edges_list = []
-    row_offset = 0
-    for r in range(num_ctrl_rows):
-        row_edges = np.array([[i, i+1] for i in range(nout - 1)], dtype=np.int32) + row_offset
-        edges_list.append(row_edges)
-        row_offset += nout
-    edges = np.vstack(edges_list)
-    
-    L0 = bitmap_width / (nout - 1)
-    
     # 1. Compute energies, gradients, and Hessians on unit cell
-    e_el, g_el, H_el = compute_elastic_forces_and_hessian(V, edges, L0, k_s, k_b)
+    e_el, g_el, H_el = compute_elastic_forces_and_hessian(V, edges, L0_array, k_s, k_b, D, nout)
     e_col, g_col, H_col = compute_collision_forces_and_hessian(V, D, edges, dhat, k_c)
     
     e = e_el + e_col
@@ -466,21 +489,21 @@ def run_simulation_step(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat):
     P_cand = flat_P.reshape(-1, 3) + delta_P_reshaped
     
     # Map P_cand back to V_cand
-    V_cand_list = []
+    ctrl_rows_cand = []
     ctrl_offset = 0
     for r in range(num_ctrl_rows):
         n_c = len(ctrl_rows[r])
         cp_cand = P_cand[ctrl_offset:ctrl_offset+n_c]
-        pts_cand = eval_centerline(cp_cand, D, nout)
-        V_cand_list.append(pts_cand)
+        ctrl_rows_cand.append(cp_cand)
         ctrl_offset += n_c
-    V_cand = np.vstack(V_cand_list)
+    V_cand, _, _, _ = evaluate_centerlines(ctrl_rows_cand, D, config)
     
     # Replicate for CCD step size check
+    D_Y = D[1] if D[1] > 1e-6 else float(np.linalg.norm(D))
     offsets = []
     for c_x in [-1, 0, 1]:
         for c_y in [-1, 0, 1]:
-            offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D[1], 0.0]))
+            offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D_Y, 0.0]))
     
     V_tiled_0 = np.vstack([V + offset[None, :] for offset in offsets])
     V_tiled_1 = np.vstack([V_cand + offset[None, :] for offset in offsets])
@@ -500,28 +523,34 @@ def run_simulation_step(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat):
     for search_iter in range(10):
         P_new = flat_P.reshape(-1, 3) + alpha * delta_P_reshaped
         # Evaluate new energy
-        V_new_list = []
-        ctrl_offset = 0
         new_ctrl_rows = []
+        ctrl_offset = 0
         for r in range(num_ctrl_rows):
             n_c = len(ctrl_rows[r])
             cp_new = P_new[ctrl_offset:ctrl_offset+n_c]
             new_ctrl_rows.append(cp_new)
-            pts_new = eval_centerline(cp_new, D, nout)
-            V_new_list.append(pts_new)
             ctrl_offset += n_c
-        V_new = np.vstack(V_new_list)
+            
+        V_new, _, _, _ = evaluate_centerlines(new_ctrl_rows, D, config)
         
         # Elastic energy
-        e_el_new = 0.0
-        for edge in edges:
-            v0, v1 = edge
-            e_el_new += 0.5 * k_s * (np.linalg.norm(V_new[v1] - V_new[v0]) - L0)**2
-        for i in range(M):
-            v_prev = (i - 1) % M
-            v_curr = i
-            v_next = (i + 1) % M
-            e_el_new += 0.5 * k_b * np.sum((V_new[v_prev] - 2.0 * V_new[v_curr] + V_new[v_next])**2)
+        v0_pts = V_new[edges[:, 0]]
+        v1_pts = V_new[edges[:, 1]]
+        e_el_new = 0.5 * k_s * np.sum((np.linalg.norm(v1_pts - v0_pts, axis=1) - L0_array)**2)
+        
+        e_b_new = 0.0
+        for r in range(num_ctrl_rows):
+            start = r * nout
+            end = (r + 1) * nout
+            v_prev = V_new[start : end - 2]
+            v_curr = V_new[start + 1 : end - 1]
+            v_next = V_new[start + 2 : end]
+            e_b_new += 0.5 * k_b * np.sum((v_prev - 2.0 * v_curr + v_next)**2)
+            
+            bound_prev = V_new[end - 2] - D
+            bound_curr = V_new[start]
+            bound_next = V_new[start + 1]
+            e_b_new += 0.5 * k_b * np.sum((bound_prev - 2.0 * bound_curr + bound_next)**2)
             
         # Barrier energy
         V_tiled_new = np.vstack([V_new + offset[None, :] for offset in offsets])
@@ -546,7 +575,7 @@ def run_simulation_step(ctrl_rows, D, config, J_cached, k_s, k_b, k_c, dhat):
     return ctrl_rows
 
 
-def eval_energy(flat_P, ctrl_rows, D, config, k_s, k_b, k_c, dhat):
+def eval_energy(flat_P, ctrl_rows, D, config, L0_array, k_s, k_b, k_c, dhat, filter_collisions=True):
     num_ctrl_rows = len(ctrl_rows)
     ctrl_offset = 0
     perturbed_ctrl_rows = []
@@ -556,46 +585,38 @@ def eval_energy(flat_P, ctrl_rows, D, config, k_s, k_b, k_c, dhat):
         perturbed_ctrl_rows.append(flat_P_reshaped[ctrl_offset:ctrl_offset+n_c])
         ctrl_offset += n_c
         
-    res = config["knit_parameters"]["loop_res"]
-    bitmap_width = float(np.linalg.norm(D))
-    nout = res * int(round(bitmap_width)) + 1
-    
-    V_list = []
-    for cp in perturbed_ctrl_rows:
-        pts = eval_centerline(cp, D, nout)
-        V_list.append(pts)
-    V = np.vstack(V_list)
+    V, edges, D, nout = evaluate_centerlines(perturbed_ctrl_rows, D, config)
     M = len(V)
     
-    edges_list = []
-    row_offset = 0
+    # Elastic energy
+    v0_pts = V[edges[:, 0]]
+    v1_pts = V[edges[:, 1]]
+    e_el = 0.5 * k_s * np.sum((np.linalg.norm(v1_pts - v0_pts, axis=1) - L0_array)**2)
+    
+    e_b = 0.0
     for r in range(num_ctrl_rows):
-        row_edges = np.array([[i, i+1] for i in range(nout - 1)], dtype=np.int32) + row_offset
-        edges_list.append(row_edges)
-        row_offset += nout
-    edges = np.vstack(edges_list)
-    
-    L0 = bitmap_width / (nout - 1)
-    
-    e_el = 0.0
-    for edge in edges:
-        v0, v1 = edge
-        e_el += 0.5 * k_s * (np.linalg.norm(V[v1] - V[v0]) - L0)**2
-    for i in range(M):
-        v_prev = (i - 1) % M
-        v_curr = i
-        v_next = (i + 1) % M
-        e_el += 0.5 * k_b * np.sum((V[v_prev] - 2.0 * V[v_curr] + V[v_next])**2)
+        start = r * nout
+        end = (r + 1) * nout
+        v_prev = V[start : end - 2]
+        v_curr = V[start + 1 : end - 1]
+        v_next = V[start + 2 : end]
+        e_b += 0.5 * k_b * np.sum((v_prev - 2.0 * v_curr + v_next)**2)
+        
+        bound_prev = V[end - 2] - D
+        bound_curr = V[start]
+        bound_next = V[start + 1]
+        e_b += 0.5 * k_b * np.sum((bound_prev - 2.0 * bound_curr + bound_next)**2)
         
     if k_c > 0.0:
+        D_Y = D[1] if D[1] > 1e-6 else float(np.linalg.norm(D))
         offsets = []
         for c_x in [-1, 0, 1]:
             for c_y in [-1, 0, 1]:
-                offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D[1], 0.0]))
+                offsets.append(c_x * np.array([D[0], 0.0, 0.0]) + c_y * np.array([0.0, D_Y, 0.0]))
         V_tiled = np.vstack([V + offset[None, :] for offset in offsets])
         edges_tiled = np.vstack([edges + c * M for c in range(9)])
         mesh_tiled = ipctk.CollisionMesh(V_tiled, edges_tiled, np.empty((0, 3), dtype=np.int32))
-        mesh_tiled.can_collide = build_can_collide(M, edges, D)
+        mesh_tiled.can_collide = build_can_collide(M, edges, D) if filter_collisions else ipctk.SparseCanCollide({}, True)
         
         collisions = ipctk.NormalCollisions()
         collisions.build(mesh_tiled, V_tiled, dhat)
@@ -604,7 +625,7 @@ def eval_energy(flat_P, ctrl_rows, D, config, k_s, k_b, k_c, dhat):
     else:
         e_col = 0.0
         
-    return e_el + e_col
+    return e_el, e_b, e_col
 
 
 # %% HEADLESS FINITE DIFFERENCE VERIFICATION ──────────────────────────────────────────
@@ -632,10 +653,11 @@ def check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s, k_b, k_
     edges = np.vstack(edges_list)
     
     L0 = bitmap_width / (nout - 1)
+    L0_array = np.full(len(edges), L0, dtype=float)
     
     # 1. Analytical Evaluation
     import ipctk
-    e_el, g_el, H_el = compute_elastic_forces_and_hessian(V, edges, L0, k_s, k_b, project_psd=False)
+    e_el, g_el, H_el = compute_elastic_forces_and_hessian(V, edges, L0_array, k_s, k_b, D, nout, project_psd=False)
     e_col, g_col, H_col = compute_collision_forces_and_hessian(V, D, edges, dhat, k_c, psd_projection=ipctk.PSDProjectionMethod.NONE)
     
     g_V = g_el + g_col
@@ -659,7 +681,7 @@ def check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s, k_b, k_
             V_new_list.append(pts)
         V_new = np.vstack(V_new_list)
         
-        _, g_el_new, _ = compute_elastic_forces_and_hessian(V_new, edges, L0, k_s, k_b, project_psd=False)
+        _, g_el_new, _ = compute_elastic_forces_and_hessian(V_new, edges, L0_array, k_s, k_b, D, nout, project_psd=False)
         _, g_col_new, _ = compute_collision_forces_and_hessian(V_new, D, edges, dhat, k_c, psd_projection=ipctk.PSDProjectionMethod.NONE)
         
         g_V_new = g_el_new + g_col_new
@@ -670,11 +692,11 @@ def check_gradients_and_hessians_fd(ctrl_rows, D, config, J_cached, k_s, k_b, k_
     for i in range(N):
         P_plus = flat_P.copy()
         P_plus[i] += eps
-        E_plus = eval_energy(P_plus, ctrl_rows, D, config, k_s, k_b, k_c, dhat)
+        E_plus = sum(eval_energy(P_plus, ctrl_rows, D, config, L0_array, k_s, k_b, k_c, dhat))
         
         P_minus = flat_P.copy()
         P_minus[i] -= eps
-        E_minus = eval_energy(P_minus, ctrl_rows, D, config, k_s, k_b, k_c, dhat)
+        E_minus = sum(eval_energy(P_minus, ctrl_rows, D, config, L0_array, k_s, k_b, k_c, dhat))
         
         if np.isinf(E_plus) or np.isinf(E_minus):
             g_num[i] = 0.0
@@ -728,17 +750,17 @@ def build_can_collide(M, edges, D):
         r = u // nout
         i = u % nout
         if i == nout - 1:
-            return (r + c_y, 0, c_x + 1)
+            return (r, c_y, 0, c_x + 1)
         else:
-            return (r + c_y, i, c_x)
+            return (r, c_y, i, c_x)
             
     keys = [get_lattice_coords(v) for v in range(9 * M)]
     by_grid = {}
-    for v, (r, i, px) in enumerate(keys):
-        by_grid.setdefault((r, px), []).append((i, v))
+    for v, (r, c_y, i, c_x) in enumerate(keys):
+        by_grid.setdefault((r, c_y, c_x), []).append((i, v))
         
     explicit_values = {}
-    for (r, px), items in by_grid.items():
+    for key, items in by_grid.items():
         n_items = len(items)
         for idx1 in range(n_items):
             i1, v1 = items[idx1]

@@ -128,8 +128,14 @@ class AppState:
             'sim_k_s': 1000.0,
             'sim_k_b': 10.0,
             'sim_k_c': 1.0,
-            'sim_dhat': 0.02,
+            'sim_dhat': 0.1,
+            'sim_show_forces': True,
             'sim_needs_jacobian_rebuild': True,
+            'sim_L0': np.array([]),
+            'sim_e_el': 0.0,
+            'sim_e_b': 0.0,
+            'sim_e_col': 0.0,
+            'sim_delta_P': None,
         }
         for k, v in computed_defaults.items():
             state_defaults[k] = AppState._clone(_coerce(v))
@@ -327,6 +333,15 @@ class AppState:
         self.sim_needs_jacobian_rebuild = False
 
     def rebuild_spline_mesh(self, preserve_model_placement=True):
+        from knitting_core import evaluate_centerlines
+        V, edges, _, _ = evaluate_centerlines(self.ctrl_rows, self.period_offset, self.config)
+        if len(edges) > 0:
+            v0_pts = V[edges[:, 0]]
+            v1_pts = V[edges[:, 1]]
+            self.sim_L0 = np.linalg.norm(v1_pts - v0_pts, axis=1)
+        else:
+            self.sim_L0 = np.array([])
+            
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
         self._ensure_spline_radius_rows()

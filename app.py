@@ -121,14 +121,37 @@ def main():
                         D = state.period_offset.copy()
                         config = state.config.copy()
                         J_cached = state.J_cached
+                        L0_array = state.sim_L0
                         ks = state.sim_k_s
                         kb = state.sim_k_b
                         kc = state.sim_k_c
                         dhat = state.sim_dhat
                     
-                    new_ctrl_rows = run_simulation_step(ctrl_rows, D, config, J_cached, ks, kb, kc, dhat)
+                    if L0_array is None or len(L0_array) == 0:
+                        time.sleep(0.01)
+                        continue
+                        
+                    new_ctrl_rows = run_simulation_step(ctrl_rows, D, config, J_cached, L0_array, ks, kb, kc, dhat)
+                    
+                    from knitting_core import eval_energy
+                    flat_P_old = np.concatenate(ctrl_rows).astype(float) if ctrl_rows else np.empty((0, 3), float)
+                    flat_P = np.concatenate(new_ctrl_rows).astype(float) if new_ctrl_rows else np.empty((0, 3), float)
+                    if len(flat_P) > 0:
+                        e_el, e_b, e_col = eval_energy(flat_P, new_ctrl_rows, D, config, L0_array, ks, kb, kc, dhat)
+                    else:
+                        e_el, e_b, e_col = 0.0, 0.0, 0.0
+                    
+                    if len(flat_P_old) == len(flat_P) and len(flat_P) > 0:
+                        delta_P = flat_P - flat_P_old
+                    else:
+                        delta_P = None
                     
                     with state.sim_lock:
+                        state.sim_e_el = float(e_el)
+                        state.sim_e_b = float(e_b)
+                        state.sim_e_col = float(e_col)
+                        if delta_P is not None:
+                            state.sim_delta_P = delta_P.copy()
                         if not state.sim_needs_jacobian_rebuild:
                             state.ctrl_rows = new_ctrl_rows
                             state.flat_pts = np.concatenate(new_ctrl_rows).astype(np.float32) if new_ctrl_rows else np.empty((0, 3), np.float32)

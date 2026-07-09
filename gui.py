@@ -203,7 +203,26 @@ def draw_sidebar(state, renderer):
                 )
                 state.status_msg = res_str.replace("\n", " | ")
 
-    imgui.separator()
+        imgui.separator()
+        imgui.text("Energy Metrics:")
+        with state.sim_lock:
+            e_el = state.sim_e_el
+            e_b = state.sim_e_b
+            e_col = state.sim_e_col
+            delta_P = state.sim_delta_P
+        imgui.text(f"Stretch:   {e_el:.6e}")
+        imgui.text(f"Bending:   {e_b:.6e}")
+        imgui.text(f"Collision: {e_col:.6e}")
+        imgui.text(f"Total:     {e_el + e_b + e_col:.6e}")
+        if delta_P is not None:
+            max_force = np.max(np.linalg.norm(delta_P, axis=1))
+            imgui.text(f"Max Force: {max_force:.6e}")
+        else:
+            imgui.text("Max Force: N/A")
+            
+        imgui.separator()
+        changed_forces, val_forces = imgui.checkbox("Visualize Forces##show_forces", state.sim_show_forces)
+        if changed_forces: state.sim_show_forces = val_forces
 
     if stage == 0:
         imgui.text("Viewport Alignment")
@@ -926,6 +945,39 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.rebuild_spline_mesh()
         elif state.gizmo_edit_active and not imguizmo.im_guizmo.is_using():
             state.gizmo_edit_active = False
+
+    # Draw simulation forces
+    if getattr(state, 'sim_show_forces', False) and len(visible_ctrl_indices) > 0:
+        with state.sim_lock:
+            delta_P = state.sim_delta_P
+            
+        if delta_P is not None and len(delta_P) > 0:
+            dl = imgui.get_window_draw_list()
+            ox, oy = float(state.vp_origin[0]), float(state.vp_origin[1])
+            view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+            
+            for idx in visible_ctrl_indices:
+                if idx >= len(delta_P): continue
+                p0_local = state.flat_pts_all[idx].astype(np.float32)
+                p1_local = p0_local + delta_P[idx].astype(np.float32) * 5.0 # Scale for visibility
+                
+                p0_world = transform_points([p0_local], model_mat)[0]
+                p1_world = transform_points([p1_local], model_mat)[0]
+                
+                def project(pt):
+                    h = np.array([pt[0], pt[1], pt[2], 1.0], dtype=np.float32) @ view_proj.T
+                    if h[3] < 1e-6: return None
+                    ndc = h[:3] / h[3]
+                    return (
+                        ox + (ndc[0] * 0.5 + 0.5) * disp_w,
+                        oy + (1.0 - (ndc[1] * 0.5 + 0.5)) * disp_h
+                    )
+                
+                s0 = project(p0_world)
+                s1 = project(p1_world)
+                if s0 and s1:
+                    dl.add_line(s0, s1, imgui.get_color_u32((1.0, 0.2, 0.2, 1.0)), 2.0)
+                    dl.add_circle_filled(s1, 3.0, imgui.get_color_u32((1.0, 0.2, 0.2, 1.0)))
 
     # Mouse interaction inside the viewport
     alignment_locked = bool(state.show_ref_bg and state.ref_bg_lock_zoom)
