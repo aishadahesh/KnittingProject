@@ -36,7 +36,6 @@ from gui import (
      draw_menu_bar,
      draw_sidebar,
      draw_viewport,
-     draw_reference_image_panel,
 )
 
 # %% MAIN ─────────────────────────────────────────────────────────────────────
@@ -164,7 +163,12 @@ def main():
         imgui.end()
 
         # ── Sidebar ───────────────────────────────────────────────────────────
-        draw_sidebar(state, renderer)
+        draw_sidebar(state, renderer, window)
+
+        # MuJoCo offscreen rendering can make its own GL context current.
+        # Restore the app context before ModernGL allocates/draws viewport buffers.
+        glfw.make_context_current(window)
+        ctx.screen.use()
 
         # ── 3D Viewport ───────────────────────────────────────────────────────
         draw_viewport(state, renderer, ref_tex, window)
@@ -172,7 +176,6 @@ def main():
 
 
         # ── Reference Image ───────────────────────────────────────────────────
-        draw_reference_image_panel(state, ref_tex)
 
         # ── Final GL clear + imgui draw ───────────────────────────────────────
         ctx.screen.use()
@@ -189,6 +192,18 @@ def main():
         glfw.swap_buffers(window)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
+    embedded = getattr(state, 'embedded_scanner', None)
+    if embedded is not None:
+        try:
+            embedded.close()
+        except Exception:
+            pass
+        state.embedded_scanner = None
+    try:
+        glfw.make_context_current(window)
+        ctx.screen.use()
+    except Exception:
+        pass
     impl.shutdown()
     imgui.destroy_context()
     glfw.terminate()

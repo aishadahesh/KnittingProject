@@ -100,9 +100,24 @@ def _serpentine_indices(rows: int, cols: int):
 
 
 def _normalize_palette(palette) -> list[tuple[float, float, float, float]]:
+    if palette is None:
+        return list(SWATCH_PALETTE)
+    if isinstance(palette, np.ndarray):
+        palette = palette.tolist()
+    if (
+        isinstance(palette, (list, tuple))
+        and len(palette) >= 3
+        and all(isinstance(v, (int, float, np.integer, np.floating)) for v in palette[:3])
+    ):
+        r, g, b = [float(v) for v in palette[:3]]
+        a = float(palette[3]) if len(palette) > 3 else 1.0
+        return [(r, g, b, a)]
+
     colors = []
     for color in palette or []:
-        if len(color) < 3:
+        if isinstance(color, np.ndarray):
+            color = color.tolist()
+        if not isinstance(color, (list, tuple)) or len(color) < 3:
             continue
         r, g, b = [float(v) for v in color[:3]]
         a = float(color[3]) if len(color) > 3 else 1.0
@@ -205,16 +220,23 @@ def _default_cell_color_set(row: int, col: int, palette=None) -> list[tuple[floa
 
 def _normalize_cell_color_sets(raw_sets, rows: int, cols: int, palette=None) -> list[list[tuple[float, float, float, float]]]:
     normalized: list[list[tuple[float, float, float, float]]] = []
+    flat_sets = raw_sets if isinstance(raw_sets, list) and len(raw_sets) == rows * cols else None
     for row in range(rows):
         for col in range(cols):
             raw_cell = None
-            try:
-                raw_cell = raw_sets[row][col]
-            except Exception:
-                raw_cell = None
+            if flat_sets is not None:
+                raw_cell = flat_sets[row * cols + col]
+            else:
+                try:
+                    raw_cell = raw_sets[row][col]
+                except Exception:
+                    raw_cell = None
             color_set = _normalize_palette(raw_cell)
             if not raw_cell or len(color_set) < 4:
-                color_set = _default_cell_color_set(row, col, palette)
+                if color_set:
+                    color_set = [color_set[0] for _ in range(4)]
+                else:
+                    color_set = _default_cell_color_set(row, col, palette)
             normalized.append(color_set[:4])
     return normalized
 
@@ -299,7 +321,13 @@ def resolve_fabric_grid(args: argparse.Namespace) -> None:
 
 def build_plan(args: argparse.Namespace) -> FabricPlan:
     resolve_fabric_grid(args)
-    model_curves = _load_saved_model_curves(getattr(args, "model_json", ""))
+    model_curves = getattr(args, "model_curves", None)
+    if model_curves is None:
+        model_curves = _load_saved_model_curves(getattr(args, "model_json", ""))
+    else:
+        model_curves = [np.asarray(curve, dtype=np.float32) for curve in model_curves if len(curve) > 1]
+        if not model_curves:
+            model_curves = _load_saved_model_curves(getattr(args, "model_json", ""))
     raw_stations, station_cells, station_colors, cell_color_sets = build_fabric_grid_stations(
         width=args.width,
         length=args.length,
@@ -415,9 +443,8 @@ def rot_from_wxyz(q: np.ndarray) -> Rotation:
     return Rotation.from_quat([q[1], q[2], q[3], q[0]])
 
 
-def load_ur5e_scene():
+def load_ur5e_model_data():
     import mujoco
-    import mujoco.viewer
     from robot_descriptions import ur5e_mj_description
 
     model = mujoco.MjModel.from_xml_path(ur5e_mj_description.MJCF_PATH)
@@ -426,8 +453,21 @@ def load_ur5e_scene():
     if site_id < 0:
         raise RuntimeError("UR5e MJCF does not contain site 'attachment_site'")
 
+    # Keep the simulated UR5 base frame rotated exactly 180 degrees around Z,
+    # then start joint 1 at zero. This rotates the robot placement itself
+    # instead of twisting the shoulder joint to fake the direction.
+    base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base")
+    if base_id >= 0:
+        model.body_quat[base_id] = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
     data.qpos[:6] = [0.0, -np.pi / 2, np.pi / 2, -np.pi / 2, -np.pi / 2, 0.0]
     mujoco.mj_forward(model, data)
+    return mujoco, model, data, site_id
+
+
+def load_ur5e_scene():
+    import mujoco.viewer
+
+    mujoco, model, data, site_id = load_ur5e_model_data()
     handle = mujoco.viewer.launch_passive(model, data)
     return mujoco, model, data, site_id, handle
 
@@ -540,7 +580,7 @@ def _add_cell_fabric_model(mujoco, scn, center_x: float, center_y: float, z: flo
         )
 
 
-def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z: float, highlight=False) -> None:
+def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z: float, highlight=False, simplified=False) -> None:
     cell_w = plan.fabric_size[0] / plan.grid_cols
     cell_l = plan.fabric_size[1] / plan.grid_rows
     center_x = plan.fabric_origin[0] + cell_w * (col + 0.5)
@@ -555,9 +595,16 @@ def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z:
     )
     yarn_width = max(min(cell_w, cell_l) * 0.025, 0.0014)
     z_step = max(FABRIC_THICKNESS * 0.25, yarn_width * 0.35)
-    for curve_idx, curve in enumerate(plan.model_curves):
+    curves = plan.model_curves
+    if simplified and len(curves) > 12:
+        step = max(1, int(math.ceil(len(curves) / 12)))
+        curves = curves[::step]
+    for curve_idx, curve in enumerate(curves):
         color = colors[curve_idx % len(colors)]
         rgba = (color[0], color[1], color[2], 1.0)
+        if simplified and len(curve) > 5:
+            sample_idx = np.linspace(0, len(curve) - 1, 5).astype(int)
+            curve = [curve[int(i)] for i in sample_idx]
         pts = [
             np.array([
                 center_x + float(p[0]) * cell_w,
@@ -575,6 +622,39 @@ def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z:
             [center_x, center_y, z + FABRIC_THICKNESS * 0.12],
             [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.12],
             (0.1, 1.0, 0.3, 0.20),
+        )
+
+
+def _add_color_picker_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z: float, highlight=False) -> None:
+    cell_w = plan.fabric_size[0] / plan.grid_cols
+    cell_l = plan.fabric_size[1] / plan.grid_rows
+    center_x = plan.fabric_origin[0] + cell_w * (col + 0.5)
+    center_y = plan.fabric_origin[1] + cell_l * (row + 0.5)
+    color = _cell_color_set(plan, row, col)[0]
+    rgba = (float(color[0]), float(color[1]), float(color[2]), 1.0)
+    _add_box(
+        mujoco,
+        scn,
+        [center_x, center_y, z],
+        [cell_w * 0.492, cell_l * 0.492, FABRIC_THICKNESS * 0.20],
+        rgba,
+    )
+    border = (0.92, 0.94, 0.98, 0.75)
+    corners = [
+        np.array([center_x - cell_w * 0.50, center_y - cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
+        np.array([center_x + cell_w * 0.50, center_y - cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
+        np.array([center_x + cell_w * 0.50, center_y + cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
+        np.array([center_x - cell_w * 0.50, center_y + cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
+    ]
+    for a, b in zip(corners, corners[1:] + corners[:1]):
+        _add_segment(mujoco, scn, a, b, border, max(min(cell_w, cell_l) * 0.006, 0.0008))
+    if highlight:
+        _add_box(
+            mujoco,
+            scn,
+            [center_x, center_y, z + FABRIC_THICKNESS * 0.24],
+            [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.10],
+            (0.1, 1.0, 0.3, 0.24),
         )
 
 
@@ -634,27 +714,56 @@ def draw_scene(
     camera_enabled: bool = False,
     current_pose: np.ndarray | None = None,
     target_pose: np.ndarray | None = None,
+    clear_scene: bool = True,
+    simplified: bool = False,
+    color_picker_mode: bool = False,
 ) -> None:
     scn = handle.user_scn
-    scn.ngeom = 0
+    if clear_scene:
+        scn.ngeom = 0
 
     cell_w = plan.fabric_size[0] / plan.grid_cols
     cell_l = plan.fabric_size[1] / plan.grid_rows
     z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.5
+    fabric_center = plan.fabric_origin + np.array([plan.fabric_size[0] * 0.5, plan.fabric_size[1] * 0.5, 0.0])
+    _add_box(
+        mujoco,
+        scn,
+        [fabric_center[0] - 0.12, fabric_center[1], -0.018],
+        [0.62, 0.42, 0.012],
+        (0.10, 0.105, 0.115, 1.0),
+    )
+    _add_box(
+        mujoco,
+        scn,
+        [fabric_center[0], fabric_center[1], z - FABRIC_THICKNESS * 0.55],
+        [plan.fabric_size[0] * 0.54, plan.fabric_size[1] * 0.54, FABRIC_THICKNESS * 0.16],
+        (0.030, 0.036, 0.046, 1.0),
+    )
     station_id = plan.station_ids[min(target_index, len(plan.station_ids) - 1)]
     active_cell = plan.station_cells[station_id]
     for row in range(plan.grid_rows):
         for col in range(plan.grid_cols):
-            _add_model_cell_fabric(mujoco, scn, plan, row, col, z, highlight=(row, col) == active_cell)
+            if color_picker_mode:
+                _add_color_picker_cell_fabric(mujoco, scn, plan, row, col, z, highlight=(row, col) == active_cell)
+            else:
+                _add_model_cell_fabric(mujoco, scn, plan, row, col, z, highlight=(row, col) == active_cell, simplified=simplified)
 
-    for i in range(len(plan.mapped_points) - 1):
-        _add_segment(mujoco, scn, plan.mapped_points[i], plan.mapped_points[i + 1], (0.20, 0.24, 0.30, 0.28), 0.0018)
+    path_step = max(1, int(math.ceil(len(plan.mapped_points) / 80))) if simplified else 1
+    for i in range(0, len(plan.mapped_points) - 1, path_step):
+        j = min(i + path_step, len(plan.mapped_points) - 1)
+        _add_segment(mujoco, scn, plan.mapped_points[i], plan.mapped_points[j], (0.20, 0.24, 0.30, 0.28), 0.0018)
 
     if target_index > 0:
-        for i in range(min(target_index, len(plan.mapped_points) - 1)):
-            _add_segment(mujoco, scn, plan.mapped_points[i], plan.mapped_points[i + 1], (0.15, 0.85, 0.35, 0.55), 0.0026)
+        progress_step = max(1, int(math.ceil(target_index / 80))) if simplified else 1
+        for i in range(0, min(target_index, len(plan.mapped_points) - 1), progress_step):
+            j = min(i + progress_step, len(plan.mapped_points) - 1)
+            _add_segment(mujoco, scn, plan.mapped_points[i], plan.mapped_points[j], (0.15, 0.85, 0.35, 0.55), 0.0026)
 
-    trail = executed[-MAX_TRAIL_POINTS:]
+    trail_limit = min(MAX_TRAIL_POINTS, 60 if simplified else MAX_TRAIL_POINTS)
+    trail = executed[-trail_limit:]
+    if simplified and len(trail) > 40:
+        trail = trail[::max(1, int(math.ceil(len(trail) / 40)))]
     for a, b in zip(trail, trail[1:]):
         _add_segment(mujoco, scn, a, b, (1.00, 0.42, 0.08, 0.90), 0.0032)
 
@@ -676,6 +785,149 @@ def draw_scene(
     handle.sync()
 
 
+def render_camera_image(
+    plan: FabricPlan,
+    tcp_pos: np.ndarray,
+    target_index: int,
+    station_id: int,
+    view_name: str,
+    target_pose: np.ndarray | None = None,
+    color_picker_mode: bool = False,
+) -> Image.Image:
+    width_px, height_px = CAMERA_IMAGE_SIZE
+    station = plan.mapped_stations[station_id]
+    cell_w = plan.fabric_size[0] / plan.grid_cols
+    cell_l = plan.fabric_size[1] / plan.grid_rows
+    grid_origin_x = float(plan.mapped_stations[:, 0].min() - cell_w * 0.5)
+    grid_origin_y = float(plan.mapped_stations[:, 1].min() - cell_l * 0.5)
+    if target_pose is None:
+        target_pose = plan.poses[min(target_index, len(plan.poses) - 1)]
+    target_pose = np.asarray(target_pose, dtype=float)
+
+    img = Image.new("RGB", (width_px, height_px), (19, 22, 28))
+
+    from PIL import ImageDraw, ImageFilter
+
+    rotation = Rotation.from_rotvec(target_pose[3:6])
+    forward = rotation.apply([0.0, 0.0, 1.0])
+    forward = forward / max(float(np.linalg.norm(forward)), 1e-8)
+    if forward[2] > -0.15:
+        forward = station - target_pose[:3]
+        forward = forward / max(float(np.linalg.norm(forward)), 1e-8)
+    right = rotation.apply([1.0, 0.0, 0.0])
+    right = right - forward * float(np.dot(right, forward))
+    right = right / max(float(np.linalg.norm(right)), 1e-8)
+    up = np.cross(right, forward)
+    up = up / max(float(np.linalg.norm(up)), 1e-8)
+
+    lens_pos = np.asarray(tcp_pos[:3], dtype=float)
+    # The tool site is the gripper TCP, while the simulated camera lens sits
+    # slightly behind it on the gripper body. This offset gives a real scanner
+    # view of the fabric instead of an unusably tiny contact-distance crop.
+    camera_standoff = max(0.120, max(cell_w, cell_l) * 1.55, float(np.linalg.norm(lens_pos - station)) * 1.75)
+    lens_pos = lens_pos - forward * camera_standoff
+    focus = station + np.array([0.0, 0.0, FABRIC_THICKNESS * 0.15], dtype=float)
+    # Aim the saved camera at the active station while preserving the roll/right
+    # axis from the selected scan angle.
+    forward = focus - lens_pos
+    forward = forward / max(float(np.linalg.norm(forward)), 1e-8)
+    right = right - forward * float(np.dot(right, forward))
+    right = right / max(float(np.linalg.norm(right)), 1e-8)
+    up = np.cross(right, forward)
+    up = up / max(float(np.linalg.norm(up)), 1e-8)
+
+    fov_y = math.radians(74.0)
+    focal = (height_px * 0.5) / math.tan(fov_y * 0.5)
+    near = 0.004
+
+    def project_camera(point: np.ndarray) -> tuple[int, int, float] | None:
+        rel = np.asarray(point, dtype=float) - lens_pos
+        depth = float(np.dot(rel, forward))
+        if depth <= near:
+            return None
+        camera_x = float(np.dot(rel, right))
+        camera_y = float(np.dot(rel, up))
+        x = int(width_px * 0.5 + focal * camera_x / depth)
+        y = int(height_px * 0.5 - focal * camera_y / depth)
+        return x, y, depth
+
+    def visible_line(points: list[np.ndarray]) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for point in points:
+            projected = project_camera(point)
+            if projected is not None:
+                x, y, _ = projected
+                out.append((x, y))
+        return out
+
+    draw = ImageDraw.Draw(img)
+    active_row, active_col = plan.station_cells[station_id]
+    fabric_z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.48
+    for row in range(plan.grid_rows):
+        for col in range(plan.grid_cols):
+            x0 = grid_origin_x + col * cell_w
+            y0 = grid_origin_y + row * cell_l
+            x1, y1 = x0 + cell_w, y0 + cell_l
+            colors = _cell_color_set(plan, row, col)
+            cell_poly = [
+                project_camera(np.array([x0, y0, fabric_z])),
+                project_camera(np.array([x1, y0, fabric_z])),
+                project_camera(np.array([x1, y1, fabric_z])),
+                project_camera(np.array([x0, y1, fabric_z])),
+            ]
+            if all(p is not None for p in cell_poly):
+                if color_picker_mode:
+                    fill_rgba = colors[0]
+                    fill = tuple(int(255 * c) for c in fill_rgba[:3])
+                else:
+                    fill = (18, 23, 31)
+                draw.polygon([(p[0], p[1]) for p in cell_poly if p is not None], fill=fill)
+            depth_to_cell = max(float(np.dot(np.array([x0 + cell_w * 0.5, y0 + cell_l * 0.5, fabric_z]) - lens_pos, forward)), near)
+            yarn_px = max(3, min(18, int(focal * max(min(cell_w, cell_l) * 0.030, 0.0014) / depth_to_cell)))
+            if not color_picker_mode:
+                for curve_idx, curve in enumerate(plan.model_curves):
+                    rgba = colors[curve_idx % len(colors)]
+                    color = tuple(int(255 * c) for c in rgba[:3])
+                    shade = tuple(max(0, int(channel * 0.45)) for channel in color)
+                    z = fabric_z + curve_idx * max(FABRIC_THICKNESS * 0.08, 0.00045)
+                    pts = [
+                        np.array([
+                            x0 + (float(p[0]) + 0.5) * cell_w,
+                            y0 + (float(p[1]) + 0.5) * cell_l,
+                            z,
+                        ])
+                        for p in curve
+                    ]
+                    pts2d = visible_line(pts)
+                    if len(pts2d) >= 2:
+                        draw.line(pts2d, fill=shade, width=yarn_px + 3, joint="curve")
+                        draw.line(pts2d, fill=color, width=yarn_px, joint="curve")
+            outline = (60, 255, 120) if (row, col) == (active_row, active_col) else (245, 245, 240)
+            width = 4 if (row, col) == (active_row, active_col) else 1
+            poly = [
+                project_camera(np.array([x0, y0, fabric_z + 0.0002])),
+                project_camera(np.array([x1, y0, fabric_z + 0.0002])),
+                project_camera(np.array([x1, y1, fabric_z + 0.0002])),
+                project_camera(np.array([x0, y1, fabric_z + 0.0002])),
+            ]
+            if all(p is not None for p in poly):
+                poly2d = [(p[0], p[1]) for p in poly if p is not None]
+                draw.line(poly2d + [poly2d[0]], fill=outline, width=width)
+
+    overlay = Image.new("L", (width_px, height_px), 0)
+    mask_draw = ImageDraw.Draw(overlay)
+    mask_draw.ellipse([-70, -45, width_px + 70, height_px + 45], fill=255)
+    mask = overlay.filter(ImageFilter.GaussianBlur(12))
+    dark = Image.new("RGB", (width_px, height_px), (0, 0, 0))
+    img = Image.composite(img, dark, mask)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, 430, 54], fill=(0, 0, 0))
+    draw.text((14, 10), f"UR5 camera | station {station_id + 1} | row {active_row + 1}, col {active_col + 1}", fill=(255, 255, 255))
+    draw.text((14, 30), f"{view_name} | lens follows gripper pose | tcp z {tcp_pos[2]:.3f} m", fill=(210, 230, 255))
+
+    return img
+
+
 def save_camera_image(
     plan: FabricPlan,
     tcp_pos: np.ndarray,
@@ -683,98 +935,20 @@ def save_camera_image(
     target_index: int,
     station_id: int,
     view_name: str,
+    target_pose: np.ndarray | None = None,
+    color_picker_mode: bool = False,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    width_px, height_px = CAMERA_IMAGE_SIZE
-    station = plan.mapped_stations[station_id]
-    target = plan.mapped_points[target_index]
-    cell_w = plan.fabric_size[0] / plan.grid_cols
-    cell_l = plan.fabric_size[1] / plan.grid_rows
-    view_span = max(cell_w * 2.4, cell_l * 2.4, 0.035)
-    center = station[:2]
-    angle_deg = 0.0
-    if view_name.startswith("angle "):
-        try:
-            angle_deg = float(view_name.split(" ", 1)[1])
-        except ValueError:
-            angle_deg = 0.0
-    theta = math.radians(angle_deg)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
-
-    img = Image.new("RGB", (width_px, height_px), (19, 22, 28))
-
-    def project_xy(point: np.ndarray) -> tuple[int, int]:
-        delta = np.asarray(point[:2], dtype=float) - center
-        camera_x = cos_t * delta[0] + sin_t * delta[1]
-        camera_y = -sin_t * delta[0] + cos_t * delta[1]
-        x = int((camera_x / view_span + 0.5) * (width_px - 1))
-        y = int((0.5 - camera_y / view_span) * (height_px - 1))
-        return x, y
-
-    from PIL import ImageDraw, ImageFilter
-
-    draw = ImageDraw.Draw(img)
+    img = render_camera_image(
+        plan,
+        tcp_pos,
+        target_index,
+        station_id,
+        view_name,
+        target_pose=target_pose,
+        color_picker_mode=color_picker_mode,
+    )
     active_row, active_col = plan.station_cells[station_id]
-    for row in range(plan.grid_rows):
-        for col in range(plan.grid_cols):
-            x0 = plan.fabric_origin[0] + col * cell_w
-            y0 = plan.fabric_origin[1] + row * cell_l
-            x1, y1 = x0 + cell_w, y0 + cell_l
-            colors = _cell_color_set(plan, row, col)
-            cell_poly = [
-                project_xy(np.array([x0, y0])),
-                project_xy(np.array([x1, y0])),
-                project_xy(np.array([x1, y1])),
-                project_xy(np.array([x0, y1])),
-            ]
-            draw.polygon(cell_poly, fill=(18, 23, 31))
-            yarn_px = max(5, int(min(width_px, height_px) * min(cell_w, cell_l) / max(view_span, 1e-6) * 0.045))
-            for curve_idx, curve in enumerate(plan.model_curves):
-                rgba = colors[curve_idx % len(colors)]
-                color = tuple(int(255 * c) for c in rgba[:3])
-                shade = tuple(max(0, int(channel * 0.45)) for channel in color)
-                pts = [
-                    project_xy(np.array([
-                        x0 + (float(p[0]) + 0.5) * cell_w,
-                        y0 + (float(p[1]) + 0.5) * cell_l,
-                    ]))
-                    for p in curve
-                ]
-                if len(pts) >= 2:
-                    draw.line(pts, fill=shade, width=yarn_px + 3, joint="curve")
-                    draw.line(pts, fill=color, width=yarn_px, joint="curve")
-            outline = (60, 255, 120) if (row, col) == (active_row, active_col) else (245, 245, 240)
-            width = 4 if (row, col) == (active_row, active_col) else 1
-            poly = [
-                project_xy(np.array([x0, y0])),
-                project_xy(np.array([x1, y0])),
-                project_xy(np.array([x1, y1])),
-                project_xy(np.array([x0, y1])),
-            ]
-            draw.line(poly + [poly[0]], fill=outline, width=width)
-
-    for sid, point in enumerate(plan.mapped_stations):
-        px, py = project_xy(point[:2])
-        if -12 <= px <= width_px + 12 and -12 <= py <= height_px + 12:
-            r = 5 if sid == station_id else 3
-            fill = (255, 255, 255) if sid == station_id else (30, 30, 30)
-            draw.ellipse([px - r, py - r, px + r, py + r], fill=fill, outline=(0, 0, 0))
-
-    tx, ty = project_xy(target[:2])
-    draw.line([tx - 16, ty, tx + 16, ty], fill=(0, 255, 80), width=3)
-    draw.line([tx, ty - 16, tx, ty + 16], fill=(0, 255, 80), width=3)
-    draw.ellipse([tx - 8, ty - 8, tx + 8, ty + 8], outline=(0, 255, 80), width=3)
-
-    overlay = Image.new("L", (width_px, height_px), 0)
-    mask_draw = ImageDraw.Draw(overlay)
-    mask_draw.ellipse([-90, -60, width_px + 90, height_px + 60], fill=255)
-    mask = overlay.filter(ImageFilter.GaussianBlur(12))
-    dark = Image.new("RGB", (width_px, height_px), (0, 0, 0))
-    img = Image.composite(img, dark, mask)
-    draw = ImageDraw.Draw(img)
-    draw.text((14, 12), f"station {station_id + 1} | row {active_row + 1}, col {active_col + 1} | {view_name}", fill=(255, 255, 255))
-    draw.text((14, 32), f"captured mini-fabric: R{active_row + 1} C{active_col + 1} | tcp z {tcp_pos[2]:.3f} m", fill=(210, 230, 255))
-
     clean_view = view_name.replace(" ", "_")
     path = output_dir / f"scan_{target_index + 1:04d}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_station_{station_id + 1:03d}_{clean_view}.png"
     img.save(path)
@@ -903,6 +1077,7 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
                         target_index,
                         station,
                         plan.view_names[target_index],
+                        target_pose=pose,
                     )
                     saved_count += 1
                     saved_targets.add(target_index)
@@ -947,6 +1122,7 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
                             target_index,
                             station,
                             plan.view_names[target_index],
+                            target_pose=pose,
                         )
                         saved_count += 1
                         print(f"[camera] saved {path}")

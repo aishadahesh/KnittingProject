@@ -3,8 +3,6 @@ import glob
 import os
 import sys
 import json
-import jax
-import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import CubicSpline
 
@@ -30,33 +28,74 @@ def _preload_linux_nvidia_libs():
 
 _preload_linux_nvidia_libs()
 
-@jax.jit
-def _scale_factors_jax(bitmap):
-    a = bitmap > 0.5
-    rows = bitmap.shape[0]
+def compute_bitmap_scale_factors(bitmap):
+    """Return active spans; zero bitmap cells remain inactive."""
+    bitmap_array = np.asarray(bitmap, dtype=np.float32) > 0.5
+    n_rows, n_cols = bitmap_array.shape
+    scale_factors = np.zeros((n_rows, n_cols), dtype=np.float32)
 
-    def step(nxt, i):
-        m = a[i]
-        s = jnp.where(m, nxt - i, 0)
-        return jnp.where(m, i, nxt), s
+    for col_idx in range(n_cols):
+        active_rows = np.flatnonzero(bitmap_array[:, col_idx])
+        for active_index, row_idx in enumerate(active_rows):
+            next_row = active_rows[active_index + 1] if active_index + 1 < len(active_rows) else n_rows
+            scale_factors[row_idx, col_idx] = float(next_row - row_idx)
 
-    init = jnp.full((bitmap.shape[1],), rows, dtype=jnp.int32)
-    _, rev = jax.lax.scan(step, init, jnp.arange(rows - 1, -1, -1, dtype=jnp.int32))
-    return jnp.flip(rev.astype(jnp.float32), axis=0)
-
-
-@jax.jit
-def eval_curve(t, hl, lh, sb, sz):
-    x = sb * jnp.sin(2 * t) + t / (2 * jnp.pi)
-    y = lh * (-(jnp.cos(t) - 1) / 2)
-    z = sz * (jnp.cos(2 * t) - 1) / 2 * hl
-    x = jnp.where(hl == 0.0, t / (2 * jnp.pi), x)
-    y = jnp.where(hl == 0.0, 0.0, y)
-    z = jnp.where(hl == 0.0, 0.0, z)
-    return jnp.stack((x, y, z), axis=-1)
+    return scale_factors
 
 
+def _height_grid_from_params(params, bitmap, lh_idx):
+    params = np.asarray(params, dtype=np.float32)
+    bitmap = np.asarray(bitmap, dtype=np.float32)
+    row_heights = np.asarray(params[np.array(lh_idx, dtype=np.int32)], dtype=np.float32)
+    if row_heights.size == 0:
+        return np.zeros_like(bitmap, dtype=np.float32)
+    grid = np.zeros_like(bitmap, dtype=np.float32)
+    for row_idx in range(bitmap.shape[0]):
+        grid[row_idx, :] = float(row_heights[min(row_idx, row_heights.size - 1)])
+    return grid
 
+
+def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5, loop_heights=None):
+    """Build stitch control rows with per-bitmap-cell loop heights."""
+    p = np.asarray(params, dtype=np.float32)
+    bitmap_array = np.asarray(bitmap, dtype=np.float32)
+    stitch_bulge = float(p[pidx["stitch_bulge"]])
+    stitch_z = float(p[pidx["stitch_z"]])
+    dy = float(p[pidx["dy"]])
+    if loop_heights is None:
+        height_grid = _height_grid_from_params(p, bitmap_array, lh_idx)
+    else:
+        height_grid = np.asarray(loop_heights, dtype=np.float32)
+        if height_grid.shape != bitmap_array.shape:
+            fallback = _height_grid_from_params(p, bitmap_array, lh_idx)
+            fixed = fallback.copy()
+            h_rows = min(fixed.shape[0], height_grid.shape[0])
+            h_cols = min(fixed.shape[1], height_grid.shape[1])
+            fixed[:h_rows, :h_cols] = height_grid[:h_rows, :h_cols]
+            height_grid = fixed
+    scale_factors = compute_bitmap_scale_factors(bitmap_array)
+    n_rows, n_cols = scale_factors.shape
+    base_t_values = np.linspace(0.0, 2.0 * np.pi, int(spl), endpoint=False, dtype=np.float32)
+    rows = []
+
+    for row_idx in range(n_rows):
+        row_points = []
+        col_indices = range(n_cols) if row_idx % 2 == 0 else range(n_cols - 1, -1, -1)
+        t_values = base_t_values if row_idx % 2 == 0 else base_t_values[::-1]
+
+        for col_idx in col_indices:
+            has_loop = 1.0 if scale_factors[row_idx, col_idx] > 0.0 else 0.0
+            loop_height = float(height_grid[row_idx, col_idx]) if has_loop else 0.0
+            for t in t_values:
+                x = col_idx + (stitch_bulge * np.sin(2.0 * t) if has_loop else 0.0) + t / (2.0 * np.pi)
+                y = row_idx * dy - loop_height * (np.cos(t) - 1.0) / 2.0
+                z = has_loop * stitch_z * (np.cos(2.0 * t) - 1.0) / 2.0
+                row_points.append([x, y, z])
+
+        row_points.append([float(n_cols if row_idx % 2 == 0 else 0.0), row_idx * dy, 0.0])
+        rows.append(np.array(row_points, dtype=float))
+
+    return rows
 
 def compute_knitting_faces(seg, vl):
     if not vl:
@@ -70,30 +109,6 @@ def compute_knitting_faces(seg, vl):
         (i + 1) * seg + j
     ), axis=-1).reshape(-1, 4)
     return [faces] * len(vl)
-
-
-def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5):
-    p = np.asarray(params, dtype=np.float32)
-    idx = pidx
-    bulge, stz, dy = float(p[idx["stitch_bulge"]]), float(p[idx["stitch_z"]]), float(p[idx["dy"]])
-    lut = np.concatenate((np.zeros(1), p[np.array(lh_idx)]))
-    sf = np.asarray(_scale_factors_jax(jnp.asarray(bitmap))).astype(np.int32)
-    rows, cols = sf.shape
-    x_pitch = 1.0
-    base_t = np.linspace(0.0, 2 * np.pi, spl, endpoint=False, dtype=np.float32)
-    t = np.tile(base_t, (rows, cols))
-    xoff = np.repeat(np.arange(cols, dtype=np.float32), spl)
-    s = np.repeat(sf, spl, axis=1)
-    has = (s > 0).astype(np.float32)
-    h = lut[s]
-    c = np.array(eval_curve(
-        jnp.asarray(t), jnp.asarray(has), jnp.asarray(h), bulge, stz
-    ), dtype=np.float32, copy=True)
-    c[:, :, 0] = (c[:, :, 0] + xoff[None, :]) * x_pitch
-    c[:, :, 1] += np.arange(rows, dtype=np.float32)[:, None] * dy
-
-    return [c[r].astype(float) for r in range(rows)]
-
 
 
 def build_surface_fiber_meshes(
@@ -177,37 +192,6 @@ def build_surface_fiber_meshes(
     return out_vl, meta
 
 
-def _apply_straight_bitmap_spans(pts, cp_aug, t, to, straight_mask, samples_per_loop):
-    if straight_mask is None or samples_per_loop <= 1:
-        return pts
-
-    mask = np.asarray(straight_mask, dtype=bool).reshape(-1)
-    if not np.any(mask):
-        return pts
-
-    out = pts.copy()
-    for col_idx, is_straight in enumerate(mask):
-        if not is_straight:
-            continue
-
-        start_idx = col_idx * samples_per_loop
-        end_idx = (col_idx + 1) * samples_per_loop
-        if end_idx >= len(cp_aug) or end_idx >= len(t):
-            continue
-
-        t0, t1 = float(t[start_idx]), float(t[end_idx])
-        if t1 <= t0:
-            continue
-
-        span_mask = (to >= t0) & (to <= t1)
-        if not np.any(span_mask):
-            continue
-
-        alpha = ((to[span_mask] - t0) / (t1 - t0))[:, None]
-        out[span_mask] = cp_aug[start_idx] * (1.0 - alpha) + cp_aug[end_idx] * alpha
-
-    return out
-
 
 def build_spline_mesh(
     ctrl_rows,
@@ -216,8 +200,6 @@ def build_spline_mesh(
     pidx,
     period_offset,
     radius_ctrl_rows=None,
-    pattern_bitmap=None,
-    samples_per_loop=5,
 ):
     p = np.asarray(params)
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
@@ -249,16 +231,6 @@ def build_spline_mesh(
             else:
                 pts_detrended = np.column_stack([CubicSpline(t, cp_detrended[:, i], bc_type="periodic")(to) for i in range(3)])
             pts = pts_detrended + D[None, :] * (to / t[-1])[:, None]
-            if pattern_bitmap is not None and row_idx < len(pattern_bitmap):
-                row_pattern = np.asarray(pattern_bitmap[row_idx], dtype=np.float32) <= 0.5
-                pts = _apply_straight_bitmap_spans(
-                    pts,
-                    cp_aug,
-                    t,
-                    to,
-                    row_pattern,
-                    int(samples_per_loop),
-                )
             ctrl_sample_idx = np.linspace(0.0, len(cp), nout, dtype=float)
 
         if radius_ctrl_rows is not None and row_idx < len(radius_ctrl_rows):

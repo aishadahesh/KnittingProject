@@ -80,6 +80,8 @@ class AppState:
         }
         for attr, cast_fn in _SCHEMA_CASTS.items():
             super().__setattr__(attr, cast_fn(app_config[attr]))
+        extra_saved_keys = ('app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme')
+        super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
         # Auto-coerce flat numeric lists to np.float32 arrays, leaving other structures intact
         def _coerce(val):
@@ -113,6 +115,10 @@ class AppState:
             'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
             'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
             'display_copies': np.array([0, 0], dtype=np.int32),
+            'app_mode': 'edit',
+            'scanner_layout_pattern': 'grid',
+            'ui_theme': 'dark',
+            'loop_heights': np.full((3, config_data['knit_parameters']['bitmap_loops']), 3.0, dtype=np.float32),
             'mesh_center': np.zeros(3, dtype=np.float32),
             'row_colors': [
                 list(config_data['knit_parameters']['yarn_colors'][i % len(config_data['knit_parameters']['yarn_colors'])])
@@ -219,11 +225,13 @@ class AppState:
         if scanner_preview:
             scanner_cols = max(1, int(self.get('scanner_preview_cols', 1)))
             scanner_rows = max(1, int(self.get('scanner_preview_rows', 1)))
+            layout_pattern = str(self.get('scanner_layout_pattern', 'grid'))
             for y_tile in range(scanner_rows):
                 y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+                row_offset = 0.5 * x_period if layout_pattern == 'staggered' and (y_tile % 2 == 1) else 0.0
                 for x_tile in range(scanner_cols):
                     cell_index = y_tile * scanner_cols + x_tile
-                    x_translation = np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
+                    x_translation = np.array([x_tile * x_period + row_offset, 0.0, 0.0], dtype=np.float32)
                     for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
                         base_row = int(part_meta.get('row', 0))
                         translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation
@@ -384,28 +392,21 @@ class AppState:
         return self.build_display_meshes_precise(vl, fl, meta)
 
     def active_colors(self):
+        base_colors = self.row_colors if self.use_row_colors else [self.single_model_color]
         if bool(self.get('scanner_preview_grid_enabled', False)):
             rows = max(1, int(self.get('scanner_preview_rows', 1)))
             cols = max(1, int(self.get('scanner_preview_cols', 1)))
             base_rows = max(1, int(self.bitmap_size[0]))
             cell_sets = self.get('scanner_cell_color_sets', [])
-            if isinstance(cell_sets, np.ndarray):
-                cell_sets = cell_sets.tolist()
             colors = []
-            fallback = self.row_colors if self.use_row_colors else [self.single_model_color]
-            for r in range(rows):
-                for c in range(cols):
-                    try:
-                        cell = cell_sets[r][c]
-                    except Exception:
-                        cell = fallback
-                    if not cell:
-                        cell = fallback
-                    for base_row in range(base_rows):
-                        src = cell[base_row % len(cell)]
-                        colors.append([float(src[0]), float(src[1]), float(src[2])])
-            return colors or fallback
-        return self.row_colors if self.use_row_colors else [self.single_model_color]
+            for cell in range(rows * cols):
+                cell_palette = cell_sets[cell] if isinstance(cell_sets, list) and cell < len(cell_sets) and cell_sets[cell] else base_colors
+                batch_color = cell_palette[0]
+                for base_row in range(base_rows):
+                    src = batch_color
+                    colors.append([float(src[0]), float(src[1]), float(src[2])])
+            return colors or base_colors
+        return base_colors
 
 
     def _ensure_spline_radius_rows(self):
@@ -450,7 +451,6 @@ class AppState:
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
         self._ensure_spline_radius_rows()
         radius_profiles = [np.asarray(row, dtype=np.float32) for row in self.spline_radius_rows]
-        pattern_for_mesh = np.asarray(self.bitmap, dtype=np.float32)
         vl = build_spline_mesh(
             self.ctrl_rows,
             self.params,
@@ -458,8 +458,6 @@ class AppState:
             self._pidx,
             np.asarray(self.period_offset, dtype=np.float32),
             radius_ctrl_rows=radius_profiles,
-            pattern_bitmap=pattern_for_mesh,
-            samples_per_loop=int(self.samples_per_loop),
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
@@ -530,8 +528,46 @@ class AppState:
     def center_model_on_view(self):
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
 
+    def _default_loop_height_for_row(self, row_idx):
+        if not self._lh_idx:
+            return 0.0
+        idx = self._lh_idx[min(int(row_idx), len(self._lh_idx) - 1)]
+        return float(self.params[idx])
+
+    def _sync_loop_heights(self):
+        rows, cols = int(self.bitmap_size[0]), int(self.bitmap_size[1])
+        existing = np.asarray(self.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
+        synced = np.zeros((rows, cols), dtype=np.float32)
+        for row_idx in range(rows):
+            synced[row_idx, :] = self._default_loop_height_for_row(row_idx)
+        if existing.ndim == 2:
+            keep_rows = min(rows, existing.shape[0])
+            keep_cols = min(cols, existing.shape[1])
+            if keep_rows > 0 and keep_cols > 0:
+                synced[:keep_rows, :keep_cols] = existing[:keep_rows, :keep_cols]
+        self.loop_heights = synced
+        return synced
+
+    def set_loop_height_cell(self, row_idx, col_idx, value):
+        self._sync_loop_heights()
+        row_idx = int(np.clip(row_idx, 0, int(self.bitmap_size[0]) - 1))
+        col_idx = int(np.clip(col_idx, 0, int(self.bitmap_size[1]) - 1))
+        lo, hi = 0.0, 6.0
+        if self._lh_idx:
+            pd = self.config['knit_parameters']['parameters'][self._lh_idx[min(row_idx, len(self._lh_idx) - 1)]]
+            lo, hi = float(pd['range'][0]), float(pd['range'][1])
+        self.loop_heights[row_idx, col_idx] = float(np.clip(value, lo, hi))
+
     def _fresh_rebuild_rows(self):
-        return build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
+        self._sync_loop_heights()
+        return build_parametric_control_rows(
+            self.params,
+            self.bitmap,
+            self._pidx,
+            self._lh_idx,
+            self.samples_per_loop,
+            loop_heights=self.loop_heights,
+        )
 
     def rebuild_spline_from_params(self):
         self.ctrl_rows = self._fresh_rebuild_rows()
@@ -722,7 +758,7 @@ class AppState:
             'fiber_geometry_twist', 'spline_keyboard_step',
             'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset',
+            'period_offset', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
         )
         for key in reset_keys:
             if key in defaults:
@@ -733,6 +769,7 @@ class AppState:
 
         self._sync_row_colors(int(self.bitmap_size[0]))
         self._sync_row_visibility(int(self.bitmap_size[0]))
+        self._sync_loop_heights()
         self.spline_radius_rows = []
         self.param_ref_ctrl_rows = []
         self.rebuild_spline_from_params()
@@ -763,7 +800,7 @@ class AppState:
             'fiber_geometry_surface_arc', 'fiber_geometry_randomness',
             'fiber_geometry_twist', 'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset',
+            'period_offset', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
         ):
             if key in defaults:
                 self._data[key] = self._clone(defaults[key])
@@ -788,7 +825,8 @@ class AppState:
     # ── BITMAP / WORKFLOW UPDATES ─────────────────────────────────────────────
 
     def on_bitmap_change(self):
-        self.nudge_spline_from_params(preserve_bounds=True)
+        self._sync_loop_heights()
+        self.rebuild_spline_from_params()
 
     def on_bitmap_resize(self, new_rows, new_cols):
         new_rows = max(1, min(int(new_rows), int(self.config['knit_parameters']['bitmap_rows'])))
@@ -800,8 +838,8 @@ class AppState:
         self.bitmap_size = np.array([new_rows, new_cols], dtype=np.int32)
         self._sync_row_colors(new_rows)
         self._sync_row_visibility(new_rows)
-        self.nudge_spline_from_params(preserve_bounds=False)
-        self.sync_period_offset_to_model_width()
+        self._sync_loop_heights()
+        self.rebuild_spline_from_params()
 
     def loop_height_span(self, name):
         if name.startswith("loop_height_"):
@@ -897,6 +935,8 @@ class AppState:
                 val = get_val(field)
                 if val is not None:
                     setattr(self.camera, attr, np.array(val, dtype=float) if isinstance(val, list) else float(val))
+
+            self._sync_loop_heights()
 
             row_vis = get_val('row_visible')
             if row_vis is not None:
