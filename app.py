@@ -118,7 +118,8 @@ def main():
                             time.sleep(0.01)
                             continue
                         ctrl_rows = [cp.copy() for cp in state.ctrl_rows]
-                        D = state.period_offset.copy()
+                        period_offset_x = state.period_offset_x.copy()
+                        period_offset_y = state.period_offset_y.copy()
                         config = state.config.copy()
                         J_cached = state.J_cached
                         L0_array = state.sim_L0
@@ -131,13 +132,13 @@ def main():
                         time.sleep(0.01)
                         continue
                         
-                    new_ctrl_rows = run_simulation_step(ctrl_rows, D, config, J_cached, L0_array, ks, kb, kc, dhat)
+                    new_ctrl_rows = run_simulation_step(ctrl_rows, period_offset_x, period_offset_y, config, J_cached, L0_array, ks, kb, kc, dhat)
                     
                     from knitting_core import eval_energy
                     flat_P_old = np.concatenate(ctrl_rows).astype(float) if ctrl_rows else np.empty((0, 3), float)
                     flat_P = np.concatenate(new_ctrl_rows).astype(float) if new_ctrl_rows else np.empty((0, 3), float)
                     if len(flat_P) > 0:
-                        e_el, e_b, e_col = eval_energy(flat_P, new_ctrl_rows, D, config, L0_array, ks, kb, kc, dhat)
+                        e_el, e_b, e_col = eval_energy(flat_P, new_ctrl_rows, period_offset_x, period_offset_y, config, L0_array, ks, kb, kc, dhat)
                     else:
                         e_el, e_b, e_col = 0.0, 0.0, 0.0
                     

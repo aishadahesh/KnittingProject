@@ -8,7 +8,8 @@ from PIL import Image
 
 from knitting_core import (
     compute_knitting_faces,
-    build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes
+    build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes,
+    build_display_meshes_precise
 )
 
 # %% APP STATE ─────────────────────────────────────────────────────────────────
@@ -123,7 +124,8 @@ class AppState:
             'row_visible': np.ones(3, dtype=bool),
             'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
             'mi_cam_fov': float(config_data['rendering']['camera_fov']),
-            'period_offset': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
+            'period_offset_x': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
+            'period_offset_y': np.array([0.0, 3.0 * (float(config_data['knit_parameters']['parameters'][pidx.get('dy')]['initial']) if pidx.get('dy') is not None else 1.0), 0.0], dtype=np.float32),
             'sim_active': False,
             'sim_k_s': 1000.0,
             'sim_k_b': 10.0,
@@ -200,65 +202,6 @@ class AppState:
         new_vis[:min(old.shape[0], n_rows)] = old[:min(old.shape[0], n_rows)]
         self.row_visible = new_vis
 
-    def build_display_meshes_precise(self, verts_list, faces_list, meta):
-        if not verts_list:
-            return [], [], []
-        radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        row_count = max(1, int(self.bitmap_size[0]))
-        x_period = self._display_copy_x_period(verts_list, radius)
-        y_period = self._display_copy_y_period(verts_list, radius)
-        
-        seg = int(self.config['knit_parameters']['segments'])
-        x_tiles = list(range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1))
-        y_tiles = list(range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1))
-
-        display_vl, display_fl, display_meta = [], [], []
-        for y_tile in y_tiles:
-            y_translation = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
-            for part_idx, ((verts, n_points), _faces, part_meta) in enumerate(zip(verts_list, faces_list, meta)):
-                rings = np.asarray(verts, dtype=np.float32).reshape(int(n_points), seg, 3)
-                base_faces = compute_knitting_faces(seg, [(rings.reshape(-1, 3), int(n_points))])[0]
-                
-                stitched_rings = []
-                stitched_faces = []
-                for tile_i, x_tile in enumerate(x_tiles):
-                    translated = rings + x_tile * self.period_offset[None, None, :]
-                    stitched_rings.append(translated)
-                    
-                    tile_faces = base_faces + tile_i * int(n_points) * seg
-                    stitched_faces.append(tile_faces)
-                    
-                stitched = np.concatenate(stitched_rings, axis=0) + y_translation
-                stitched_n_points = int(stitched.shape[0])
-                display_vl.append((stitched.reshape(-1, 3), stitched_n_points))
-                
-                combined_faces = np.concatenate(stitched_faces, axis=0)
-                display_fl.append(combined_faces)
-                copied_meta = dict(part_meta)
-                copied_meta['row'] = int(copied_meta.get('row', 0)) + y_tile * row_count
-                copied_meta['base_row'] = int(part_meta.get('row', 0))
-                copied_meta['tile_x'] = 0
-                copied_meta['tile_y'] = y_tile
-                copied_meta['stitched_x_copies'] = len(x_tiles)
-                display_meta.append(copied_meta)
-        return display_vl, display_fl, display_meta
-
-    def _display_copy_x_period(self, verts_list, radius):
-        return max(float(self.bitmap_size[1]), radius)
-
-    def _display_copy_y_period(self, verts_list, radius):
-        if self.ctrl_rows:
-            row_centers = np.array([
-                float(np.mean(row[:, 1]))
-                for row in self.ctrl_rows
-                if len(row)
-            ], dtype=np.float32)
-            if len(row_centers) > 1:
-                row_pitch = float(np.median(np.diff(np.sort(row_centers))))
-                return max(abs(row_pitch) * len(row_centers), radius)
-        base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
-        return max(float(base_bounds[:, 1].max() - base_bounds[:, 1].min()) - radius * 2.0, radius)
-
     def prepare_display_meshes(self, vl, fl):
         vl, meta = build_surface_fiber_meshes(
             vl,
@@ -273,27 +216,22 @@ class AppState:
             twist=float(self.fiber_geometry_twist),
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
-        return self.build_display_meshes_precise(vl, fl, meta)
+        return build_display_meshes_precise(
+            vl, fl, meta,
+            radius=float(self.params[self._pidx['radius']]),
+            bitmap_size=self.bitmap_size,
+            period_offset_x=self.period_offset_x,
+            period_offset_y=self.period_offset_y,
+            display_copies=self.display_copies,
+            segments=self.config['knit_parameters']['segments'],
+            ctrl_rows=self.ctrl_rows
+        )
 
     def active_colors(self):
         return self.row_colors if self.use_row_colors else [self.single_model_color]
 
 
-    def _ensure_spline_radius_rows(self):
-        base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        rows = self.get('spline_radius_rows')
-        if (
-            not rows
-            or len(rows) != len(self.ctrl_rows)
-            or any(np.asarray(rad).shape[0] != len(row) for rad, row in zip(rows, self.ctrl_rows))
-        ):
-            self.spline_radius_rows = [
-                np.full(len(row), base_radius, dtype=np.float32)
-                for row in self.ctrl_rows
-            ]
-
     def set_local_radius(self, flat_idx, value, start_rows=None):
-        self._ensure_spline_radius_rows()
         row_idx = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
         if not (0 <= row_idx < len(self.spline_radius_rows)):
             return
@@ -323,10 +261,10 @@ class AppState:
         import scipy.sparse
         J_blocks = []
         res = self.config["knit_parameters"]["loop_res"]
-        bitmap_width = float(np.linalg.norm(self.period_offset))
+        bitmap_width = float(np.linalg.norm(self.period_offset_x))
         nout = res * int(round(bitmap_width)) + 1
         for cp in self.ctrl_rows:
-            J_r = build_row_spline_jacobian(cp, self.period_offset, nout)
+            J_r = build_row_spline_jacobian(cp, self.period_offset_x, nout)
             J_blocks.append(J_r)
         J_base = scipy.sparse.block_diag(J_blocks, format="csr")
         super().__setattr__('J_cached', scipy.sparse.kron(J_base, scipy.sparse.identity(3), format="csr"))
@@ -334,7 +272,7 @@ class AppState:
 
     def rebuild_spline_mesh(self, preserve_model_placement=True):
         from knitting_core import evaluate_centerlines
-        V, edges, _, _ = evaluate_centerlines(self.ctrl_rows, self.period_offset, self.config)
+        V, edges, _, _ = evaluate_centerlines(self.ctrl_rows, self.period_offset_x, self.config)
         if len(edges) > 0:
             v0_pts = V[edges[:, 0]]
             v1_pts = V[edges[:, 1]]
@@ -344,14 +282,13 @@ class AppState:
             
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
-        self._ensure_spline_radius_rows()
         radius_profiles = [np.asarray(row, dtype=np.float32) for row in self.spline_radius_rows]
         vl = build_spline_mesh(
             self.ctrl_rows,
             self.params,
             self.config,
             self._pidx,
-            self.period_offset,
+            self.period_offset_x,
             radius_ctrl_rows=radius_profiles,
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
@@ -364,15 +301,12 @@ class AppState:
             self.mesh_center = old_center
             self.model_t = old_model_t
         else:
-            self._recompute_center(display_vl)
-
-    def _recompute_center(self, display_vl):
-        if not display_vl:
-            self.mesh_center = np.zeros(3, dtype=np.float32)
-        else:
-            all_v = np.vstack([v for v, _ in display_vl])
-            self.mesh_center = (all_v.min(axis=0) + all_v.max(axis=0)) / 2.0
-        self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
+            if not display_vl:
+                self.mesh_center = np.zeros(3, dtype=np.float32)
+            else:
+                all_v = np.vstack([v for v, _ in display_vl])
+                self.mesh_center = (all_v.min(axis=0) + all_v.max(axis=0)) / 2.0
+            self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
 
     def _rebuild_spline_points(self):
         self._row_starts = np.concatenate(([0], np.cumsum([len(r) for r in self.ctrl_rows]))).tolist()
@@ -382,18 +316,23 @@ class AppState:
     def flat_pts_all(self):
         if not self.ctrl_rows:
             return np.empty((0, 3), dtype=np.float32)
-        virtual_pts = np.array([row[0] + self.period_offset for row in self.ctrl_rows], dtype=np.float32)
-        return np.concatenate((self.flat_pts, virtual_pts), axis=0)
+        virtual_pts_x = np.array([row[0] + self.period_offset_x for row in self.ctrl_rows], dtype=np.float32)
+        virtual_pts_y = np.array([row[0] + self.period_offset_y for row in self.ctrl_rows], dtype=np.float32)
+        return np.concatenate((self.flat_pts, virtual_pts_x, virtual_pts_y), axis=0)
 
     def move_ctrl_pt(self, flat_idx, pos):
         with self.sim_lock:
             self.sim_needs_jacobian_rebuild = True
             n_real = len(self.flat_pts)
             if flat_idx >= n_real:
-                row_idx = flat_idx - n_real
-                if 0 <= row_idx < len(self.ctrl_rows):
-                    self.period_offset = pos - self.ctrl_rows[row_idx][0]
-                    self.rebuild_spline_mesh()
+                n_virtual = len(self.ctrl_rows)
+                if flat_idx < n_real + n_virtual:
+                    row_idx = flat_idx - n_real
+                    self.period_offset_x = pos - self.ctrl_rows[row_idx][0]
+                else:
+                    row_idx = flat_idx - n_real - n_virtual
+                    self.period_offset_y = pos - self.ctrl_rows[row_idx][0]
+                self.rebuild_spline_mesh()
             else:
                 r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
                 if 0 <= r < len(self.ctrl_rows):
@@ -403,13 +342,13 @@ class AppState:
     def center_model_on_view(self):
         self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
 
-    def _fresh_rebuild_rows(self):
-        return build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
-
     def rebuild_spline_from_params(self):
         with self.sim_lock:
             self.sim_needs_jacobian_rebuild = True
-            self.ctrl_rows = self._fresh_rebuild_rows()
+            self.ctrl_rows = build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
+            dy_idx = self._pidx.get("dy")
+            dy_val = float(self.params[dy_idx]) if dy_idx is not None else 1.0
+            self.period_offset_y = np.array([0.0, len(self.ctrl_rows) * dy_val, 0.0], dtype=np.float32)
             base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
             self.spline_radius_rows = [
                 np.full(len(row), base_radius, dtype=np.float32)
@@ -423,7 +362,7 @@ class AppState:
     def nudge_spline_from_params(self):
         with self.sim_lock:
             self.sim_needs_jacobian_rebuild = True
-            target_rows = self._fresh_rebuild_rows()
+            target_rows = build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
             ref_rows = self.get('param_ref_ctrl_rows')
             current_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
             ref_radius = getattr(self, 'param_ref_radius', current_radius)
@@ -438,7 +377,6 @@ class AppState:
                 for current_row, ref_row, target_row in zip(self.ctrl_rows, ref_rows, target_rows):
                     nudged_rows.append(current_row + (target_row - ref_row))
                 self.ctrl_rows = nudged_rows
-                self._ensure_spline_radius_rows()
                 if abs(current_radius - ref_radius) > 1e-7:
                     ratio = current_radius / ref_radius
                     for r_idx, row in enumerate(self.spline_radius_rows):
@@ -450,27 +388,13 @@ class AppState:
             self.rebuild_spline_mesh()
 
     def debug_compare_to_fresh_rebuild(self):
-        fresh_rows = self._fresh_rebuild_rows()
+        fresh_rows = build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
         curr_rows = self.ctrl_rows
         if len(curr_rows) != len(fresh_rows):
-            return {
-                'ok': False,
-                'reason': 'row_count_mismatch',
-                'curr_rows': len(curr_rows),
-                'fresh_rows': len(fresh_rows),
-            }
-        all_d = []
-        for curr, fresh in zip(curr_rows, fresh_rows):
-            if curr.shape != fresh.shape:
-                return {
-                    'ok': False,
-                    'reason': 'row_shape_mismatch',
-                    'curr_shape': tuple(curr.shape),
-                    'fresh_shape': tuple(fresh.shape),
-                }
-            d = np.linalg.norm(curr - fresh, axis=1)
-            all_d.append(d)
-        all_d = np.concatenate(all_d) if all_d else np.zeros((0,), dtype=np.float32)
+            return {'ok': False, 'reason': 'row_count_mismatch', 'curr_rows': len(curr_rows), 'fresh_rows': len(fresh_rows)}
+        if any(curr.shape != fresh.shape for curr, fresh in zip(curr_rows, fresh_rows)):
+            return {'ok': False, 'reason': 'row_shape_mismatch'}
+        all_d = np.concatenate([np.linalg.norm(curr - fresh, axis=1) for curr, fresh in zip(curr_rows, fresh_rows)]) if curr_rows else np.array([])
         if all_d.size == 0:
             return {'ok': True, 'mean': 0.0, 'max': 0.0, 'p95': 0.0}
         return {
@@ -481,15 +405,11 @@ class AppState:
         }
 
     def current_model_matrix(self):
-        model_s = np.eye(4, dtype=np.float32)
-        model_s[0, 0] = 1.0
-        model_s[1, 1] = 1.0
-        model_s[2, 2] = 1.0
         tneg, tpos, tuser = np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32)
         tneg[:3, 3] = -self.mesh_center
         tpos[:3, 3] = self.mesh_center
         tuser[:3, 3] = self.model_t
-        return (tuser @ tpos @ model_s @ tneg).astype(np.float32)
+        return (tuser @ tpos @ tneg).astype(np.float32)
 
     # ── UNDO / REDO ───────────────────────────────────────────────────────────
 
@@ -519,10 +439,9 @@ class AppState:
 
         self.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
         self.spline_radius_rows = [row.copy() for row in snap.get('spline_radius_rows', [])]
-        self._ensure_spline_radius_rows()
         self.param_ref_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
         self._rebuild_spline_points()
-        self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
+        self.param_ref_ctrl_rows = build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)
 
         self.rebuild_spline_mesh()
 
@@ -532,30 +451,41 @@ class AppState:
         self.restore_snapshot(self.undo_stack.pop())
         self.status_msg = 'Undid last change'
 
-    def reset_to_initial(self):
-        self.push_undo("Reset all")
+    def reset(self, unit_model=False):
+        self.push_undo("Reset unit model" if unit_model else "Reset all")
         defaults = self._state_defaults
 
         self.params = [p['initial'] for p in self.config['knit_parameters']['parameters']]
-        self.bitmap_size = defaults['bitmap_size'].copy()
-        self.bitmap = defaults['bitmap'].copy()
+        if unit_model:
+            radius_idx = self._pidx['radius']
+            radius_range = self.config['knit_parameters']['parameters'][radius_idx]['range']
+            self.params[radius_idx] = float(np.clip(0.5, radius_range[0], radius_range[1]))
+            self.bitmap_size = defaults['bitmap_size'].copy()
+            self.bitmap = np.ones(tuple(int(v) for v in self.bitmap_size), dtype=np.float32)
+        else:
+            self.bitmap_size = defaults['bitmap_size'].copy()
+            self.bitmap = defaults['bitmap'].copy()
+
         self.samples_per_loop = 5
         self.display_copies = defaults['display_copies'].copy()
         self.mode = defaults['mode']
         self.workflow_step = 0
 
-        reset_keys = (
+        reset_keys = [
             'selected_idx', 'hover_idx', 'hover_mesh_idx', 'selected_mesh_idx',
             'model_rot', 'model_scale', 'model_t', 'mesh_center',
             'use_row_colors', 'single_model_color', 'row_colors', 'row_visible',
             'fiber_geometry_enabled', 'fiber_geometry_count',
             'fiber_geometry_radius_scale', 'fiber_geometry_lift',
             'fiber_geometry_surface_arc', 'fiber_geometry_randomness',
-            'fiber_geometry_twist', 'spline_keyboard_step',
-            'spline_grab_active', 'radius_grab_active',
+            'fiber_geometry_twist', 'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset',
-        )
+            'period_offset_x',
+            'period_offset_y',
+        ]
+        if not unit_model:
+            reset_keys.append('spline_keyboard_step')
+
         for key in reset_keys:
             if key in defaults:
                 self._data[key] = self._clone(defaults[key])
@@ -565,51 +495,13 @@ class AppState:
 
         self._sync_row_colors(int(self.bitmap_size[0]))
         self._sync_row_visibility(int(self.bitmap_size[0]))
+        if unit_model:
+            self.row_visible[:] = True
         self.spline_radius_rows = []
         self.param_ref_ctrl_rows = []
         self.rebuild_spline_from_params()
         self.center_model_on_view()
-        self.status_msg = 'Reset to initial parameters'
-
-    def reset_to_unit_model(self):
-        self.push_undo("Reset unit model")
-        defaults = self._state_defaults
-
-        self.params = [p['initial'] for p in self.config['knit_parameters']['parameters']]
-        radius_idx = self._pidx['radius']
-        radius_range = self.config['knit_parameters']['parameters'][radius_idx]['range']
-        self.params[radius_idx] = float(np.clip(0.5, radius_range[0], radius_range[1]))
-        self.bitmap_size = defaults['bitmap_size'].copy()
-        self.bitmap = np.ones(tuple(int(v) for v in self.bitmap_size), dtype=np.float32)
-        self.samples_per_loop = 5
-        self.display_copies = defaults['display_copies'].copy()
-        self.mode = defaults['mode']
-        self.workflow_step = 0
-
-        for key in (
-            'selected_idx', 'hover_idx', 'hover_mesh_idx', 'selected_mesh_idx',
-            'model_rot', 'model_scale', 'model_t', 'mesh_center',
-            'use_row_colors', 'single_model_color', 'row_colors', 'row_visible',
-            'fiber_geometry_enabled', 'fiber_geometry_count',
-            'fiber_geometry_radius_scale', 'fiber_geometry_lift',
-            'fiber_geometry_surface_arc', 'fiber_geometry_randomness',
-            'fiber_geometry_twist', 'spline_grab_active', 'radius_grab_active',
-            'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset',
-        ):
-            if key in defaults:
-                self._data[key] = self._clone(defaults[key])
-        for key in ('render_texture_color', *self.texture_param_keys):
-            if key in defaults:
-                self._data[key] = self._clone(defaults[key])
-        self._sync_row_colors(int(self.bitmap_size[0]))
-        self._sync_row_visibility(int(self.bitmap_size[0]))
-        self.row_visible[:] = True
-        self.spline_radius_rows = []
-        self.param_ref_ctrl_rows = []
-        self.rebuild_spline_from_params()
-        self.center_model_on_view()
-        self.status_msg = 'Reset initial model: pattern=1, samples=5, radius=0.5, multi-fiber off'
+        self.status_msg = 'Reset initial model: pattern=1, samples=5, radius=0.5, multi-fiber off' if unit_model else 'Reset to initial parameters'
 
     def apply_texture_preset(self, preset_name, undo_label="Texture preset"):
         if preset_name in self.texture_presets:
@@ -631,7 +523,9 @@ class AppState:
         new_bm[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)] = old[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)]
         self.bitmap = new_bm
         self.bitmap_size = np.array([new_rows, new_cols], dtype=np.int32)
-        self.period_offset = (self.period_offset * (float(new_cols) / float(old_cols))).astype(np.float32)
+        old_rows = max(1, old.shape[0])
+        self.period_offset_x = (self.period_offset_x * (float(new_cols) / float(old_cols))).astype(np.float32)
+        self.period_offset_y = (self.period_offset_y * (float(new_rows) / float(old_rows))).astype(np.float32)
         self._sync_row_colors(new_rows)
         self._sync_row_visibility(new_rows)
         self.on_bitmap_change()
@@ -670,7 +564,8 @@ class AppState:
             'format_version': 2,
             'params': params_to_save,
             'bitmap': self.bitmap.tolist(),
-            'period_offset': self.period_offset.tolist(),
+            'period_offset_x': self.period_offset_x.tolist(),
+            'period_offset_y': self.period_offset_y.tolist(),
             'spline_control_rows': [row.tolist() for row in self.ctrl_rows],
             'spline_radius_rows': [row.tolist() for row in self.spline_radius_rows],
             'gui_state': gui_state,
@@ -754,20 +649,24 @@ class AppState:
             self.camera.fov_deg = self.view_fov
             self.load_path = path
             self.status_msg = f'Loaded ← {os.path.basename(path)}'
-            self.period_offset = np.array(data.get('period_offset', [float(self.bitmap_size[1]), 0.0, 0.0]), dtype=np.float32)
+            self.period_offset_x = np.array(data['period_offset_x'], dtype=np.float32)
+            self.period_offset_y = np.array(data['period_offset_y'], dtype=np.float32)
             self.rebuild_spline_from_params()
             if loaded_spline_rows:
                 self.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]
-                if loaded_radius_rows and len(loaded_radius_rows) == len(self.ctrl_rows):
+                base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+                if loaded_radius_rows and len(loaded_radius_rows) == len(self.ctrl_rows) and all(np.asarray(rad).shape[0] == len(row) for rad, row in zip(loaded_radius_rows, self.ctrl_rows)):
                     self.spline_radius_rows = [
                         np.array(row, dtype=np.float32)
                         for row in loaded_radius_rows
                     ]
                 else:
-                    self.spline_radius_rows = []
-                self._ensure_spline_radius_rows()
+                    self.spline_radius_rows = [
+                        np.full(len(row), base_radius, dtype=np.float32)
+                        for row in self.ctrl_rows
+                    ]
                 self._rebuild_spline_points()
-                self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
+                self.param_ref_ctrl_rows = [row.copy() for row in build_parametric_control_rows(self.params, self.bitmap, self._pidx, self._lh_idx, self.samples_per_loop)]
                 self.rebuild_spline_mesh(preserve_model_placement=False)
         except Exception as e:
             self.status_msg = f"Load error: {e}"

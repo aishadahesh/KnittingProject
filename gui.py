@@ -112,7 +112,7 @@ def draw_sidebar(state, renderer):
     imgui.separator()
 
     if imgui.button("Reset initial model##reset_unit_model_global", (-1, 0)):
-        state.reset_to_unit_model()
+        state.reset(unit_model=True)
     imgui.separator()
 
     stage = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
@@ -163,6 +163,28 @@ def draw_sidebar(state, renderer):
         state.push_undo("Display copies")
         state.display_copies = np.array([new_copies_x, new_copies_y], dtype=np.int32)
         state.rebuild_spline_mesh(preserve_model_placement=True)
+        
+    imgui.text("Period X Vector:")
+    ox = state.period_offset_x.copy()
+    ch_ox0, val_ox0 = imgui.slider_float("Period X.x", float(ox[0]), -10.0, 10.0, "%.2f")
+    ch_ox1, val_ox1 = imgui.slider_float("Period X.y", float(ox[1]), -10.0, 10.0, "%.2f")
+    ch_ox2, val_ox2 = imgui.slider_float("Period X.z", float(ox[2]), -10.0, 10.0, "%.2f")
+    if ch_ox0 or ch_ox1 or ch_ox2:
+        state.push_undo("Period X change")
+        state.period_offset_x = np.array([val_ox0, val_ox1, val_ox2], dtype=np.float32)
+        state.sim_needs_jacobian_rebuild = True
+        state.rebuild_spline_mesh(preserve_model_placement=True)
+
+    imgui.text("Period Y Vector:")
+    oy = state.period_offset_y.copy()
+    ch_oy0, val_oy0 = imgui.slider_float("Period Y.x", float(oy[0]), -10.0, 10.0, "%.2f")
+    ch_oy1, val_oy1 = imgui.slider_float("Period Y.y", float(oy[1]), -10.0, 10.0, "%.2f")
+    ch_oy2, val_oy2 = imgui.slider_float("Period Y.z", float(oy[2]), -10.0, 10.0, "%.2f")
+    if ch_oy0 or ch_oy1 or ch_oy2:
+        state.push_undo("Period Y change")
+        state.period_offset_y = np.array([val_oy0, val_oy1, val_oy2], dtype=np.float32)
+        state.sim_needs_jacobian_rebuild = True
+        state.rebuild_spline_mesh(preserve_model_placement=True)
     imgui.separator()
 
     if imgui.collapsing_header("Yarn Simulation##sim_header"):
@@ -193,7 +215,8 @@ def draw_sidebar(state, renderer):
                     state.rebuild_cached_jacobian()
                 res_str = check_gradients_and_hessians_fd(
                     state.ctrl_rows,
-                    state.period_offset,
+                    state.period_offset_x,
+                    state.period_offset_y,
                     state.config,
                     state.J_cached,
                     state.sim_k_s,
@@ -651,10 +674,10 @@ def draw_sidebar(state, renderer):
             if path:
                 state.load_params(path)
         if imgui.button("Reset all to initial##reset_all", (half_w, 0)):
-            state.reset_to_initial()
+            state.reset(unit_model=False)
         imgui.same_line()
         if imgui.button("Reset initial model##reset_unit_model", (half_w, 0)):
-            state.reset_to_unit_model()
+            state.reset(unit_model=True)
         changed_auto, new_auto = imgui.checkbox("Autosave", state.autosave_enabled)
         if changed_auto:
             state.autosave_enabled = new_auto
@@ -695,6 +718,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     visible_ctrl_index_map = {}
     if state.mode == 'spline':
         n_real_total = len(state.flat_pts)
+        num_rows = len(state.ctrl_rows)
         real_chunks = []
         virtual_indices = []
         for row_idx, row in enumerate(state.ctrl_rows):
@@ -704,6 +728,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             end = start + len(row)
             real_chunks.append(np.arange(start, end, dtype=np.int32))
             virtual_indices.append(n_real_total + row_idx)
+            virtual_indices.append(n_real_total + num_rows + row_idx)
         if real_chunks:
             visible_ctrl_indices = np.concatenate(real_chunks + [np.array(virtual_indices, dtype=np.int32)])
             visible_ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
@@ -775,6 +800,16 @@ def draw_viewport(state, renderer, ref_tex, window):
         camera      = state.camera,
         n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx])
     )
+
+    # DEBUG: overlay the raw centerline geometry from the last eval_energy call
+    import knitting_core as _kc
+    dbg = _kc._debug_sim_geometry
+    if dbg is not None:
+        renderer.set_debug_lines(dbg[0], dbg[1])
+    
+    dbg_cols = getattr(_kc, "_debug_collisions", None)
+    if dbg_cols is not None:
+        renderer.set_collision_pts(dbg_cols)
 
     # Display FBO
     drawn_rect = draw_fitted_texture(
@@ -1013,7 +1048,8 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_t = np.array(state.model_t, dtype=np.float32)
             if state.mode == 'spline':
                 state.bbox_start_ctrl_rows = [row.copy() for row in state.ctrl_rows]
-                state.bbox_start_period_offset = np.array(state.period_offset, dtype=np.float32).copy()
+                state.bbox_start_period_offset_x = np.array(state.period_offset_x, dtype=np.float32).copy()
+                state.bbox_start_period_offset_y = np.array(state.period_offset_y, dtype=np.float32).copy()
             else:
                 state.bbox_start_model_scale = np.array(state.model_scale, dtype=np.float32)
             suppress_mesh_click = True
@@ -1076,8 +1112,10 @@ def draw_viewport(state, renderer, ref_tex, window):
                     else:
                         pivot = np.asarray(state.mesh_center, dtype=np.float32)
                     state.ctrl_rows = [pivot + (row - pivot) * scale_vec for row in base_rows]
-                    if state.get('bbox_start_period_offset') is not None:
-                        state.period_offset = (state.bbox_start_period_offset * scale_vec).astype(np.float32)
+                    if state.get('bbox_start_period_offset_x') is not None:
+                        state.period_offset_x = (state.bbox_start_period_offset_x * scale_vec).astype(np.float32)
+                    if state.get('bbox_start_period_offset_y') is not None:
+                        state.period_offset_y = (state.bbox_start_period_offset_y * scale_vec).astype(np.float32)
                     state._rebuild_spline_points()
                     state.rebuild_spline_mesh()
             else:
@@ -1099,7 +1137,8 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.bbox_start_t = None
             state.bbox_start_model_scale = None
             state.bbox_start_ctrl_rows = None
-            state.bbox_start_period_offset = None
+            state.bbox_start_period_offset_x = None
+            state.bbox_start_period_offset_y = None
 
         state.hover_mesh_idx = renderer.pick_mesh_index(model_mat, state.camera, disp_w, disp_h, lx, ly, visible_rows=state.row_visible)
 
@@ -1155,7 +1194,6 @@ def draw_viewport(state, renderer, ref_tex, window):
         return -1
 
     def local_radius_value(flat_idx):
-        state._ensure_spline_radius_rows()
         row_idx = np.searchsorted(state._row_starts, flat_idx, side="right") - 1
         if not (0 <= row_idx < len(state.spline_radius_rows)):
             return float(state.params[state._pidx['radius']])
@@ -1371,10 +1409,9 @@ def draw_viewport(state, renderer, ref_tex, window):
                 state.spline_keyboard_edit_active = False
 
         state.model_rot_dragging = False
-        if not (
-            not alignment_locked
-            and imgui.get_io().key_shift
-            and glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+        if (
+            glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.RELEASE
+            and glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.RELEASE
         ):
             state.model_drag_undo_active = False
 

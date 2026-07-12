@@ -146,6 +146,44 @@ void main() {
 }
 """
 
+LINE_VERT = """
+#version 330
+in  vec3 in_pos;
+uniform mat4 mvp;
+void main() {
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+LINE_FRAG = """
+#version 330
+uniform vec3 line_color;
+out vec4 f_color;
+void main() {
+    f_color = vec4(line_color, 1.0);
+}
+"""
+
+COLLISION_PT_VERT = """
+#version 330
+in  vec3 in_pos;
+uniform mat4 mvp;
+void main() {
+    gl_Position = mvp * vec4(in_pos, 1.0);
+    gl_PointSize = 18.0;
+}
+"""
+
+COLLISION_PT_FRAG = """
+#version 330
+out vec4 f_color;
+void main() {
+    vec2 c = gl_PointCoord * 2.0 - 1.0;
+    if (dot(c, c) > 1.0) discard;
+    f_color = vec4(1.0, 0.0, 0.0, 1.0); // Bright Red
+}
+"""
+
 PT_VERT = """
 #version 330
 in  vec3 in_pos;
@@ -510,6 +548,12 @@ class MeshRenderer:
         self.mesh_pick_data = []
         self.pt_vao = None
         self.n_pts  = 0
+        self.line_prog = ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
+        self.line_vao  = None
+        self.n_lines   = 0
+        self.collision_pt_prog = ctx.program(vertex_shader=COLLISION_PT_VERT, fragment_shader=COLLISION_PT_FRAG)
+        self.collision_pt_vao  = None
+        self.n_collision_pts   = 0
         self.resize(vp_w, vp_h)
 
     @property
@@ -629,6 +673,33 @@ class MeshRenderer:
                 best_idx = mesh_idx
 
         return best_idx
+
+    def set_debug_lines(self, V, edges):
+        """Upload the raw centerline geometry (V, edges) for the debug overlay."""
+        if self.line_vao is not None:
+            self.line_vao.release()
+            self.line_vao = None
+        self.n_lines = 0
+        if V is None or edges is None or len(V) == 0 or len(edges) == 0:
+            return
+        # Build a flat array of line-segment endpoints (2 verts per edge)
+        seg_verts = np.asarray(V, dtype=np.float32)[edges.flatten()]
+        vbo = self.ctx.buffer(seg_verts.tobytes())
+        self.line_vao = self.ctx.vertex_array(self.line_prog, [(vbo, '3f', 'in_pos')])
+        self.n_lines  = len(edges) * 2
+
+    def set_collision_pts(self, pts):
+        """Upload the collision points (pts: ndarray(N,3)) for the debug overlay."""
+        if self.collision_pt_vao is not None:
+            self.collision_pt_vao.release()
+            self.collision_pt_vao = None
+        self.n_collision_pts = 0
+        if pts is None or len(pts) == 0:
+            return
+        pts = np.asarray(pts, dtype=np.float32)
+        vbo = self.ctx.buffer(pts.tobytes())
+        self.collision_pt_vao = self.ctx.vertex_array(self.collision_pt_prog, [(vbo, '3f', 'in_pos')])
+        self.n_collision_pts  = len(pts)
 
     def set_ctrl_pts(self, flat_pts):
         if self.pt_vao:
@@ -811,6 +882,22 @@ class MeshRenderer:
             if 'n_real' in self.pt_prog:
                 self.pt_prog['n_real'].value   = n_real_pts if n_real_pts >= 0 else self.n_pts
             self.pt_vao.render(moderngl.POINTS, vertices=self.n_pts)
+
+        # ── Debug: draw raw sim centerline geometry (V + edges from eval_energy) ──
+        if self.line_vao is not None and self.n_lines > 0:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.CULL_FACE)
+            self.line_prog['mvp'].write(mvp.T.tobytes())
+            self.line_prog['line_color'].value = (0.0, 1.0, 0.8)  # bright cyan
+            self.line_vao.render(moderngl.LINES, vertices=self.n_lines)
+
+        # ── Debug: draw collision points ──
+        if self.collision_pt_vao is not None and self.n_collision_pts > 0:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.CULL_FACE)
+            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+            self.collision_pt_prog['mvp'].write(mvp.T.tobytes())
+            self.collision_pt_vao.render(moderngl.POINTS, vertices=self.n_collision_pts)
 
         self.ctx.screen.use()
 
