@@ -84,6 +84,7 @@ class AppState:
             'app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
             'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
             'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols', 'scanner_capture_mode',
+            'scanner_camera_workflow', 'scanner_single_row', 'scanner_single_col', 'scanner_single_angle', 'scanner_camera_zoom',
         )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
@@ -128,6 +129,11 @@ class AppState:
             'scanner_pattern_repeat_rows': 3,
             'scanner_pattern_repeat_cols': 3,
             'scanner_capture_mode': 'natural',
+            'scanner_camera_workflow': 'path',
+            'scanner_single_row': 1,
+            'scanner_single_col': 1,
+            'scanner_single_angle': 1,
+            'scanner_camera_zoom': 1.0,
             'ui_theme': 'dark',
             'loop_heights': np.full((3, config_data['knit_parameters']['bitmap_loops']), 3.0, dtype=np.float32),
             'mesh_center': np.zeros(3, dtype=np.float32),

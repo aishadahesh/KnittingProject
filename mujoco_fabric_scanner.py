@@ -981,6 +981,7 @@ def render_camera_image(
     target_pose: np.ndarray | None = None,
     color_picker_mode: bool = False,
     capture_mode: str = CAMERA_CAPTURE_NATURAL,
+    camera_zoom: float = 1.0,
 ) -> Image.Image:
     width_px, height_px = CAMERA_IMAGE_SIZE
     station = plan.mapped_stations[station_id]
@@ -1051,12 +1052,14 @@ def render_camera_image(
     up = np.cross(right, forward)
     up = up / max(float(np.linalg.norm(up)), 1e-8)
 
+    camera_zoom = max(0.20, float(camera_zoom))
     if focused_capture:
         batch_span = math.hypot(cell_w, cell_l)
         fov_y = 2.0 * math.atan((batch_span * 0.58) / max(camera_standoff, 1e-6))
         fov_y = float(np.clip(fov_y, math.radians(36.0), math.radians(68.0)))
     else:
         fov_y = math.radians(74.0)
+    fov_y = float(np.clip(fov_y / camera_zoom, math.radians(12.0), math.radians(86.0)))
     focal = (height_px * 0.5) / math.tan(fov_y * 0.5)
     near = 0.004
 
@@ -1191,6 +1194,7 @@ def save_camera_image(
     target_pose: np.ndarray | None = None,
     color_picker_mode: bool = False,
     capture_mode: str = CAMERA_CAPTURE_NATURAL,
+    camera_zoom: float = 1.0,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     img = render_camera_image(
@@ -1202,6 +1206,7 @@ def save_camera_image(
         target_pose=target_pose,
         color_picker_mode=color_picker_mode,
         capture_mode=capture_mode,
+        camera_zoom=camera_zoom,
     )
     active_row, active_col = plan.station_cells[station_id]
     clean_view = view_name.replace(" ", "_")
