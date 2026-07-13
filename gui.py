@@ -14,6 +14,7 @@ import moderngl
 import tkinter as tk
 from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
+from PIL import Image
 
 from rendering import draw_fitted_texture, transform_points
 from knitting_core import build_parametric_control_rows
@@ -194,8 +195,8 @@ def _scanner_pattern_dimensions(state):
 
 
 def _scanner_pattern_repeats(state):
-    repeat_rows = max(1, int(state.get('scanner_pattern_repeat_rows', 3)))
-    repeat_cols = max(1, int(state.get('scanner_pattern_repeat_cols', 3)))
+    repeat_rows = int(np.clip(int(state.get('scanner_pattern_repeat_rows', 3)), 1, 24))
+    repeat_cols = int(np.clip(int(state.get('scanner_pattern_repeat_cols', 3)), 1, 32))
     return repeat_rows, repeat_cols
 
 
@@ -210,6 +211,39 @@ def _normalize_scanner_curves(curves):
     span = np.maximum(max_xy - min_xy, 1e-6)
     scale = 1.08 / float(max(span[0], span[1]))
     return [((curve - center) * scale).astype(np.float32) for curve in valid]
+
+
+def _capture_scan_preview_image(renderer):
+    tex = getattr(renderer, "color_tex", None)
+    if tex is None:
+        return None
+    try:
+        raw = tex.read(alignment=1)
+    except Exception:
+        return None
+    width, height = int(renderer.vp_w), int(renderer.vp_h)
+    if width <= 1 or height <= 1:
+        return None
+    rgba = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))
+    rgb = np.flipud(rgba[:, :, :3])
+    edge = np.concatenate([
+        rgb[:8, :, :].reshape(-1, 3),
+        rgb[-8:, :, :].reshape(-1, 3),
+        rgb[:, :8, :].reshape(-1, 3),
+        rgb[:, -8:, :].reshape(-1, 3),
+    ])
+    bg = np.median(edge, axis=0)
+    diff = np.linalg.norm(rgb.astype(np.float32) - bg.astype(np.float32), axis=2)
+    mask = (diff > 20.0) | (rgb.max(axis=2) > 70)
+    ys, xs = np.where(mask)
+    if xs.size < 32 or ys.size < 32:
+        return Image.fromarray(rgb.copy(), "RGB")
+    pad = 12
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(width, int(xs.max()) + pad + 1)
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(height, int(ys.max()) + pad + 1)
+    return Image.fromarray(rgb[y0:y1, x0:x1].copy(), "RGB")
 
 
 def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density, repeat_rows=3, repeat_cols=3):
@@ -263,7 +297,7 @@ class EmbeddedMujocoScanner:
     CAMERA_PREVIEW_INTERVAL = 0.18
     MAX_EXECUTED_TRAIL_POINTS = 300
 
-    def __init__(self, state, gl_ctx, window=None, width=512, height=384):
+    def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None):
         import mujoco_fabric_scanner as scanner
 
         self.scanner = scanner
@@ -314,7 +348,12 @@ class EmbeddedMujocoScanner:
             pattern_repeat_cols=int(repeat_cols),
             color_picker_mode=self.color_picker_mode,
         )
-        self.plan = scanner.densify_plan_for_robot(scanner.build_plan(self.args))
+        # The embedded viewer only needs the true scan targets. Keeping the
+        # intermediate densified path for the GUI makes scanning much slower
+        # without improving camera-capture accuracy.
+        self.plan = scanner.build_plan(self.args)
+        if preview_image is not None:
+            self.plan.rendered_fabric_image = preview_image.convert("RGB")
         self.mujoco, self.model, self.data, self.site_id = scanner.load_ur5e_model_data()
         self.mj_context = None
         self.renderer = None
@@ -498,6 +537,25 @@ class EmbeddedMujocoScanner:
             self.executed.append(point.copy())
             if len(self.executed) > self.MAX_EXECUTED_TRAIL_POINTS:
                 self.executed = self.executed[-self.MAX_EXECUTED_TRAIL_POINTS:]
+
+    def _adaptive_ik_substeps(self, target_pose, single_target=False):
+        tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
+        err_pos, err_rot = self.scanner.pose_errors(tcp, target_pose)
+        speed = max(float(getattr(self.args, "speed", 1.0)), 0.05)
+        if single_target:
+            speed = max(speed, 1.25)
+        if err_pos > 0.08 or err_rot > 0.55:
+            return min(36, max(8, int(self.scanner.IK_SUBSTEPS * speed * 5.0)))
+        if err_pos > 0.025 or err_rot > 0.22:
+            return min(24, max(5, int(self.scanner.IK_SUBSTEPS * speed * 3.2)))
+        return min(12, max(2, int(self.scanner.IK_SUBSTEPS * speed * 1.8)))
+
+    def _step_toward_pose(self, target_pose, single_target=False):
+        for _ in range(self._adaptive_ik_substeps(target_pose, single_target=single_target)):
+            self.scanner.step_ik(self.mujoco, self.model, self.data, self.site_id, target_pose)
+        tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
+        self._append_executed_point(tcp[:3])
+        return tcp
 
     def _scan_indices_for_station(self, station_id):
         non_scan = getattr(self.scanner, "NON_SCAN_VIEW_NAMES", set())
@@ -696,10 +754,7 @@ class EmbeddedMujocoScanner:
 
         pose = self.plan.poses[self.target_index]
         if self.single_capture_mode and self.paused and self.single_target_active:
-            for _ in range(min(6, max(1, int(self.scanner.IK_SUBSTEPS * 0.8)))):
-                self.scanner.step_ik(self.mujoco, self.model, self.data, self.site_id, pose)
-            tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
-            self._append_executed_point(tcp[:3])
+            tcp = self._step_toward_pose(pose, single_target=True)
             err_pos, err_rot = self.scanner.pose_errors(tcp, pose)
             station = int(getattr(self, "single_target_station", self.plan.station_ids[self.target_index]))
             active_row, active_col = self.plan.station_cells[station]
@@ -709,18 +764,15 @@ class EmbeddedMujocoScanner:
             else:
                 self.status = f"Moving to target row {active_row + 1}, col {active_col + 1} | pos err {err_pos:.3f} m"
         elif self.running and not self.paused:
-            substeps = min(6, max(1, int(self.scanner.IK_SUBSTEPS * max(float(self.args.speed), 0.05))))
-            for _ in range(substeps):
-                self.scanner.step_ik(self.mujoco, self.model, self.data, self.site_id, pose)
-            tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
-            self._append_executed_point(tcp[:3])
+            tcp = self._step_toward_pose(pose)
 
             err_pos, err_rot = self.scanner.pose_errors(tcp, pose)
             now = time.monotonic()
             if err_pos < self.scanner.TARGET_TOL and err_rot < self.scanner.TARGET_ROT_TOL:
-                if self.dwell_until == 0.0:
-                    self.dwell_until = now + max(float(self.args.dwell), 0.0)
-                elif now >= self.dwell_until:
+                dwell = max(float(self.args.dwell), 0.0)
+                if dwell <= 0.0 or self.dwell_until == 0.0:
+                    self.dwell_until = now + dwell
+                if dwell <= 0.0 or now >= self.dwell_until:
                     station = self.plan.station_ids[self.target_index]
                     if self.scanner.should_save_scan_image(
                         self.args,
@@ -947,7 +999,12 @@ def draw_sidebar(state, renderer, window=None):
                 previous = state.get('embedded_scanner')
                 if previous is not None:
                     previous.close()
-                state.embedded_scanner = EmbeddedMujocoScanner(state, renderer.ctx, window)
+                state.embedded_scanner = EmbeddedMujocoScanner(
+                    state,
+                    renderer.ctx,
+                    window,
+                    preview_image=_capture_scan_preview_image(renderer),
+                )
                 state.scanner_status = "Embedded MuJoCo scanner running"
             except Exception as exc:
                 state.embedded_scanner = None
@@ -1020,7 +1077,12 @@ def draw_sidebar(state, renderer, window=None):
         embedded = state.get('embedded_scanner')
         if embedded is None:
             try:
-                embedded = EmbeddedMujocoScanner(state, renderer.ctx, window)
+                embedded = EmbeddedMujocoScanner(
+                    state,
+                    renderer.ctx,
+                    window,
+                    preview_image=_capture_scan_preview_image(renderer),
+                )
                 state.embedded_scanner = embedded
             except Exception as exc:
                 state.embedded_scanner = None
@@ -1380,8 +1442,8 @@ def draw_sidebar(state, renderer, window=None):
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         changed_pr, new_pr = imgui.slider_int("Pattern bitmap rows##scanner_pattern_rows", pattern_rows, 2, 10)
         changed_pc, new_pc = imgui.slider_int("Pattern bitmap cols##scanner_pattern_cols", pattern_cols, 2, 12)
-        changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 8)
-        changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 8)
+        changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 24)
+        changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 32)
         changed_density, new_density = imgui.slider_float(
             "Active stitch probability##scanner_density",
             float(state.get('scanner_pattern_density', 0.62)),
@@ -1490,7 +1552,7 @@ def draw_sidebar(state, renderer, window=None):
             changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
             if changed_mode:
                 state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
-        changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 2.0, "%.2f")
+        changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 8.0, "%.2f")
         if changed_speed:
             state.scanner_speed = float(new_speed)
         if not single_workflow:
