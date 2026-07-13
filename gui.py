@@ -195,8 +195,8 @@ def _scanner_pattern_dimensions(state):
 
 
 def _scanner_pattern_repeats(state):
-    repeat_rows = int(np.clip(int(state.get('scanner_pattern_repeat_rows', 3)), 1, 24))
-    repeat_cols = int(np.clip(int(state.get('scanner_pattern_repeat_cols', 3)), 1, 32))
+    repeat_rows = int(np.clip(int(state.get('scanner_pattern_repeat_rows', 3)), 1, 64))
+    repeat_cols = int(np.clip(int(state.get('scanner_pattern_repeat_cols', 3)), 1, 64))
     return repeat_rows, repeat_cols
 
 
@@ -419,6 +419,8 @@ class EmbeddedMujocoScanner:
         self.saved_targets = set()
         self.saved_stations = set()
         self.saved_count = 0
+        self.capture_records = []
+        self.analysis_results = None
         self.running = True
         self.paused = False
         self.latest_camera_image = None
@@ -511,6 +513,7 @@ class EmbeddedMujocoScanner:
             f"scan_{target_index + 1:04d}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_"
             f"station_{station_id + 1:03d}_{clean_view}.png"
         )
+        self._record_capture_analysis(image, path, target_index, station_id)
         self._queue_image_save(image, path)
         return path
 
@@ -530,6 +533,94 @@ class EmbeddedMujocoScanner:
 
     def _queue_image_save(self, image, path):
         self._save_queue.put((image.copy(), Path(path)))
+
+    @staticmethod
+    def _average_visible_rgb(image):
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+        if rgb.ndim != 3 or rgb.shape[0] <= 0 or rgb.shape[1] <= 0:
+            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        # Ignore the black label strip and the scanner background. The goal is
+        # perceived fabric color, not UI text/background color.
+        if rgb.shape[0] > 70:
+            rgb = rgb[58:, :, :]
+        brightness = rgb.max(axis=2)
+        mask = brightness > 35.0
+        if int(mask.sum()) < 16:
+            mask = brightness > 8.0
+        if int(mask.sum()) < 1:
+            return rgb.reshape(-1, 3).mean(axis=0)
+        return rgb[mask].mean(axis=0)
+
+    def _record_capture_analysis(self, image, path, target_index, station_id):
+        row, col = self.plan.station_cells[station_id]
+        view_name = str(self.plan.view_names[target_index])
+        avg = self._average_visible_rgb(image)
+        self.capture_records.append({
+            "row": int(row),
+            "col": int(col),
+            "station": int(station_id),
+            "target_index": int(target_index),
+            "angle": view_name,
+            "path": str(path),
+            "rgb": [float(v) for v in avg],
+        })
+        self.analysis_results = None
+
+    def analyze_captures(self, save_outputs=True):
+        if not self.capture_records:
+            self.analysis_results = {"cells": [], "summary": "No captured images to analyze."}
+            return self.analysis_results
+        grouped = {}
+        for record in self.capture_records:
+            key = (int(record["row"]), int(record["col"]))
+            grouped.setdefault(key, []).append(record)
+
+        cells = []
+        for (row, col), records in sorted(grouped.items()):
+            all_rgb = np.asarray([record["rgb"] for record in records], dtype=np.float32)
+            overall = all_rgb.mean(axis=0)
+            angle_results = []
+            for angle in sorted({str(record["angle"]) for record in records}):
+                angle_rgb = np.asarray([record["rgb"] for record in records if str(record["angle"]) == angle], dtype=np.float32)
+                angle_results.append({
+                    "angle": angle,
+                    "rgb": [float(v) for v in angle_rgb.mean(axis=0)],
+                    "count": int(len(angle_rgb)),
+                })
+            cells.append({
+                "row": int(row),
+                "col": int(col),
+                "overall_rgb": [float(v) for v in overall],
+                "count": int(len(records)),
+                "angles": angle_results,
+            })
+
+        result = {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "image_count": int(len(self.capture_records)),
+            "cells": cells,
+        }
+        if save_outputs:
+            output_dir = Path(self.args.image_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            json_path = output_dir / "per_sample_rgb_analysis.json"
+            with json_path.open("w", encoding="utf-8") as handle:
+                json.dump(result, handle, indent=2)
+            swatch_w, swatch_h = 72, 54
+            for cell in cells:
+                row = int(cell["row"])
+                col = int(cell["col"])
+                color = tuple(int(np.clip(v, 0, 255)) for v in cell["overall_rgb"])
+                Image.new("RGB", (swatch_w, swatch_h), color).save(output_dir / f"avg_rgb_row_{row + 1:02d}_col_{col + 1:02d}.png")
+                for angle_result in cell["angles"]:
+                    angle_name = str(angle_result["angle"]).replace(" ", "_").replace("/", "_")
+                    angle_color = tuple(int(np.clip(v, 0, 255)) for v in angle_result["rgb"])
+                    Image.new("RGB", (swatch_w, swatch_h), angle_color).save(
+                        output_dir / f"avg_rgb_row_{row + 1:02d}_col_{col + 1:02d}_{angle_name}.png"
+                    )
+            result["json_path"] = str(json_path)
+        self.analysis_results = result
+        return result
 
     def _append_executed_point(self, point):
         point = np.asarray(point, dtype=float)
@@ -622,6 +713,7 @@ class EmbeddedMujocoScanner:
             f"station_{station_id + 1:03d}_{clean_view}.png"
         )
         image.save(path)
+        self._record_capture_analysis(image, path, target_index, station_id)
         self.saved_count += 1
         self.status = f"Captured single target: {path.name}"
         return path
@@ -1442,8 +1534,8 @@ def draw_sidebar(state, renderer, window=None):
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         changed_pr, new_pr = imgui.slider_int("Pattern bitmap rows##scanner_pattern_rows", pattern_rows, 2, 10)
         changed_pc, new_pc = imgui.slider_int("Pattern bitmap cols##scanner_pattern_cols", pattern_cols, 2, 12)
-        changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 24)
-        changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 32)
+        changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
+        changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
         changed_density, new_density = imgui.slider_float(
             "Active stitch probability##scanner_density",
             float(state.get('scanner_pattern_density', 0.62)),
@@ -1713,6 +1805,107 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_preview_grid_enabled = True
             state.rebuild_spline_mesh(preserve_model_placement=False)
             state.scanner_status = "Scan layout reset"
+        imgui.separator()
+        imgui.text("Per-sample RGB analysis")
+        analysis_ready = embedded is not None and bool(getattr(embedded, "capture_records", []))
+        if not analysis_ready:
+            imgui.text_disabled("Capture scanner images first.")
+        if not analysis_ready:
+            imgui.begin_disabled()
+        if imgui.button("Analyze captured RGB##scanner_analyze_rgb", (-1, 0)):
+            result = embedded.analyze_captures(save_outputs=True)
+            if result.get("cells"):
+                state.scanner_status = f"RGB analysis saved for {len(result['cells'])} mini-squares"
+            else:
+                state.scanner_status = result.get("summary", "No RGB analysis results")
+        if not analysis_ready:
+            imgui.end_disabled()
+        result = getattr(embedded, "analysis_results", None) if embedded is not None else None
+        if result and result.get("cells"):
+            imgui.text(f"Images analyzed: {int(result.get('image_count', 0))}")
+            json_path = result.get("json_path")
+            if json_path:
+                imgui.text_disabled(f"Saved: {Path(json_path).name}")
+            cells_by_pos = {
+                (int(cell["row"]), int(cell["col"])): cell
+                for cell in result["cells"]
+            }
+            rows = max(1, int(state.scanner_rows))
+            cols = max(1, int(state.scanner_cols))
+            selected = np.asarray(state.get('scanner_analysis_selected_cell', state.get('scanner_selected_cell', [0, 0])), dtype=np.int32).reshape(-1)
+            selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+            selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+            if (selected_r, selected_c) not in cells_by_pos and cells_by_pos:
+                selected_r, selected_c = next(iter(cells_by_pos.keys()))
+            state.scanner_analysis_selected_cell = [selected_r, selected_c]
+
+            imgui.text("Average color grid")
+            cell_size = max(24.0, min(48.0, (imgui.get_content_region_avail().x - max(0, cols - 1) * 4.0) / max(cols, 1)))
+            imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(4, 4))
+            for r in range(rows):
+                for c in range(cols):
+                    cell = cells_by_pos.get((r, c))
+                    if cell is None:
+                        rgba = (0.10, 0.10, 0.10, 1.0)
+                    else:
+                        rgb = [float(v) for v in cell["overall_rgb"]]
+                        rgba = (
+                            np.clip(rgb[0] / 255.0, 0.0, 1.0),
+                            np.clip(rgb[1] / 255.0, 0.0, 1.0),
+                            np.clip(rgb[2] / 255.0, 0.0, 1.0),
+                            1.0,
+                        )
+                    imgui.push_style_color(imgui.Col_.button, rgba)
+                    imgui.push_style_color(imgui.Col_.button_hovered, (
+                        min(float(rgba[0]) + 0.12, 1.0),
+                        min(float(rgba[1]) + 0.12, 1.0),
+                        min(float(rgba[2]) + 0.12, 1.0),
+                        1.0,
+                    ))
+                    border_selected = r == selected_r and c == selected_c
+                    if border_selected:
+                        imgui.push_style_color(imgui.Col_.border, (1.0, 0.78, 0.15, 1.0))
+                        imgui.push_style_var(imgui.StyleVar_.frame_border_size, 2.0)
+                    clicked = imgui.button(f"##rgb_result_{r}_{c}", imgui.ImVec2(cell_size, cell_size))
+                    if border_selected:
+                        imgui.pop_style_var()
+                        imgui.pop_style_color()
+                    imgui.pop_style_color(2)
+                    if clicked and cell is not None:
+                        selected_r, selected_c = r, c
+                        state.scanner_analysis_selected_cell = [r, c]
+                    if c < cols - 1:
+                        imgui.same_line()
+                if r < rows - 1:
+                    imgui.spacing()
+            imgui.pop_style_var()
+
+            selected_cell = cells_by_pos.get((selected_r, selected_c))
+            if selected_cell is not None:
+                rgb = [float(v) for v in selected_cell["overall_rgb"]]
+                imgui.separator()
+                imgui.text(f"Selected mini-square: R{selected_r + 1} C{selected_c + 1}")
+                imgui.color_button(
+                    "##selected_overall_rgb",
+                    (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
+                    imgui.ColorEditFlags_.no_tooltip,
+                    imgui.ImVec2(46, 28),
+                )
+                imgui.same_line()
+                imgui.text(f"All views average RGB: {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f}")
+                imgui.text("Per-angle colors")
+                for angle_index, angle_result in enumerate(selected_cell["angles"]):
+                    angle_rgb = [float(v) for v in angle_result["rgb"]]
+                    imgui.color_button(
+                        f"##angle_rgb_{selected_r}_{selected_c}_{angle_index}",
+                        (angle_rgb[0] / 255.0, angle_rgb[1] / 255.0, angle_rgb[2] / 255.0, 1.0),
+                        imgui.ColorEditFlags_.no_tooltip,
+                        imgui.ImVec2(34, 22),
+                    )
+                    imgui.same_line()
+                    imgui.text(
+                        f"{angle_result['angle']}: {angle_rgb[0]:.0f}, {angle_rgb[1]:.0f}, {angle_rgb[2]:.0f}"
+                    )
         imgui.text_wrapped(str(state.scanner_status))
 
     embedded = state.get('embedded_scanner')
