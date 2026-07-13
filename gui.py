@@ -5,6 +5,8 @@ import glfw
 import subprocess
 import sys
 import time
+import queue
+import threading
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -258,6 +260,9 @@ def _generate_scanner_random_patterns(state):
 
 
 class EmbeddedMujocoScanner:
+    CAMERA_PREVIEW_INTERVAL = 0.18
+    MAX_EXECUTED_TRAIL_POINTS = 300
+
     def __init__(self, state, gl_ctx, window=None, width=512, height=384):
         import mujoco_fabric_scanner as scanner
 
@@ -272,7 +277,7 @@ class EmbeddedMujocoScanner:
         self.camera_preview_height = int(scanner.CAMERA_IMAGE_SIZE[1])
         self.color_picker_mode = str(state.get('scanner_color_mode', 'realistic')) == 'picker'
         palette = _scanner_base_palette(state)
-        cell_sets = _scanner_shared_cell_color_sets(state)
+        cell_sets = _ensure_scanner_cell_color_sets(state) if self.color_picker_mode else _scanner_shared_cell_color_sets(state)
         cell_model_curves = _generate_scanner_random_patterns(state)
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
@@ -381,6 +386,13 @@ class EmbeddedMujocoScanner:
         self.single_capture_mode = False
         self.single_target_active = False
         self.single_target_station = 0
+        self._last_camera_preview_time = 0.0
+        self._camera_preview_dirty = True
+        self._last_camera_preview_key = None
+        self._save_queue = queue.Queue()
+        self._save_stop = threading.Event()
+        self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
+        self._save_thread.start()
         self.status = f"Ready: {len(self.plan.poses)} scan poses"
 
     def pause(self):
@@ -435,19 +447,57 @@ class EmbeddedMujocoScanner:
 
     def _save_gripper_camera_image(self, tcp_pos, target_index, station_id):
         output_dir = Path(self.args.image_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
         target_pose = self.plan.poses[min(target_index, len(self.plan.poses) - 1)]
-        return self.scanner.save_camera_image(
+        capture_mode = str(getattr(self.args, "capture_mode", "natural"))
+        image = self.scanner.render_camera_image(
             self.plan,
             tcp_pos[:3],
-            output_dir,
             target_index,
             station_id,
             self.plan.view_names[target_index],
             target_pose=target_pose,
             color_picker_mode=self.color_picker_mode,
-            capture_mode=str(getattr(self.args, "capture_mode", "natural")),
+            capture_mode=capture_mode,
             camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
         )
+        self._upload_camera_preview(image)
+        self.latest_camera_image = image
+        self._last_camera_preview_time = time.monotonic()
+        self._camera_preview_dirty = False
+        active_row, active_col = self.plan.station_cells[station_id]
+        clean_view = self.plan.view_names[target_index].replace(" ", "_")
+        clean_mode = "focused_batch" if capture_mode == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
+        path = output_dir / (
+            f"scan_{target_index + 1:04d}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_"
+            f"station_{station_id + 1:03d}_{clean_view}.png"
+        )
+        self._queue_image_save(image, path)
+        return path
+
+    def _save_worker(self):
+        while not self._save_stop.is_set() or not self._save_queue.empty():
+            try:
+                image, path = self._save_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                image.save(path)
+            except Exception as exc:
+                self.status = f"Could not save scan image: {exc}"
+            finally:
+                self._save_queue.task_done()
+
+    def _queue_image_save(self, image, path):
+        self._save_queue.put((image.copy(), Path(path)))
+
+    def _append_executed_point(self, point):
+        point = np.asarray(point, dtype=float)
+        if not self.executed or float(np.linalg.norm(np.asarray(self.executed[-1]) - point)) > 0.004:
+            self.executed.append(point.copy())
+            if len(self.executed) > self.MAX_EXECUTED_TRAIL_POINTS:
+                self.executed = self.executed[-self.MAX_EXECUTED_TRAIL_POINTS:]
 
     def _scan_indices_for_station(self, station_id):
         non_scan = getattr(self.scanner, "NON_SCAN_VIEW_NAMES", set())
@@ -521,6 +571,13 @@ class EmbeddedMujocoScanner:
     def close(self):
         self.running = False
         self.paused = False
+        try:
+            if hasattr(self, '_save_stop'):
+                self._save_stop.set()
+            if hasattr(self, '_save_thread') and self._save_thread.is_alive():
+                self._save_thread.join(timeout=1.5)
+        except Exception:
+            pass
         try:
             if self.window is not None:
                 glfw.make_context_current(self.window)
@@ -601,6 +658,16 @@ class EmbeddedMujocoScanner:
             self.camera_texture.write(rgba.tobytes())
 
     def _render_camera_preview(self, tcp_pose, target_index, target_pose):
+        preview_key = (
+            int(target_index),
+            str(getattr(self.args, "capture_mode", "natural")),
+            round(float(getattr(self.args, "camera_zoom", 1.0)), 3),
+            bool(self.color_picker_mode),
+        )
+        now = time.monotonic()
+        force = self._camera_preview_dirty or preview_key != self._last_camera_preview_key or self.single_capture_mode
+        if not force and self.latest_camera_image is not None and now - self._last_camera_preview_time < self.CAMERA_PREVIEW_INTERVAL:
+            return
         station = self.plan.station_ids[min(target_index, len(self.plan.station_ids) - 1)]
         image = self.scanner.render_camera_image(
             self.plan,
@@ -615,6 +682,9 @@ class EmbeddedMujocoScanner:
         )
         self._upload_camera_preview(image)
         self.latest_camera_image = image
+        self._last_camera_preview_key = preview_key
+        self._last_camera_preview_time = now
+        self._camera_preview_dirty = False
 
     def update(self):
         if self.target_index >= len(self.plan.poses):
@@ -629,7 +699,7 @@ class EmbeddedMujocoScanner:
             for _ in range(min(6, max(1, int(self.scanner.IK_SUBSTEPS * 0.8)))):
                 self.scanner.step_ik(self.mujoco, self.model, self.data, self.site_id, pose)
             tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
-            self.executed.append(tcp[:3].copy())
+            self._append_executed_point(tcp[:3])
             err_pos, err_rot = self.scanner.pose_errors(tcp, pose)
             station = int(getattr(self, "single_target_station", self.plan.station_ids[self.target_index]))
             active_row, active_col = self.plan.station_cells[station]
@@ -643,7 +713,7 @@ class EmbeddedMujocoScanner:
             for _ in range(substeps):
                 self.scanner.step_ik(self.mujoco, self.model, self.data, self.site_id, pose)
             tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
-            self.executed.append(tcp[:3].copy())
+            self._append_executed_point(tcp[:3])
 
             err_pos, err_rot = self.scanner.pose_errors(tcp, pose)
             now = time.monotonic()
@@ -668,7 +738,9 @@ class EmbeddedMujocoScanner:
                             station,
                         )
                         self.saved_count += 1
+                        self._camera_preview_dirty = True
                     self.target_index += 1
+                    self._camera_preview_dirty = True
                     self.dwell_until = 0.0
 
         self._render_frame()
@@ -903,7 +975,7 @@ def draw_sidebar(state, renderer, window=None):
                 "--image-every", str(state.scanner_image_every),
                 "--capture-mode", str(state.get('scanner_capture_mode', 'natural')),
             ])
-        cell_color_sets = _scanner_shared_cell_color_sets(state)
+        cell_color_sets = _ensure_scanner_cell_color_sets(state) if str(state.get('scanner_color_mode', 'realistic')) == 'picker' else _scanner_shared_cell_color_sets(state)
         cmd.extend(["--cell-colors-json", json.dumps(cell_color_sets)])
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
@@ -1383,20 +1455,49 @@ def draw_sidebar(state, renderer, window=None):
             )
             if color_idx < min(len(palette), 8) - 1:
                 imgui.same_line()
-        mode_is_robot = str(state.scanner_execution_mode) == "robot"
-        changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
-        if changed_mode:
-            state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
-        changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 2.0, "%.2f")
-        changed_dwell, new_dwell = imgui.slider_float("Dwell per view (s)##scanner_dwell", float(state.scanner_dwell), 0.0, 2.0, "%.2f")
-        if changed_speed:
-            state.scanner_speed = float(new_speed)
-        if changed_dwell:
-            state.scanner_dwell = float(new_dwell)
-        _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
+        if not realistic_mode:
+            cell_sets = _ensure_scanner_cell_color_sets(state)
+            rows = max(1, int(state.scanner_rows))
+            cols = max(1, int(state.scanner_cols))
+            selected = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
+            selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+            selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+            selected_index = selected_r * cols + selected_c
+            selected_color = cell_sets[selected_index][0]
+            imgui.text(f"Selected mini-grid: R{selected_r + 1} C{selected_c + 1}")
+            changed_batch_color, batch_color = imgui.color_edit3(
+                "Mini-grid color##scanner_selected_batch_color",
+                (float(selected_color[0]), float(selected_color[1]), float(selected_color[2])),
+            )
+            if changed_batch_color:
+                new_rgba = [float(batch_color[0]), float(batch_color[1]), float(batch_color[2]), 1.0]
+                base_count = max(1, len(_scanner_base_palette(state)))
+                state.scanner_cell_color_sets[selected_index] = [list(new_rgba) for _ in range(base_count)]
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    try:
+                        embedded.close()
+                    except Exception:
+                        pass
+                    state.embedded_scanner = None
+                state.scanner_status = f"Updated mini-grid R{selected_r + 1} C{selected_c + 1} color"
+                state.rebuild_spline_mesh(preserve_model_placement=False)
         capture_mode = str(state.get('scanner_capture_mode', 'natural'))
         focused = capture_mode == "focused"
         single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
+        mode_is_robot = str(state.scanner_execution_mode) == "robot"
+        if not single_workflow:
+            changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
+            if changed_mode:
+                state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
+        changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 2.0, "%.2f")
+        if changed_speed:
+            state.scanner_speed = float(new_speed)
+        if not single_workflow:
+            changed_dwell, new_dwell = imgui.slider_float("Dwell per view (s)##scanner_dwell", float(state.scanner_dwell), 0.0, 2.0, "%.2f")
+            if changed_dwell:
+                state.scanner_dwell = float(new_dwell)
+        _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
         imgui.text("Camera image mode")
         if imgui.radio_button("Single-batch focused##scanner_capture_focused", focused and not single_workflow):
             state.scanner_camera_workflow = 'path'
@@ -1413,105 +1514,102 @@ def draw_sidebar(state, renderer, window=None):
         if imgui.radio_button("Single image capture##scanner_capture_single", single_workflow):
             state.scanner_camera_workflow = 'single'
             state.scanner_status = "Single image capture: click a mini-fabric in the 3D view"
-        _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
-        if bool(state.scanner_save_images):
-            every_view = str(state.scanner_image_every) == "view"
-            changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
-            if changed_every:
-                state.scanner_image_every = "view" if every_view else "station"
+        if not single_workflow:
+            _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
+            if bool(state.scanner_save_images):
+                every_view = str(state.scanner_image_every) == "view"
+                changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
+                if changed_every:
+                    state.scanner_image_every = "view" if every_view else "station"
         imgui.separator()
         single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
-        imgui.text_disabled("Single image capture: click the fabric, adjust angle/zoom, then capture one image.")
-        max_row = max(1, int(state.scanner_rows))
-        max_col = max(1, int(state.scanner_cols))
-        max_angle = max(1, int(state.scanner_angles))
-        state.scanner_single_row = int(np.clip(int(state.get('scanner_single_row', 1)), 1, max_row))
-        state.scanner_single_col = int(np.clip(int(state.get('scanner_single_col', 1)), 1, max_col))
-        imgui.text_colored(
-            (0.95, 0.80, 0.20, 1.0),
-            f"Target: row {int(state.scanner_single_row)}, col {int(state.scanner_single_col)}",
-        )
-        changed_single_angle, single_angle = imgui.slider_int(
-            "Camera angle##single_capture_angle",
-            int(np.clip(int(state.get('scanner_single_angle', 1)), 1, max_angle)),
-            1,
-            max_angle,
-        )
-        if changed_single_angle:
-            state.scanner_single_angle = int(single_angle)
-            embedded = state.get('embedded_scanner')
-            if embedded is not None and single_workflow:
-                embedded.preview_single_target(
-                    int(state.get('scanner_single_row', 1)) - 1,
-                    int(state.get('scanner_single_col', 1)) - 1,
-                    int(state.get('scanner_single_angle', 1)) - 1,
-                    float(state.get('scanner_camera_zoom', 1.0)),
-                )
-        changed_camera_zoom, camera_zoom = imgui.slider_float(
-            "Robot camera zoom##single_capture_zoom",
-            float(np.clip(float(state.get('scanner_camera_zoom', 1.0)), 0.25, 5.0)),
-            0.25,
-            5.0,
-            "%.2fx",
-        )
-        if changed_camera_zoom:
-            state.scanner_camera_zoom = float(camera_zoom)
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                embedded.args.camera_zoom = float(camera_zoom)
-                if single_workflow:
+        if single_workflow:
+            imgui.text_disabled("Click the fabric, adjust angle/zoom, then capture one image.")
+            max_row = max(1, int(state.scanner_rows))
+            max_col = max(1, int(state.scanner_cols))
+            max_angle = max(1, int(state.scanner_angles))
+            state.scanner_single_row = int(np.clip(int(state.get('scanner_single_row', 1)), 1, max_row))
+            state.scanner_single_col = int(np.clip(int(state.get('scanner_single_col', 1)), 1, max_col))
+            imgui.text_colored(
+                (0.95, 0.80, 0.20, 1.0),
+                f"Target: row {int(state.scanner_single_row)}, col {int(state.scanner_single_col)}",
+            )
+            changed_single_angle, single_angle = imgui.slider_int(
+                "Camera angle##single_capture_angle",
+                int(np.clip(int(state.get('scanner_single_angle', 1)), 1, max_angle)),
+                1,
+                max_angle,
+            )
+            if changed_single_angle:
+                state.scanner_single_angle = int(single_angle)
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
                     embedded.preview_single_target(
                         int(state.get('scanner_single_row', 1)) - 1,
                         int(state.get('scanner_single_col', 1)) - 1,
                         int(state.get('scanner_single_angle', 1)) - 1,
                         float(state.get('scanner_camera_zoom', 1.0)),
                     )
-        if imgui.small_button("Zoom in##single_capture_zoom_in"):
-            state.scanner_camera_zoom = float(min(5.0, float(state.get('scanner_camera_zoom', 1.0)) * 1.15))
-            embedded = state.get('embedded_scanner')
-            if embedded is not None and single_workflow:
-                embedded.preview_single_target(
-                    int(state.get('scanner_single_row', 1)) - 1,
-                    int(state.get('scanner_single_col', 1)) - 1,
-                    int(state.get('scanner_single_angle', 1)) - 1,
-                    float(state.get('scanner_camera_zoom', 1.0)),
-                )
-        imgui.same_line()
-        if imgui.small_button("Zoom out##single_capture_zoom_out"):
-            state.scanner_camera_zoom = float(max(0.25, float(state.get('scanner_camera_zoom', 1.0)) / 1.15))
-            embedded = state.get('embedded_scanner')
-            if embedded is not None and single_workflow:
-                embedded.preview_single_target(
-                    int(state.get('scanner_single_row', 1)) - 1,
-                    int(state.get('scanner_single_col', 1)) - 1,
-                    int(state.get('scanner_single_angle', 1)) - 1,
-                    float(state.get('scanner_camera_zoom', 1.0)),
-                )
-        if not single_workflow:
-            imgui.begin_disabled()
-        if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
-            embedded = ensure_embedded_single_capture()
-            if embedded is not None:
-                embedded.preview_single_target(
-                    int(state.get('scanner_single_row', 1)) - 1,
-                    int(state.get('scanner_single_col', 1)) - 1,
-                    int(state.get('scanner_single_angle', 1)) - 1,
-                    float(state.get('scanner_camera_zoom', 1.0)),
-                )
-                state.scanner_status = embedded.status
-        if imgui.button("Capture Image##single_capture_save", (-1, 0)):
-            embedded = ensure_embedded_single_capture()
-            if embedded is not None:
-                path = embedded.capture_single_target(
-                    int(state.get('scanner_single_row', 1)) - 1,
-                    int(state.get('scanner_single_col', 1)) - 1,
-                    int(state.get('scanner_single_angle', 1)) - 1,
-                    float(state.get('scanner_camera_zoom', 1.0)),
-                )
-                state.scanner_status = f"Saved single capture: {Path(path).name}"
-        if not single_workflow:
-            imgui.end_disabled()
-        if str(state.scanner_execution_mode) == "robot":
+            changed_camera_zoom, camera_zoom = imgui.slider_float(
+                "Robot camera zoom##single_capture_zoom",
+                float(np.clip(float(state.get('scanner_camera_zoom', 1.0)), 0.25, 5.0)),
+                0.25,
+                5.0,
+                "%.2fx",
+            )
+            if changed_camera_zoom:
+                state.scanner_camera_zoom = float(camera_zoom)
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    embedded.args.camera_zoom = float(camera_zoom)
+                    embedded.preview_single_target(
+                        int(state.get('scanner_single_row', 1)) - 1,
+                        int(state.get('scanner_single_col', 1)) - 1,
+                        int(state.get('scanner_single_angle', 1)) - 1,
+                        float(state.get('scanner_camera_zoom', 1.0)),
+                    )
+            if imgui.small_button("Zoom in##single_capture_zoom_in"):
+                state.scanner_camera_zoom = float(min(5.0, float(state.get('scanner_camera_zoom', 1.0)) * 1.15))
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    embedded.preview_single_target(
+                        int(state.get('scanner_single_row', 1)) - 1,
+                        int(state.get('scanner_single_col', 1)) - 1,
+                        int(state.get('scanner_single_angle', 1)) - 1,
+                        float(state.get('scanner_camera_zoom', 1.0)),
+                    )
+            imgui.same_line()
+            if imgui.small_button("Zoom out##single_capture_zoom_out"):
+                state.scanner_camera_zoom = float(max(0.25, float(state.get('scanner_camera_zoom', 1.0)) / 1.15))
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    embedded.preview_single_target(
+                        int(state.get('scanner_single_row', 1)) - 1,
+                        int(state.get('scanner_single_col', 1)) - 1,
+                        int(state.get('scanner_single_angle', 1)) - 1,
+                        float(state.get('scanner_camera_zoom', 1.0)),
+                    )
+            if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
+                embedded = ensure_embedded_single_capture()
+                if embedded is not None:
+                    embedded.preview_single_target(
+                        int(state.get('scanner_single_row', 1)) - 1,
+                        int(state.get('scanner_single_col', 1)) - 1,
+                        int(state.get('scanner_single_angle', 1)) - 1,
+                        float(state.get('scanner_camera_zoom', 1.0)),
+                    )
+                    state.scanner_status = embedded.status
+            if imgui.button("Capture Image##single_capture_save", (-1, 0)):
+                embedded = ensure_embedded_single_capture()
+                if embedded is not None:
+                    path = embedded.capture_single_target(
+                        int(state.get('scanner_single_row', 1)) - 1,
+                        int(state.get('scanner_single_col', 1)) - 1,
+                        int(state.get('scanner_single_angle', 1)) - 1,
+                        float(state.get('scanner_camera_zoom', 1.0)),
+                    )
+                    state.scanner_status = f"Saved single capture: {Path(path).name}"
+        if not single_workflow and str(state.scanner_execution_mode) == "robot":
             changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip), 64)
             changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
             if changed_ip:
@@ -1969,7 +2067,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             fill_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.055))
             selected_fill = imgui.get_color_u32((1.0, 0.78, 0.18, 0.18))
             selected_line = imgui.get_color_u32((1.0, 0.78, 0.18, 0.92))
-            cell_sets = _scanner_shared_cell_color_sets(state) if scanner_picker_mode else []
+            cell_sets = _ensure_scanner_cell_color_sets(state) if scanner_picker_mode else []
             for r in range(rows):
                 for c in range(cols):
                     cell_bounds = scanner_cell_bounds[r * cols + c]
