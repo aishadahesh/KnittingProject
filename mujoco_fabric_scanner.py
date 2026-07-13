@@ -55,6 +55,8 @@ CAMERA_MARKER_SIZE = np.array([0.018, 0.012, 0.010])
 CAMERA_IMAGE_SIZE = (640, 480)
 CAMERA_SAVE_EVERY_STATION = "station"
 CAMERA_SAVE_EVERY_VIEW = "view"
+CAMERA_CAPTURE_NATURAL = "natural"
+CAMERA_CAPTURE_FOCUSED = "focused"
 NON_SCAN_VIEW_NAMES = {"approach", "retreat", "travel"}
 MODE_SIMULATION = "simulation"
 MODE_ROBOT = "robot"
@@ -978,6 +980,7 @@ def render_camera_image(
     view_name: str,
     target_pose: np.ndarray | None = None,
     color_picker_mode: bool = False,
+    capture_mode: str = CAMERA_CAPTURE_NATURAL,
 ) -> Image.Image:
     width_px, height_px = CAMERA_IMAGE_SIZE
     station = plan.mapped_stations[station_id]
@@ -1005,13 +1008,40 @@ def render_camera_image(
     up = np.cross(right, forward)
     up = up / max(float(np.linalg.norm(up)), 1e-8)
 
+    active_row, active_col = plan.station_cells[station_id]
     lens_pos = np.asarray(tcp_pos[:3], dtype=float)
     # The tool site is the gripper TCP, while the simulated camera lens sits
     # slightly behind it on the gripper body. This offset gives a real scanner
     # view of the fabric instead of an unusably tiny contact-distance crop.
-    camera_standoff = max(0.120, max(cell_w, cell_l) * 1.55, float(np.linalg.norm(lens_pos - station)) * 1.75)
-    lens_pos = lens_pos - forward * camera_standoff
-    focus = station + np.array([0.0, 0.0, FABRIC_THICKNESS * 0.15], dtype=float)
+    focused_capture = str(capture_mode) == CAMERA_CAPTURE_FOCUSED
+    rendered_cell_center = np.array(
+        [
+            grid_origin_x + (active_col + 0.5) * cell_w,
+            grid_origin_y + (active_row + 0.5) * cell_l,
+            station[2],
+        ],
+        dtype=float,
+    )
+    focus = rendered_cell_center + np.array([0.0, 0.0, FABRIC_THICKNESS * 0.15], dtype=float)
+    if focused_capture:
+        # Focused mode is a batch inspection capture. Use a stable camera
+        # centered on the selected batch; the selected scan angle becomes roll
+        # around the batch normal. This keeps every station framed consistently.
+        angle_deg = 0.0
+        if "angle" in str(view_name).lower():
+            try:
+                angle_deg = float(str(view_name).lower().split("angle", 1)[1].strip().split()[0])
+            except (IndexError, ValueError):
+                angle_deg = 0.0
+        theta = math.radians(angle_deg)
+        forward = np.array([0.0, 0.0, -1.0], dtype=float)
+        right = np.array([math.cos(theta), math.sin(theta), 0.0], dtype=float)
+        up = np.array([-math.sin(theta), math.cos(theta), 0.0], dtype=float)
+        camera_standoff = max(0.105, max(cell_w, cell_l) * 1.35)
+        lens_pos = focus - forward * camera_standoff
+    else:
+        camera_standoff = max(0.120, max(cell_w, cell_l) * 1.55, float(np.linalg.norm(lens_pos - station)) * 1.75)
+        lens_pos = lens_pos - forward * camera_standoff
     # Aim the saved camera at the active station while preserving the roll/right
     # axis from the selected scan angle.
     forward = focus - lens_pos
@@ -1021,7 +1051,12 @@ def render_camera_image(
     up = np.cross(right, forward)
     up = up / max(float(np.linalg.norm(up)), 1e-8)
 
-    fov_y = math.radians(74.0)
+    if focused_capture:
+        batch_span = math.hypot(cell_w, cell_l)
+        fov_y = 2.0 * math.atan((batch_span * 0.58) / max(camera_standoff, 1e-6))
+        fov_y = float(np.clip(fov_y, math.radians(36.0), math.radians(68.0)))
+    else:
+        fov_y = math.radians(74.0)
     focal = (height_px * 0.5) / math.tan(fov_y * 0.5)
     near = 0.004
 
@@ -1046,10 +1081,11 @@ def render_camera_image(
         return out
 
     draw = ImageDraw.Draw(img)
-    active_row, active_col = plan.station_cells[station_id]
     fabric_z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.48
-    for row in range(plan.grid_rows):
-        for col in range(plan.grid_cols):
+    render_rows = [active_row] if focused_capture else range(plan.grid_rows)
+    render_cols = [active_col] if focused_capture else range(plan.grid_cols)
+    for row in render_rows:
+        for col in render_cols:
             x0 = grid_origin_x + col * cell_w
             y0 = grid_origin_y + row * cell_l
             x1, y1 = x0 + cell_w, y0 + cell_l
@@ -1138,7 +1174,7 @@ def render_camera_image(
     draw.text((14, 10), f"UR5 camera | station {station_id + 1} | row {active_row + 1}, col {active_col + 1}", fill=(255, 255, 255))
     draw.text(
         (14, 30),
-        f"{view_name} | image repeats {plan.pattern_repeat_rows}x{plan.pattern_repeat_cols} | tcp z {tcp_pos[2]:.3f} m",
+        f"{view_name} | {capture_mode} | repeats {plan.pattern_repeat_rows}x{plan.pattern_repeat_cols} | tcp z {tcp_pos[2]:.3f} m",
         fill=(210, 230, 255),
     )
 
@@ -1154,6 +1190,7 @@ def save_camera_image(
     view_name: str,
     target_pose: np.ndarray | None = None,
     color_picker_mode: bool = False,
+    capture_mode: str = CAMERA_CAPTURE_NATURAL,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     img = render_camera_image(
@@ -1164,10 +1201,12 @@ def save_camera_image(
         view_name,
         target_pose=target_pose,
         color_picker_mode=color_picker_mode,
+        capture_mode=capture_mode,
     )
     active_row, active_col = plan.station_cells[station_id]
     clean_view = view_name.replace(" ", "_")
-    path = output_dir / f"scan_{target_index + 1:04d}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_station_{station_id + 1:03d}_{clean_view}.png"
+    clean_mode = "focused_batch" if str(capture_mode) == CAMERA_CAPTURE_FOCUSED else "natural"
+    path = output_dir / f"scan_{target_index + 1:04d}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_station_{station_id + 1:03d}_{clean_view}.png"
     img.save(path)
     return path
 
@@ -1295,6 +1334,7 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
                         station,
                         plan.view_names[target_index],
                         target_pose=pose,
+                        capture_mode=args.capture_mode,
                     )
                     saved_count += 1
                     saved_targets.add(target_index)
@@ -1340,6 +1380,7 @@ def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
                             station,
                             plan.view_names[target_index],
                             target_pose=pose,
+                            capture_mode=args.capture_mode,
                         )
                         saved_count += 1
                         print(f"[camera] saved {path}")
@@ -1672,6 +1713,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-images", action="store_true", help="Save simulated scanner camera images")
     parser.add_argument("--image-dir", default="scanner_images", help="Directory for saved camera images")
     parser.add_argument("--image-every", choices=[CAMERA_SAVE_EVERY_STATION, CAMERA_SAVE_EVERY_VIEW], default=CAMERA_SAVE_EVERY_VIEW, help="Save one image per station or every angle view")
+    parser.add_argument("--capture-mode", choices=[CAMERA_CAPTURE_NATURAL, CAMERA_CAPTURE_FOCUSED], default=CAMERA_CAPTURE_NATURAL, help="Natural robot camera images or focused single-batch images")
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="Real UR5 robot IP address for URScript mode")
     parser.add_argument("--robot-port", type=int, default=DEFAULT_ROBOT_PORT, help="Real UR5 primary interface port for URScript mode")
     parser.add_argument("--robot-vel", type=float, default=0.015, help="Real robot Cartesian velocity for moveL (m/s)")

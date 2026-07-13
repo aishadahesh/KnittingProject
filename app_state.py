@@ -83,7 +83,7 @@ class AppState:
         extra_saved_keys = (
             'app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
             'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
-            'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols',
+            'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols', 'scanner_capture_mode',
         )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
@@ -127,6 +127,7 @@ class AppState:
             'scanner_pattern_cols': 5,
             'scanner_pattern_repeat_rows': 3,
             'scanner_pattern_repeat_cols': 3,
+            'scanner_capture_mode': 'natural',
             'ui_theme': 'dark',
             'loop_heights': np.full((3, config_data['knit_parameters']['bitmap_loops']), 3.0, dtype=np.float32),
             'mesh_center': np.zeros(3, dtype=np.float32),

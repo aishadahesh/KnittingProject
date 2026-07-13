@@ -298,6 +298,7 @@ class EmbeddedMujocoScanner:
             save_images=bool(state.scanner_save_images),
             image_dir=str((Path(state.project_root) / 'scanner_images').resolve()),
             image_every=str(state.scanner_image_every),
+            capture_mode=str(state.get('scanner_capture_mode', 'natural')),
             palette=palette,
             cell_color_sets=cell_sets,
             model_json=str(state.save_path),
@@ -439,6 +440,7 @@ class EmbeddedMujocoScanner:
             self.plan.view_names[target_index],
             target_pose=target_pose,
             color_picker_mode=self.color_picker_mode,
+            capture_mode=str(getattr(self.args, "capture_mode", "natural")),
         )
 
     def close(self):
@@ -533,6 +535,7 @@ class EmbeddedMujocoScanner:
             self.plan.view_names[min(target_index, len(self.plan.view_names) - 1)],
             target_pose=target_pose,
             color_picker_mode=self.color_picker_mode,
+            capture_mode=str(getattr(self.args, "capture_mode", "natural")),
         )
         self._upload_camera_preview(image)
 
@@ -803,7 +806,11 @@ def draw_sidebar(state, renderer, window=None):
         if bool(state.scanner_add_camera):
             cmd.append("--add-camera")
         if bool(state.scanner_save_images):
-            cmd.extend(["--save-images", "--image-every", str(state.scanner_image_every)])
+            cmd.extend([
+                "--save-images",
+                "--image-every", str(state.scanner_image_every),
+                "--capture-mode", str(state.get('scanner_capture_mode', 'natural')),
+            ])
         cell_color_sets = _scanner_shared_cell_color_sets(state)
         cmd.extend(["--cell-colors-json", json.dumps(cell_color_sets)])
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
@@ -1274,6 +1281,19 @@ def draw_sidebar(state, renderer, window=None):
         if changed_dwell:
             state.scanner_dwell = float(new_dwell)
         _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
+        capture_mode = str(state.get('scanner_capture_mode', 'natural'))
+        focused = capture_mode == "focused"
+        imgui.text("Camera image mode")
+        if imgui.radio_button("Single-batch focused##scanner_capture_focused", focused):
+            state.scanner_capture_mode = "focused"
+            embedded = state.get('embedded_scanner')
+            if embedded is not None:
+                embedded.args.capture_mode = "focused"
+        if imgui.radio_button("Natural robot camera##scanner_capture_natural", not focused):
+            state.scanner_capture_mode = "natural"
+            embedded = state.get('embedded_scanner')
+            if embedded is not None:
+                embedded.args.capture_mode = "natural"
         _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
         if bool(state.scanner_save_images):
             every_view = str(state.scanner_image_every) == "view"
