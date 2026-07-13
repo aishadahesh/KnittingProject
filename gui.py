@@ -14,6 +14,7 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 
 from rendering import draw_fitted_texture, transform_points
+from knitting_core import build_parametric_control_rows
 
 # %% FILE PICKER HELPERS ───────────────────────────────────────────────────────
 
@@ -176,6 +177,82 @@ def _ensure_scanner_cell_color_sets(state):
     ]
     return sets
 
+
+def _scanner_shared_cell_color_sets(state):
+    rows = max(1, int(state.scanner_rows))
+    cols = max(1, int(state.scanner_cols))
+    base = _scanner_base_palette(state)
+    return [[list(color) for color in base] for _ in range(rows * cols)]
+
+
+def _scanner_pattern_dimensions(state):
+    rows = max(2, int(state.get('scanner_pattern_rows', max(2, int(state.bitmap_size[0])))))
+    cols = max(2, int(state.get('scanner_pattern_cols', max(2, int(state.bitmap_size[1])))))
+    return rows, cols
+
+
+def _scanner_pattern_repeats(state):
+    repeat_rows = max(1, int(state.get('scanner_pattern_repeat_rows', 3)))
+    repeat_cols = max(1, int(state.get('scanner_pattern_repeat_cols', 3)))
+    return repeat_rows, repeat_cols
+
+
+def _normalize_scanner_curves(curves):
+    valid = [np.asarray(curve, dtype=np.float32)[:, :2] for curve in curves if len(curve) > 1]
+    if not valid:
+        return []
+    pts = np.vstack(valid)
+    min_xy = pts.min(axis=0)
+    max_xy = pts.max(axis=0)
+    center = (min_xy + max_xy) * 0.5
+    span = np.maximum(max_xy - min_xy, 1e-6)
+    scale = 1.08 / float(max(span[0], span[1]))
+    return [((curve - center) * scale).astype(np.float32) for curve in valid]
+
+
+def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density, repeat_rows=3, repeat_cols=3):
+    rng = np.random.default_rng(int(seed))
+    density = float(np.clip(density, 0.05, 0.95))
+    bitmap = (rng.random((pattern_rows, pattern_cols)) < density).astype(np.float32)
+    if not np.any(bitmap > 0.5):
+        bitmap[rng.integers(0, pattern_rows), rng.integers(0, pattern_cols)] = 1.0
+
+    heights = np.zeros_like(bitmap, dtype=np.float32)
+    source = np.asarray(state.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
+    for row_idx in range(pattern_rows):
+        if getattr(state, '_lh_idx', ()):
+            idx = state._lh_idx[min(row_idx, len(state._lh_idx) - 1)]
+            heights[row_idx, :] = float(state.params[idx])
+        else:
+            heights[row_idx, :] = 3.0
+    if source.ndim == 2 and source.size:
+        keep_rows = min(pattern_rows, source.shape[0])
+        keep_cols = min(pattern_cols, source.shape[1])
+        heights[:keep_rows, :keep_cols] = source[:keep_rows, :keep_cols]
+
+    ctrl_rows = build_parametric_control_rows(
+        state.params,
+        bitmap,
+        state._pidx,
+        state._lh_idx,
+        state.samples_per_loop,
+        loop_heights=heights * (bitmap > 0.5),
+    )
+    return _normalize_scanner_curves(ctrl_rows)
+
+
+def _generate_scanner_random_patterns(state):
+    rows = max(1, int(state.scanner_rows))
+    cols = max(1, int(state.scanner_cols))
+    pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+    repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+    seed = int(state.get('scanner_random_seed', 1))
+    density = float(state.get('scanner_pattern_density', 0.62))
+    return [
+        _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed + cell * 9973, density, repeat_rows, repeat_cols)
+        for cell in range(rows * cols)
+    ]
+
 # %% GUI DRAWING PANELS ────────────────────────────────────────────────────────
 
 
@@ -195,13 +272,16 @@ class EmbeddedMujocoScanner:
         self.camera_preview_height = int(scanner.CAMERA_IMAGE_SIZE[1])
         self.color_picker_mode = str(state.get('scanner_color_mode', 'realistic')) == 'picker'
         palette = _scanner_base_palette(state)
-        cell_sets = _ensure_scanner_cell_color_sets(state)
+        cell_sets = _scanner_shared_cell_color_sets(state)
+        cell_model_curves = _generate_scanner_random_patterns(state)
+        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         self.args = SimpleNamespace(
             rows=int(state.scanner_rows),
             cols=int(state.scanner_cols),
             number_of_angles=int(state.scanner_angles),
-            width=float(max(0.06, int(state.scanner_cols) * int(state.bitmap_size[1]) * 0.045)),
-            length=float(max(0.06, int(state.scanner_rows) * int(state.bitmap_size[0]) * 0.040)),
+            width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
+            length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
             edge_margin=0.004,
             square_margin=0.006,
             surface_wave=0.003,
@@ -221,7 +301,10 @@ class EmbeddedMujocoScanner:
             palette=palette,
             cell_color_sets=cell_sets,
             model_json=str(state.save_path),
-            model_curves=_state_scanner_model_curves(state),
+            model_curves=cell_model_curves[0] if cell_model_curves else None,
+            cell_model_curves=cell_model_curves,
+            pattern_repeat_rows=int(repeat_rows),
+            pattern_repeat_cols=int(repeat_cols),
             color_picker_mode=self.color_picker_mode,
         )
         self.plan = scanner.densify_plan_for_robot(scanner.build_plan(self.args))
@@ -721,8 +804,19 @@ def draw_sidebar(state, renderer, window=None):
             cmd.append("--add-camera")
         if bool(state.scanner_save_images):
             cmd.extend(["--save-images", "--image-every", str(state.scanner_image_every)])
-        cell_color_sets = _ensure_scanner_cell_color_sets(state)
+        cell_color_sets = _scanner_shared_cell_color_sets(state)
         cmd.extend(["--cell-colors-json", json.dumps(cell_color_sets)])
+        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+        cmd.extend([
+            "--random-patterns",
+            "--pattern-rows", str(int(pattern_rows)),
+            "--pattern-cols", str(int(pattern_cols)),
+            "--pattern-repeat-rows", str(int(repeat_rows)),
+            "--pattern-repeat-cols", str(int(repeat_cols)),
+            "--pattern-density", f"{float(state.get('scanner_pattern_density', 0.62)):.3f}",
+            "--random-seed", str(int(state.get('scanner_random_seed', 1))),
+        ])
         cmd.extend(["--robot-ip", str(state.scanner_robot_ip), "--robot-port", str(int(state.scanner_robot_port))])
         try:
             state.scanner_process = subprocess.Popen(cmd, cwd=state.project_root)
@@ -1069,7 +1163,6 @@ def draw_sidebar(state, renderer, window=None):
         if changed_layout:
             state.scanner_preview_rows = max(1, int(state.scanner_rows))
             state.scanner_preview_cols = max(1, int(state.scanner_cols))
-            _ensure_scanner_cell_color_sets(state)
             embedded = state.get('embedded_scanner')
             if embedded is not None:
                 try:
@@ -1077,7 +1170,7 @@ def draw_sidebar(state, renderer, window=None):
                 except Exception:
                     pass
                 state.embedded_scanner = None
-                state.scanner_status = "Scanner layout changed; press Start Scanner to rebuild from latest model"
+                state.scanner_status = "Scanner layout changed; press Start Scanner to generate new random patterns"
             state.rebuild_spline_mesh(preserve_model_placement=False)
         imgui.text("Layout pattern")
         grid_active = str(state.get('scanner_layout_pattern', 'grid')) == 'grid'
@@ -1089,19 +1182,54 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_layout_pattern = 'staggered'
             state.rebuild_spline_mesh(preserve_model_placement=False)
         imgui.separator()
-        imgui.text("Batch colors")
-        cell_sets = _ensure_scanner_cell_color_sets(state)
-        selected = np.asarray(state.scanner_selected_cell, dtype=np.int32).reshape(-1)
-        selected_r = int(selected[0]) if selected.size > 0 else 0
-        selected_c = int(selected[1]) if selected.size > 1 else 0
-        selected_r = int(np.clip(selected_r, 0, max(0, int(state.scanner_rows) - 1)))
-        selected_c = int(np.clip(selected_c, 0, max(0, int(state.scanner_cols) - 1)))
-        selected_index = selected_r * max(1, int(state.scanner_cols)) + selected_c
+        imgui.text("Random pattern generation")
+        imgui.text_wrapped("Each mini-grid is one fabric sample. A random bitmap pattern is generated once, then repeated many times inside that sample. All samples use the same colors; only the bitmap changes.")
+        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+        changed_pr, new_pr = imgui.slider_int("Pattern bitmap rows##scanner_pattern_rows", pattern_rows, 2, 10)
+        changed_pc, new_pc = imgui.slider_int("Pattern bitmap cols##scanner_pattern_cols", pattern_cols, 2, 12)
+        changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 8)
+        changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 8)
+        changed_density, new_density = imgui.slider_float(
+            "Active stitch probability##scanner_density",
+            float(state.get('scanner_pattern_density', 0.62)),
+            0.05,
+            0.95,
+            "%.2f",
+        )
+        changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
+        random_changed = changed_pr or changed_pc or changed_rr or changed_rc or changed_density or changed_seed
+        if changed_pr:
+            state.scanner_pattern_rows = int(new_pr)
+        if changed_pc:
+            state.scanner_pattern_cols = int(new_pc)
+        if changed_rr:
+            state.scanner_pattern_repeat_rows = int(new_rr)
+        if changed_rc:
+            state.scanner_pattern_repeat_cols = int(new_rc)
+        if changed_density:
+            state.scanner_pattern_density = float(new_density)
+        if changed_seed:
+            state.scanner_random_seed = int(new_seed)
+        if imgui.small_button("Generate new random patterns##scanner_randomize"):
+            state.scanner_random_seed = int(time.time()) % 1000000
+            random_changed = True
+        if random_changed:
+            embedded = state.get('embedded_scanner')
+            if embedded is not None:
+                try:
+                    embedded.close()
+                except Exception:
+                    pass
+                state.embedded_scanner = None
+            state.scanner_status = "Random pattern settings changed; press Start Scanner to rebuild"
+        imgui.separator()
+        imgui.text("Preview mode")
         if not state.get('scanner_color_mode'):
             state.scanner_color_mode = 'realistic'
         realistic_mode = str(state.get('scanner_color_mode', 'realistic')) == 'realistic'
-        if imgui.radio_button("Realistic model preview##scanner_color_realistic", realistic_mode):
-            if str(state.get('scanner_color_mode', 'realistic')) != 'realistic':
+        if imgui.radio_button("Random fabric preview##scanner_preview_realistic", realistic_mode):
+            if not realistic_mode:
                 state.scanner_color_mode = 'realistic'
                 embedded = state.get('embedded_scanner')
                 if embedded is not None:
@@ -1110,10 +1238,10 @@ def draw_sidebar(state, renderer, window=None):
                     except Exception:
                         pass
                     state.embedded_scanner = None
-                state.scanner_status = "Scanner view changed; press Start Scanner to rebuild"
+                state.scanner_status = "Preview mode changed; press Start Scanner to rebuild"
         imgui.same_line()
-        if imgui.radio_button("Color picker mode##scanner_color_picker", not realistic_mode):
-            if str(state.get('scanner_color_mode', 'realistic')) != 'picker':
+        if imgui.radio_button("Color picker mode##scanner_preview_picker", not realistic_mode):
+            if realistic_mode:
                 state.scanner_color_mode = 'picker'
                 embedded = state.get('embedded_scanner')
                 if embedded is not None:
@@ -1122,77 +1250,19 @@ def draw_sidebar(state, renderer, window=None):
                     except Exception:
                         pass
                     state.embedded_scanner = None
-                state.scanner_status = "Scanner view changed; press Start Scanner to rebuild"
-        imgui.text_colored((1.0, 0.78, 0.18, 1.0), f"Selected batch: R{selected_r + 1} C{selected_c + 1}")
-        imgui.text_disabled("Click a mini-square in the 3D view, or use the batch grid below.")
+                state.scanner_status = "Preview mode changed; press Start Scanner to rebuild"
 
-        cell_changed = False
-        if not realistic_mode:
-            imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(3, 3))
-            for r in range(max(1, int(state.scanner_rows))):
-                for c in range(max(1, int(state.scanner_cols))):
-                    idx = r * max(1, int(state.scanner_cols)) + c
-                    palette = cell_sets[idx]
-                    first = palette[0]
-                    is_selected = idx == selected_index
-                    btn_col = (float(first[0]), float(first[1]), float(first[2]), 1.0)
-                    hover_col = tuple(min(1.0, float(ch) + 0.15) for ch in btn_col[:3]) + (1.0,)
-                    active_col = (1.0, 0.78, 0.18, 1.0) if is_selected else btn_col
-                    imgui.push_style_color(imgui.Col_.button, active_col)
-                    imgui.push_style_color(imgui.Col_.button_hovered, hover_col)
-                    imgui.push_style_color(imgui.Col_.button_active, active_col)
-                    if imgui.button(f"{r + 1},{c + 1}##scanner_batch_{r}_{c}", imgui.ImVec2(42, 24)):
-                        state.scanner_selected_cell = [r, c]
-                        selected_r, selected_c, selected_index = r, c, idx
-                    imgui.pop_style_color(3)
-                    if c < int(state.scanner_cols) - 1:
-                        imgui.same_line()
-            imgui.pop_style_var()
-        else:
-            imgui.text_wrapped("Realistic preview is shown in the main 3D view. The selected mini-square is highlighted there; this color is a batch tint, not an edit to the original model internals.")
-
-        selected_color = cell_sets[selected_index][0]
-        changed_color, new_color = imgui.color_edit3(
-            f"Batch color##scanner_batch_color_{selected_index}",
-            (float(selected_color[0]), float(selected_color[1]), float(selected_color[2])),
-        )
-        if changed_color:
-            batch_color = [float(new_color[0]), float(new_color[1]), float(new_color[2]), 1.0]
-            state.scanner_cell_color_sets[selected_index] = [
-                list(batch_color)
-                for _ in range(max(1, int(state.bitmap_size[0])))
-            ]
-            cell_changed = True
-        if imgui.small_button("Use Edit Mode base color##scanner_copy_selected"):
-            base = _scanner_base_palette(state)[0]
-            state.scanner_cell_color_sets[selected_index] = [
-                list(base)
-                for _ in range(max(1, int(state.bitmap_size[0])))
-            ]
-            cell_changed = True
-        imgui.same_line()
-        if imgui.small_button("Apply selected to all##scanner_apply_all"):
-            selected_batch = list(state.scanner_cell_color_sets[selected_index][0])
-            batch_palette = [
-                list(selected_batch)
-                for _ in range(max(1, int(state.bitmap_size[0])))
-            ]
-            state.scanner_cell_color_sets = [
-                [list(c) for c in batch_palette]
-                for _ in range(max(1, int(state.scanner_rows)) * max(1, int(state.scanner_cols)))
-            ]
-            cell_changed = True
-        if cell_changed:
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                try:
-                    embedded.close()
-                except Exception:
-                    pass
-                state.embedded_scanner = None
-                state.scanner_status = "Batch colors changed; press Start Scanner to rebuild scanner view"
-        imgui.text_wrapped("Scan Mode duplicates the edited fabric square. The picker assigns one color to each mini-square/batch while keeping the original model structure, pattern, and texture unchanged.")
+        palette = _scanner_base_palette(state)
+        imgui.text(f"Shared colors: {len(palette)}")
+        for color_idx, color in enumerate(palette[:8]):
+            imgui.color_button(
+                f"##scanner_shared_color_{color_idx}",
+                (float(color[0]), float(color[1]), float(color[2]), 1.0),
+                imgui.ColorEditFlags_.no_tooltip,
+                imgui.ImVec2(22, 16),
+            )
+            if color_idx < min(len(palette), 8) - 1:
+                imgui.same_line()
         mode_is_robot = str(state.scanner_execution_mode) == "robot"
         changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
         if changed_mode:
@@ -1658,7 +1728,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             fill_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.055))
             selected_fill = imgui.get_color_u32((1.0, 0.78, 0.18, 0.18))
             selected_line = imgui.get_color_u32((1.0, 0.78, 0.18, 0.92))
-            cell_sets = _ensure_scanner_cell_color_sets(state) if scanner_picker_mode else []
+            cell_sets = _scanner_shared_cell_color_sets(state) if scanner_picker_mode else []
             for r in range(rows):
                 for c in range(cols):
                     cell_bounds = scanner_cell_bounds[r * cols + c]

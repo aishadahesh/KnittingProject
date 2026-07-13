@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 from scipy.spatial.transform import Rotation
+from knitting_core import build_parametric_control_rows
 
 from Robot_fabric_scanner import (
     DEFAULT_CENTER,
@@ -48,6 +49,8 @@ MARKER_RADIUS = 0.006
 PATH_WIDTH = 0.003
 POSE_AXIS_LENGTH = 0.035
 FABRIC_THICKNESS = 0.003
+IMAGE_REPEAT_OVERLAP = 1.68
+SCAN_PATTERN_FILL = 1.08
 CAMERA_MARKER_SIZE = np.array([0.018, 0.012, 0.010])
 CAMERA_IMAGE_SIZE = (640, 480)
 CAMERA_SAVE_EVERY_STATION = "station"
@@ -90,6 +93,9 @@ class FabricPlan:
     square_width: float
     square_length: float
     model_curves: list[np.ndarray]
+    cell_model_curves: list[list[np.ndarray]] | None = None
+    pattern_repeat_rows: int = 1
+    pattern_repeat_cols: int = 1
 
 
 def _serpentine_indices(rows: int, cols: int):
@@ -241,6 +247,151 @@ def _normalize_cell_color_sets(raw_sets, rows: int, cols: int, palette=None) -> 
     return normalized
 
 
+def _normalize_cell_model_curves(raw_sets, rows: int, cols: int) -> list[list[np.ndarray]] | None:
+    if not isinstance(raw_sets, (list, tuple)) or len(raw_sets) != rows * cols:
+        return None
+    normalized: list[list[np.ndarray]] = []
+    for cell in raw_sets:
+        curves = []
+        if isinstance(cell, (list, tuple)):
+            for curve in cell:
+                arr = np.asarray(curve, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[0] > 1 and arr.shape[1] >= 2:
+                    curves.append(arr[:, :2].astype(np.float32))
+        normalized.append(curves)
+    return normalized if any(normalized) else None
+
+
+def _normalize_model_curves(curves: list[np.ndarray]) -> list[np.ndarray]:
+    valid = [np.asarray(curve, dtype=np.float32)[:, :2] for curve in curves if len(curve) > 1]
+    if not valid:
+        return _fallback_model_curves()
+    pts = np.vstack(valid)
+    min_xy = pts.min(axis=0)
+    max_xy = pts.max(axis=0)
+    span = np.maximum(max_xy - min_xy, 1e-6)
+    center = (min_xy + max_xy) * 0.5
+    scale = SCAN_PATTERN_FILL / float(max(span[0], span[1]))
+    return [((curve - center) * scale).astype(np.float32) for curve in valid]
+
+
+def _scanner_param_context(model_json: str | None):
+    project_root = Path(__file__).resolve().parent
+    with (project_root / "config.json").open("r") as handle:
+        config = json.load(handle)
+    params = np.asarray([p["initial"] for p in config["knit_parameters"]["parameters"]], dtype=np.float32)
+    samples_per_loop = 5
+    saved_loop_heights = None
+    if model_json and Path(model_json).exists():
+        try:
+            with Path(model_json).open("r") as handle:
+                saved = json.load(handle)
+            if "params" in saved:
+                if isinstance(saved["params"], dict):
+                    loaded_params = params.copy()
+                    for name, value in saved["params"].items():
+                        index = next(
+                            (
+                                idx
+                                for idx, param in enumerate(config["knit_parameters"]["parameters"])
+                                if param["name"] == name
+                            ),
+                            None,
+                        )
+                        if index is not None:
+                            loaded_params[index] = float(value)
+                else:
+                    loaded_params = np.asarray(saved["params"], dtype=np.float32)
+                if loaded_params.shape == params.shape:
+                    params = loaded_params
+            if "samples_per_loop" in saved:
+                samples_per_loop = int(saved.get("samples_per_loop", samples_per_loop))
+            elif isinstance(saved.get("gui_state"), dict) and "samples_per_loop" in saved["gui_state"]:
+                samples_per_loop = int(saved["gui_state"].get("samples_per_loop", samples_per_loop))
+            raw_loop_heights = saved.get("loop_heights")
+            if raw_loop_heights is None and isinstance(saved.get("gui_state"), dict):
+                raw_loop_heights = saved["gui_state"].get("loop_heights")
+            if raw_loop_heights is not None:
+                saved_loop_heights = np.asarray(raw_loop_heights, dtype=np.float32)
+        except Exception as exc:
+            print(f"[scanner] could not read param context from {model_json}: {exc}")
+    pidx = {p["name"]: i for i, p in enumerate(config["knit_parameters"]["parameters"])}
+    lh_names = sorted(
+        [p["name"] for p in config["knit_parameters"]["parameters"] if p["name"].startswith("loop_height_")],
+        key=lambda name: int(name.split("_")[-1]),
+    )
+    lh_idx = tuple(pidx[name] for name in lh_names)
+    return params, pidx, lh_idx, samples_per_loop, saved_loop_heights
+
+
+def _loop_heights_for_random_bitmap(params, bitmap, lh_idx, saved_loop_heights):
+    heights = np.zeros_like(bitmap, dtype=np.float32)
+    for row_idx in range(bitmap.shape[0]):
+        if lh_idx:
+            heights[row_idx, :] = float(params[lh_idx[min(row_idx, len(lh_idx) - 1)]])
+        else:
+            heights[row_idx, :] = 3.0
+    saved = np.asarray(saved_loop_heights, dtype=np.float32) if saved_loop_heights is not None else np.empty((0, 0), dtype=np.float32)
+    if saved.ndim == 2 and saved.size:
+        keep_rows = min(bitmap.shape[0], saved.shape[0])
+        keep_cols = min(bitmap.shape[1], saved.shape[1])
+        heights[:keep_rows, :keep_cols] = saved[:keep_rows, :keep_cols]
+    return heights * (bitmap > 0.5)
+
+
+def _random_bitmap_model_curves(
+    pattern_rows: int,
+    pattern_cols: int,
+    seed: int,
+    density: float,
+    repeat_rows: int = 3,
+    repeat_cols: int = 3,
+    model_json: str | None = None,
+) -> list[np.ndarray]:
+    rng = np.random.default_rng(int(seed))
+    pattern_rows = max(2, int(pattern_rows))
+    pattern_cols = max(2, int(pattern_cols))
+    density = float(np.clip(density, 0.05, 0.95))
+    bitmap = (rng.random((pattern_rows, pattern_cols)) < density).astype(np.float32)
+    if not np.any(bitmap > 0.5):
+        bitmap[rng.integers(0, pattern_rows), rng.integers(0, pattern_cols)] = 1.0
+
+    params, pidx, lh_idx, samples_per_loop, saved_loop_heights = _scanner_param_context(model_json)
+    loop_heights = _loop_heights_for_random_bitmap(params, bitmap, lh_idx, saved_loop_heights)
+    curves = build_parametric_control_rows(
+        params,
+        bitmap,
+        pidx,
+        lh_idx,
+        samples_per_loop,
+        loop_heights=loop_heights,
+    )
+    return _normalize_model_curves(curves)
+
+
+def _generate_random_cell_model_curves(args: argparse.Namespace) -> list[list[np.ndarray]]:
+    rows = max(1, int(args.rows))
+    cols = max(1, int(args.cols))
+    seed = int(getattr(args, "random_seed", 1))
+    pattern_rows = int(getattr(args, "pattern_rows", 4))
+    pattern_cols = int(getattr(args, "pattern_cols", 5))
+    repeat_rows = int(getattr(args, "pattern_repeat_rows", 3))
+    repeat_cols = int(getattr(args, "pattern_repeat_cols", 3))
+    density = float(getattr(args, "pattern_density", 0.62))
+    return [
+        _random_bitmap_model_curves(
+            pattern_rows,
+            pattern_cols,
+            seed + cell * 9973,
+            density,
+            repeat_rows,
+            repeat_cols,
+            getattr(args, "model_json", ""),
+        )
+        for cell in range(rows * cols)
+    ]
+
+
 def build_fabric_grid_stations(
     width: float,
     length: float,
@@ -339,6 +490,15 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         palette=getattr(args, "palette", None),
         cell_color_sets=getattr(args, "cell_color_sets", None),
     )
+    cell_model_curves = _normalize_cell_model_curves(
+        getattr(args, "cell_model_curves", None),
+        args.rows,
+        args.cols,
+    )
+    if cell_model_curves is None and bool(getattr(args, "random_patterns", False)):
+        cell_model_curves = _generate_random_cell_model_curves(args)
+        if cell_model_curves:
+            model_curves = cell_model_curves[0]
     raw_points, station_ids, view_names, rotvecs = expand_stations_to_angle_viewpoints(
         raw_stations,
         number_of_angles=args.number_of_angles,
@@ -380,6 +540,9 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         square_width=args.square_width,
         square_length=args.square_length,
         model_curves=model_curves,
+        cell_model_curves=cell_model_curves,
+        pattern_repeat_rows=max(1, int(getattr(args, "pattern_repeat_rows", 1))),
+        pattern_repeat_cols=max(1, int(getattr(args, "pattern_repeat_cols", 1))),
     )
 
 
@@ -538,6 +701,15 @@ def _cell_color_set(plan: FabricPlan, row: int, col: int) -> list[tuple[float, f
     return _default_cell_color_set(row, col)
 
 
+def _cell_model_curves(plan: FabricPlan, row: int, col: int) -> list[np.ndarray]:
+    idx = row * plan.grid_cols + col
+    if plan.cell_model_curves is not None and 0 <= idx < len(plan.cell_model_curves):
+        curves = plan.cell_model_curves[idx]
+        if curves:
+            return curves
+    return plan.model_curves
+
+
 def _knit_cell_curves() -> list[list[tuple[float, float]]]:
     return [
         [(-0.48, 0.16), (-0.33, 0.38), (-0.08, 0.47), (0.18, 0.43), (0.40, 0.24), (0.30, 0.08), (0.06, -0.02), (-0.20, 0.02), (-0.40, 0.14)],
@@ -593,28 +765,41 @@ def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z:
         [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.25],
         (0.018, 0.022, 0.030, 1.0),
     )
-    yarn_width = max(min(cell_w, cell_l) * 0.025, 0.0014)
+    repeat_rows = max(1, int(plan.pattern_repeat_rows))
+    repeat_cols = max(1, int(plan.pattern_repeat_cols))
+    tile_w = cell_w / repeat_cols
+    tile_l = cell_l / repeat_rows
+    yarn_width = max(min(tile_w, tile_l) * 0.050, 0.00075)
     z_step = max(FABRIC_THICKNESS * 0.25, yarn_width * 0.35)
-    curves = plan.model_curves
+    curves = _cell_model_curves(plan, row, col)
     if simplified and len(curves) > 12:
         step = max(1, int(math.ceil(len(curves) / 12)))
         curves = curves[::step]
-    for curve_idx, curve in enumerate(curves):
-        color = colors[curve_idx % len(colors)]
-        rgba = (color[0], color[1], color[2], 1.0)
-        if simplified and len(curve) > 5:
-            sample_idx = np.linspace(0, len(curve) - 1, 5).astype(int)
-            curve = [curve[int(i)] for i in sample_idx]
-        pts = [
-            np.array([
-                center_x + float(p[0]) * cell_w,
-                center_y + float(p[1]) * cell_l,
-                z + FABRIC_THICKNESS * 0.65 + (curve_idx % len(colors)) * z_step,
-            ])
-            for p in curve
-        ]
-        for a, b in zip(pts, pts[1:]):
-            _add_segment(mujoco, scn, a, b, rgba, yarn_width)
+    image_repeat_proxy = repeat_rows > 1 or repeat_cols > 1
+    if image_repeat_proxy and len(curves) > 8:
+        curves = curves[::max(1, int(math.ceil(len(curves) / 8)))]
+    x0 = center_x - cell_w * 0.5
+    y0 = center_y - cell_l * 0.5
+    for tr in range(repeat_rows):
+        for tc in range(repeat_cols):
+            tile_cx = x0 + (tc + 0.5) * tile_w
+            tile_cy = y0 + (tr + 0.5) * tile_l
+            for curve_idx, curve in enumerate(curves):
+                color = colors[curve_idx % len(colors)]
+                rgba = (color[0], color[1], color[2], 1.0)
+                if (simplified or image_repeat_proxy) and len(curve) > 6:
+                    sample_idx = np.linspace(0, len(curve) - 1, 6).astype(int)
+                    curve = [curve[int(i)] for i in sample_idx]
+                pts = [
+                    np.array([
+                        tile_cx + float(p[0]) * tile_w * IMAGE_REPEAT_OVERLAP,
+                        tile_cy + float(p[1]) * tile_l * IMAGE_REPEAT_OVERLAP,
+                        z + FABRIC_THICKNESS * 0.65 + (0 if image_repeat_proxy else (curve_idx % len(colors))) * z_step,
+                    ])
+                    for p in curve
+                ]
+                for a, b in zip(pts, pts[1:]):
+                    _add_segment(mujoco, scn, a, b, rgba, yarn_width)
     if highlight:
         _add_box(
             mujoco,
@@ -884,24 +1069,52 @@ def render_camera_image(
                 draw.polygon([(p[0], p[1]) for p in cell_poly if p is not None], fill=fill)
             depth_to_cell = max(float(np.dot(np.array([x0 + cell_w * 0.5, y0 + cell_l * 0.5, fabric_z]) - lens_pos, forward)), near)
             yarn_px = max(3, min(18, int(focal * max(min(cell_w, cell_l) * 0.030, 0.0014) / depth_to_cell)))
-            if not color_picker_mode:
-                for curve_idx, curve in enumerate(plan.model_curves):
-                    rgba = colors[curve_idx % len(colors)]
-                    color = tuple(int(255 * c) for c in rgba[:3])
-                    shade = tuple(max(0, int(channel * 0.45)) for channel in color)
-                    z = fabric_z + curve_idx * max(FABRIC_THICKNESS * 0.08, 0.00045)
-                    pts = [
-                        np.array([
-                            x0 + (float(p[0]) + 0.5) * cell_w,
-                            y0 + (float(p[1]) + 0.5) * cell_l,
-                            z,
-                        ])
-                        for p in curve
-                    ]
-                    pts2d = visible_line(pts)
-                    if len(pts2d) >= 2:
-                        draw.line(pts2d, fill=shade, width=yarn_px + 3, joint="curve")
-                        draw.line(pts2d, fill=color, width=yarn_px, joint="curve")
+            repeat_rows = max(1, int(plan.pattern_repeat_rows))
+            repeat_cols = max(1, int(plan.pattern_repeat_cols))
+            tile_w = cell_w / repeat_cols
+            tile_l = cell_l / repeat_rows
+            if color_picker_mode:
+                fill_rgba = colors[0]
+                fill = tuple(int(255 * c) for c in fill_rgba[:3])
+                for tr in range(repeat_rows):
+                    for tc in range(repeat_cols):
+                        tx0 = x0 + tc * tile_w
+                        ty0 = y0 + tr * tile_l
+                        tx1 = tx0 + tile_w
+                        ty1 = ty0 + tile_l
+                        tile_poly = [
+                            project_camera(np.array([tx0, ty0, fabric_z + 0.00035])),
+                            project_camera(np.array([tx1, ty0, fabric_z + 0.00035])),
+                            project_camera(np.array([tx1, ty1, fabric_z + 0.00035])),
+                            project_camera(np.array([tx0, ty1, fabric_z + 0.00035])),
+                        ]
+                        if all(p is not None for p in tile_poly):
+                            draw.polygon([(p[0], p[1]) for p in tile_poly if p is not None], fill=fill)
+            else:
+                curves = _cell_model_curves(plan, row, col)
+                for tr in range(repeat_rows):
+                    for tc in range(repeat_cols):
+                        tile_x0 = x0 + tc * tile_w
+                        tile_y0 = y0 + tr * tile_l
+                        tile_cx = tile_x0 + tile_w * 0.5
+                        tile_cy = tile_y0 + tile_l * 0.5
+                        for curve_idx, curve in enumerate(curves):
+                            rgba = colors[curve_idx % len(colors)]
+                            color = tuple(int(255 * c) for c in rgba[:3])
+                            shade = tuple(max(0, int(channel * 0.45)) for channel in color)
+                            z = fabric_z + curve_idx * max(FABRIC_THICKNESS * 0.08, 0.00045)
+                            pts = [
+                                np.array([
+                                    tile_cx + float(p[0]) * tile_w * IMAGE_REPEAT_OVERLAP,
+                                    tile_cy + float(p[1]) * tile_l * IMAGE_REPEAT_OVERLAP,
+                                    z,
+                                ])
+                                for p in curve
+                            ]
+                            pts2d = visible_line(pts)
+                            if len(pts2d) >= 2:
+                                draw.line(pts2d, fill=shade, width=max(1, yarn_px // max(repeat_rows, repeat_cols)) + 2, joint="curve")
+                                draw.line(pts2d, fill=color, width=max(1, yarn_px // max(repeat_rows, repeat_cols)), joint="curve")
             outline = (60, 255, 120) if (row, col) == (active_row, active_col) else (245, 245, 240)
             width = 4 if (row, col) == (active_row, active_col) else 1
             poly = [
@@ -923,7 +1136,11 @@ def render_camera_image(
     draw = ImageDraw.Draw(img)
     draw.rectangle([0, 0, 430, 54], fill=(0, 0, 0))
     draw.text((14, 10), f"UR5 camera | station {station_id + 1} | row {active_row + 1}, col {active_col + 1}", fill=(255, 255, 255))
-    draw.text((14, 30), f"{view_name} | lens follows gripper pose | tcp z {tcp_pos[2]:.3f} m", fill=(210, 230, 255))
+    draw.text(
+        (14, 30),
+        f"{view_name} | image repeats {plan.pattern_repeat_rows}x{plan.pattern_repeat_cols} | tcp z {tcp_pos[2]:.3f} m",
+        fill=(210, 230, 255),
+    )
 
     return img
 
@@ -1468,6 +1685,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-json", default="", help="Saved app params.json containing the edited knitted model")
     parser.add_argument("--palette-json", default="", help="JSON list of RGB/RGBA colors for fabric mini-squares")
     parser.add_argument("--cell-colors-json", default="", help="JSON rows x cols x 4 x RGB/RGBA colors for each mini-fabric")
+    parser.add_argument("--cell-model-curves-json", default="", help="JSON rows*cols list of random model curves for each mini-fabric")
+    parser.add_argument("--random-patterns", action="store_true", help="Generate random bitmap-based fabric patterns instead of scanning the saved edited model")
+    parser.add_argument("--pattern-rows", type=int, default=4, help="Rows in each random bitmap pattern")
+    parser.add_argument("--pattern-cols", type=int, default=5, help="Columns in each random bitmap pattern")
+    parser.add_argument("--pattern-repeat-rows", type=int, default=3, help="How many times to repeat each random bitmap vertically inside one fabric sample")
+    parser.add_argument("--pattern-repeat-cols", type=int, default=3, help="How many times to repeat each random bitmap horizontally inside one fabric sample")
+    parser.add_argument("--pattern-density", type=float, default=0.62, help="Probability that a random bitmap stitch is active")
+    parser.add_argument("--random-seed", type=int, default=1, help="Seed for reproducible random pattern generation")
     args = parser.parse_args()
     if args.palette_json:
         try:
@@ -1483,6 +1708,13 @@ def parse_args() -> argparse.Namespace:
             raise SystemExit(f"Invalid --cell-colors-json: {exc}") from exc
     else:
         args.cell_color_sets = None
+    if args.cell_model_curves_json:
+        try:
+            args.cell_model_curves = json.loads(args.cell_model_curves_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid --cell-model-curves-json: {exc}") from exc
+    else:
+        args.cell_model_curves = None
     return args
 
 

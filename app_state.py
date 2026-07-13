@@ -80,7 +80,11 @@ class AppState:
         }
         for attr, cast_fn in _SCHEMA_CASTS.items():
             super().__setattr__(attr, cast_fn(app_config[attr]))
-        extra_saved_keys = ('app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme')
+        extra_saved_keys = (
+            'app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
+            'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
+            'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols',
+        )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
         # Auto-coerce flat numeric lists to np.float32 arrays, leaving other structures intact
@@ -117,6 +121,12 @@ class AppState:
             'display_copies': np.array([0, 0], dtype=np.int32),
             'app_mode': 'edit',
             'scanner_layout_pattern': 'grid',
+            'scanner_random_seed': 1,
+            'scanner_pattern_density': 0.62,
+            'scanner_pattern_rows': 4,
+            'scanner_pattern_cols': 5,
+            'scanner_pattern_repeat_rows': 3,
+            'scanner_pattern_repeat_cols': 3,
             'ui_theme': 'dark',
             'loop_heights': np.full((3, config_data['knit_parameters']['bitmap_loops']), 3.0, dtype=np.float32),
             'mesh_center': np.zeros(3, dtype=np.float32),
@@ -194,6 +204,85 @@ class AppState:
         new_vis[:min(old.shape[0], n_rows)] = old[:min(old.shape[0], n_rows)]
         self.row_visible = new_vis
 
+    def _scanner_random_bitmap(self, cell_index):
+        pattern_rows = max(2, int(self.get('scanner_pattern_rows', max(2, int(self.bitmap_size[0])))))
+        pattern_cols = max(2, int(self.get('scanner_pattern_cols', max(2, int(self.bitmap_size[1])))))
+        density = float(np.clip(float(self.get('scanner_pattern_density', 0.62)), 0.05, 0.95))
+        seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
+        rng = np.random.default_rng(seed)
+        bitmap = (rng.random((pattern_rows, pattern_cols)) < density).astype(np.float32)
+        if not np.any(bitmap > 0.5):
+            bitmap[rng.integers(0, pattern_rows), rng.integers(0, pattern_cols)] = 1.0
+        return bitmap
+
+    def _scanner_loop_heights_for_bitmap(self, bitmap):
+        bitmap = np.asarray(bitmap, dtype=np.float32)
+        heights = np.zeros_like(bitmap, dtype=np.float32)
+        source = np.asarray(self.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
+        for row_idx in range(bitmap.shape[0]):
+            default_height = self._default_loop_height_for_row(row_idx)
+            heights[row_idx, :] = default_height
+        if source.ndim == 2 and source.size:
+            keep_rows = min(bitmap.shape[0], source.shape[0])
+            keep_cols = min(bitmap.shape[1], source.shape[1])
+            heights[:keep_rows, :keep_cols] = source[:keep_rows, :keep_cols]
+        return heights * (bitmap > 0.5)
+
+    def _fit_vl_to_bounds(self, vl, target_bounds):
+        if not vl:
+            return vl
+        src_bounds = self._display_mesh_bounds(vl)
+        if src_bounds is None or target_bounds is None:
+            return vl
+        src_min, src_max = src_bounds
+        dst_min, dst_max = target_bounds
+        src_center = (src_min + src_max) * 0.5
+        dst_center = (dst_min + dst_max) * 0.5
+        src_span = np.maximum(src_max - src_min, 1e-6)
+        dst_span = np.maximum(dst_max - dst_min, 1e-6)
+        scale = float(min(dst_span[0] / src_span[0], dst_span[1] / src_span[1]))
+        fitted = []
+        for verts, n_points in vl:
+            verts = (np.asarray(verts, dtype=np.float32) - src_center) * scale + dst_center
+            fitted.append((verts.astype(np.float32), int(n_points)))
+        return fitted
+
+    def _scanner_pattern_meshes(self, cell_index, target_bounds):
+        bitmap = self._scanner_random_bitmap(cell_index)
+        loop_heights = self._scanner_loop_heights_for_bitmap(bitmap)
+        ctrl_rows = build_parametric_control_rows(
+            self.params,
+            bitmap,
+            self._pidx,
+            self._lh_idx,
+            self.samples_per_loop,
+            loop_heights=loop_heights,
+        )
+        period_offset = np.array([float(bitmap.shape[1]), 0.0, 0.0], dtype=np.float32)
+        radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+        radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
+        vl = build_spline_mesh(
+            ctrl_rows,
+            self.params,
+            self.config,
+            self._pidx,
+            period_offset,
+            radius_ctrl_rows=radius_profiles,
+        )
+        vl, meta = build_surface_fiber_meshes(
+            vl,
+            segments=int(self.config['knit_parameters']['segments']),
+            enabled=self.fiber_geometry_enabled,
+            count=max(1, int(round(float(self.fiber_geometry_count)))),
+            radius=radius,
+            radius_scale=float(self.fiber_geometry_radius_scale),
+            lift=float(self.fiber_geometry_lift),
+            surface_arc=float(self.fiber_geometry_surface_arc),
+            randomness=float(self.fiber_geometry_randomness),
+            twist=float(self.fiber_geometry_twist),
+        )
+        return self._fit_vl_to_bounds(vl, target_bounds), meta
+
     def build_display_meshes_precise(self, verts_list, faces_list, meta):
         if not verts_list:
             return [], [], []
@@ -226,12 +315,29 @@ class AppState:
             scanner_cols = max(1, int(self.get('scanner_preview_cols', 1)))
             scanner_rows = max(1, int(self.get('scanner_preview_rows', 1)))
             layout_pattern = str(self.get('scanner_layout_pattern', 'grid'))
+            base_bounds = self._display_mesh_bounds(verts_list)
             for y_tile in range(scanner_rows):
                 y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
                 row_offset = 0.5 * x_period if layout_pattern == 'staggered' and (y_tile % 2 == 1) else 0.0
                 for x_tile in range(scanner_cols):
                     cell_index = y_tile * scanner_cols + x_tile
                     x_translation = np.array([x_tile * x_period + row_offset, 0.0, 0.0], dtype=np.float32)
+                    if base_bounds is not None:
+                        cell_parts, cell_meta = self._scanner_pattern_meshes(cell_index, base_bounds)
+                        for curve_idx, ((verts, n_points), part_meta) in enumerate(zip(cell_parts, cell_meta)):
+                            base_row = int(part_meta.get('row', curve_idx)) % row_count
+                            translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation
+                            display_vl.append((translated.astype(np.float32), int(n_points)))
+                            display_fl.extend(compute_knitting_faces(seg, [(translated, int(n_points))]))
+                            display_meta.append({
+                                'row': cell_index * row_count + base_row,
+                                'base_row': base_row,
+                                'tile_x': x_tile,
+                                'tile_y': y_tile,
+                                'scanner_cell': cell_index,
+                            })
+                        continue
+
                     for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
                         base_row = int(part_meta.get('row', 0))
                         translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation
@@ -397,13 +503,10 @@ class AppState:
             rows = max(1, int(self.get('scanner_preview_rows', 1)))
             cols = max(1, int(self.get('scanner_preview_cols', 1)))
             base_rows = max(1, int(self.bitmap_size[0]))
-            cell_sets = self.get('scanner_cell_color_sets', [])
             colors = []
-            for cell in range(rows * cols):
-                cell_palette = cell_sets[cell] if isinstance(cell_sets, list) and cell < len(cell_sets) and cell_sets[cell] else base_colors
-                batch_color = cell_palette[0]
+            for _cell in range(rows * cols):
                 for base_row in range(base_rows):
-                    src = batch_color
+                    src = base_colors[base_row % len(base_colors)]
                     colors.append([float(src[0]), float(src[1]), float(src[2])])
             return colors or base_colors
         return base_colors
