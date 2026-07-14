@@ -85,7 +85,7 @@ def _state_scanner_model_curves(state):
     return [((curve - center) * scale).astype(np.float32) for curve in curves]
 
 
-def _scanner_base_palette(state):
+def _default_scanner_palette_from_model(state):
     if bool(state.use_row_colors):
         source = state.row_colors
     else:
@@ -111,15 +111,30 @@ def _as_rgba(color, fallback):
     ]
 
 
-def _scanner_default_batch_colors(state):
-    variants = state.get('scanner_color_variants', [])
-    base = _scanner_base_palette(state)
-    fallback = base[0]
+def _ensure_scanner_shared_colors(state, count=None):
+    fallback_palette = _default_scanner_palette_from_model(state)
+    raw = state.get('scanner_color_variants', [])
+    if count is None:
+        count = len(raw) if isinstance(raw, list) and raw else len(fallback_palette)
+    count = int(np.clip(int(count), 1, 12))
+
     colors = []
-    if isinstance(variants, list):
-        for color in variants:
-            colors.append(_as_rgba(color, fallback))
-    return colors or base
+    for i in range(count):
+        fallback = fallback_palette[i % len(fallback_palette)]
+        if isinstance(raw, list) and i < len(raw):
+            colors.append(_as_rgba(raw[i], fallback))
+        else:
+            colors.append(list(fallback))
+    state.scanner_color_variants = colors
+    return colors
+
+
+def _scanner_base_palette(state):
+    return [list(color) for color in _ensure_scanner_shared_colors(state)]
+
+
+def _scanner_default_batch_colors(state):
+    return _scanner_base_palette(state)
 
 
 def _batch_color_from_saved_cell(saved_cell, fallback):
@@ -1745,17 +1760,48 @@ def draw_sidebar(state, renderer, window=None):
                     state.embedded_scanner = None
                 state.scanner_status = "Preview mode changed; press Start Scanner to rebuild"
 
-        palette = _scanner_base_palette(state)
-        imgui.text(f"Shared colors: {len(palette)}")
-        for color_idx, color in enumerate(palette[:8]):
-            imgui.color_button(
-                f"##scanner_shared_color_{color_idx}",
-                (float(color[0]), float(color[1]), float(color[2]), 1.0),
-                imgui.ColorEditFlags_.no_tooltip,
-                imgui.ImVec2(22, 16),
+        imgui.separator()
+        imgui.text("Shared fabric colors")
+        palette = _ensure_scanner_shared_colors(state)
+        changed_color_count, color_count = imgui.slider_int(
+            "Number of colors##scanner_shared_color_count",
+            len(palette),
+            1,
+            12,
+        )
+        palette_changed = False
+        if changed_color_count:
+            palette = _ensure_scanner_shared_colors(state, int(color_count))
+            palette_changed = True
+        imgui.text_disabled("These colors are reused for every random fabric sample; only bitmap patterns change.")
+        for color_idx, color in enumerate(palette):
+            changed_shared, new_shared = imgui.color_edit3(
+                f"Color {color_idx + 1}##scanner_shared_color_{color_idx}",
+                (float(color[0]), float(color[1]), float(color[2])),
             )
-            if color_idx < min(len(palette), 8) - 1:
-                imgui.same_line()
+            if changed_shared:
+                palette[color_idx] = [
+                    float(new_shared[0]),
+                    float(new_shared[1]),
+                    float(new_shared[2]),
+                    1.0,
+                ]
+                state.scanner_color_variants = [list(c) for c in palette]
+                palette_changed = True
+        if palette_changed:
+            if realistic_mode:
+                state.scanner_cell_color_sets = []
+            else:
+                _ensure_scanner_cell_color_sets(state)
+            embedded = state.get('embedded_scanner')
+            if embedded is not None:
+                try:
+                    embedded.close()
+                except Exception:
+                    pass
+                state.embedded_scanner = None
+            state.scanner_status = "Shared scanner colors changed; press Start Scanner to rebuild"
+            state.rebuild_spline_mesh(preserve_model_placement=False)
         if not realistic_mode:
             cell_sets = _ensure_scanner_cell_color_sets(state)
             rows = max(1, int(state.scanner_rows))

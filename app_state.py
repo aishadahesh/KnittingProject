@@ -378,6 +378,9 @@ class AppState:
         z_period = self._display_copy_z_period(verts_list, depth_gap)
         scanner_preview = bool(self.get('scanner_preview_grid_enabled', False))
         if scanner_preview:
+            template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
+            if template_bitmap.ndim == 2 and template_bitmap.shape[0] > 0:
+                row_count = int(template_bitmap.shape[0])
             bounds = self._display_mesh_bounds(verts_list)
             if bounds is not None:
                 min_v, max_v = bounds
@@ -590,7 +593,11 @@ class AppState:
         if bool(self.get('scanner_preview_grid_enabled', False)):
             rows = max(1, int(self.get('scanner_preview_rows', 1)))
             cols = max(1, int(self.get('scanner_preview_cols', 1)))
-            base_rows = max(1, int(self.bitmap_size[0]))
+            template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
+            base_rows = int(template_bitmap.shape[0]) if template_bitmap.ndim == 2 and template_bitmap.shape[0] > 0 else max(1, int(self.bitmap_size[0]))
+            scanner_palette = self.get('scanner_color_variants', [])
+            if isinstance(scanner_palette, list) and scanner_palette:
+                base_colors = scanner_palette
             colors = []
             for _cell in range(rows * cols):
                 for base_row in range(base_rows):
