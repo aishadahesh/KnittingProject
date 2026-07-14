@@ -49,6 +49,8 @@ class AppState:
         with open(os.path.join(project_root, "config.json"), "r") as f:
             config_data = json.load(f)
         super().__setattr__('config', config_data)
+        super().__setattr__('_scanner_template_cache', None)
+        super().__setattr__('_scanner_template_mtime', None)
 
         pidx = {p["name"]: i for i, p in enumerate(config_data["knit_parameters"]["parameters"])}
         super().__setattr__('_pidx', pidx)
@@ -112,6 +114,17 @@ class AppState:
         for k, v in preset_soft.items():
             state_defaults[k] = AppState._clone(_coerce(v))
 
+        initial_pattern_rows = 4
+        initial_pattern_cols = int(config_data['knit_parameters']['bitmap_loops'])
+        try:
+            with open(os.path.join(project_root, 'initial_params.json'), 'r') as f:
+                initial_data = json.load(f)
+            initial_bitmap = np.asarray(initial_data.get('bitmap', []), dtype=np.float32)
+            if initial_bitmap.ndim == 2 and initial_bitmap.size:
+                initial_pattern_rows, initial_pattern_cols = [int(v) for v in initial_bitmap.shape]
+        except Exception:
+            pass
+
         # 5. Overlay computed defaults depending on config.json or runtime pathing
         computed_defaults = {
             'save_path': os.path.join(project_root, 'params.json'),
@@ -124,8 +137,8 @@ class AppState:
             'scanner_layout_pattern': 'grid',
             'scanner_random_seed': 1,
             'scanner_pattern_density': 0.62,
-            'scanner_pattern_rows': 4,
-            'scanner_pattern_cols': 5,
+            'scanner_pattern_rows': initial_pattern_rows,
+            'scanner_pattern_cols': initial_pattern_cols,
             'scanner_pattern_repeat_rows': 3,
             'scanner_pattern_repeat_cols': 3,
             'scanner_capture_mode': 'natural',
@@ -211,9 +224,70 @@ class AppState:
         new_vis[:min(old.shape[0], n_rows)] = old[:min(old.shape[0], n_rows)]
         self.row_visible = new_vis
 
+    def _scanner_template(self):
+        path = os.path.join(self.project_root, 'initial_params.json')
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        cached = getattr(self, '_scanner_template_cache', None)
+        if cached is not None and getattr(self, '_scanner_template_mtime', None) == mtime:
+            return cached
+
+        params = np.array(
+            [p['initial'] for p in self.config['knit_parameters']['parameters']],
+            dtype=np.float32,
+        )
+        bitmap = np.ones(
+            (max(1, int(self.get('scanner_pattern_rows', 4))), max(1, int(self.get('scanner_pattern_cols', self.config['knit_parameters']['bitmap_loops'])))),
+            dtype=np.float32,
+        )
+        loop_heights = np.empty((0, 0), dtype=np.float32)
+        gui_state = {}
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            p_dict = data.get('params', {})
+            for i, pd in enumerate(self.config['knit_parameters']['parameters']):
+                if pd["name"] in p_dict:
+                    lo, hi = pd["range"]
+                    params[i] = float(np.clip(p_dict[pd["name"]], lo, hi))
+            loaded_bitmap = np.asarray(data.get('bitmap', bitmap), dtype=np.float32)
+            if loaded_bitmap.ndim == 2 and loaded_bitmap.size:
+                bitmap = loaded_bitmap
+            gui_state = data.get('gui_state', {}) if isinstance(data.get('gui_state', {}), dict) else {}
+            loaded_heights = np.asarray(gui_state.get('loop_heights', data.get('loop_heights', loop_heights)), dtype=np.float32)
+            if loaded_heights.ndim == 2 and loaded_heights.size:
+                loop_heights = loaded_heights
+        except Exception:
+            pass
+
+        template = {
+            'params': params,
+            'bitmap': bitmap,
+            'loop_heights': loop_heights,
+            'gui_state': gui_state,
+        }
+        super().__setattr__('_scanner_template_cache', template)
+        super().__setattr__('_scanner_template_mtime', mtime)
+        return template
+
+    def _scanner_template_params(self):
+        return np.asarray(self._scanner_template()['params'], dtype=np.float32).copy()
+
+    def _scanner_default_loop_height_for_row(self, params, row_idx):
+        if not self._lh_idx:
+            return 0.0
+        idx = self._lh_idx[min(int(row_idx), len(self._lh_idx) - 1)]
+        return float(params[idx])
+
     def _scanner_random_bitmap(self, cell_index):
-        pattern_rows = max(2, int(self.get('scanner_pattern_rows', max(2, int(self.bitmap_size[0])))))
-        pattern_cols = max(2, int(self.get('scanner_pattern_cols', max(2, int(self.bitmap_size[1])))))
+        template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.ones((2, 2))), dtype=np.float32)
+        if template_bitmap.ndim == 2 and template_bitmap.size:
+            pattern_rows, pattern_cols = [max(2, int(v)) for v in template_bitmap.shape]
+        else:
+            pattern_rows = max(2, int(self.get('scanner_pattern_rows', max(2, int(self.bitmap_size[0])))))
+            pattern_cols = max(2, int(self.get('scanner_pattern_cols', max(2, int(self.bitmap_size[1])))))
         density = float(np.clip(float(self.get('scanner_pattern_density', 0.62)), 0.05, 0.95))
         seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
         rng = np.random.default_rng(seed)
@@ -224,10 +298,12 @@ class AppState:
 
     def _scanner_loop_heights_for_bitmap(self, bitmap):
         bitmap = np.asarray(bitmap, dtype=np.float32)
+        template = self._scanner_template()
+        params = np.asarray(template['params'], dtype=np.float32)
         heights = np.zeros_like(bitmap, dtype=np.float32)
-        source = np.asarray(self.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
+        source = np.asarray(template.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
         for row_idx in range(bitmap.shape[0]):
-            default_height = self._default_loop_height_for_row(row_idx)
+            default_height = self._scanner_default_loop_height_for_row(params, row_idx)
             heights[row_idx, :] = default_height
         if source.ndim == 2 and source.size:
             keep_rows = min(bitmap.shape[0], source.shape[0])
@@ -257,8 +333,9 @@ class AppState:
     def _scanner_pattern_meshes(self, cell_index, target_bounds):
         bitmap = self._scanner_random_bitmap(cell_index)
         loop_heights = self._scanner_loop_heights_for_bitmap(bitmap)
+        params = self._scanner_template_params()
         ctrl_rows = build_parametric_control_rows(
-            self.params,
+            params,
             bitmap,
             self._pidx,
             self._lh_idx,
@@ -266,11 +343,11 @@ class AppState:
             loop_heights=loop_heights,
         )
         period_offset = np.array([float(bitmap.shape[1]), 0.0, 0.0], dtype=np.float32)
-        radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+        radius = max(float(params[self._pidx['radius']]), 1e-6)
         radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
         vl = build_spline_mesh(
             ctrl_rows,
-            self.params,
+            params,
             self.config,
             self._pidx,
             period_offset,
@@ -306,8 +383,8 @@ class AppState:
                 min_v, max_v = bounds
                 model_w = float(max_v[0] - min_v[0])
                 model_h = float(max_v[1] - min_v[1])
-                x_period = max(model_w - radius * 1.15, radius)
-                y_period = max(model_h - radius * 5.7, radius)
+                x_period = max(model_w - radius * 2.25, radius)
+                y_period = max(model_h - radius * 7.25, radius)
         
         seg = int(self.config['knit_parameters']['segments'])
         if scanner_preview:
@@ -330,7 +407,11 @@ class AppState:
                     cell_index = y_tile * scanner_cols + x_tile
                     x_translation = np.array([x_tile * x_period + row_offset, 0.0, 0.0], dtype=np.float32)
                     if base_bounds is not None:
-                        cell_parts, cell_meta = self._scanner_pattern_meshes(cell_index, base_bounds)
+                        tile_bounds = (
+                            base_bounds[0] + np.array([radius * 0.10, radius * 0.20, 0.0], dtype=np.float32),
+                            base_bounds[1] - np.array([radius * 0.10, radius * 0.20, 0.0], dtype=np.float32),
+                        )
+                        cell_parts, cell_meta = self._scanner_pattern_meshes(cell_index, tile_bounds)
                         for curve_idx, ((verts, n_points), part_meta) in enumerate(zip(cell_parts, cell_meta)):
                             base_row = int(part_meta.get('row', curve_idx)) % row_count
                             translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation

@@ -1003,7 +1003,7 @@ def _trim_rendered_texture(texture: Image.Image) -> Image.Image:
     ys, xs = np.where(mask)
     if xs.size < 16 or ys.size < 16:
         return texture
-    pad = 2
+    pad = 0
     x0 = max(0, int(xs.min()) - pad)
     x1 = min(texture.size[0], int(xs.max()) + pad + 1)
     y0 = max(0, int(ys.min()) - pad)
@@ -1239,9 +1239,24 @@ def render_camera_image(
 
     camera_zoom = max(0.20, float(camera_zoom))
     if focused_capture:
-        batch_span = math.hypot(cell_w, cell_l)
-        fov_y = 2.0 * math.atan((batch_span * 0.58) / max(camera_standoff, 1e-6))
-        fov_y = float(np.clip(fov_y, math.radians(36.0), math.radians(68.0)))
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+        half_view_w = 0.5 * (
+            abs(float(np.dot(x_axis, right))) * cell_w
+            + abs(float(np.dot(y_axis, right))) * cell_l
+        )
+        half_view_h = 0.5 * (
+            abs(float(np.dot(x_axis, up))) * cell_w
+            + abs(float(np.dot(y_axis, up))) * cell_l
+        )
+        aspect = float(width_px) / max(float(height_px), 1.0)
+        framing_pad = 1.08
+        fov_y = 2.0 * math.atan(
+            framing_pad
+            * max(half_view_h, half_view_w / max(aspect, 1e-6))
+            / max(camera_standoff, 1e-6)
+        )
+        fov_y = float(np.clip(fov_y, math.radians(16.0), math.radians(58.0)))
     else:
         fov_y = math.radians(74.0)
     fov_y = float(np.clip(fov_y / camera_zoom, math.radians(12.0), math.radians(86.0)))

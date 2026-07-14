@@ -189,9 +189,18 @@ def _scanner_shared_cell_color_sets(state):
 
 
 def _scanner_pattern_dimensions(state):
-    rows = max(2, int(state.get('scanner_pattern_rows', max(2, int(state.bitmap_size[0])))))
-    cols = max(2, int(state.get('scanner_pattern_cols', max(2, int(state.bitmap_size[1])))))
-    return rows, cols
+    template_bitmap = None
+    if hasattr(state, '_scanner_template'):
+        try:
+            template_bitmap = np.asarray(state._scanner_template().get('bitmap', None), dtype=np.float32)
+        except Exception:
+            template_bitmap = None
+    if template_bitmap is not None and template_bitmap.ndim == 2 and template_bitmap.size:
+        return max(2, int(template_bitmap.shape[0])), max(2, int(template_bitmap.shape[1]))
+    return (
+        max(2, int(state.get('scanner_pattern_rows', max(2, int(state.bitmap_size[0]))))),
+        max(2, int(state.get('scanner_pattern_cols', max(2, int(state.bitmap_size[1]))))),
+    )
 
 
 def _scanner_pattern_repeats(state):
@@ -238,7 +247,7 @@ def _capture_scan_preview_image(renderer):
     ys, xs = np.where(mask)
     if xs.size < 32 or ys.size < 32:
         return Image.fromarray(rgb.copy(), "RGB")
-    pad = 12
+    pad = 0
     x0 = max(0, int(xs.min()) - pad)
     x1 = min(width, int(xs.max()) + pad + 1)
     y0 = max(0, int(ys.min()) - pad)
@@ -253,12 +262,23 @@ def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density
     if not np.any(bitmap > 0.5):
         bitmap[rng.integers(0, pattern_rows), rng.integers(0, pattern_cols)] = 1.0
 
+    if hasattr(state, '_scanner_template'):
+        try:
+            template = state._scanner_template()
+            params = np.asarray(template.get('params', state.params), dtype=np.float32).copy()
+            source = np.asarray(template.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
+        except Exception:
+            params = np.asarray(state.params, dtype=np.float32)
+            source = np.empty((0, 0), dtype=np.float32)
+    else:
+        params = np.asarray(state.params, dtype=np.float32)
+        source = np.empty((0, 0), dtype=np.float32)
+
     heights = np.zeros_like(bitmap, dtype=np.float32)
-    source = np.asarray(state.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
     for row_idx in range(pattern_rows):
         if getattr(state, '_lh_idx', ()):
             idx = state._lh_idx[min(row_idx, len(state._lh_idx) - 1)]
-            heights[row_idx, :] = float(state.params[idx])
+            heights[row_idx, :] = float(params[idx])
         else:
             heights[row_idx, :] = 3.0
     if source.ndim == 2 and source.size:
@@ -267,7 +287,7 @@ def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density
         heights[:keep_rows, :keep_cols] = source[:keep_rows, :keep_cols]
 
     ctrl_rows = build_parametric_control_rows(
-        state.params,
+        params,
         bitmap,
         state._pidx,
         state._lh_idx,
@@ -535,26 +555,126 @@ class EmbeddedMujocoScanner:
         self._save_queue.put((image.copy(), Path(path)))
 
     @staticmethod
-    def _average_visible_rgb(image):
+    def _fabric_rgb_stats(image, debug_path=None):
         rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
         if rgb.ndim != 3 or rgb.shape[0] <= 0 or rgb.shape[1] <= 0:
-            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        # Ignore the black label strip and the scanner background. The goal is
-        # perceived fabric color, not UI text/background color.
-        if rgb.shape[0] > 70:
-            rgb = rgb[58:, :, :]
-        brightness = rgb.max(axis=2)
-        mask = brightness > 35.0
-        if int(mask.sum()) < 16:
-            mask = brightness > 8.0
+            return {
+                "rgb": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                "pixel_count": 0,
+                "total_pixels": 0,
+                "method": "empty",
+            }
+
+        # Ignore the black label strip and scanner annotations. The analysis is
+        # the perceived fabric color, not UI text/background color.
+        y_offset = 58 if rgb.shape[0] > 70 else 0
+        work = rgb[y_offset:, :, :]
+        h, w = work.shape[:2]
+        total_pixels = int(h * w)
+
+        def finish(mask, method):
+            mask = np.asarray(mask, dtype=bool)
+            if int(mask.sum()) < 1:
+                fabric = work.reshape(-1, 3)
+                mask = np.ones((h, w), dtype=bool)
+                method = "full frame fallback"
+            else:
+                fabric = work[mask]
+
+            saved_debug_path = None
+            if debug_path is not None and int(mask.sum()) > 0:
+                try:
+                    ys_mask, xs_mask = np.where(mask)
+                    x0, x1 = int(xs_mask.min()), int(xs_mask.max()) + 1
+                    y0, y1 = int(ys_mask.min()), int(ys_mask.max()) + 1
+                    crop_rgb = np.clip(work[y0:y1, x0:x1], 0, 255).astype(np.uint8)
+                    crop_mask = mask[y0:y1, x0:x1]
+                    rgba = np.zeros((crop_rgb.shape[0], crop_rgb.shape[1], 4), dtype=np.uint8)
+                    rgba[:, :, :3] = crop_rgb
+                    rgba[:, :, 3] = np.where(crop_mask, 255, 0).astype(np.uint8)
+                    debug_out = Path(debug_path)
+                    debug_out.parent.mkdir(parents=True, exist_ok=True)
+                    Image.fromarray(rgba, "RGBA").save(debug_out)
+                    saved_debug_path = str(debug_out)
+                except Exception:
+                    saved_debug_path = None
+
+            return {
+                "rgb": fabric.mean(axis=0),
+                "pixel_count": int(len(fabric)),
+                "total_pixels": total_pixels,
+                "method": method,
+                "debug_path": saved_debug_path,
+            }
+
+        # Preferred path: saved scan images draw a bright green rectangle around
+        # the target fabric. Use that outline to build an oriented rectangle mask
+        # and average only the pixels inside the fabric area.
+        green = (
+            (work[:, :, 1] > 165.0)
+            & (work[:, :, 0] < 90.0)
+            & (work[:, :, 2] < 135.0)
+        )
+        ys, xs = np.where(green)
+        if xs.size >= 24:
+            pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
+            center = pts.mean(axis=0)
+            centered = pts - center
+            cov = centered.T @ centered / max(float(len(pts) - 1), 1.0)
+            try:
+                _, vecs = np.linalg.eigh(cov)
+                axes = vecs[:, ::-1].astype(np.float32)
+                outline_proj = centered @ axes
+                lo = outline_proj.min(axis=0)
+                hi = outline_proj.max(axis=0)
+                margin = 4.0
+                if np.all((hi - lo) > margin * 3.0):
+                    yy, xx = np.mgrid[0:h, 0:w]
+                    grid = np.column_stack((xx.reshape(-1), yy.reshape(-1))).astype(np.float32)
+                    proj = (grid - center) @ axes
+                    mask = (
+                        (proj[:, 0] >= lo[0] + margin)
+                        & (proj[:, 0] <= hi[0] - margin)
+                        & (proj[:, 1] >= lo[1] + margin)
+                        & (proj[:, 1] <= hi[1] - margin)
+                    ).reshape(h, w)
+                    mask &= ~green
+                    if int(mask.sum()) >= 32:
+                        brightness = work.max(axis=2)
+                        saturation = work.max(axis=2) - work.min(axis=2)
+                        color_mask = mask & (brightness > 42.0) & (saturation > 16.0)
+                        if int(color_mask.sum()) >= 32:
+                            return finish(color_mask, "fabric-outline color mask")
+                        else:
+                            return finish(mask, "fabric-outline mask")
+            except Exception:
+                pass
+
+        # Fallback: estimate the scanner background from image edges and keep
+        # pixels that differ from that background enough to be fabric.
+        edge = np.concatenate([
+            work[:8, :, :].reshape(-1, 3),
+            work[-8:, :, :].reshape(-1, 3),
+            work[:, :8, :].reshape(-1, 3),
+            work[:, -8:, :].reshape(-1, 3),
+        ])
+        bg = np.median(edge, axis=0)
+        diff = np.linalg.norm(work - bg[None, None, :], axis=2)
+        brightness = work.max(axis=2)
+        saturation = work.max(axis=2) - work.min(axis=2)
+        mask = (diff > 30.0) & (brightness > 42.0) & (saturation > 16.0)
+        mask &= ~green
+        if int(mask.sum()) < 32:
+            mask = (diff > 22.0) & (brightness > 28.0) & (saturation > 10.0)
         if int(mask.sum()) < 1:
-            return rgb.reshape(-1, 3).mean(axis=0)
-        return rgb[mask].mean(axis=0)
+            return finish(np.ones((h, w), dtype=bool), "full frame fallback")
+        return finish(mask, "background mask")
 
     def _record_capture_analysis(self, image, path, target_index, station_id):
         row, col = self.plan.station_cells[station_id]
         view_name = str(self.plan.view_names[target_index])
-        avg = self._average_visible_rgb(image)
+        stats = self._fabric_rgb_stats(image)
+        avg = np.asarray(stats["rgb"], dtype=np.float32)
         self.capture_records.append({
             "row": int(row),
             "col": int(col),
@@ -563,6 +683,9 @@ class EmbeddedMujocoScanner:
             "angle": view_name,
             "path": str(path),
             "rgb": [float(v) for v in avg],
+            "fabric_pixel_count": int(stats["pixel_count"]),
+            "analysis_total_pixels": int(stats["total_pixels"]),
+            "analysis_mask": str(stats["method"]),
         })
         self.analysis_results = None
 
@@ -570,6 +693,29 @@ class EmbeddedMujocoScanner:
         if not self.capture_records:
             self.analysis_results = {"cells": [], "summary": "No captured images to analyze."}
             return self.analysis_results
+        output_dir = Path(self.args.image_dir)
+        debug_dir = output_dir / "analysis_used_pixels"
+        for record in self.capture_records:
+            path = Path(str(record.get("path", "")))
+            if not path.exists():
+                continue
+            try:
+                debug_path = None
+                if save_outputs:
+                    safe_stem = path.stem.replace(" ", "_")
+                    debug_path = debug_dir / f"{safe_stem}_used_pixels.png"
+                with Image.open(path) as saved_image:
+                    stats = self._fabric_rgb_stats(saved_image, debug_path=debug_path)
+            except Exception:
+                continue
+            rgb = np.asarray(stats["rgb"], dtype=np.float32)
+            record["rgb"] = [float(v) for v in rgb]
+            record["fabric_pixel_count"] = int(stats["pixel_count"])
+            record["analysis_total_pixels"] = int(stats["total_pixels"])
+            record["analysis_mask"] = str(stats["method"])
+            if stats.get("debug_path"):
+                record["analysis_used_image"] = str(stats["debug_path"])
+
         grouped = {}
         for record in self.capture_records:
             key = (int(record["row"]), int(record["col"]))
@@ -593,15 +739,19 @@ class EmbeddedMujocoScanner:
                 "overall_rgb": [float(v) for v in overall],
                 "count": int(len(records)),
                 "angles": angle_results,
+                "fabric_pixel_count": int(sum(int(record.get("fabric_pixel_count", 0)) for record in records)),
+                "analysis_total_pixels": int(sum(int(record.get("analysis_total_pixels", 0)) for record in records)),
+                "analysis_masks": sorted({str(record.get("analysis_mask", "unknown")) for record in records}),
             })
 
         result = {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "image_count": int(len(self.capture_records)),
             "cells": cells,
+            "background_ignored": True,
+            "analysis_note": "Average RGB is computed from detected fabric pixels only; scanner background and label areas are ignored.",
         }
         if save_outputs:
-            output_dir = Path(self.args.image_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             json_path = output_dir / "per_sample_rgb_analysis.json"
             with json_path.open("w", encoding="utf-8") as handle:
@@ -619,6 +769,7 @@ class EmbeddedMujocoScanner:
                         output_dir / f"avg_rgb_row_{row + 1:02d}_col_{col + 1:02d}_{angle_name}.png"
                     )
             result["json_path"] = str(json_path)
+            result["used_pixels_dir"] = str(debug_dir)
         self.analysis_results = result
         return result
 
@@ -1532,8 +1683,8 @@ def draw_sidebar(state, renderer, window=None):
         imgui.text_wrapped("Each mini-grid is one fabric sample. A random bitmap pattern is generated once, then repeated many times inside that sample. All samples use the same colors; only the bitmap changes.")
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-        changed_pr, new_pr = imgui.slider_int("Pattern bitmap rows##scanner_pattern_rows", pattern_rows, 2, 10)
-        changed_pc, new_pc = imgui.slider_int("Pattern bitmap cols##scanner_pattern_cols", pattern_cols, 2, 12)
+        imgui.text(f"Template bitmap: {pattern_rows} rows x {pattern_cols} cols")
+        imgui.text_disabled("Loaded from initial_params.json; Scan Mode randomizes only 0/1 bitmap values.")
         changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
         changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
         changed_density, new_density = imgui.slider_float(
@@ -1544,11 +1695,7 @@ def draw_sidebar(state, renderer, window=None):
             "%.2f",
         )
         changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
-        random_changed = changed_pr or changed_pc or changed_rr or changed_rc or changed_density or changed_seed
-        if changed_pr:
-            state.scanner_pattern_rows = int(new_pr)
-        if changed_pc:
-            state.scanner_pattern_cols = int(new_pc)
+        random_changed = changed_rr or changed_rc or changed_density or changed_seed
         if changed_rr:
             state.scanner_pattern_repeat_rows = int(new_rr)
         if changed_rc:
@@ -1823,9 +1970,14 @@ def draw_sidebar(state, renderer, window=None):
         result = getattr(embedded, "analysis_results", None) if embedded is not None else None
         if result and result.get("cells"):
             imgui.text(f"Images analyzed: {int(result.get('image_count', 0))}")
+            if bool(result.get("background_ignored", False)):
+                imgui.text_wrapped("Background ignored: RGB is calculated only from detected fabric pixels.")
             json_path = result.get("json_path")
             if json_path:
                 imgui.text_disabled(f"Saved: {Path(json_path).name}")
+            used_dir = result.get("used_pixels_dir")
+            if used_dir:
+                imgui.text_disabled(f"Used-pixel crops: {Path(used_dir).name}/")
             cells_by_pos = {
                 (int(cell["row"]), int(cell["col"])): cell
                 for cell in result["cells"]
@@ -1893,6 +2045,14 @@ def draw_sidebar(state, renderer, window=None):
                 )
                 imgui.same_line()
                 imgui.text(f"All views average RGB: {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f}")
+                fabric_px = int(selected_cell.get("fabric_pixel_count", 0))
+                total_px = int(selected_cell.get("analysis_total_pixels", 0))
+                if fabric_px > 0 and total_px > 0:
+                    pct = 100.0 * float(fabric_px) / max(float(total_px), 1.0)
+                    masks = ", ".join(str(v) for v in selected_cell.get("analysis_masks", []))
+                    imgui.text_disabled(f"Fabric pixels used: {fabric_px} / {total_px} ({pct:.1f}%)")
+                    if masks:
+                        imgui.text_disabled(f"Mask: {masks}")
                 imgui.text("Per-angle colors")
                 for angle_index, angle_result in enumerate(selected_cell["angles"]):
                     angle_rgb = [float(v) for v in angle_result["rgb"]]
