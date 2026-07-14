@@ -2041,12 +2041,19 @@ def draw_viewport(state, renderer, ref_tex, window):
     bg_zoom = state.camera.zoom_factor()
     scanner_stage_active = str(state.get('app_mode', 'edit')) == 'scan'
     scanner_picker_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'picker'
+    edit_controls_active = not scanner_stage_active
+    if scanner_stage_active:
+        state.bbox_active_handle = -1
+        state.bbox_hover_handle = -1
+        state.spline_grab_active = False
+        state.radius_grab_active = False
+        state.gizmo_edit_active = False
 
     render_hover_idx = state.hover_idx
     render_selected_idx = state.selected_idx
     visible_ctrl_indices = np.empty((0,), dtype=np.int32)
     visible_ctrl_index_map = {}
-    if state.mode == 'spline':
+    if state.mode == 'spline' and edit_controls_active:
         n_real_total = len(state.flat_pts)
         real_chunks = []
         virtual_indices = []
@@ -2069,7 +2076,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         }
         render_hover_idx = visible_ctrl_index_map.get(int(state.hover_idx), -1)
         render_selected_idx = visible_ctrl_index_map.get(int(state.selected_idx), -1)
-    if scanner_picker_mode:
+    else:
         renderer.set_ctrl_pts(np.empty((0, 3), dtype=np.float32))
         render_hover_idx = -1
         render_selected_idx = -1
@@ -2126,8 +2133,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         hover_mesh_idx=state.hover_mesh_idx,
         selected_mesh_idx=state.selected_mesh_idx,
         visible_rows=np.zeros(max(1, len(state.row_visible)), dtype=bool) if scanner_picker_mode else state.row_visible,
-        bg_tex      = None if scanner_picker_mode else (ref_tex if state.show_ref_bg else None),
-        bg_alpha    = 0.0 if scanner_picker_mode else state.ref_bg_alpha,
+        bg_tex      = None if scanner_stage_active else (ref_tex if state.show_ref_bg else None),
+        bg_alpha    = 0.0 if scanner_stage_active else state.ref_bg_alpha,
         bg_uniforms = bg_uniforms,
         camera      = state.camera,
         n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx])
@@ -2293,7 +2300,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     active_handle = int(state.get('bbox_active_handle', -1))
     hover_handle = -1
     scanner_cell_bounds = projected_scanner_cell_bounds() if scanner_stage_active else None
-    if gizmo_bounds is not None and is_hovered:
+    if edit_controls_active and gizmo_bounds is not None and is_hovered:
         handles = bounds_handles(gizmo_bounds)
         d2 = [((lx - hx) ** 2 + (ly - hy) ** 2) for hx, hy in handles]
         best_idx = int(np.argmin(d2))
@@ -2305,7 +2312,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         dl = imgui.get_window_draw_list()
         ox, oy = float(state.vp_origin[0]), float(state.vp_origin[1])
         x_min, y_min, x_max, y_max = gizmo_bounds
-        if not scanner_picker_mode:
+        if edit_controls_active:
             rect_col = imgui.get_color_u32((0.95, 0.95, 0.95, 0.92))
             dl.add_rect((ox + x_min, oy + y_min), (ox + x_max, oy + y_max), rect_col, 0.0, 2.0, 0)
         if scanner_stage_active and scanner_cell_bounds:
@@ -2368,7 +2375,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                         2.0 if selected_cell else 1.0,
                         0,
                     )
-        if not scanner_picker_mode:
+        if edit_controls_active:
             for i, (hx, hy) in enumerate(bounds_handles(gizmo_bounds)):
                 is_hot = (i == hover_handle or i == active_handle)
                 fill = imgui.get_color_u32((0.95, 0.65, 0.10, 1.0) if is_hot else (0.96, 0.96, 0.96, 0.95))
@@ -2377,7 +2384,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 dl.add_circle((ox + hx, oy + hy), handle_radius, stroke, 16, 1.5)
 
     # ImGuizmo
-    if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map:
+    if edit_controls_active and state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map:
         local_pos = state.flat_pts_all[state.selected_idx].astype(np.float32)
         pos = transform_points([local_pos], model_mat)[0].astype(np.float32)
         M16 = imguizmo.im_guizmo.Matrix16
@@ -2467,7 +2474,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                     break
 
         # Bounding-box resize handles (window-like scaling in screen space).
-        if gizmo_bounds is not None and hover_handle >= 0 and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:
+        if edit_controls_active and gizmo_bounds is not None and hover_handle >= 0 and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:
             state.push_undo("Bounding box scale")
             state.bbox_active_handle = int(hover_handle)
             state.bbox_start_bounds = np.array(gizmo_bounds, dtype=np.float32)
@@ -2477,7 +2484,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             suppress_mesh_click = True
 
         active_handle = int(state.get('bbox_active_handle', -1))
-        if active_handle >= 0 and lmb_down and state.get('bbox_start_bounds') is not None:
+        if edit_controls_active and active_handle >= 0 and lmb_down and state.get('bbox_start_bounds') is not None:
             x0_min, y0_min, x0_max, y0_max = [float(v) for v in state.bbox_start_bounds]
             old_w = max(1e-4, x0_max - x0_min)
             old_h = max(1e-4, y0_max - y0_min)
@@ -2515,7 +2522,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             correction = viewport_pixel_delta_to_world(new_cx - old_cx, new_cy - old_cy)
             state.model_t = (start_t + correction).astype(np.float32)
             suppress_mesh_click = True
-        elif active_handle >= 0 and not lmb_down:
+        elif active_handle >= 0 and (not edit_controls_active or not lmb_down):
             state.bbox_active_handle = -1
             state.bbox_start_bounds = None
             state.bbox_start_mouse = None
@@ -2528,10 +2535,10 @@ def draw_viewport(state, renderer, ref_tex, window):
         if color_pick_active:
             imgui.set_mouse_cursor(imgui.MouseCursor_.hand)
 
-        if imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not color_pick_active and not suppress_mesh_click:
+        if edit_controls_active and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not color_pick_active and not suppress_mesh_click:
             state.selected_mesh_idx = state.hover_mesh_idx
 
-        if color_pick_active and imgui.is_mouse_clicked(imgui.MouseButton_.left):
+        if edit_controls_active and color_pick_active and imgui.is_mouse_clicked(imgui.MouseButton_.left):
             mesh_idx = state.hover_mesh_idx if state.hover_mesh_idx >= 0 else state.selected_mesh_idx
             sampled = sample_reference_color(lx, ly)
             if sampled is None:
@@ -2550,7 +2557,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.hover_mesh_idx = -1
         active_handle = int(state.get('bbox_active_handle', -1))
         lmb_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
-        if active_handle >= 0 and not lmb_down:
+        if active_handle >= 0 and (not edit_controls_active or not lmb_down):
             state.bbox_active_handle = -1
             state.bbox_start_bounds = None
             state.bbox_start_mouse = None
@@ -2615,7 +2622,9 @@ def draw_viewport(state, renderer, ref_tex, window):
             mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE)== glfw.PRESS
             shift_down = imgui.get_io().key_shift
 
-            if shift_down and state.mode == 'spline' and state.selected_idx >= 0 and (
+            if not edit_controls_active:
+                can_transform_model = False
+            elif shift_down and state.mode == 'spline' and state.selected_idx >= 0 and (
                     imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()):
                 can_transform_model = False
             elif shift_down and state.mode == 'spline' and state.hover_idx >= 0:
@@ -2631,7 +2640,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                     state.push_undo("Model transform")
                     state.model_drag_undo_active = True
                 state.model_t += pixel_drag_to_world_delta(dx, dy)
-            elif lmb and not shift_down and not bbox_drag_active and not spline_drag_active and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
+            elif edit_controls_active and lmb and not shift_down and not bbox_drag_active and not spline_drag_active and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
                 if not state.model_drag_undo_active:
                     state.push_undo("Model translate")
                     state.model_drag_undo_active = True
@@ -2640,7 +2649,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         r_down = glfw.get_key(window, glfw.KEY_R) == glfw.PRESS
         r_pressed = r_down and not bool(state.radius_grab_key_was_down)
         state.radius_grab_key_was_down = r_down
-        if r_pressed and not bool(state.radius_grab_active):
+        if edit_controls_active and r_pressed and not bool(state.radius_grab_active):
             edit_idx = local_radius_edit_index()
             if edit_idx >= 0:
                 state.push_undo("Local tube radius")
@@ -2651,7 +2660,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 state.radius_grab_start_value = local_radius_value(edit_idx)
                 state.radius_grab_start_rows = [row.copy() for row in state.spline_radius_rows]
 
-        if bool(state.radius_grab_active):
+        if edit_controls_active and bool(state.radius_grab_active):
             start_mouse = np.asarray(state.radius_grab_start_mouse, dtype=np.float32)
             start_radius = float(state.radius_grab_start_value)
             _, lo, hi = radius_range()
@@ -2685,7 +2694,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 state.radius_grab_active = False
                 state.radius_grab_start_rows = []
 
-        if not bool(state.radius_grab_active):
+        if edit_controls_active and not bool(state.radius_grab_active):
             radius_delta = 0.0
             edit_idx = local_radius_edit_index()
             current_radius = local_radius_value(edit_idx) if edit_idx >= 0 else 0.0
@@ -2711,7 +2720,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             else:
                 state.radius_keyboard_edit_active = False
 
-        if state.mode == 'spline' and len(visible_ctrl_indices) > 0 and not bool(state.radius_grab_active):
+        if edit_controls_active and state.mode == 'spline' and len(visible_ctrl_indices) > 0 and not bool(state.radius_grab_active):
             g_down = glfw.get_key(window, glfw.KEY_G) == glfw.PRESS
             g_pressed = g_down and not bool(state.spline_grab_key_was_down)
             state.spline_grab_key_was_down = g_down
@@ -2752,7 +2761,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                         state.rebuild_spline_mesh()
                         state.spline_grab_active = False
 
-        if state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map and not bool(state.radius_grab_active):
+        if edit_controls_active and state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map and not bool(state.radius_grab_active):
             view = state.camera.view()
             right = view[0, :3]
             up = view[1, :3]
@@ -2800,7 +2809,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.model_drag_undo_active = False
 
         # Spline handle hover + select
-        if state.mode == 'spline' and len(visible_ctrl_indices) > 0:
+        if edit_controls_active and state.mode == 'spline' and len(visible_ctrl_indices) > 0:
             gizmo_active = state.selected_idx >= 0 and (
                 imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()
             )
@@ -2841,6 +2850,8 @@ def draw_viewport(state, renderer, ref_tex, window):
 
 
 def draw_reference_image_panel(state, ref_tex):
+    if str(state.get('app_mode', 'edit')) == 'scan':
+        return
     imgui.set_next_window_pos((1220, 400), cond=imgui.Cond_.first_use_ever)
     imgui.set_next_window_size((420, 440), cond=imgui.Cond_.first_use_ever)
     imgui.begin("Reference Image")

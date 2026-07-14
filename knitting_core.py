@@ -212,12 +212,14 @@ def build_spline_mesh(
         D = np.asarray(period_offset, dtype=float)
         bitmap_width = float(np.linalg.norm(D))
         
-    nout = res * int(round(bitmap_width)) + 1
+    nout = max(3, res * int(round(bitmap_width)) + 1)
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
     out = []
     for row_idx, r in enumerate(ctrl_rows):
         cp = np.asarray(r, dtype=float)
+        if len(cp) == 0:
+            continue
         if len(cp) <= 1:
             pts = np.repeat(cp, nout, axis=0)
             ctrl_sample_idx = np.zeros(nout, dtype=float)
