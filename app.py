@@ -106,7 +106,7 @@ def main():
     def start_simulation_thread(state):
         import time
         import threading
-        from knitting_core import run_simulation_step
+        from yarn_simulation import run_simulation_step
         
         def run_loop():
             while True:
@@ -134,11 +134,11 @@ def main():
                         
                     new_ctrl_rows = run_simulation_step(ctrl_rows, period_offset_x, period_offset_y, config, J_cached, L0_array, ks, kb, kc, dhat)
                     
-                    from knitting_core import eval_energy
+                    from yarn_simulation import eval_energy
                     flat_P_old = np.concatenate(ctrl_rows).astype(float) if ctrl_rows else np.empty((0, 3), float)
                     flat_P = np.concatenate(new_ctrl_rows).astype(float) if new_ctrl_rows else np.empty((0, 3), float)
                     if len(flat_P) > 0:
-                        e_el, e_b, e_col = eval_energy(flat_P, new_ctrl_rows, period_offset_x, period_offset_y, config, L0_array, ks, kb, kc, dhat)
+                        e_el, e_b, e_col = eval_energy(flat_P, new_ctrl_rows, period_offset_x, period_offset_y, config, L0_array, dhat)
                     else:
                         e_el, e_b, e_col = 0.0, 0.0, 0.0
                     
@@ -253,5 +253,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# %%
