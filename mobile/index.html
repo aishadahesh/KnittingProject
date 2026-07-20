@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Knitting Mobile Previewer</title>
+    <!-- Modern Premium Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Three.js and OrbitControls CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --card-bg: rgba(25, 25, 35, 0.65);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --accent: #ff4757;
+            --accent-hover: #ff6b81;
+            --accent-glow: rgba(255, 71, 87, 0.35);
+            --text-primary: #f1f2f6;
+            --text-secondary: #a4b0be;
+            --active-glow: 0 0 15px var(--accent-glow);
+            --font-main: 'Outfit', sans-serif;
+            --border-radius: 16px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+        }
+
+        body {
+            font-family: var(--font-main);
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Responsive Split Screen Layout */
+        #viewport-container {
+            height: 50vh;
+            width: 100vw;
+            position: relative;
+            background: radial-gradient(circle at center, #1b1b2f 0%, #0a0a0f 100%);
+        }
+
+        #canvas3d {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        /* Overlay Controls in Viewport */
+        .viewport-overlay {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            right: 16px;
+            pointer-events: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .overlay-card {
+            background: rgba(10, 10, 15, 0.75);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--card-border);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .overlay-button {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: rgba(10, 10, 15, 0.75);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: auto;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .overlay-button:active {
+            transform: scale(0.9);
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        /* Control Panel */
+        #controls-container {
+            height: 50vh;
+            width: 100vw;
+            background-color: var(--bg-secondary);
+            border-top: 1px solid var(--card-border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 -10px 30px rgba(0,0,0,0.5);
+        }
+
+        /* Tab Switcher */
+        .tab-bar {
+            display: flex;
+            background: rgba(0, 0, 0, 0.25);
+            border-bottom: 1px solid var(--card-border);
+            padding: 6px;
+            gap: 6px;
+        }
+
+        .tab-button {
+            flex: 1;
+            padding: 10px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            font-family: var(--font-main);
+            font-size: 0.95rem;
+            font-weight: 600;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .tab-button.active {
+            background-color: var(--card-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--card-border);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .tab-content-wrapper {
+            flex: 1;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        .tab-content {
+            display: none;
+            padding: 16px;
+            height: 100%;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Grid Pattern Editor Style */
+        .grid-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+
+        .grid-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .grid-controls {
+            display: flex;
+            gap: 8px;
+        }
+
+        .grid-btn {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            padding: 6px 12px;
+            border-radius: 10px;
+            font-family: var(--font-main);
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .grid-btn:active {
+            transform: scale(0.95);
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .grid-wrapper {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.15);
+            border-radius: var(--border-radius);
+            border: 1px solid var(--card-border);
+            overflow-x: auto;
+        }
+
+        .knitting-grid {
+            display: grid;
+            gap: 6px;
+            justify-content: center;
+        }
+
+        .grid-cell {
+            aspect-ratio: 1;
+            width: 44px;
+            height: 44px;
+            border-radius: 10px;
+            border: 2px solid rgba(255, 255, 255, 0.15);
+            background-color: rgba(20, 20, 30, 0.5);
+            cursor: pointer;
+            transition: all 0.15s ease;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .grid-cell::before {
+            content: '∪';
+            font-size: 1.4rem;
+            color: rgba(255, 255, 255, 0.1);
+            font-weight: bold;
+            transition: color 0.2s ease;
+        }
+
+        .grid-cell.active-1 {
+            background-color: rgb(217, 31, 26);
+            border-color: rgba(255, 255, 255, 0.4);
+            box-shadow: 0 0 10px rgba(217, 31, 26, 0.35);
+        }
+        .grid-cell.active-1::before { color: rgba(255,255,255,0.7); }
+
+        .grid-cell.active-2 {
+            background-color: rgb(242, 209, 51);
+            border-color: rgba(255, 255, 255, 0.4);
+            box-shadow: 0 0 10px rgba(242, 209, 51, 0.35);
+        }
+        .grid-cell.active-2::before { color: rgba(0,0,0,0.5); }
+
+        .grid-cell.active-3 {
+            background-color: rgb(36, 115, 230);
+            border-color: rgba(255, 255, 255, 0.4);
+            box-shadow: 0 0 10px rgba(36, 115, 230, 0.35);
+        }
+        .grid-cell.active-3::before { color: rgba(255,255,255,0.7); }
+
+        .grid-cell.active-4 {
+            background-color: rgb(89, 46, 20);
+            border-color: rgba(255, 255, 255, 0.4);
+            box-shadow: 0 0 10px rgba(89, 46, 20, 0.35);
+        }
+        .grid-cell.active-4::before { color: rgba(255,255,255,0.7); }
+
+        /* Sliders Panel Style */
+        .sliders-list {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            padding-bottom: 24px;
+        }
+
+        .slider-group {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            padding: 12px 16px;
+            border-radius: var(--border-radius);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .slider-label-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .slider-title {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .slider-value-badge {
+            background: rgba(255, 255, 255, 0.08);
+            padding: 2px 8px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .slider-input-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.1);
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: var(--text-primary);
+            cursor: pointer;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+            transition: transform 0.1s ease;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:active {
+            transform: scale(1.2);
+            background: var(--accent);
+        }
+
+        /* Color Palette Preview */
+        .color-legend {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: center;
+            margin-top: 12px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .legend-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        /* Tiling Toggle UI */
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            padding: 12px 16px;
+            border-radius: var(--border-radius);
+            margin-bottom: 12px;
+        }
+        
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 48px;
+            height: 26px;
+        }
+        
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        
+        .slider-toggle {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: rgba(255,255,255,0.15);
+            transition: .3s;
+            border-radius: 34px;
+        }
+        
+        .slider-toggle:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+        }
+        
+        input:checked + .slider-toggle {
+            background-color: var(--accent);
+        }
+        
+        input:checked + .slider-toggle:before {
+            transform: translateX(22px);
+        }
+
+        /* Desktop Optimization */
+        @media (min-width: 768px) {
+            body {
+                flex-direction: row;
+            }
+            #viewport-container {
+                height: 100vh;
+                flex: 3;
+            }
+            #controls-container {
+                height: 100vh;
+                flex: 2;
+                border-top: none;
+                border-left: 1px solid var(--card-border);
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 3D Viewport -->
+    <div id="viewport-container">
+        <canvas id="canvas3d"></canvas>
+        <div class="viewport-overlay">
+            <div class="overlay-card" id="status-card">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #2ecc71; box-shadow: 0 0 8px #2ecc71;"></span>
+                3D Viewport Live
+            </div>
+            <button class="overlay-button" id="reset-cam" title="Reset Camera">⟲</button>
+        </div>
+    </div>
+
+    <!-- Controls Panel -->
+    <div id="controls-container">
+        <!-- Tab Navigation -->
+        <div class="tab-bar">
+            <button class="tab-button active" onclick="switchTab('pattern')">
+                <span style="font-size: 1.1rem;">▦</span> Pattern Grid
+            </button>
+            <button class="tab-button" onclick="switchTab('params')">
+                <span style="font-size: 1.1rem;">⚙</span> Sliders Panel
+            </button>
+        </div>
+
+        <div class="tab-content-wrapper">
+            <!-- Pattern Editor Tab -->
+            <div class="tab-content active" id="tab-pattern">
+                <div class="grid-header">
+                    <span class="grid-title">Bitmap Grid Settings</span>
+                    <div class="grid-controls">
+                        <button class="grid-btn" onclick="resizeGrid('cols', -1)">- Col</button>
+                        <button class="grid-btn" onclick="resizeGrid('cols', 1)">+ Col</button>
+                        <button class="grid-btn" onclick="resizeGrid('rows', -1)">- Row</button>
+                        <button class="grid-btn" onclick="resizeGrid('rows', 1)">+ Row</button>
+                    </div>
+                </div>
+
+                <div class="grid-wrapper">
+                    <div class="knitting-grid" id="knitting-grid"></div>
+                </div>
+
+                <div class="color-legend">
+                    Cycle stitches: 
+                    <span class="legend-dot" style="background-color: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);"></span> Off
+                    <span class="legend-dot" style="background-color: rgb(217,31,26);"></span> C1
+                    <span class="legend-dot" style="background-color: rgb(242,209,51);"></span> C2
+                    <span class="legend-dot" style="background-color: rgb(36,115,230);"></span> C3
+                    <span class="legend-dot" style="background-color: rgb(89,46,20);"></span> C4
+                </div>
+            </div>
+
+            <!-- Sliders Panel Tab -->
+            <div class="tab-content" id="tab-params">
+                <!-- Tiling Control -->
+                <div class="toggle-container">
+                    <div>
+                        <div style="font-weight: 500; font-size: 0.95rem;">Tile Repeat Preview</div>
+                        <div style="font-size: 0.8rem; color: var(--text-secondary);">Render periodic copies (3x3 grid)</div>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="tile-toggle" onchange="toggleTiling(this)">
+                        <span class="slider-toggle"></span>
+                    </label>
+                </div>
+
+                <div class="sliders-list" id="sliders-list">
+                    <!-- Sliders will be injected by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Application Logic -->
+    <script>
+        // Default color palette in RGB values
+        const yarnColors = [
+            [0.85, 0.12, 0.1], // C1: Red
+            [0.95, 0.82, 0.2], // C2: Yellow
+            [0.14, 0.45, 0.9], // C3: Blue
+            [0.35, 0.18, 0.08]  // C4: Brown
+        ];
+
+        // Core Parameters Schema (mapped directly to config.json ranges)
+        const paramsSchema = [
+            { id: "stitch_bulge", label: "Stitch Bulge", min: 0.0, max: 1.0, step: 0.01, default: 0.25 },
+            { id: "stitch_z", label: "Stitch Depth (Z)", min: -1.0, max: 1.0, step: 0.01, default: -0.721 },
+            { id: "dy", label: "Row Spacing (dy)", min: 0.1, max: 3.0, step: 0.01, default: 1.177 },
+            { id: "radius", label: "Yarn Radius", min: 0.01, max: 0.5, step: 0.005, default: 0.2014 },
+            { id: "ellipse_ratio", label: "Ellipse Ratio", min: 0.2, max: 3.0, step: 0.01, default: 1.0 },
+            { id: "loop_height_1", label: "Loop Height C1", min: 0.1, max: 6.0, step: 0.01, default: 3.0 },
+            { id: "loop_height_2", label: "Loop Height C2", min: 0.1, max: 6.0, step: 0.01, default: 3.0 },
+            { id: "loop_height_3", label: "Loop Height C3", min: 0.1, max: 6.0, step: 0.01, default: 3.0 },
+            { id: "loop_height_4", label: "Loop Height C4", min: 0.1, max: 6.0, step: 0.01, default: 3.0 }
+        ];
+
+        // Active State variables
+        let params = {};
+        let bitmap = [
+            [1.0, 1.0, 1.0, 1.0],
+            [2.0, 2.0, 2.0, 2.0],
+            [3.0, 3.0, 3.0, 3.0],
+            [4.0, 4.0, 4.0, 4.0]
+        ];
+        let displayTiling = false;
+
+        // Initialize parameters values from schema
+        paramsSchema.forEach(p => {
+            params[p.id] = p.default;
+        });
+
+        // 3D Scene globals
+        let scene, camera, renderer, controls;
+        let yarnMeshesGroup;
+
+        // =====================================================================
+        // PERIODIC CUBIC SPLINE MATHEMATICS (JS PORT OF JAX/SCIPY PIPELINE)
+        // =====================================================================
+
+        // Cyclic/Periodic Tridiagonal Solver (Cyclic Thomas Algorithm)
+        class PeriodicCubicSpline {
+            constructor(x, y) {
+                const N = x.length - 1;
+                this.x = x;
+                this.y = y;
+                this.N = N;
+
+                if (N < 3) {
+                    // Linear fallback
+                    this.m = new Float64Array(x.length);
+                    return;
+                }
+
+                const h = new Float64Array(N);
+                for (let i = 0; i < N; i++) {
+                    h[i] = Math.max(x[i + 1] - x[i], 1e-6);
+                }
+
+                // Setup RHS values D
+                const D = new Float64Array(N);
+                for (let i = 0; i < N; i++) {
+                    const im1 = (i === 0) ? N - 1 : i - 1;
+                    const val_im1 = (i === 0) ? y[N - 1] : y[i - 1];
+                    D[i] = 6 * ((y[i + 1] - y[i]) / h[i] - (y[i] - val_im1) / h[im1]);
+                }
+
+                // Solve cyclic tridiagonal system of size N via Sherman-Morrison
+                const M = N - 1;
+                const a = new Float64Array(M);
+                const b = new Float64Array(M);
+                const c = new Float64Array(M);
+
+                for (let i = 0; i < M; i++) {
+                    const im1 = (i === 0) ? N - 1 : i - 1;
+                    b[i] = 2 * (h[im1] + h[i]);
+                    if (i > 0) a[i] = h[im1];
+                    if (i < M - 1) c[i] = h[i];
+                }
+
+                const dx = new Float64Array(M);
+                for (let i = 0; i < M; i++) {
+                    dx[i] = D[i];
+                }
+
+                const dy = new Float64Array(M);
+                dy[0] = -h[N - 1];
+                dy[M - 1] = -h[M - 2];
+
+                const z = this._solveTridiagonal(a, b, c, dx);
+                const q = this._solveTridiagonal(a, b, c, dy);
+
+                const A_last = h[N - 2];
+                const B_last = 2 * (h[N - 2] + h[N - 1]);
+                const C_last = h[N - 1];
+                const D_last = D[N - 1];
+
+                const m_last = (D_last - A_last * z[M - 1] - C_last * z[0]) / 
+                               (A_last * q[M - 1] + B_last + C_last * q[0]);
+
+                this.m = new Float64Array(N + 1);
+                for (let i = 0; i < M; i++) {
+                    this.m[i] = z[i] + m_last * q[i];
+                }
+                this.m[N - 1] = m_last;
+                this.m[N] = this.m[0];
+            }
+
+            _solveTridiagonal(a, b, c, d) {
+                const n = d.length;
+                const cp = new Float64Array(n);
+                const dp = new Float64Array(n);
+
+                cp[0] = c[0] / b[0];
+                dp[0] = d[0] / b[0];
+
+                for (let i = 1; i < n; i++) {
+                    const denom = b[i] - a[i] * cp[i - 1];
+                    cp[i] = c[i] / denom;
+                    dp[i] = (d[i] - a[i] * dp[i - 1]) / denom;
+                }
+
+                const x = new Float64Array(n);
+                x[n - 1] = dp[n - 1];
+                for (let i = n - 2; i >= 0; i--) {
+                    x[i] = dp[i] - cp[i] * x[i + 1];
+                }
+                return x;
+            }
+
+            evaluate(t_val) {
+                const N = this.N;
+                if (N < 3) {
+                    let i = 0;
+                    while (i < N && t_val > this.x[i + 1]) i++;
+                    const t0 = this.x[i], t1 = this.x[i + 1];
+                    const y0 = this.y[i], y1 = this.y[i + 1];
+                    const alpha = (t_val - t0) / (t1 - t0);
+                    return y0 + alpha * (y1 - y0);
+                }
+
+                if (t_val <= this.x[0]) return this.y[0];
+                if (t_val >= this.x[N]) return this.y[N];
+
+                let low = 0, high = N;
+                while (low < high - 1) {
+                    const mid = (low + high) >> 1;
+                    if (t_val >= this.x[mid]) {
+                        low = mid;
+                    } else {
+                        high = mid;
+                    }
+                }
+                const i = low;
+
+                const h = this.x[i + 1] - this.x[i];
+                const dx = t_val - this.x[i];
+                const a = this.y[i];
+                const c = this.m[i] / 2;
+                const d = (this.m[i + 1] - this.m[i]) / (6 * h);
+                const b = (this.y[i + 1] - this.y[i]) / h - (h / 6) * (2 * this.m[i] + this.m[i + 1]);
+
+                return a + b * dx + c * dx * dx + d * dx * dx * dx;
+            }
+        }
+
+        // JS Port of _scale_factors_jax
+        function computeScaleFactors(grid) {
+            const rows = grid.length;
+            const cols = grid[0].length;
+            const sf = Array.from({ length: rows }, () => new Float32Array(cols));
+
+            for (let c = 0; c < cols; c++) {
+                const activeRows = [];
+                for (let r = 0; r < rows; r++) {
+                    if (grid[r][c] > 0.5) {
+                        activeRows.push(r);
+                    }
+                }
+
+                if (activeRows.length === 0) continue;
+
+                for (let i = 0; i < activeRows.length; i++) {
+                    const curr = activeRows[i];
+                    let next;
+                    if (i < activeRows.length - 1) {
+                        next = activeRows[i + 1];
+                        sf[curr][c] = next - curr;
+                    } else {
+                        next = activeRows[0];
+                        sf[curr][c] = (rows + next) - curr;
+                    }
+                }
+            }
+            return sf;
+        }
+
+        // JS Port of eval_curve
+        function evalCurve(t, hl, lh, sb, sz) {
+            const x = sb * Math.sin(2 * t) + t / (2 * Math.PI);
+            const y = lh * (-(Math.cos(t) - 1) / 2);
+            const z = sz * (Math.cos(2 * t) - 1) / 2 * hl;
+            if (hl === 0.0) {
+                return [t / (2 * Math.PI), 0, 0];
+            }
+            return [x, y, z];
+        }
+
+        // JS Port of eval_centerline
+        function evalCenterline(cp, D, nout, t_cache = null, to_cache = null) {
+            const num_ctrl = cp.length;
+            if (num_ctrl <= 1) {
+                const r = [];
+                for (let i = 0; i < nout; i++) r.push(new THREE.Vector3().fromArray(cp[0]));
+                return r;
+            }
+
+            // cp_aug = [cp, cp[0] + D]
+            const cp_aug = [];
+            for (let i = 0; i < num_ctrl; i++) cp_aug.push(cp[i].slice());
+            cp_aug.push([cp[0][0] + D[0], cp[0][1] + D[1], cp[0][2] + D[2]]);
+
+            // Calculate chord-lengths
+            let t = t_cache;
+            let to = to_cache;
+            if (!t || !to) {
+                t = new Float64Array(num_ctrl + 1);
+                t[0] = 0.0;
+                for (let i = 0; i < num_ctrl; i++) {
+                    const dx = cp_aug[i + 1][0] - cp_aug[i][0];
+                    const dy = cp_aug[i + 1][1] - cp_aug[i][1];
+                    const dz = cp_aug[i + 1][2] - cp_aug[i][2];
+                    const dist = Math.max(Math.sqrt(dx*dx + dy*dy + dz*dz), 1e-6);
+                    t[i + 1] = t[i] + dist;
+                }
+                to = new Float64Array(nout);
+                const step = t[t.length - 1] / (nout - 1);
+                for (let i = 0; i < nout; i++) {
+                    to[i] = i * step;
+                }
+            }
+
+            const t_max = t[t.length - 1];
+
+            // detrend cp_aug
+            const cp_detrended = Array.from({ length: num_ctrl + 1 }, () => new Float64Array(3));
+            for (let i = 0; i <= num_ctrl; i++) {
+                const ratio = t[i] / t_max;
+                cp_detrended[i][0] = cp_aug[i][0] - D[0] * ratio;
+                cp_detrended[i][1] = cp_aug[i][1] - D[1] * ratio;
+                cp_detrended[i][2] = cp_aug[i][2] - D[2] * ratio;
+            }
+
+            // Fit periodic cubic splines for X, Y, Z
+            const splines = [];
+            for (let dim = 0; dim < 3; dim++) {
+                const y_coords = new Float64Array(num_ctrl + 1);
+                for (let i = 0; i <= num_ctrl; i++) y_coords[i] = cp_detrended[i][dim];
+                splines.push(new PeriodicCubicSpline(t, y_coords));
+            }
+
+            // Evaluate spline and add back trend
+            const points = [];
+            for (let i = 0; i < nout; i++) {
+                const to_val = to[i];
+                const ratio = to_val / t_max;
+                const px = splines[0].evaluate(to_val) + D[0] * ratio;
+                const py = splines[1].evaluate(to_val) + D[1] * ratio;
+                const pz = splines[2].evaluate(to_val) + D[2] * ratio;
+                points.push(new THREE.Vector3(px, py, pz));
+            }
+
+            return points;
+        }
+
+        // Port of build_parametric_control_rows
+        function buildParametricControlRows(spl = 5) {
+            const bulge = params.stitch_bulge;
+            const stz = params.stitch_z;
+            const dy = params.dy;
+            
+            const lut = [
+                0, 
+                params.loop_height_1, 
+                params.loop_height_2, 
+                params.loop_height_3, 
+                params.loop_height_4
+            ];
+
+            const sf = computeScaleFactors(bitmap);
+            const rows = sf.length;
+            const cols = sf[0].length;
+
+            const base_t = new Float32Array(spl);
+            for (let i = 0; i < spl; i++) {
+                base_t[i] = (i / spl) * 2 * Math.PI;
+            }
+
+            const out_rows = [];
+
+            for (let r = 0; r < rows; r++) {
+                const row_cps = [];
+                for (let c = 0; c < cols; c++) {
+                    const state = sf[r][c];
+                    const has = state > 0.5 ? 1.0 : 0.0;
+                    const h = lut[Math.min(Math.round(bitmap[r][c]), 4)];
+
+                    for (let s = 0; s < spl; s++) {
+                        const t_val = base_t[s];
+                        const curve_pt = evalCurve(t_val, has, h, bulge, stz);
+                        
+                        // Apply offsets
+                        const x = (curve_pt[0] + c) * 1.0;
+                        const y = curve_pt[1] + r * dy;
+                        const z = curve_pt[2];
+                        
+                        row_cps.push([x, y, z]);
+                    }
+                }
+                out_rows.push(row_cps);
+            }
+            return out_rows;
+        }
+
+        // Evaluates all splines and returns the 3D points list per row
+        function generateSplineMeshPoints() {
+            const ctrl_rows = buildParametricControlRows();
+            const rows = ctrl_rows.length;
+            const cols = ctrl_rows[0].length / 5;
+            
+            const period_offset_x = [cols * 1.0, 0.0, 0.0];
+            const loop_res = 32;
+            const nout = loop_res * cols + 1;
+
+            const results = [];
+
+            for (let r = 0; r < rows; r++) {
+                const pts = evalCenterline(ctrl_rows[r], period_offset_x, nout);
+                results.push({
+                    points: pts,
+                    rowIdx: r
+                });
+            }
+            return results;
+        }
+
+        // =====================================================================
+        // THREE.JS VIEWPORT RENDERER & INTERACTIVE SCENE
+        // =====================================================================
+
+        // Custom curve class for Three.js TubeGeometry
+        class CustomSplineCurve extends THREE.Curve {
+            constructor(points) {
+                super();
+                this.points = points;
+            }
+            getPoint(t, optionalTarget = new THREE.Vector3()) {
+                const pointIndex = t * (this.points.length - 1);
+                const lower = Math.floor(pointIndex);
+                const upper = Math.min(lower + 1, this.points.length - 1);
+                const weight = pointIndex - lower;
+                
+                const p0 = this.points[lower];
+                const p1 = this.points[upper];
+                
+                optionalTarget.lerpVectors(p0, p1, weight);
+                return optionalTarget;
+            }
+        }
+
+        function init3D() {
+            const container = document.getElementById('viewport-container');
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x0a0a0f, 0.025);
+
+            camera = new THREE.PerspectiveCamera(40, w / h, 0.1, 100);
+            camera.position.set(2, 2, 8);
+
+            renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('canvas3d'), antialias: true, alpha: false });
+            renderer.setSize(w, h);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.maxPolarAngle = Math.PI / 2 + 0.1; // Don't go below floor too much
+            controls.minDistance = 2;
+            controls.maxDistance = 30;
+
+            // Studio Lighting Setup
+            const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+            scene.add(ambient);
+
+            const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.85);
+            dirLight1.position.set(5, 10, 7);
+            dirLight1.castShadow = true;
+            scene.add(dirLight1);
+
+            const dirLight2 = new THREE.DirectionalLight(0x7090ff, 0.45);
+            dirLight2.position.set(-5, 5, -5);
+            scene.add(dirLight2);
+
+            const pointLight = new THREE.PointLight(0xff4757, 0.5, 15);
+            pointLight.position.set(2, 2, 2);
+            scene.add(pointLight);
+
+            // Yarn Mesh Group
+            yarnMeshesGroup = new THREE.Group();
+            scene.add(yarnMeshesGroup);
+
+            // Floor Grid Helper (Subtle design)
+            const gridHelper = new THREE.GridHelper(40, 40, 0x2473e6, 0x1f1f2f);
+            gridHelper.position.y = -1;
+            scene.add(gridHelper);
+
+            // Handle Camera Reset
+            document.getElementById('reset-cam').addEventListener('click', () => {
+                controls.reset();
+                camera.position.set(2, 2, 8);
+                controls.target.set(2, 2, 0);
+            });
+
+            // Adjust size on window changes
+            window.addEventListener('resize', onWindowResize);
+
+            // Initial render
+            rebuildYarnGeometry();
+            animate();
+        }
+
+        function onWindowResize() {
+            const container = document.getElementById('viewport-container');
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+        }
+
+        // Dynamically rebuilds all tube meshes representing yarn
+        function rebuildYarnGeometry() {
+            // Clean old meshes
+            while(yarnMeshesGroup.children.length > 0) {
+                const obj = yarnMeshesGroup.children[0];
+                obj.geometry.dispose();
+                if (Array.isArray(obj.material)) {
+                    obj.material.forEach(m => m.dispose());
+                } else {
+                    obj.material.dispose();
+                }
+                yarnMeshesGroup.remove(obj);
+            }
+
+            const splineData = generateSplineMeshPoints();
+            if (splineData.length === 0) return;
+
+            const radius = params.radius;
+            const ratio = params.ellipse_ratio; // optional scaling on Y/Z
+            const rows = bitmap.length;
+            const cols = bitmap[0].length;
+            
+            const periodX = cols * 1.0;
+            const periodY = rows * params.dy;
+
+            // Generate tiles copies
+            const x_tiles = displayTiling ? [-1, 0, 1] : [0];
+            const y_tiles = displayTiling ? [-1, 0, 1] : [0];
+
+            splineData.forEach(rowInfo => {
+                const curve = new CustomSplineCurve(rowInfo.points);
+                // Create Three.js Tube Geometry
+                const tubeGeo = new THREE.TubeGeometry(curve, rowInfo.points.length, radius, 8, false);
+
+                // Row Color mapping from palette
+                const colIndex = rowInfo.rowIdx % yarnColors.length;
+                const rgb = yarnColors[colIndex];
+                
+                // Shader Material for Realistic Yarn Look (Subtle Velvet/Matte feel)
+                const yarnMat = new THREE.MeshPhysicalMaterial({
+                    color: new THREE.Color(rgb[0], rgb[1], rgb[2]),
+                    roughness: 0.85,
+                    metalness: 0.1,
+                    clearcoat: 0.05,
+                    clearcoatRoughness: 0.5,
+                    flatShading: false
+                });
+
+                // Add copies for tiling
+                y_tiles.forEach(ty => {
+                    x_tiles.forEach(tx => {
+                        const mesh = new THREE.Mesh(tubeGeo, yarnMat);
+                        mesh.position.set(tx * periodX, ty * periodY, 0);
+                        mesh.castShadow = true;
+                        mesh.receiveShadow = true;
+                        yarnMeshesGroup.add(mesh);
+                    });
+                });
+            });
+
+            // Adjust Camera Target to the center of the mesh repeat
+            const center_x = periodX / 2;
+            const center_y = (rows * params.dy) / 2;
+            controls.target.set(center_x, center_y, 0);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // =====================================================================
+        // GRID CONTROLS & PATTERN EDITOR
+        // =====================================================================
+
+        function renderGridUI() {
+            const gridContainer = document.getElementById('knitting-grid');
+            gridContainer.innerHTML = '';
+            
+            const rows = bitmap.length;
+            const cols = bitmap[0].length;
+            
+            gridContainer.style.gridTemplateColumns = `repeat(${cols}, 44px)`;
+
+            // Render from top row (rows - 1) down to 0 to match visual coordinate systems
+            for (let r = rows - 1; r >= 0; r--) {
+                for (let c = 0; c < cols; c++) {
+                    const val = bitmap[r][c];
+                    const cell = document.createElement('div');
+                    cell.className = 'grid-cell';
+                    if (val > 0.5) {
+                        cell.classList.add(`active-${Math.min(Math.round(val), 4)}`);
+                    }
+                    
+                    cell.addEventListener('click', () => {
+                        // Cycle cell value: 0 -> 1 -> 2 -> 3 -> 4 -> 0
+                        let nextVal = Math.round(bitmap[r][c]) + 1;
+                        if (nextVal > 4) nextVal = 0;
+                        bitmap[r][c] = nextVal;
+                        
+                        renderGridUI();
+                        rebuildYarnGeometry();
+                    });
+                    
+                    gridContainer.appendChild(cell);
+                }
+            }
+        }
+
+        function resizeGrid(dimension, delta) {
+            if (dimension === 'cols') {
+                const currentCols = bitmap[0].length;
+                const newCols = Math.max(2, Math.min(10, currentCols + delta));
+                if (newCols === currentCols) return;
+
+                bitmap = bitmap.map(row => {
+                    if (delta > 0) {
+                        return [...row, 1.0]; // Add default C1
+                    } else {
+                        return row.slice(0, -1);
+                    }
+                });
+            } else if (dimension === 'rows') {
+                const currentRows = bitmap.length;
+                const newRows = Math.max(2, Math.min(10, currentRows + delta));
+                if (newRows === currentRows) return;
+
+                if (delta > 0) {
+                    // Add new row at the top with a cycled color state
+                    const colCount = bitmap[0].length;
+                    const nextColor = (currentRows % 4) + 1;
+                    bitmap.push(Array(colCount).fill(nextColor));
+                } else {
+                    bitmap.pop();
+                }
+            }
+
+            renderGridUI();
+            rebuildYarnGeometry();
+        }
+
+        function toggleTiling(elem) {
+            displayTiling = elem.checked;
+            rebuildYarnGeometry();
+        }
+
+        // =====================================================================
+        // SLIDERS GENERATOR & BINDING
+        // =====================================================================
+
+        function renderSlidersUI() {
+            const list = document.getElementById('sliders-list');
+            list.innerHTML = '';
+
+            paramsSchema.forEach(p => {
+                const group = document.createElement('div');
+                group.className = 'slider-group';
+
+                group.innerHTML = `
+                    <div class="slider-label-row">
+                        <span class="slider-title">${p.label}</span>
+                        <span class="slider-value-badge" id="val-${p.id}">${params[p.id].toFixed(p.step < 0.01 ? 4 : 2)}</span>
+                    </div>
+                    <div class="slider-input-wrapper">
+                        <input type="range" 
+                               id="slide-${p.id}" 
+                               min="${p.min}" 
+                               max="${p.max}" 
+                               step="${p.step}" 
+                               value="${params[p.id]}"
+                               oninput="onSliderChange('${p.id}', this.value)">
+                    </div>
+                `;
+                list.appendChild(group);
+            });
+        }
+
+        function onSliderChange(id, value) {
+            const floatVal = parseFloat(value);
+            params[id] = floatVal;
+            
+            // Update UI badge
+            const step = paramsSchema.find(p => p.id === id).step;
+            document.getElementById(`val-${id}`).innerText = floatVal.toFixed(step < 0.01 ? 4 : 2);
+
+            // Rebuild mesh geometry
+            rebuildYarnGeometry();
+        }
+
+        // =====================================================================
+        // TAB SWAPPER
+        // =====================================================================
+
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+
+            if (tabId === 'pattern') {
+                document.querySelectorAll('.tab-button')[0].classList.add('active');
+                document.getElementById('tab-pattern').classList.add('active');
+            } else {
+                document.querySelectorAll('.tab-button')[1].classList.add('active');
+                document.getElementById('tab-params').classList.add('active');
+            }
+        }
+
+        // =====================================================================
+        // APP BOOTSTRAP
+        // =====================================================================
+
+        window.onload = () => {
+            renderGridUI();
+            renderSlidersUI();
+            init3D();
+        };
+    </script>
+</body>
+</html>
