@@ -481,12 +481,7 @@
                 </div>
 
                 <div class="color-legend">
-                    Cycle stitches: 
-                    <span class="legend-dot" style="background-color: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);"></span> Off
-                    <span class="legend-dot" style="background-color: rgb(217,31,26);"></span> C1
-                    <span class="legend-dot" style="background-color: rgb(242,209,51);"></span> C2
-                    <span class="legend-dot" style="background-color: rgb(36,115,230);"></span> C3
-                    <span class="legend-dot" style="background-color: rgb(89,46,20);"></span> C4
+                    Tapping a grid cell toggles the stitch on/off. Active stitches display in their row's color.
                 </div>
             </div>
 
@@ -538,9 +533,9 @@
         let params = {};
         let bitmap = [
             [1.0, 1.0, 1.0, 1.0],
-            [2.0, 2.0, 2.0, 2.0],
-            [3.0, 3.0, 3.0, 3.0],
-            [4.0, 4.0, 4.0, 4.0]
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0]
         ];
         let displayTiling = false;
 
@@ -822,7 +817,7 @@
                 for (let c = 0; c < cols; c++) {
                     const state = sf[r][c];
                     const has = state > 0.5 ? 1.0 : 0.0;
-                    const h = lut[Math.min(Math.round(bitmap[r][c]), 4)];
+                    const h = lut[Math.min(state, 4)];
 
                     for (let s = 0; s < spl; s++) {
                         const t_val = base_t[s];
@@ -1052,14 +1047,12 @@
                     const cell = document.createElement('div');
                     cell.className = 'grid-cell';
                     if (val > 0.5) {
-                        cell.classList.add(`active-${Math.min(Math.round(val), 4)}`);
+                        const colorIndex = (r % yarnColors.length) + 1;
+                        cell.classList.add(`active-${colorIndex}`);
                     }
                     
                     cell.addEventListener('click', () => {
-                        // Cycle cell value: 0 -> 1 -> 2 -> 3 -> 4 -> 0
-                        let nextVal = Math.round(bitmap[r][c]) + 1;
-                        if (nextVal > 4) nextVal = 0;
-                        bitmap[r][c] = nextVal;
+                        bitmap[r][c] = bitmap[r][c] > 0.5 ? 0.0 : 1.0;
                         
                         renderGridUI();
                         rebuildYarnGeometry();
@@ -1089,10 +1082,9 @@
                 if (newRows === currentRows) return;
 
                 if (delta > 0) {
-                    // Add new row at the top with a cycled color state
+                    // Add new row at the top (active by default)
                     const colCount = bitmap[0].length;
-                    const nextColor = (currentRows % 4) + 1;
-                    bitmap.push(Array(colCount).fill(nextColor));
+                    bitmap.push(Array(colCount).fill(1.0));
                 } else {
                     bitmap.pop();
                 }
