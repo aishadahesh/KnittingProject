@@ -621,7 +621,7 @@ class CollisionObjective(Objective):
         else:
             _debug_collisions = np.empty((0, 3), dtype=np.float32)
 
-        barrier = ipctk.BarrierPotential(self.dhat)
+        barrier = ipctk.BarrierPotential(self.dhat, 1.0)
         return float(barrier(collisions, mesh_tiled, V_tiled))
 
     def gradient(self, V: np.ndarray, eps: float = 1e-5) -> np.ndarray:
@@ -638,7 +638,7 @@ class CollisionObjective(Objective):
         mesh_tiled.can_collide = build_can_collide(M, self.edges, self.period_offset_x, self.period_offset_y)
         collisions = ipctk.NormalCollisions()
         collisions.build(mesh_tiled, V_tiled, self.dhat)
-        barrier = ipctk.BarrierPotential(self.dhat)
+        barrier = ipctk.BarrierPotential(self.dhat, 1.0)
         barrier_grad = barrier.gradient(collisions, mesh_tiled, V_tiled)
         grad_V = np.zeros((M, 3))
         barrier_grad_reshaped = barrier_grad.reshape(num_copies, M, 3)
@@ -660,7 +660,7 @@ class CollisionObjective(Objective):
         mesh_tiled.can_collide = build_can_collide(M, self.edges, self.period_offset_x, self.period_offset_y)
         collisions = ipctk.NormalCollisions()
         collisions.build(mesh_tiled, V_tiled, self.dhat)
-        barrier = ipctk.BarrierPotential(self.dhat)
+        barrier = ipctk.BarrierPotential(self.dhat, 1.0)
         barrier_hess = barrier.hessian(collisions, mesh_tiled, V_tiled, self.psd_projection)
         barrier_hess_coo = barrier_hess.tocoo()
         folded_rows = barrier_hess_coo.row % (3 * M)
@@ -921,4 +921,4 @@ def build_can_collide(M, edges, period_offset_x, period_offset_y):
                 if abs(ax1 - ax2) <= 4:
                     explicit_values[(min(v1, v2), max(v1, v2))] = False
 
-    return ipctk.SparseCanCollide(explicit_values, True)
+    return ipctk.make_sparse_filter(explicit_values, True)

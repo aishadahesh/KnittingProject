@@ -344,17 +344,17 @@ class CollisionObjective(Objective):
              _debug_collisions = np.empty((0, 3), dtype=np.float32)
 
     def value(self) -> float:
-        barrier = ipctk.BarrierPotential(self.dhat)
+        barrier = ipctk.BarrierPotential(self.dhat, 1.0)
         return float(barrier(self.collisions, self.mesh_tiled, self.V_tiled))
 
     def gradient(self) -> np.ndarray:
-        barrier = ipctk.BarrierPotential(self.dhat)
+        barrier = ipctk.BarrierPotential(self.dhat, 1.0)
         barrier_grad = barrier.gradient(self.collisions, self.mesh_tiled, self.V_tiled)
         barrier_grad_reshaped = barrier_grad.reshape(self.num_copies, self.M, 3)
         return np.sum(barrier_grad_reshaped, axis=0)
 
     def hessian(self) -> scipy.sparse.csr_matrix:
-        barrier = ipctk.BarrierPotential(self.dhat)
+        barrier = ipctk.BarrierPotential(self.dhat, 1.0)
         barrier_hess = barrier.hessian(self.collisions, self.mesh_tiled, self.V_tiled, self.psd_projection)
         barrier_hess_coo = barrier_hess.tocoo()
         folded_rows = barrier_hess_coo.row % (3 * self.M)
@@ -656,6 +656,6 @@ def build_can_collide(M, edges, period_offset_x, period_offset_y):
                 if abs(ax1 - ax2) <= 4:
                     explicit_values[(min(v1, v2), max(v1, v2))] = False
 
-    res = ipctk.SparseCanCollide(explicit_values, True)
+    res = ipctk.make_sparse_filter(explicit_values, True)
     _can_collide_cache[key] = res
     return res

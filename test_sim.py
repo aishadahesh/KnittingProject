@@ -56,7 +56,7 @@ def compute_energy_and_gradient(P_flat, J, edges, mesh, dhat, L0, k_s, k_b, k_c)
     collisions = ipctk.NormalCollisions()
     collisions.build(mesh, V, dhat)
     
-    barrier = ipctk.BarrierPotential(dhat)
+    barrier = ipctk.BarrierPotential(dhat, 1.0)
     barrier_E = barrier(collisions, mesh, V)
     barrier_grad = barrier.gradient(collisions, mesh, V)
     # 5. Chain Rule: Map gradients back to the control points
