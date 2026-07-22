@@ -85,7 +85,10 @@ class AppState:
         extra_saved_keys = (
             'app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
             'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
-            'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols', 'scanner_capture_mode',
+            'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols',
+            'scanner_repeat_spacing_x', 'scanner_repeat_spacing_y', 'scanner_capture_mode',
+            'scanner_lighting_enabled', 'scanner_light_azimuth', 'scanner_light_elevation', 'scanner_light_sun_intensity',
+            'scanner_light_shadow', 'scanner_light_sheen', 'scanner_light_preview_compare',
             'scanner_camera_workflow', 'scanner_single_row', 'scanner_single_col', 'scanner_single_angle', 'scanner_camera_zoom',
         )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
@@ -141,6 +144,15 @@ class AppState:
             'scanner_pattern_cols': initial_pattern_cols,
             'scanner_pattern_repeat_rows': 3,
             'scanner_pattern_repeat_cols': 3,
+            'scanner_repeat_spacing_x': 1.0,
+            'scanner_repeat_spacing_y': 1.0,
+            'scanner_lighting_enabled': True,
+            'scanner_light_azimuth': -35.0,
+            'scanner_light_elevation': 48.0,
+            'scanner_light_sun_intensity': 0.68,
+            'scanner_light_shadow': 0.20,
+            'scanner_light_sheen': 0.025,
+            'scanner_light_preview_compare': True,
             'scanner_capture_mode': 'natural',
             'scanner_camera_workflow': 'path',
             'scanner_single_row': 1,

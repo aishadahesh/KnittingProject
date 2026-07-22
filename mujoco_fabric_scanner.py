@@ -24,7 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from scipy.spatial.transform import Rotation
 from knitting_core import build_parametric_control_rows
 
@@ -63,6 +63,74 @@ MODE_ROBOT = "robot"
 DEFAULT_ROBOT_IP = "132.74.121.230"
 DEFAULT_ROBOT_PORT = 30001
 ROBOT_MAX_CARTESIAN_STEP = 0.040
+SCANNER_SUN_AZIMUTH_DEG = -35.0
+SCANNER_SUN_ELEVATION_DEG = 48.0
+SCANNER_AMBIENT_LIGHT = 0.38
+SCANNER_SUN_INTENSITY = 0.68
+SCANNER_SIDE_SHADOW = 0.20
+SCANNER_SPECULAR_STRENGTH = 0.055
+SCANNER_SHEEN_STRENGTH = 0.025
+SCANNER_FABRIC_GRADIENT_STRENGTH = 0.14
+SCANNER_FABRIC_VIGNETTE_STRENGTH = 0.06
+SCANNER_LIGHTING_BLUR_RADIUS = 1.35
+SCANNER_LIGHTING_RELIEF = 1.45
+SCANNER_LIGHTING_FOCUSED_RELIEF = 1.75
+
+
+def _default_scanner_lighting() -> dict[str, float]:
+    return {
+        "enabled": 1.0,
+        "azimuth": SCANNER_SUN_AZIMUTH_DEG,
+        "elevation": SCANNER_SUN_ELEVATION_DEG,
+        "ambient": SCANNER_AMBIENT_LIGHT,
+        "sun_intensity": SCANNER_SUN_INTENSITY,
+        "shadow": SCANNER_SIDE_SHADOW,
+        "specular": SCANNER_SPECULAR_STRENGTH,
+        "sheen": SCANNER_SHEEN_STRENGTH,
+        "gradient": SCANNER_FABRIC_GRADIENT_STRENGTH,
+        "vignette": SCANNER_FABRIC_VIGNETTE_STRENGTH,
+        "blur": SCANNER_LIGHTING_BLUR_RADIUS,
+        "relief": SCANNER_LIGHTING_RELIEF,
+        "focused_relief": SCANNER_LIGHTING_FOCUSED_RELIEF,
+    }
+
+
+def _normalize_scanner_lighting(settings=None) -> dict[str, float]:
+    lighting = _default_scanner_lighting()
+    if isinstance(settings, dict):
+        for key, value in settings.items():
+            if key in lighting:
+                try:
+                    lighting[key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+    lighting["elevation"] = float(np.clip(lighting["elevation"], 5.0, 85.0))
+    lighting["enabled"] = 1.0 if float(lighting.get("enabled", 1.0)) >= 0.5 else 0.0
+    lighting["ambient"] = float(np.clip(lighting["ambient"], 0.10, 0.90))
+    lighting["sun_intensity"] = float(np.clip(lighting["sun_intensity"], 0.0, 1.50))
+    lighting["shadow"] = float(np.clip(lighting["shadow"], 0.0, 0.60))
+    lighting["specular"] = float(np.clip(lighting["specular"], 0.0, 0.25))
+    lighting["sheen"] = float(np.clip(lighting["sheen"], 0.0, 0.16))
+    lighting["gradient"] = float(np.clip(lighting["gradient"], 0.0, 0.45))
+    lighting["vignette"] = float(np.clip(lighting["vignette"], 0.0, 0.25))
+    lighting["blur"] = float(np.clip(lighting["blur"], 0.0, 4.0))
+    lighting["relief"] = float(np.clip(lighting["relief"], 0.0, 4.0))
+    lighting["focused_relief"] = float(np.clip(lighting["focused_relief"], 0.0, 4.0))
+    return lighting
+
+
+def _scanner_lighting_from_args(args) -> dict[str, float]:
+    settings = getattr(args, "scanner_lighting", None)
+    if isinstance(settings, dict):
+        return _normalize_scanner_lighting(settings)
+    return _normalize_scanner_lighting({
+        "azimuth": getattr(args, "scanner_light_azimuth", SCANNER_SUN_AZIMUTH_DEG),
+        "enabled": 0.0 if bool(getattr(args, "no_scanner_lighting", False)) else 1.0,
+        "elevation": getattr(args, "scanner_light_elevation", SCANNER_SUN_ELEVATION_DEG),
+        "sun_intensity": getattr(args, "scanner_light_sun_intensity", SCANNER_SUN_INTENSITY),
+        "shadow": getattr(args, "scanner_light_shadow", SCANNER_SIDE_SHADOW),
+        "sheen": getattr(args, "scanner_light_sheen", SCANNER_SHEEN_STRENGTH),
+    })
 
 SWATCH_PALETTE = [
     (0.86, 0.12, 0.18, 1.0),
@@ -98,6 +166,9 @@ class FabricPlan:
     cell_model_curves: list[list[np.ndarray]] | None = None
     pattern_repeat_rows: int = 1
     pattern_repeat_cols: int = 1
+    pattern_repeat_spacing_x: float = 1.0
+    pattern_repeat_spacing_y: float = 1.0
+    scanner_lighting: dict[str, float] | None = None
 
 
 def _serpentine_indices(rows: int, cols: int):
@@ -545,6 +616,9 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         cell_model_curves=cell_model_curves,
         pattern_repeat_rows=max(1, int(getattr(args, "pattern_repeat_rows", 1))),
         pattern_repeat_cols=max(1, int(getattr(args, "pattern_repeat_cols", 1))),
+        pattern_repeat_spacing_x=float(np.clip(float(getattr(args, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45)),
+        pattern_repeat_spacing_y=float(np.clip(float(getattr(args, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45)),
+        scanner_lighting=_scanner_lighting_from_args(args),
     )
 
 
@@ -876,8 +950,8 @@ def _add_color_picker_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: 
         )
 
 
-def _add_rendered_fabric_proxy(mujoco, scn, plan: FabricPlan, z: float) -> bool:
-    texture = _rendered_texture_for_camera(plan, 0, 0, focused=False)
+def _add_rendered_fabric_proxy(mujoco, scn, plan: FabricPlan, z: float, view_name: str = "angle 0") -> bool:
+    texture = _lit_rendered_texture_for_camera(plan, 0, 0, focused=False, view_name=view_name)
     if texture is None:
         return False
     tex_w, tex_h = texture.size
@@ -1011,24 +1085,166 @@ def _trim_rendered_texture(texture: Image.Image) -> Image.Image:
     return texture.crop((x0, y0, x1, y1))
 
 
-def _tile_rendered_texture(texture: Image.Image, repeat_rows: int, repeat_cols: int) -> Image.Image:
+def _tile_rendered_texture(
+    texture: Image.Image,
+    repeat_rows: int,
+    repeat_cols: int,
+    spacing_x: float = 1.0,
+    spacing_y: float = 1.0,
+) -> Image.Image:
     repeat_rows = max(1, int(repeat_rows))
     repeat_cols = max(1, int(repeat_cols))
+    spacing_x = float(np.clip(float(spacing_x), 0.55, 1.45))
+    spacing_y = float(np.clip(float(spacing_y), 0.55, 1.45))
     tile = _trim_rendered_texture(texture)
     tile_w, tile_h = tile.size
     if tile_w <= 1 or tile_h <= 1:
         return tile
     max_dim = 2048
-    scale = min(1.0, max_dim / max(float(tile_w * repeat_cols), 1.0), max_dim / max(float(tile_h * repeat_rows), 1.0))
+    step_w = max(1, int(round(tile_w * spacing_x)))
+    step_h = max(1, int(round(tile_h * spacing_y)))
+    canvas_w = step_w * (repeat_cols - 1) + tile_w
+    canvas_h = step_h * (repeat_rows - 1) + tile_h
+    scale = min(1.0, max_dim / max(float(canvas_w), 1.0), max_dim / max(float(canvas_h), 1.0))
     if scale < 1.0:
         resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
         tile = tile.resize((max(1, int(tile_w * scale)), max(1, int(tile_h * scale))), resample)
         tile_w, tile_h = tile.size
-    canvas = Image.new("RGB", (tile_w * repeat_cols, tile_h * repeat_rows), (18, 22, 28))
+        step_w = max(1, int(round(tile_w * spacing_x)))
+        step_h = max(1, int(round(tile_h * spacing_y)))
+    canvas_w = step_w * (repeat_cols - 1) + tile_w
+    canvas_h = step_h * (repeat_rows - 1) + tile_h
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (18, 22, 28))
     for r in range(repeat_rows):
         for c in range(repeat_cols):
-            canvas.paste(tile, (c * tile_w, r * tile_h))
+            canvas.paste(tile, (c * step_w, r * step_h))
     return canvas
+
+
+def _view_angle_degrees(view_name: str) -> float:
+    text = str(view_name).lower()
+    if "angle" not in text:
+        return 0.0
+    try:
+        return float(text.split("angle", 1)[1].strip().split()[0])
+    except (IndexError, ValueError):
+        return 0.0
+
+
+def _apply_scanner_lighting(texture: Image.Image, view_name: str, focused: bool, lighting_settings=None) -> Image.Image:
+    """Apply lightweight lighting to the assembled repeated fabric image.
+
+    The source texture is already the full repeated fabric layout. Lighting is
+    applied once across that full image, so all repeated copies share one
+    continuous asymmetric light field instead of each tile looking separately lit.
+    """
+    src = texture.convert("RGB")
+    arr = np.asarray(src, dtype=np.float32) / 255.0
+    if arr.ndim != 3 or arr.shape[0] < 3 or arr.shape[1] < 3:
+        return src
+    lighting = _normalize_scanner_lighting(lighting_settings)
+    if lighting["enabled"] < 0.5:
+        return src
+
+    h, w = arr.shape[:2]
+    luminance = (
+        arr[:, :, 0] * 0.299
+        + arr[:, :, 1] * 0.587
+        + arr[:, :, 2] * 0.114
+    )
+    lum_u8 = np.clip(luminance * 255.0, 0, 255).astype(np.uint8)
+    smooth_luminance = (
+        np.asarray(
+            Image.fromarray(lum_u8, "L").filter(ImageFilter.GaussianBlur(lighting["blur"])),
+            dtype=np.float32,
+        )
+        / 255.0
+    )
+    gy, gx = np.gradient(smooth_luminance)
+    relief = lighting["focused_relief"] if focused else lighting["relief"]
+    normals = np.dstack((-gx * relief, -gy * relief, np.ones_like(luminance)))
+    normals /= np.maximum(np.linalg.norm(normals, axis=2, keepdims=True), 1e-6)
+
+    angle = math.radians(_view_angle_degrees(view_name))
+    sun_azimuth = math.radians(lighting["azimuth"])
+    sun_elevation = math.radians(lighting["elevation"])
+    # A fixed one-sided "sun" in fabric/world coordinates. The camera/fabric
+    # view rotates through scan angles while this light stays put, so the same
+    # fabric can look slightly different from each viewing angle.
+    light_xy = sun_azimuth - angle
+    light = np.array(
+        [
+            math.cos(light_xy) * math.cos(sun_elevation),
+            math.sin(light_xy) * math.cos(sun_elevation),
+            math.sin(sun_elevation),
+        ],
+        dtype=np.float32,
+    )
+    light /= max(float(np.linalg.norm(light)), 1e-6)
+    view = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    half_vec = light + view
+    half_vec /= max(float(np.linalg.norm(half_vec)), 1e-6)
+
+    diffuse = np.clip(np.sum(normals * light[None, None, :], axis=2), 0.0, 1.0)
+    specular = np.clip(np.sum(normals * half_vec[None, None, :], axis=2), 0.0, 1.0) ** 22.0
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    xx = (xx / max(float(w - 1), 1.0)) - 0.5
+    yy = (yy / max(float(h - 1), 1.0)) - 0.5
+    directional_falloff = xx * math.cos(light_xy) + yy * math.sin(light_xy)
+    broad_light = 1.0 + lighting["shadow"] * directional_falloff
+    fabric_gradient = 1.0 + lighting["gradient"] * directional_falloff
+    vignette = 1.0 - lighting["vignette"] * np.clip(xx * xx + yy * yy, 0.0, 0.5)
+
+    # Preserve the fabric's actual colors while letting shadows and highlights
+    # affect every color equally.
+    shade = (lighting["ambient"] + lighting["sun_intensity"] * diffuse) * broad_light * fabric_gradient * vignette
+    shade = np.clip(shade, 0.62, 1.16)
+    lit = arr * shade[:, :, None]
+    lit += specular[:, :, None] * lighting["specular"]
+
+    # Slight view-dependent yarn sheen. It uses the smoothed luminance map so it
+    # reads as a soft material response instead of pixel-level sparkle/noise.
+    ridge = np.clip((smooth_luminance - np.percentile(smooth_luminance, 42.0)) * 1.65, 0.0, 1.0)
+    sheen_axis = angle - sun_azimuth
+    sheen_phase = np.sin((xx * math.cos(sheen_axis) + yy * math.sin(sheen_axis)) * math.pi * 5.5)
+    sheen = np.clip(sheen_phase, 0.0, 1.0) * ridge * lighting["sheen"]
+    lit += sheen[:, :, None]
+
+    out = np.clip(lit * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
+
+
+def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool, view_name: str) -> Image.Image | None:
+    texture = _rendered_texture_for_camera(plan, row, col, focused)
+    if texture is None:
+        return None
+    repeat_rows = max(1, int(plan.pattern_repeat_rows))
+    repeat_cols = max(1, int(plan.pattern_repeat_cols))
+    spacing_x = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45))
+    spacing_y = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45))
+    lighting = _normalize_scanner_lighting(getattr(plan, "scanner_lighting", None))
+    lighting_key = tuple((key, round(float(lighting[key]), 4)) for key in sorted(lighting))
+    cache_key = (
+        "lit",
+        "cell" if focused else "full",
+        int(row),
+        int(col),
+        repeat_rows,
+        repeat_cols,
+        round(spacing_x, 3),
+        round(spacing_y, 3),
+        str(view_name),
+        bool(focused),
+        lighting_key,
+    )
+    cache = getattr(plan, "_rendered_texture_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(plan, "_rendered_texture_cache", cache)
+    if cache_key not in cache:
+        cache[cache_key] = _apply_scanner_lighting(texture, view_name, focused, lighting)
+    return cache[cache_key]
 
 
 def _rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool) -> Image.Image | None:
@@ -1038,14 +1254,16 @@ def _rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: 
     texture = texture.convert("RGB")
     repeat_rows = max(1, int(plan.pattern_repeat_rows))
     repeat_cols = max(1, int(plan.pattern_repeat_cols))
+    spacing_x = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45))
+    spacing_y = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45))
     if not focused:
-        cache_key = ("full", repeat_rows, repeat_cols)
+        cache_key = ("full", repeat_rows, repeat_cols, round(spacing_x, 3), round(spacing_y, 3))
         cache = getattr(plan, "_rendered_texture_cache", None)
         if cache is None:
             cache = {}
             setattr(plan, "_rendered_texture_cache", cache)
         if cache_key not in cache:
-            cache[cache_key] = _tile_rendered_texture(texture, repeat_rows, repeat_cols)
+            cache[cache_key] = _tile_rendered_texture(texture, repeat_rows, repeat_cols, spacing_x, spacing_y)
         return cache[cache_key]
     rows = max(1, int(plan.grid_rows))
     cols = max(1, int(plan.grid_cols))
@@ -1054,13 +1272,13 @@ def _rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: 
     x1 = int(np.clip(round((col + 1) * w / cols), x0 + 1, w))
     y0 = int(np.clip(round(row * h / rows), 0, h - 1))
     y1 = int(np.clip(round((row + 1) * h / rows), y0 + 1, h))
-    cache_key = ("cell", int(row), int(col), repeat_rows, repeat_cols)
+    cache_key = ("cell", int(row), int(col), repeat_rows, repeat_cols, round(spacing_x, 3), round(spacing_y, 3))
     cache = getattr(plan, "_rendered_texture_cache", None)
     if cache is None:
         cache = {}
         setattr(plan, "_rendered_texture_cache", cache)
     if cache_key not in cache:
-        cache[cache_key] = _tile_rendered_texture(texture.crop((x0, y0, x1, y1)), repeat_rows, repeat_cols)
+        cache[cache_key] = _tile_rendered_texture(texture.crop((x0, y0, x1, y1)), repeat_rows, repeat_cols, spacing_x, spacing_y)
     return cache[cache_key]
 
 
@@ -1101,7 +1319,8 @@ def draw_scene(
     )
     station_id = plan.station_ids[min(target_index, len(plan.station_ids) - 1)]
     active_cell = plan.station_cells[station_id]
-    rendered_proxy = False if color_picker_mode else _add_rendered_fabric_proxy(mujoco, scn, plan, z)
+    view_name = plan.view_names[min(target_index, len(plan.view_names) - 1)] if plan.view_names else "angle 0"
+    rendered_proxy = False if color_picker_mode else _add_rendered_fabric_proxy(mujoco, scn, plan, z, view_name=view_name)
     for row in range(plan.grid_rows):
         for col in range(plan.grid_cols):
             if color_picker_mode:
@@ -1211,8 +1430,9 @@ def render_camera_image(
     focus = rendered_cell_center + np.array([0.0, 0.0, FABRIC_THICKNESS * 0.15], dtype=float)
     if focused_capture:
         # Focused mode is a batch inspection capture. Use a stable camera
-        # centered on the selected batch; the selected scan angle becomes roll
-        # around the batch normal. This keeps every station framed consistently.
+        # centered on the selected batch. The selected scan angle moves the
+        # camera around the batch at a shallow oblique angle, not just a flat
+        # image roll, so lighting/perspective can affect per-angle RGB.
         angle_deg = 0.0
         if "angle" in str(view_name).lower():
             try:
@@ -1220,18 +1440,19 @@ def render_camera_image(
             except (IndexError, ValueError):
                 angle_deg = 0.0
         theta = math.radians(angle_deg)
-        forward = np.array([0.0, 0.0, -1.0], dtype=float)
-        right = np.array([math.cos(theta), math.sin(theta), 0.0], dtype=float)
-        up = np.array([-math.sin(theta), math.cos(theta), 0.0], dtype=float)
         camera_standoff = max(0.105, max(cell_w, cell_l) * 1.35)
-        lens_pos = focus - forward * camera_standoff
+        orbit = max(min(cell_w, cell_l) * 0.22, camera_standoff * 0.18)
+        horizontal = np.array([math.cos(theta), math.sin(theta), 0.0], dtype=float)
+        lens_pos = focus + horizontal * orbit + np.array([0.0, 0.0, camera_standoff], dtype=float)
+        right = np.array([-math.sin(theta), math.cos(theta), 0.0], dtype=float)
     else:
         camera_standoff = max(0.120, max(cell_w, cell_l) * 1.55, float(np.linalg.norm(lens_pos - station)) * 1.75)
         lens_pos = lens_pos - forward * camera_standoff
     # Aim the saved camera at the active station while preserving the roll/right
     # axis from the selected scan angle.
     forward = focus - lens_pos
-    forward = forward / max(float(np.linalg.norm(forward)), 1e-8)
+    camera_standoff = max(float(np.linalg.norm(forward)), 1e-8)
+    forward = forward / camera_standoff
     right = right - forward * float(np.dot(right, forward))
     right = right / max(float(np.linalg.norm(right)), 1e-8)
     up = np.cross(right, forward)
@@ -1285,11 +1506,12 @@ def render_camera_image(
 
     draw = ImageDraw.Draw(img)
     fabric_z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.48
-    rendered_texture = None if color_picker_mode else _rendered_texture_for_camera(
+    rendered_texture = None if color_picker_mode else _lit_rendered_texture_for_camera(
         plan,
         active_row,
         active_col,
         focused_capture,
+        view_name,
     )
     if rendered_texture is not None:
         if focused_capture:
@@ -1968,8 +2190,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pattern-cols", type=int, default=5, help="Columns in each random bitmap pattern")
     parser.add_argument("--pattern-repeat-rows", type=int, default=3, help="How many times to repeat each random bitmap vertically inside one fabric sample")
     parser.add_argument("--pattern-repeat-cols", type=int, default=3, help="How many times to repeat each random bitmap horizontally inside one fabric sample")
+    parser.add_argument("--pattern-repeat-spacing-x", type=float, default=1.0, help="Horizontal spacing factor between image-based repeats; below 1 overlaps, above 1 adds space")
+    parser.add_argument("--pattern-repeat-spacing-y", type=float, default=1.0, help="Vertical spacing factor between image-based repeats; below 1 overlaps, above 1 adds space")
     parser.add_argument("--pattern-density", type=float, default=0.62, help="Probability that a random bitmap stitch is active")
     parser.add_argument("--random-seed", type=int, default=1, help="Seed for reproducible random pattern generation")
+    parser.add_argument("--scanner-light-azimuth", type=float, default=SCANNER_SUN_AZIMUTH_DEG, help="Scanner sun/light azimuth in degrees")
+    parser.add_argument("--scanner-light-elevation", type=float, default=SCANNER_SUN_ELEVATION_DEG, help="Scanner sun/light elevation in degrees")
+    parser.add_argument("--scanner-light-sun-intensity", type=float, default=SCANNER_SUN_INTENSITY, help="Scanner directional light strength")
+    parser.add_argument("--scanner-light-shadow", type=float, default=SCANNER_SIDE_SHADOW, help="Scanner soft side-shadow strength")
+    parser.add_argument("--scanner-light-sheen", type=float, default=SCANNER_SHEEN_STRENGTH, help="Scanner yarn sheen strength")
+    parser.add_argument("--no-scanner-lighting", action="store_true", help="Disable scanner image lighting and save flat fabric colors")
     args = parser.parse_args()
     if args.palette_json:
         try:

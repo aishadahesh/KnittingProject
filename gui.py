@@ -14,7 +14,7 @@ import moderngl
 import tkinter as tk
 from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from rendering import draw_fitted_texture, transform_points
 from knitting_core import build_parametric_control_rows
@@ -224,6 +224,193 @@ def _scanner_pattern_repeats(state):
     return repeat_rows, repeat_cols
 
 
+def _scanner_repeat_spacing(state):
+    spacing_x = float(np.clip(float(state.get('scanner_repeat_spacing_x', 1.0)), 0.55, 1.45))
+    spacing_y = float(np.clip(float(state.get('scanner_repeat_spacing_y', 1.0)), 0.55, 1.45))
+    return spacing_x, spacing_y
+
+
+def _scanner_lighting_settings(state):
+    return {
+        "enabled": 1.0 if bool(state.get('scanner_lighting_enabled', True)) else 0.0,
+        "azimuth": float(state.get('scanner_light_azimuth', -35.0)),
+        "elevation": float(state.get('scanner_light_elevation', 48.0)),
+        "sun_intensity": float(state.get('scanner_light_sun_intensity', 0.68)),
+        "shadow": float(state.get('scanner_light_shadow', 0.20)),
+        "sheen": float(state.get('scanner_light_sheen', 0.025)),
+    }
+
+
+def _upload_sidebar_preview_texture(state, renderer, key, image):
+    ctx = getattr(renderer, "ctx", None)
+    if ctx is None or image is None:
+        return None
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    h, w = rgb.shape[:2]
+    rgba = np.dstack((rgb, np.full((h, w), 255, dtype=np.uint8)))
+    rgba = np.ascontiguousarray(np.flipud(rgba))
+    tex_key = f"_{key}_texture"
+    size_key = f"_{key}_texture_size"
+    tex = state.__dict__.get(tex_key)
+    size = state.__dict__.get(size_key)
+    if tex is None or size != (w, h):
+        try:
+            if tex is not None:
+                tex.release()
+        except Exception:
+            pass
+        tex = ctx.texture((w, h), 4, rgba.tobytes())
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        object.__setattr__(state, tex_key, tex)
+        object.__setattr__(state, size_key, (w, h))
+    else:
+        tex.write(rgba.tobytes())
+    return tex, w, h
+
+
+def _scanner_full_layout_preview_image(state):
+    try:
+        rows = max(1, int(state.scanner_rows))
+        cols = max(1, int(state.scanner_cols))
+        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+        spacing_x, spacing_y = _scanner_repeat_spacing(state)
+        realistic_mode = str(state.get('scanner_color_mode', 'realistic')) == 'realistic'
+        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+        cache_key = (
+            rows,
+            cols,
+            repeat_rows,
+            repeat_cols,
+            round(spacing_x, 3),
+            round(spacing_y, 3),
+            realistic_mode,
+            pattern_rows,
+            pattern_cols,
+            round(float(state.get('scanner_pattern_density', 0.62)), 4),
+            int(state.get('scanner_random_seed', 1)),
+            json.dumps(state.get('scanner_color_variants', []), sort_keys=True),
+            json.dumps(state.get('scanner_cell_color_sets', []), sort_keys=True),
+        )
+        if state.__dict__.get("_scanner_full_layout_preview_key") == cache_key:
+            cached = state.__dict__.get("_scanner_full_layout_preview_image")
+            if cached is not None:
+                return cached.copy()
+        cell_sets = _scanner_shared_cell_color_sets(state) if realistic_mode else _ensure_scanner_cell_color_sets(state)
+        curves_by_cell = _generate_scanner_random_patterns(state)
+    except Exception:
+        return None
+
+    cell_w = 220
+    cell_h = 180
+    max_dim = 1400
+    canvas_w = max(1, cols * cell_w)
+    canvas_h = max(1, rows * cell_h)
+    scale = min(1.0, max_dim / max(float(canvas_w), 1.0), max_dim / max(float(canvas_h), 1.0))
+    if scale < 1.0:
+        cell_w = max(36, int(cell_w * scale))
+        cell_h = max(32, int(cell_h * scale))
+        canvas_w = max(1, cols * cell_w)
+        canvas_h = max(1, rows * cell_h)
+
+    image = Image.new("RGB", (canvas_w, canvas_h), (18, 23, 31))
+    draw = ImageDraw.Draw(image)
+    for row in range(rows):
+        for col in range(cols):
+            cell_index = row * cols + col
+            x0 = col * cell_w
+            y0 = row * cell_h
+            colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else _scanner_base_palette(state)
+            if not realistic_mode:
+                rgba = colors[0]
+                fill = tuple(int(255 * float(v)) for v in rgba[:3])
+                draw.rectangle([x0, y0, x0 + cell_w, y0 + cell_h], fill=fill)
+                continue
+
+            curves = curves_by_cell[cell_index % len(curves_by_cell)] if curves_by_cell else []
+            tile_w = cell_w / max(1.0, 1.0 + (repeat_cols - 1) * spacing_x)
+            tile_h = cell_h / max(1.0, 1.0 + (repeat_rows - 1) * spacing_y)
+            step_w = tile_w * spacing_x
+            step_h = tile_h * spacing_y
+            line_w = max(1, int(min(tile_w, tile_h) * 0.035))
+            shade_w = max(line_w + 2, int(line_w * 1.8))
+            for tr in range(repeat_rows):
+                for tc in range(repeat_cols):
+                    tx = x0 + tc * step_w
+                    ty = y0 + tr * step_h
+                    cx = tx + tile_w * 0.5
+                    cy = ty + tile_h * 0.5
+                    for curve_idx, curve in enumerate(curves):
+                        if len(curve) < 2:
+                            continue
+                        rgba = colors[curve_idx % len(colors)]
+                        color = tuple(int(255 * float(v)) for v in rgba[:3])
+                        shadow = tuple(max(0, int(channel * 0.34)) for channel in color)
+                        pts = [
+                            (
+                                int(round(cx + float(p[0]) * tile_w * 0.74)),
+                                int(round(cy - float(p[1]) * tile_h * 0.74)),
+                            )
+                            for p in curve
+                        ]
+                        draw.line(pts, fill=shadow, width=shade_w, joint="curve")
+                        draw.line(pts, fill=color, width=line_w, joint="curve")
+            border = (38, 124, 137)
+            draw.rectangle([x0, y0, x0 + cell_w - 1, y0 + cell_h - 1], outline=border, width=1)
+    object.__setattr__(state, "_scanner_full_layout_preview_key", cache_key)
+    object.__setattr__(state, "_scanner_full_layout_preview_image", image.copy())
+    return image
+
+
+def _draw_scanner_lighting_preview(state, renderer):
+    if str(state.get('scanner_color_mode', 'realistic')) != 'realistic':
+        imgui.text_disabled("Lighting preview is shown for realistic fabric preview mode.")
+        return
+    try:
+        import mujoco_fabric_scanner as scanner
+    except Exception as exc:
+        imgui.text_disabled(f"Lighting preview unavailable: {exc}")
+        return
+    source = _scanner_full_layout_preview_image(state)
+    if source is None:
+        imgui.text_disabled("Lighting preview waiting for the scan fabric layout.")
+        return
+    source = source.resize((min(420, source.size[0]), max(1, int(source.size[1] * min(420, source.size[0]) / max(source.size[0], 1)))))
+    lighting_enabled = bool(state.get('scanner_lighting_enabled', True))
+    avail = max(140, int(imgui.get_content_region_avail().x))
+    if not lighting_enabled:
+        uploaded = _upload_sidebar_preview_texture(state, renderer, "scanner_flat_preview", source)
+        if uploaded is not None:
+            tex, w, h = uploaded
+            draw_fitted_texture(tex.glo, w, h, avail, int(avail * 0.70), flip_y=False)
+            imgui.text_disabled("Flat preview: lighting effect disabled")
+        return
+    lit = scanner._apply_scanner_lighting(
+        source,
+        f"angle {int(state.get('scanner_single_angle', 1)) * 360.0 / max(1, int(state.scanner_angles)):.0f}",
+        True,
+        _scanner_lighting_settings(state),
+    )
+    compare = bool(state.get('scanner_light_preview_compare', True))
+    if compare:
+        half_w = max(90, int((avail - imgui.get_style().item_spacing.x) * 0.5))
+        left = _upload_sidebar_preview_texture(state, renderer, "scanner_unlit_preview", source)
+        right = _upload_sidebar_preview_texture(state, renderer, "scanner_lit_preview", lit)
+        if left is not None:
+            tex, w, h = left
+            draw_fitted_texture(tex.glo, w, h, half_w, int(half_w * 0.70), flip_y=False)
+            imgui.text_disabled("Without lighting")
+        imgui.same_line()
+        if right is not None:
+            tex, w, h = right
+            draw_fitted_texture(tex.glo, w, h, half_w, int(half_w * 0.70), flip_y=False)
+            imgui.text_disabled("With scanner lighting")
+    else:
+        uploaded = _upload_sidebar_preview_texture(state, renderer, "scanner_lit_preview", lit)
+        if uploaded is not None:
+            tex, w, h = uploaded
+            draw_fitted_texture(tex.glo, w, h, avail, int(avail * 0.70), flip_y=False)
+
+
 def _normalize_scanner_curves(curves):
     valid = [np.asarray(curve, dtype=np.float32)[:, :2] for curve in curves if len(curve) > 1]
     if not valid:
@@ -350,6 +537,8 @@ class EmbeddedMujocoScanner:
         cell_model_curves = _generate_scanner_random_patterns(state)
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+        spacing_x, spacing_y = _scanner_repeat_spacing(state)
+        lighting_settings = _scanner_lighting_settings(state)
         self.args = SimpleNamespace(
             rows=int(state.scanner_rows),
             cols=int(state.scanner_cols),
@@ -381,6 +570,9 @@ class EmbeddedMujocoScanner:
             cell_model_curves=cell_model_curves,
             pattern_repeat_rows=int(repeat_rows),
             pattern_repeat_cols=int(repeat_cols),
+            pattern_repeat_spacing_x=float(spacing_x),
+            pattern_repeat_spacing_y=float(spacing_y),
+            scanner_lighting=lighting_settings,
             color_picker_mode=self.color_picker_mode,
         )
         # The embedded viewer only needs the true scan targets. Keeping the
@@ -1294,14 +1486,27 @@ def draw_sidebar(state, renderer, window=None):
         cmd.extend(["--cell-colors-json", json.dumps(cell_color_sets)])
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+        spacing_x, spacing_y = _scanner_repeat_spacing(state)
         cmd.extend([
             "--random-patterns",
             "--pattern-rows", str(int(pattern_rows)),
             "--pattern-cols", str(int(pattern_cols)),
             "--pattern-repeat-rows", str(int(repeat_rows)),
             "--pattern-repeat-cols", str(int(repeat_cols)),
+            "--pattern-repeat-spacing-x", f"{float(spacing_x):.3f}",
+            "--pattern-repeat-spacing-y", f"{float(spacing_y):.3f}",
             "--pattern-density", f"{float(state.get('scanner_pattern_density', 0.62)):.3f}",
             "--random-seed", str(int(state.get('scanner_random_seed', 1))),
+        ])
+        lighting = _scanner_lighting_settings(state)
+        if float(lighting.get("enabled", 1.0)) < 0.5:
+            cmd.append("--no-scanner-lighting")
+        cmd.extend([
+            "--scanner-light-azimuth", f"{float(lighting['azimuth']):.3f}",
+            "--scanner-light-elevation", f"{float(lighting['elevation']):.3f}",
+            "--scanner-light-sun-intensity", f"{float(lighting['sun_intensity']):.3f}",
+            "--scanner-light-shadow", f"{float(lighting['shadow']):.3f}",
+            "--scanner-light-sheen", f"{float(lighting['sheen']):.4f}",
         ])
         cmd.extend(["--robot-ip", str(state.scanner_robot_ip), "--robot-port", str(int(state.scanner_robot_port))])
         try:
@@ -1698,10 +1903,26 @@ def draw_sidebar(state, renderer, window=None):
         imgui.text_wrapped("Each mini-grid is one fabric sample. A random bitmap pattern is generated once, then repeated many times inside that sample. All samples use the same colors; only the bitmap changes.")
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+        spacing_x, spacing_y = _scanner_repeat_spacing(state)
         imgui.text(f"Template bitmap: {pattern_rows} rows x {pattern_cols} cols")
         imgui.text_disabled("Loaded from initial_params.json; Scan Mode randomizes only 0/1 bitmap values.")
         changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
         changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
+        changed_sx, new_sx = imgui.slider_float(
+            "X repeat spacing##scanner_repeat_spacing_x",
+            spacing_x,
+            0.55,
+            1.45,
+            "%.2f",
+        )
+        changed_sy, new_sy = imgui.slider_float(
+            "Y repeat spacing##scanner_repeat_spacing_y",
+            spacing_y,
+            0.55,
+            1.45,
+            "%.2f",
+        )
+        imgui.text_disabled("1.00 = edge-to-edge, below 1.00 overlaps copies, above 1.00 adds space.")
         changed_density, new_density = imgui.slider_float(
             "Active stitch probability##scanner_density",
             float(state.get('scanner_pattern_density', 0.62)),
@@ -1710,18 +1931,20 @@ def draw_sidebar(state, renderer, window=None):
             "%.2f",
         )
         changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
-        random_changed = changed_rr or changed_rc or changed_density or changed_seed
+        random_changed = changed_rr or changed_rc or changed_sx or changed_sy or changed_density or changed_seed
         if changed_rr:
             state.scanner_pattern_repeat_rows = int(new_rr)
         if changed_rc:
             state.scanner_pattern_repeat_cols = int(new_rc)
+        if changed_sx:
+            state.scanner_repeat_spacing_x = float(new_sx)
+        if changed_sy:
+            state.scanner_repeat_spacing_y = float(new_sy)
         if changed_density:
             state.scanner_pattern_density = float(new_density)
         if changed_seed:
             state.scanner_random_seed = int(new_seed)
-        if imgui.small_button("Generate new random patterns##scanner_randomize"):
-            state.scanner_random_seed = int(time.time()) % 1000000
-            random_changed = True
+        imgui.text_disabled("Patterns update when repeat, spacing, density, or seed changes.")
         if random_changed:
             embedded = state.get('embedded_scanner')
             if embedded is not None:
@@ -1829,6 +2052,100 @@ def draw_sidebar(state, renderer, window=None):
                     state.embedded_scanner = None
                 state.scanner_status = f"Updated mini-grid R{selected_r + 1} C{selected_c + 1} color"
                 state.rebuild_spline_mesh(preserve_model_placement=False)
+        imgui.separator()
+        imgui.text("Scanner lighting preview")
+        imgui.text_disabled("These settings are used by the robot camera and saved scan images.")
+        lighting_changed = False
+        lighting_enabled = bool(state.get('scanner_lighting_enabled', True))
+        changed_no_lighting, no_lighting = imgui.checkbox(
+            "No Lighting Effect##scanner_no_lighting",
+            not lighting_enabled,
+        )
+        if changed_no_lighting:
+            state.scanner_lighting_enabled = not bool(no_lighting)
+            lighting_enabled = bool(state.scanner_lighting_enabled)
+            lighting_changed = True
+        if not lighting_enabled:
+            imgui.text_disabled("Flat colors: shadows, highlights, sheen, and directional shading are disabled.")
+            imgui.begin_disabled()
+        changed_az, new_az = imgui.slider_float(
+            "Sun direction##scanner_light_azimuth",
+            float(state.get('scanner_light_azimuth', -35.0)),
+            -180.0,
+            180.0,
+            "%.0f deg",
+        )
+        changed_el, new_el = imgui.slider_float(
+            "Sun height##scanner_light_elevation",
+            float(state.get('scanner_light_elevation', 48.0)),
+            10.0,
+            80.0,
+            "%.0f deg",
+        )
+        changed_si, new_si = imgui.slider_float(
+            "Light strength##scanner_light_sun",
+            float(state.get('scanner_light_sun_intensity', 0.68)),
+            0.20,
+            1.20,
+            "%.2f",
+        )
+        changed_sh, new_sh = imgui.slider_float(
+            "Soft shadow##scanner_light_shadow",
+            float(state.get('scanner_light_shadow', 0.20)),
+            0.0,
+            0.45,
+            "%.2f",
+        )
+        changed_sheen, new_sheen = imgui.slider_float(
+            "Yarn sheen##scanner_light_sheen",
+            float(state.get('scanner_light_sheen', 0.025)),
+            0.0,
+            0.10,
+            "%.3f",
+        )
+        changed_compare, new_compare = (False, bool(state.get('scanner_light_preview_compare', True)))
+        if lighting_enabled:
+            changed_compare, new_compare = imgui.checkbox(
+                "Compare with unlit preview##scanner_light_compare",
+                bool(state.get('scanner_light_preview_compare', True)),
+            )
+        if changed_az:
+            state.scanner_light_azimuth = float(new_az)
+            lighting_changed = True
+        if changed_el:
+            state.scanner_light_elevation = float(new_el)
+            lighting_changed = True
+        if changed_si:
+            state.scanner_light_sun_intensity = float(new_si)
+            lighting_changed = True
+        if changed_sh:
+            state.scanner_light_shadow = float(new_sh)
+            lighting_changed = True
+        if changed_sheen:
+            state.scanner_light_sheen = float(new_sheen)
+            lighting_changed = True
+        if changed_compare:
+            state.scanner_light_preview_compare = bool(new_compare)
+        if imgui.small_button("Reset scanner lighting##scanner_light_reset"):
+            state.scanner_lighting_enabled = True
+            state.scanner_light_azimuth = -35.0
+            state.scanner_light_elevation = 48.0
+            state.scanner_light_sun_intensity = 0.68
+            state.scanner_light_shadow = 0.20
+            state.scanner_light_sheen = 0.025
+            lighting_changed = True
+        if not lighting_enabled:
+            imgui.end_disabled()
+        if lighting_changed:
+            embedded = state.get('embedded_scanner')
+            if embedded is not None:
+                try:
+                    embedded.close()
+                except Exception:
+                    pass
+                state.embedded_scanner = None
+            state.scanner_status = "Scanner lighting changed; press Start Scanner to rebuild"
+        _draw_scanner_lighting_preview(state, renderer)
         capture_mode = str(state.get('scanner_capture_mode', 'natural'))
         focused = capture_mode == "focused"
         single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
@@ -2196,34 +2513,6 @@ def draw_sidebar(state, renderer, window=None):
                     elif (abs(dx) > 0.0 or abs(dy) > 0.0) and (rmb or mmb):
                         embedded.pan_view(dx, dy)
             imgui.text_disabled("Mouse: wheel zoom, left-drag rotate, right/middle-drag pan")
-        imgui.end()
-
-    embedded = state.get('embedded_scanner')
-    if str(state.get('app_mode', 'edit')) == 'scan':
-        imgui.set_next_window_pos((980, 80), cond=imgui.Cond_.first_use_ever)
-        imgui.set_next_window_size((380, 320), cond=imgui.Cond_.first_use_ever)
-        imgui.begin("Robot Camera View", flags=imgui.WindowFlags_.no_collapse)
-        imgui.text("Live gripper camera")
-        imgui.text_disabled("Matches saved scanner images")
-        if embedded is None:
-            imgui.separator()
-            imgui.text_wrapped("Press Start Scanner to create the live robot-camera view.")
-        elif embedded.camera_texture is None:
-            imgui.separator()
-            imgui.text_wrapped("Waiting for the first robot-camera frame...")
-            imgui.text_disabled(str(getattr(embedded, 'status', 'Scanner initializing')))
-        else:
-            avail = imgui.get_content_region_avail()
-            preview_w = max(1, int(avail.x))
-            preview_h = max(1, int(min(avail.y, preview_w * 0.75)))
-            draw_fitted_texture(
-                embedded.camera_texture.glo,
-                embedded.camera_preview_width,
-                embedded.camera_preview_height,
-                preview_w,
-                preview_h,
-                flip_y=False,
-            )
         imgui.end()
 
 def draw_viewport(state, renderer, ref_tex, window):
