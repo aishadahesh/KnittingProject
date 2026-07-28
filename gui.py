@@ -691,7 +691,7 @@ class EmbeddedMujocoScanner:
     CAMERA_PREVIEW_INTERVAL = 0.18
     MAX_EXECUTED_TRAIL_POINTS = 300
 
-    def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None):
+    def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None, auto_start=True):
         import mujoco_fabric_scanner as scanner
 
         self.scanner = scanner
@@ -790,8 +790,8 @@ class EmbeddedMujocoScanner:
             self.base_camera_distance = max(1.18, scene_span * 1.55)
             self.view_zoom = 1.0
             self.camera.distance = self.base_camera_distance
-            self.camera.azimuth =90
-            self.camera.elevation = 270 ## HERE: change robot view to top view
+            self.camera.azimuth = 235.0
+            self.camera.elevation = -20.0
             self.scene_handle = SimpleNamespace(user_scn=self.renderer.scene, sync=lambda: None)
         except Exception:
             # Some MuJoCo/OpenGL backends leave a partially initialized Renderer
@@ -822,7 +822,7 @@ class EmbeddedMujocoScanner:
         self.saved_count = 0
         self.capture_records = []
         self.analysis_results = None
-        self.running = True
+        self.running = bool(auto_start)
         self.paused = False
         self.latest_camera_image = None
         self.single_capture_mode = False
@@ -835,7 +835,12 @@ class EmbeddedMujocoScanner:
         self._save_stop = threading.Event()
         self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
         self._save_thread.start()
-        self.status = f"Ready: {len(self.plan.poses)} scan poses"
+        self.status = (
+            f"Running 1/{len(self.plan.poses)} | saved 0"
+            if self.running
+            else f"Robot Viewer ready: {len(self.plan.poses)} scan poses"
+        )
+        self._render_frame()
 
     def pause(self):
         if self.running:
@@ -847,6 +852,22 @@ class EmbeddedMujocoScanner:
             self.running = True
             self.paused = False
             self.status = f"Running {self.target_index + 1}/{len(self.plan.poses)} | saved {self.saved_count}"
+
+    def start_path(self):
+        if self.target_index >= len(self.plan.poses):
+            self.target_index = 0
+            self.dwell_until = 0.0
+            self.executed = []
+            self.saved_targets = set()
+            self.saved_stations = set()
+            self.saved_count = 0
+            self.capture_records = []
+            self.analysis_results = None
+        self.single_capture_mode = False
+        self.single_target_active = False
+        self.running = True
+        self.paused = False
+        self.status = f"Running {self.target_index + 1}/{len(self.plan.poses)} | saved {self.saved_count}"
 
     def set_zoom(self, zoom):
         self.view_zoom = float(np.clip(zoom, 0.45, 2.50))
@@ -866,6 +887,10 @@ class EmbeddedMujocoScanner:
     def orbit_view(self, dx, dy):
         self.camera.azimuth = float((self.camera.azimuth - dx * 0.35) % 360.0)
         self.camera.elevation = float(np.clip(self.camera.elevation + dy * 0.25, -80.0, -5.0))
+
+    def rotate_view(self, delta_azimuth=0.0, delta_elevation=0.0):
+        self.camera.azimuth = float((self.camera.azimuth + float(delta_azimuth)) % 360.0)
+        self.camera.elevation = float(np.clip(self.camera.elevation + float(delta_elevation), -80.0, -5.0))
 
     def pan_view(self, dx, dy):
         scale = 0.0014 * float(self.camera.distance)
@@ -1620,9 +1645,51 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_status = "Scanner finished" if code == 0 else f"Scanner stopped/error ({code})"
             state.scanner_process = None
 
-    def start_scanner_process():
+    def ensure_embedded_robot_viewer(auto_start=False):
+        if scanner_process_running():
+            return None
+        if not auto_start and bool(state.get('_embedded_scanner_viewer_failed', False)):
+            return None
+        _ensure_scanner_cell_color_sets(state)
+        state.save_params(state.save_path, silent=True)
         embedded = state.get('embedded_scanner')
         if embedded is not None:
+            if auto_start and not getattr(embedded, 'running', False):
+                try:
+                    embedded.close()
+                except Exception:
+                    pass
+                state.embedded_scanner = None
+            else:
+                return embedded
+        try:
+            embedded = EmbeddedMujocoScanner(
+                state,
+                renderer.ctx,
+                window,
+                preview_image=(
+                    _capture_scan_preview_image(renderer)
+                    if auto_start
+                    else _scanner_full_layout_preview_image(state)
+                ),
+                auto_start=auto_start,
+            )
+            state.embedded_scanner = embedded
+            state._embedded_scanner_viewer_failed = False
+            if not auto_start:
+                state.scanner_status = embedded.status
+            return embedded
+        except Exception as exc:
+            state.embedded_scanner = None
+            state._embedded_scanner_viewer_failed = True
+            label = "scanner" if auto_start else "Robot Viewer"
+            state.scanner_status = f"Could not start embedded MuJoCo {label}: {exc}"
+            return None
+
+    def start_scanner_process():
+        mode = str(state.scanner_execution_mode)
+        embedded = state.get('embedded_scanner')
+        if embedded is not None and mode == "simulation":
             if getattr(embedded, 'paused', False) and not getattr(embedded, 'single_capture_mode', False):
                 embedded.resume()
                 state.scanner_status = "Embedded MuJoCo scanner continued"
@@ -1632,27 +1699,21 @@ def draw_sidebar(state, renderer, window=None):
                 return
             embedded.close()
             state.embedded_scanner = None
+        elif embedded is not None and mode != "simulation":
+            try:
+                embedded.close()
+            except Exception:
+                pass
+            state.embedded_scanner = None
         if scanner_process_running():
             state.scanner_status = "Scanner already running"
             return
-        mode = str(state.scanner_execution_mode)
         _ensure_scanner_cell_color_sets(state)
         state.save_params(state.save_path, silent=True)
         if mode == "simulation":
-            try:
-                previous = state.get('embedded_scanner')
-                if previous is not None:
-                    previous.close()
-                state.embedded_scanner = EmbeddedMujocoScanner(
-                    state,
-                    renderer.ctx,
-                    window,
-                    preview_image=_capture_scan_preview_image(renderer),
-                )
+            embedded = ensure_embedded_robot_viewer(auto_start=True)
+            if embedded is not None:
                 state.scanner_status = "Embedded MuJoCo scanner running"
-            except Exception as exc:
-                state.embedded_scanner = None
-                state.scanner_status = f"Could not start embedded MuJoCo scanner: {exc}"
             return
 
         cmd = [
@@ -1739,6 +1800,7 @@ def draw_sidebar(state, renderer, window=None):
                     renderer.ctx,
                     window,
                     preview_image=_capture_scan_preview_image(renderer),
+                    auto_start=False,
                 )
                 state.embedded_scanner = embedded
             except Exception as exc:
@@ -2650,11 +2712,25 @@ def draw_sidebar(state, renderer, window=None):
                     )
         imgui.text_wrapped(str(state.scanner_status))
 
+    if (
+        str(state.get('app_mode', 'edit')) == 'scan'
+        and str(state.get('scanner_execution_mode', 'simulation')) == 'simulation'
+        and state.get('embedded_scanner') is None
+    ):
+        ensure_embedded_robot_viewer(auto_start=False)
+
     embedded = state.get('embedded_scanner')
     if str(state.get('app_mode', 'edit')) == 'scan' and embedded is not None:
         try:
-            embedded.update()
-            state.scanner_status = embedded.status
+            needs_update = (
+                getattr(embedded, 'running', False)
+                or getattr(embedded, 'paused', False)
+                or getattr(embedded, 'single_target_active', False)
+                or embedded.texture is None
+            )
+            if needs_update:
+                embedded.update()
+                state.scanner_status = embedded.status
         except Exception as exc:
             state.scanner_status = f"Embedded scanner error: {exc}"
             try:
@@ -2695,21 +2771,41 @@ def draw_sidebar(state, renderer, window=None):
     embedded = state.get('embedded_scanner')
     if str(state.get('app_mode', 'edit')) == 'scan' and embedded is not None and embedded.texture is not None:
         imgui.set_next_window_size((760, 540), cond=imgui.Cond_.first_use_ever)
-        imgui.begin("UR5 Scanner")
+        imgui.begin("Robot Viewer")
         imgui.text(str(embedded.status))
+        view_changed = False
         changed_zoom, zoom = imgui.slider_float("Zoom##scanner_view_zoom", float(embedded.view_zoom), 0.45, 2.50, "%.2fx")
         if changed_zoom:
             embedded.set_zoom(zoom)
+            view_changed = True
         if imgui.small_button("Zoom in##scanner_view"):
             embedded.zoom_in()
+            view_changed = True
         imgui.same_line()
         if imgui.small_button("Zoom out##scanner_view"):
             embedded.zoom_out()
+            view_changed = True
         imgui.same_line()
         if imgui.small_button("Reset view##scanner_view"):
             embedded.reset_view()
+            view_changed = True
+        if imgui.small_button("Rotate left##scanner_view"):
+            embedded.rotate_view(delta_azimuth=-12.0)
+            view_changed = True
+        imgui.same_line()
+        if imgui.small_button("Rotate right##scanner_view"):
+            embedded.rotate_view(delta_azimuth=12.0)
+            view_changed = True
+        imgui.same_line()
+        if imgui.small_button("Tilt up##scanner_view"):
+            embedded.rotate_view(delta_elevation=8.0)
+            view_changed = True
+        imgui.same_line()
+        if imgui.small_button("Tilt down##scanner_view"):
+            embedded.rotate_view(delta_elevation=-8.0)
+            view_changed = True
         imgui.separator()
-        imgui.text("UR5 Simulator View")
+        imgui.text("UR5 Robot Simulator")
         avail = imgui.get_content_region_avail()
         main_w = max(1, int(avail.x))
         main_h = max(1, int(avail.y))
@@ -2722,6 +2818,7 @@ def draw_sidebar(state, renderer, window=None):
             if image_hovered:
                 if float(io.mouse_wheel) != 0.0:
                     embedded.set_zoom(embedded.view_zoom * float(np.exp(float(io.mouse_wheel) * 0.16)))
+                    view_changed = True
                 if window is not None:
                     lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
                     rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
@@ -2729,9 +2826,13 @@ def draw_sidebar(state, renderer, window=None):
                     dx, dy = float(io.mouse_delta.x), float(io.mouse_delta.y)
                     if (abs(dx) > 0.0 or abs(dy) > 0.0) and lmb:
                         embedded.orbit_view(dx, dy)
+                        view_changed = True
                     elif (abs(dx) > 0.0 or abs(dy) > 0.0) and (rmb or mmb):
                         embedded.pan_view(dx, dy)
-            imgui.text_disabled("Mouse: wheel zoom, left-drag rotate, right/middle-drag pan")
+                        view_changed = True
+            imgui.text_disabled("Mouse over simulator: wheel zoom, left-drag rotate, right/middle-drag pan")
+        if view_changed:
+            embedded._render_frame()
         imgui.end()
 
 def draw_viewport(state, renderer, ref_tex, window):
