@@ -2956,6 +2956,36 @@ def draw_viewport(state, renderer, ref_tex, window):
         rows = max(1, int(getattr(state, 'scanner_rows', 1)))
         cols = max(1, int(getattr(state, 'scanner_cols', 1)))
         base_rows = max(1, int(state.bitmap_size[0]))
+
+        if scanner_picker_mode:
+            overall = projected_mesh_bounds(model_matrix)
+            if overall is None:
+                fallback_w = min(float(disp_w) * 0.68, float(disp_h) * 0.68)
+                fallback_h = fallback_w
+                x_min = (float(disp_w) - fallback_w) * 0.5
+                y_min = (float(disp_h) - fallback_h) * 0.5
+                x_max = x_min + fallback_w
+                y_max = y_min + fallback_h
+            else:
+                x_min, y_min, x_max, y_max = overall
+            available_w = max(12.0, float(x_max - x_min))
+            available_h = max(12.0, float(y_max - y_min))
+            cell_size = max(12.0, min(available_w / cols, available_h / rows))
+            grid_w = cell_size * cols
+            grid_h = cell_size * rows
+            left = 0.5 * (float(x_min + x_max) - grid_w)
+            top = 0.5 * (float(y_min + y_max) - grid_h)
+            return [
+                (
+                    left + c * cell_size,
+                    top + r * cell_size,
+                    left + (c + 1) * cell_size,
+                    top + (r + 1) * cell_size,
+                )
+                for r in range(rows)
+                for c in range(cols)
+            ]
+
         if not renderer.mesh_pick_data:
             return None
 
