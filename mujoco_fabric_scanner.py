@@ -39,6 +39,12 @@ from Robot_fabric_scanner import (
     save_points_csv,
 )
 
+
+# ============================================================================
+# Scanner Runtime Constants
+# ============================================================================
+
+# MuJoCo/IK tuning and scene drawing constants.
 MUJOCO_DAMPING = 1e-2
 MUJOCO_KP = 0.28
 IK_SUBSTEPS = 3
@@ -63,6 +69,14 @@ MODE_ROBOT = "robot"
 DEFAULT_ROBOT_IP = "132.74.121.230"
 DEFAULT_ROBOT_PORT = 30001
 ROBOT_MAX_CARTESIAN_STEP = 0.040
+
+
+# ============================================================================
+# Lighting Section
+# ============================================================================
+
+# Scanner lighting is applied to the image-based repeated fabric texture. This
+# keeps Scan Mode lightweight while still adding asymmetric shading and sheen.
 SCANNER_SUN_AZIMUTH_DEG = -35.0
 SCANNER_SUN_ELEVATION_DEG = 48.0
 SCANNER_AMBIENT_LIGHT = 0.38
@@ -132,6 +146,11 @@ def _scanner_lighting_from_args(args) -> dict[str, float]:
         "sheen": getattr(args, "scanner_light_sheen", SCANNER_SHEEN_STRENGTH),
     })
 
+
+# ============================================================================
+# Fabric Planning and Pattern Data
+# ============================================================================
+
 SWATCH_PALETTE = [
     (0.86, 0.12, 0.18, 1.0),
     (0.10, 0.39, 0.82, 1.0),
@@ -169,6 +188,7 @@ class FabricPlan:
     pattern_repeat_spacing_x: float = 1.0
     pattern_repeat_spacing_y: float = 1.0
     scanner_lighting: dict[str, float] | None = None
+    display_batch_colors: list[tuple[float, float, float, float]] | None = None
 
 
 def _serpentine_indices(rows: int, cols: int):
@@ -203,6 +223,34 @@ def _normalize_palette(palette) -> list[tuple[float, float, float, float]]:
         colors.append((r, g, b, a))
     return colors or list(SWATCH_PALETTE)
 
+
+def _normalize_batch_display_colors(colors, count: int) -> list[tuple[float, float, float, float]] | None:
+    if colors is None:
+        return None
+    normalized: list[tuple[float, float, float, float]] = []
+    for color in colors:
+        if isinstance(color, np.ndarray):
+            color = color.tolist()
+        if not isinstance(color, (list, tuple)) or len(color) < 3:
+            continue
+        rgb = [float(color[i]) for i in range(3)]
+        if max(rgb) > 1.0:
+            rgb = [v / 255.0 for v in rgb]
+        alpha = float(color[3]) if len(color) > 3 else 1.0
+        normalized.append((
+            float(np.clip(rgb[0], 0.0, 1.0)),
+            float(np.clip(rgb[1], 0.0, 1.0)),
+            float(np.clip(rgb[2], 0.0, 1.0)),
+            float(np.clip(alpha, 0.0, 1.0)),
+        ))
+        if len(normalized) >= count:
+            break
+    return normalized or None
+
+
+# ============================================================================
+# Fabric Model Loading and Random Pattern Generation
+# ============================================================================
 
 def _fallback_model_curves() -> list[np.ndarray]:
     return [
@@ -465,6 +513,10 @@ def _generate_random_cell_model_curves(args: argparse.Namespace) -> list[list[np
     ]
 
 
+# ============================================================================
+# Scanning Section: Stations, Angles, and Scan Plan
+# ============================================================================
+
 def build_fabric_grid_stations(
     width: float,
     length: float,
@@ -619,6 +671,7 @@ def build_plan(args: argparse.Namespace) -> FabricPlan:
         pattern_repeat_spacing_x=float(np.clip(float(getattr(args, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45)),
         pattern_repeat_spacing_y=float(np.clip(float(getattr(args, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45)),
         scanner_lighting=_scanner_lighting_from_args(args),
+        display_batch_colors=_normalize_batch_display_colors(getattr(args, "display_batch_colors", None), args.rows * args.cols),
     )
 
 
@@ -711,6 +764,10 @@ def load_ur5e_scene():
     return mujoco, model, data, site_id, handle
 
 
+# ============================================================================
+# Scanning Section: Robot Pose and IK Helpers
+# ============================================================================
+
 def get_tcp(mujoco, model, data, site_id) -> np.ndarray:
     q = np.empty(4)
     mujoco.mju_mat2Quat(q, data.site_xmat[site_id])
@@ -741,6 +798,10 @@ def pose_errors(current_pose: np.ndarray, target_pose: np.ndarray) -> tuple[floa
     ).magnitude()
     return pos_err, float(rot_err)
 
+
+# ============================================================================
+# Scanning Section: MuJoCo Scene Drawing and Fabric Proxy
+# ============================================================================
 
 def _add_sphere(mujoco, scn, pos, radius, rgba):
     if scn.ngeom >= scn.maxgeom:
@@ -982,6 +1043,41 @@ def _add_rendered_fabric_proxy(mujoco, scn, plan: FabricPlan, z: float, view_nam
     return True
 
 
+def _add_batch_result_overlay(mujoco, scn, plan: FabricPlan, z: float, active_cell: tuple[int, int]) -> None:
+    colors = plan.display_batch_colors
+    if not colors:
+        return
+
+    cell_w = plan.fabric_size[0] / max(1, plan.grid_cols)
+    cell_l = plan.fabric_size[1] / max(1, plan.grid_rows)
+    overlay_z = z + FABRIC_THICKNESS * 0.36
+    border_z = z + FABRIC_THICKNESS * 0.50
+    for row in range(plan.grid_rows):
+        for col in range(plan.grid_cols):
+            idx = row * plan.grid_cols + col
+            if idx >= len(colors):
+                continue
+            color = colors[idx]
+            center_x = plan.fabric_origin[0] + cell_w * (col + 0.5)
+            center_y = plan.fabric_origin[1] + cell_l * (row + 0.5)
+            _add_box(
+                mujoco,
+                scn,
+                [center_x, center_y, overlay_z],
+                [cell_w * 0.492, cell_l * 0.492, FABRIC_THICKNESS * 0.055],
+                (float(color[0]), float(color[1]), float(color[2]), 0.48),
+            )
+            border_color = (1.0, 0.78, 0.12, 0.95) if (row, col) == active_cell else (0.25, 0.90, 1.0, 0.50)
+            corners = [
+                np.array([center_x - cell_w * 0.50, center_y - cell_l * 0.50, border_z]),
+                np.array([center_x + cell_w * 0.50, center_y - cell_l * 0.50, border_z]),
+                np.array([center_x + cell_w * 0.50, center_y + cell_l * 0.50, border_z]),
+                np.array([center_x - cell_w * 0.50, center_y + cell_l * 0.50, border_z]),
+            ]
+            for a, b in zip(corners, corners[1:] + corners[:1]):
+                _add_segment(mujoco, scn, a, b, border_color, max(min(cell_w, cell_l) * 0.006, 0.0008))
+
+
 def _add_segment(mujoco, scn, a, b, rgba, width=PATH_WIDTH):
     if scn.ngeom >= scn.maxgeom:
         return
@@ -1028,6 +1124,10 @@ def _add_rotation_ring(mujoco, scn, center: np.ndarray, radius: float, rgba) -> 
     for a, b in zip(points, points[1:]):
         _add_segment(mujoco, scn, a, b, rgba, 0.0015)
 
+
+# ============================================================================
+# Scanning Section: Image-Based Fabric Repeats
+# ============================================================================
 
 def _perspective_coeffs(dst_points, src_points):
     matrix = []
@@ -1340,6 +1440,9 @@ def draw_scene(
                     (0.1, 1.0, 0.3, 0.18),
                 )
 
+    if not color_picker_mode:
+        _add_batch_result_overlay(mujoco, scn, plan, z, active_cell)
+
     path_step = max(1, int(math.ceil(len(plan.mapped_points) / 80))) if simplified else 1
     for i in range(0, len(plan.mapped_points) - 1, path_step):
         j = min(i + path_step, len(plan.mapped_points) - 1)
@@ -1375,6 +1478,10 @@ def draw_scene(
 
     handle.sync()
 
+
+# ============================================================================
+# Scanning Section: Robot Camera Capture
+# ============================================================================
 
 def render_camera_image(
     plan: FabricPlan,
@@ -1742,6 +1849,10 @@ class SimulationControls:
             return False
 
 
+# ============================================================================
+# Scanning Section: MuJoCo Simulation Execution
+# ============================================================================
+
 def run_simulation(plan: FabricPlan, args: argparse.Namespace) -> None:
     mujoco, model, data, site_id, handle = load_ur5e_scene()
     controls = None if args.no_run_gui else SimulationControls(args)
@@ -1875,6 +1986,10 @@ def show_missing_mujoco_help(project_dir: Path) -> None:
     except Exception:
         pass
 
+
+# ============================================================================
+# Scanning Section: Real UR5 Execution
+# ============================================================================
 
 def run_robot_motion(plan: FabricPlan, args: argparse.Namespace) -> None:
     script = generate_urscript(

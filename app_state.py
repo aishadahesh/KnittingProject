@@ -236,6 +236,10 @@ class AppState:
         new_vis[:min(old.shape[0], n_rows)] = old[:min(old.shape[0], n_rows)]
         self.row_visible = new_vis
 
+    # ── SCANNER TEMPLATE AND RANDOM PATTERN MESHES ───────────────────────────
+    # Scan Mode uses initial_params.json as the stable fabric template. These
+    # helpers randomize only the bitmap, then build meshes for preview/display.
+
     def _scanner_template(self):
         path = os.path.join(self.project_root, 'initial_params.json')
         try:
