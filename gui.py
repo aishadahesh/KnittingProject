@@ -2,8 +2,6 @@ import os
 import json
 import numpy as np
 import glfw
-import subprocess
-import sys
 import time
 import queue
 import threading
@@ -530,7 +528,7 @@ def _draw_scanner_lighting_preview(state, renderer):
         imgui.text_disabled("Lighting preview is shown for realistic fabric preview mode.")
         return
     try:
-        import mujoco_fabric_scanner as scanner
+        import fabric_scanner as scanner
     except Exception as exc:
         imgui.text_disabled(f"Lighting preview unavailable: {exc}")
         return
@@ -692,7 +690,7 @@ class EmbeddedMujocoScanner:
     MAX_EXECUTED_TRAIL_POINTS = 300
 
     def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None, auto_start=True):
-        import mujoco_fabric_scanner as scanner
+        import fabric_scanner as scanner
 
         self.scanner = scanner
         self.width = int(width)
@@ -1629,25 +1627,7 @@ def draw_sidebar(state, renderer, window=None):
     def rebuild_current_mesh(preserve=True):
         state.rebuild_spline_mesh(preserve_model_placement=preserve)
 
-    def scanner_process_running():
-        proc = getattr(state, 'scanner_process', None)
-        return proc is not None and proc.poll() is None
-
-    def update_scanner_process_status():
-        proc = getattr(state, 'scanner_process', None)
-        if proc is None:
-            return
-        code = proc.poll()
-        if code is None:
-            elapsed = max(0.0, time.time() - float(getattr(state, 'scanner_started_at', 0.0)))
-            state.scanner_status = f"Scanner running ({elapsed:.0f}s)"
-        else:
-            state.scanner_status = "Scanner finished" if code == 0 else f"Scanner stopped/error ({code})"
-            state.scanner_process = None
-
     def ensure_embedded_robot_viewer(auto_start=False):
-        if scanner_process_running():
-            return None
         if not auto_start and bool(state.get('_embedded_scanner_viewer_failed', False)):
             return None
         _ensure_scanner_cell_color_sets(state)
@@ -1705,9 +1685,6 @@ def draw_sidebar(state, renderer, window=None):
             except Exception:
                 pass
             state.embedded_scanner = None
-        if scanner_process_running():
-            state.scanner_status = "Scanner already running"
-            return
         _ensure_scanner_cell_color_sets(state)
         state.save_params(state.save_path, silent=True)
         if mode == "simulation":
@@ -1716,58 +1693,58 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_status = "Embedded MuJoCo scanner running"
             return
 
-        cmd = [
-            sys.executable,
-            os.path.join(state.project_root, "mujoco_fabric_scanner.py"),
-            "--execution-mode", mode,
-            "--no-setup-gui",
-            "--no-run-gui",
-            "--model-json", str(state.save_path),
-            "--rows", str(int(state.scanner_rows)),
-            "--cols", str(int(state.scanner_cols)),
-            "--number-of-angles", str(int(state.scanner_angles)),
-            "--speed", f"{float(state.scanner_speed):.3f}",
-            "--dwell", f"{float(state.scanner_dwell):.3f}",
-        ]
-        if bool(state.scanner_add_camera):
-            cmd.append("--add-camera")
-        if bool(state.scanner_save_images):
-            cmd.extend([
-                "--save-images",
-                "--image-every", str(state.scanner_image_every),
-                "--capture-mode", str(state.get('scanner_capture_mode', 'natural')),
-            ])
         cell_color_sets = _ensure_scanner_cell_color_sets(state) if str(state.get('scanner_color_mode', 'realistic')) == 'picker' else _scanner_shared_cell_color_sets(state)
-        cmd.extend(["--cell-colors-json", json.dumps(cell_color_sets)])
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         spacing_x, spacing_y = _scanner_repeat_spacing(state)
-        cmd.extend([
-            "--random-patterns",
-            "--pattern-rows", str(int(pattern_rows)),
-            "--pattern-cols", str(int(pattern_cols)),
-            "--pattern-repeat-rows", str(int(repeat_rows)),
-            "--pattern-repeat-cols", str(int(repeat_cols)),
-            "--pattern-repeat-spacing-x", f"{float(spacing_x):.3f}",
-            "--pattern-repeat-spacing-y", f"{float(spacing_y):.3f}",
-            "--pattern-density", f"{float(state.get('scanner_pattern_density', 0.62)):.3f}",
-            "--random-seed", str(int(state.get('scanner_random_seed', 1))),
-        ])
         lighting = _scanner_lighting_settings(state)
-        if float(lighting.get("enabled", 1.0)) < 0.5:
-            cmd.append("--no-scanner-lighting")
-        cmd.extend([
-            "--scanner-light-azimuth", f"{float(lighting['azimuth']):.3f}",
-            "--scanner-light-elevation", f"{float(lighting['elevation']):.3f}",
-            "--scanner-light-sun-intensity", f"{float(lighting['sun_intensity']):.3f}",
-            "--scanner-light-shadow", f"{float(lighting['shadow']):.3f}",
-            "--scanner-light-sheen", f"{float(lighting['sheen']):.4f}",
-        ])
-        cmd.extend(["--robot-ip", str(state.scanner_robot_ip), "--robot-port", str(int(state.scanner_robot_port))])
         try:
-            state.scanner_process = subprocess.Popen(cmd, cwd=state.project_root)
-            state.scanner_started_at = time.time()
-            state.scanner_status = "Real UR5 command running from selected GUI settings"
+            import fabric_scanner as scanner
+
+            args = SimpleNamespace(
+                rows=int(state.scanner_rows),
+                cols=int(state.scanner_cols),
+                number_of_angles=int(state.scanner_angles),
+                width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
+                length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
+                edge_margin=0.004,
+                square_margin=0.006,
+                surface_wave=0.003,
+                view_radius=0.018,
+                angle_lift=0.014,
+                approach_lift=0.040,
+                center=[-0.45, -0.08, 0.30],
+                max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
+                palette=_scanner_base_palette(state),
+                cell_color_sets=cell_color_sets,
+                model_json=str(state.save_path),
+                model_curves=None,
+                cell_model_curves=_generate_scanner_random_patterns(state),
+                random_patterns=True,
+                pattern_rows=int(pattern_rows),
+                pattern_cols=int(pattern_cols),
+                pattern_repeat_rows=int(repeat_rows),
+                pattern_repeat_cols=int(repeat_cols),
+                pattern_repeat_spacing_x=float(spacing_x),
+                pattern_repeat_spacing_y=float(spacing_y),
+                pattern_density=float(state.get('scanner_pattern_density', 0.62)),
+                random_seed=int(state.get('scanner_random_seed', 1)),
+                scanner_lighting=lighting,
+                display_batch_colors=_scanner_batch_colors_for_simulator(state),
+                robot_ip=str(state.scanner_robot_ip),
+                robot_port=int(state.scanner_robot_port),
+                robot_vel=0.015,
+                robot_acc=0.08,
+                robot_dwell=0.20,
+            )
+            plan = scanner.build_plan(args)
+            plan = scanner.densify_plan_for_robot(plan)
+            safe, issues = scanner.assess_plan_safety(plan.mapped_points, max_step=0.08)
+            if not safe:
+                state.scanner_status = "Real UR5 path blocked: " + "; ".join(issues)
+                return
+            scanner.run_robot_motion(plan, args)
+            state.scanner_status = "Real UR5 command sent from selected GUI settings"
         except Exception as exc:
             state.scanner_process = None
             state.scanner_status = f"Could not start scanner: {exc}"
@@ -1778,18 +1755,9 @@ def draw_sidebar(state, renderer, window=None):
             embedded.pause()
             state.scanner_status = embedded.status
             return
-        proc = getattr(state, 'scanner_process', None)
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            state.scanner_status = "Stopping scanner"
-        else:
-            state.scanner_process = None
-            state.scanner_status = "Scanner idle"
+        state.scanner_status = "Scanner idle"
 
     def ensure_embedded_single_capture():
-        if scanner_process_running():
-            state.scanner_status = "Stop the external scanner before single capture"
-            return None
         _ensure_scanner_cell_color_sets(state)
         state.save_params(state.save_path, silent=True)
         embedded = state.get('embedded_scanner')
@@ -2111,7 +2079,6 @@ def draw_sidebar(state, renderer, window=None):
     else:
         imgui.text("Scanner")
         # -- Scanning section: scan layout, random patterns, and capture setup --
-        update_scanner_process_status()
         rows = max(1, int(state.scanner_rows))
         cols = max(1, int(state.scanner_cols))
         preview_mismatch = (
@@ -2544,7 +2511,7 @@ def draw_sidebar(state, renderer, window=None):
         embedded = state.get('embedded_scanner')
         embedded_running = embedded is not None and getattr(embedded, 'running', False) and not getattr(embedded, 'paused', False)
         embedded_paused = embedded is not None and getattr(embedded, 'paused', False)
-        running = scanner_process_running() or embedded_running
+        running = embedded_running
         path_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'path'
         if not path_workflow:
             imgui.begin_disabled()
