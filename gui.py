@@ -393,37 +393,6 @@ def _scanner_lighting_settings(state):
     }
 
 
-# ============================================================================
-# Lighting Section: Scan Fabric Lighting Preview
-# ============================================================================
-
-def _upload_sidebar_preview_texture(state, renderer, key, image):
-    ctx = getattr(renderer, "ctx", None)
-    if ctx is None or image is None:
-        return None
-    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-    h, w = rgb.shape[:2]
-    rgba = np.dstack((rgb, np.full((h, w), 255, dtype=np.uint8)))
-    rgba = np.ascontiguousarray(np.flipud(rgba))
-    tex_key = f"_{key}_texture"
-    size_key = f"_{key}_texture_size"
-    tex = state.__dict__.get(tex_key)
-    size = state.__dict__.get(size_key)
-    if tex is None or size != (w, h):
-        try:
-            if tex is not None:
-                tex.release()
-        except Exception:
-            pass
-        tex = ctx.texture((w, h), 4, rgba.tobytes())
-        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        object.__setattr__(state, tex_key, tex)
-        object.__setattr__(state, size_key, (w, h))
-    else:
-        tex.write(rgba.tobytes())
-    return tex, w, h
-
-
 def _scanner_full_layout_preview_image(state):
     try:
         rows = max(1, int(state.scanner_rows))
@@ -431,6 +400,8 @@ def _scanner_full_layout_preview_image(state):
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         spacing_x, spacing_y = _scanner_repeat_spacing(state)
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+        lighting_settings = _scanner_lighting_settings(state)
+        lighting_key = tuple((key, round(float(lighting_settings[key]), 4)) for key in sorted(lighting_settings))
         cache_key = (
             rows,
             cols,
@@ -443,6 +414,7 @@ def _scanner_full_layout_preview_image(state):
             round(float(state.get('scanner_pattern_density', 0.62)), 4),
             int(state.get('scanner_random_seed', 1)),
             json.dumps(state.get('scanner_color_variants', []), sort_keys=True),
+            lighting_key,
         )
         if state.__dict__.get("_scanner_full_layout_preview_key") == cache_key:
             cached = state.__dict__.get("_scanner_full_layout_preview_image")
@@ -466,6 +438,37 @@ def _scanner_full_layout_preview_image(state):
         canvas_h = max(1, rows * cell_h)
 
     image = Image.new("RGB", (canvas_w, canvas_h), (18, 23, 31))
+
+    def render_unit_image(curves, colors, unit_w, unit_h):
+        unit_w = max(8, int(unit_w))
+        unit_h = max(8, int(unit_h))
+        tile = Image.new("RGB", (unit_w, unit_h), (18, 23, 31))
+        tile_draw = ImageDraw.Draw(tile)
+        line_w = max(1, int(min(unit_w, unit_h) * 0.035))
+        shade_w = max(line_w + 2, int(line_w * 1.8))
+        for curve_idx, curve in enumerate(curves):
+            if len(curve) < 2:
+                continue
+            rgba = colors[curve_idx % len(colors)]
+            color = tuple(int(255 * float(v)) for v in rgba[:3])
+            shadow = tuple(max(0, int(channel * 0.34)) for channel in color)
+            pts = [
+                (
+                    int(round(unit_w * 0.5 + float(p[0]) * unit_w * 0.37)),
+                    int(round(unit_h * 0.5 - float(p[1]) * unit_h * 0.37)),
+                )
+                for p in curve
+            ]
+            tile_draw.line(pts, fill=shadow, width=shade_w, joint="curve")
+            tile_draw.line(pts, fill=color, width=line_w, joint="curve")
+        if float(lighting_settings.get("enabled", 1.0)) >= 0.5:
+            try:
+                import fabric_scanner as scanner
+                tile = scanner._apply_scanner_lighting(tile, "angle 0", True, lighting_settings)
+            except Exception:
+                pass
+        return tile
+
     draw = ImageDraw.Draw(image)
     for row in range(rows):
         for col in range(cols):
@@ -478,81 +481,17 @@ def _scanner_full_layout_preview_image(state):
             tile_h = cell_h / max(1.0, 1.0 + (repeat_rows - 1) * spacing_y)
             step_w = tile_w * spacing_x
             step_h = tile_h * spacing_y
-            line_w = max(1, int(min(tile_w, tile_h) * 0.035))
-            shade_w = max(line_w + 2, int(line_w * 1.8))
+            unit = render_unit_image(curves, colors, int(round(tile_w)), int(round(tile_h)))
             for tr in range(repeat_rows):
                 for tc in range(repeat_cols):
-                    tx = x0 + tc * step_w
-                    ty = y0 + tr * step_h
-                    cx = tx + tile_w * 0.5
-                    cy = ty + tile_h * 0.5
-                    for curve_idx, curve in enumerate(curves):
-                        if len(curve) < 2:
-                            continue
-                        rgba = colors[curve_idx % len(colors)]
-                        color = tuple(int(255 * float(v)) for v in rgba[:3])
-                        shadow = tuple(max(0, int(channel * 0.34)) for channel in color)
-                        pts = [
-                            (
-                                int(round(cx + float(p[0]) * tile_w * 0.74)),
-                                int(round(cy - float(p[1]) * tile_h * 0.74)),
-                            )
-                            for p in curve
-                        ]
-                        draw.line(pts, fill=shadow, width=shade_w, joint="curve")
-                        draw.line(pts, fill=color, width=line_w, joint="curve")
+                    tx = int(round(x0 + tc * step_w))
+                    ty = int(round(y0 + tr * step_h))
+                    image.paste(unit, (tx, ty))
             border = (38, 124, 137)
             draw.rectangle([x0, y0, x0 + cell_w - 1, y0 + cell_h - 1], outline=border, width=1)
     object.__setattr__(state, "_scanner_full_layout_preview_key", cache_key)
     object.__setattr__(state, "_scanner_full_layout_preview_image", image.copy())
     return image
-
-
-def _draw_scanner_lighting_preview(state, renderer):
-    try:
-        import fabric_scanner as scanner
-    except Exception as exc:
-        imgui.text_disabled(f"Lighting preview unavailable: {exc}")
-        return
-    source = _scanner_full_layout_preview_image(state)
-    if source is None:
-        imgui.text_disabled("Lighting preview waiting for the scan fabric layout.")
-        return
-    source = source.resize((min(420, source.size[0]), max(1, int(source.size[1] * min(420, source.size[0]) / max(source.size[0], 1)))))
-    lighting_enabled = bool(state.get('scanner_lighting_enabled', True))
-    avail = max(140, int(imgui.get_content_region_avail().x))
-    if not lighting_enabled:
-        uploaded = _upload_sidebar_preview_texture(state, renderer, "scanner_flat_preview", source)
-        if uploaded is not None:
-            tex, w, h = uploaded
-            draw_fitted_texture(tex.glo, w, h, avail, int(avail * 0.70), flip_y=False)
-            imgui.text_disabled("Flat preview: lighting effect disabled")
-        return
-    lit = scanner._apply_scanner_lighting(
-        source,
-        f"angle {int(state.get('scanner_single_angle', 1)) * 360.0 / max(1, int(state.scanner_angles)):.0f}",
-        True,
-        _scanner_lighting_settings(state),
-    )
-    compare = bool(state.get('scanner_light_preview_compare', True))
-    if compare:
-        half_w = max(90, int((avail - imgui.get_style().item_spacing.x) * 0.5))
-        left = _upload_sidebar_preview_texture(state, renderer, "scanner_unlit_preview", source)
-        right = _upload_sidebar_preview_texture(state, renderer, "scanner_lit_preview", lit)
-        if left is not None:
-            tex, w, h = left
-            draw_fitted_texture(tex.glo, w, h, half_w, int(half_w * 0.70), flip_y=False)
-            imgui.text_disabled("Without lighting")
-        imgui.same_line()
-        if right is not None:
-            tex, w, h = right
-            draw_fitted_texture(tex.glo, w, h, half_w, int(half_w * 0.70), flip_y=False)
-            imgui.text_disabled("With scanner lighting")
-    else:
-        uploaded = _upload_sidebar_preview_texture(state, renderer, "scanner_lit_preview", lit)
-        if uploaded is not None:
-            tex, w, h = uploaded
-            draw_fitted_texture(tex.glo, w, h, avail, int(avail * 0.70), flip_y=False)
 
 
 # ============================================================================
@@ -708,6 +647,7 @@ class EmbeddedMujocoScanner:
         if preview_image is not None:
             self.plan.rendered_fabric_image = preview_image.convert("RGB")
             self.plan.rendered_fabric_image_is_full_layout = True
+            self.plan.rendered_fabric_image_lit = True
         self.mujoco, self.model, self.data, self.site_id = scanner.load_ur5e_model_data()
         self.mj_context = None
         self.renderer = None
@@ -784,6 +724,7 @@ class EmbeddedMujocoScanner:
         self._last_camera_preview_time = 0.0
         self._camera_preview_dirty = True
         self._last_camera_preview_key = None
+        self._saved_preview_hold_until = 0.0
         self._save_queue = queue.Queue()
         self._save_stop = threading.Event()
         self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
@@ -894,26 +835,51 @@ class EmbeddedMujocoScanner:
         cam.elevation = float(np.clip(np.degrees(np.arcsin(rel[2] / dist)), -85.0, 85.0))
         return cam
 
+    def _camera_render_lighting_key(self):
+        lighting = self.scanner._normalize_scanner_lighting(getattr(self.plan, "scanner_lighting", None))
+        return tuple((key, round(float(lighting[key]), 4)) for key in sorted(lighting))
+
+    def _render_robot_camera_image(self, tcp_pos, target_index, station_id=None, target_pose=None, image_size=None):
+        target_index = min(int(target_index), len(self.plan.poses) - 1)
+        if station_id is None:
+            station_id = self.plan.station_ids[target_index]
+        station_id = int(station_id)
+        if target_pose is None:
+            target_pose = self.plan.poses[target_index]
+        return self.scanner.render_camera_image(
+            self.plan,
+            np.asarray(tcp_pos, dtype=float)[:3],
+            target_index,
+            station_id,
+            self.plan.view_names[target_index],
+            target_pose=target_pose,
+            capture_mode=str(getattr(self.args, "capture_mode", "natural")),
+            camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
+            image_size=image_size if image_size is not None else self._active_camera_image_size(),
+        )
+
+    def _show_robot_camera_image(self, image, *, hold_seconds=0.0):
+        self._upload_camera_preview(image)
+        self.latest_camera_image = image.copy()
+        now = time.monotonic()
+        self._last_camera_preview_time = now
+        self._camera_preview_dirty = False
+        if hold_seconds > 0.0:
+            self._saved_preview_hold_until = max(self._saved_preview_hold_until, now + float(hold_seconds))
+
     def _save_gripper_camera_image(self, tcp_pos, target_index, station_id):
         output_dir = Path(self.args.image_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         target_pose = self.plan.poses[min(target_index, len(self.plan.poses) - 1)]
         capture_mode = str(getattr(self.args, "capture_mode", "natural"))
-        image = self.scanner.render_camera_image(
-            self.plan,
-            tcp_pos[:3],
+        image = self._render_robot_camera_image(
+            tcp_pos,
             target_index,
-            station_id,
-            self.plan.view_names[target_index],
+            station_id=station_id,
             target_pose=target_pose,
-            capture_mode=capture_mode,
-            camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
             image_size=self._capture_image_size(),
         )
-        self._upload_camera_preview(image)
-        self.latest_camera_image = image
-        self._last_camera_preview_time = time.monotonic()
-        self._camera_preview_dirty = False
+        self._show_robot_camera_image(image, hold_seconds=0.45)
         active_row, active_col = self.plan.station_cells[station_id]
         clean_view = self.plan.view_names[target_index].replace(" ", "_")
         clean_mode = "focused_batch" if capture_mode == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
@@ -1244,19 +1210,15 @@ class EmbeddedMujocoScanner:
         self.single_target_active = False
         tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
         target_pose = self.plan.poses[target_index]
-        image = self.scanner.render_camera_image(
-            self.plan,
-            tcp[:3],
+        self.args.camera_zoom = float(camera_zoom)
+        image = self._render_robot_camera_image(
+            tcp,
             target_index,
-            station_id,
-            self.plan.view_names[target_index],
+            station_id=station_id,
             target_pose=target_pose,
-            capture_mode=str(getattr(self.args, "capture_mode", "natural")),
-            camera_zoom=float(camera_zoom),
             image_size=self._single_capture_image_size(),
         )
-        self.latest_camera_image = image
-        self._upload_camera_preview(image)
+        self._show_robot_camera_image(image, hold_seconds=0.0)
         output_dir = Path(self.args.image_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         active_row, active_col = self.plan.station_cells[station_id]
@@ -1365,33 +1327,29 @@ class EmbeddedMujocoScanner:
             self.camera_texture.write(rgba.tobytes())
 
     def _render_camera_preview(self, tcp_pose, target_index, target_pose):
+        if time.monotonic() < self._saved_preview_hold_until and self.latest_camera_image is not None:
+            return
         preview_key = (
             int(target_index),
             str(getattr(self.args, "capture_mode", "natural")),
             round(float(getattr(self.args, "camera_zoom", 1.0)), 3),
             self._active_camera_image_size(),
+            self._camera_render_lighting_key(),
         )
         now = time.monotonic()
         force = self._camera_preview_dirty or preview_key != self._last_camera_preview_key or self.single_capture_mode
         if not force and self.latest_camera_image is not None and now - self._last_camera_preview_time < self.CAMERA_PREVIEW_INTERVAL:
             return
         station = self.plan.station_ids[min(target_index, len(self.plan.station_ids) - 1)]
-        image = self.scanner.render_camera_image(
-            self.plan,
-            tcp_pose[:3],
-            min(target_index, len(self.plan.poses) - 1),
-            station,
-            self.plan.view_names[min(target_index, len(self.plan.view_names) - 1)],
+        image = self._render_robot_camera_image(
+            tcp_pose,
+            target_index,
+            station_id=station,
             target_pose=target_pose,
-            capture_mode=str(getattr(self.args, "capture_mode", "natural")),
-            camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
             image_size=self._active_camera_image_size(),
         )
-        self._upload_camera_preview(image)
-        self.latest_camera_image = image
+        self._show_robot_camera_image(image, hold_seconds=0.0)
         self._last_camera_preview_key = preview_key
-        self._last_camera_preview_time = now
-        self._camera_preview_dirty = False
 
     def update(self):
         if self.target_index >= len(self.plan.poses):
@@ -2259,9 +2217,9 @@ def draw_sidebar(state, renderer, window=None):
                 _refresh_embedded_scanner_display_colors(state)
                 state.rebuild_spline_mesh(preserve_model_placement=False)
         imgui.separator()
-        # -- Lighting section: scanner lighting controls and preview -----------
-        imgui.text("Scanner lighting preview")
-        imgui.text_disabled("These settings are used by the robot camera and saved scan images.")
+        # -- Lighting section: scanner lighting controls ----------------------
+        imgui.text("Scanner lighting")
+        imgui.text_disabled("Applied directly to the Scan Mode 3D view, robot camera, and saved images.")
         lighting_changed = False
         lighting_enabled = bool(state.get('scanner_lighting_enabled', True))
         changed_no_lighting, no_lighting = imgui.checkbox(
@@ -2310,12 +2268,6 @@ def draw_sidebar(state, renderer, window=None):
             0.10,
             "%.3f",
         )
-        changed_compare, new_compare = (False, bool(state.get('scanner_light_preview_compare', True)))
-        if lighting_enabled:
-            changed_compare, new_compare = imgui.checkbox(
-                "Compare with unlit preview##scanner_light_compare",
-                bool(state.get('scanner_light_preview_compare', True)),
-            )
         if changed_az:
             state.scanner_light_azimuth = float(new_az)
             lighting_changed = True
@@ -2331,8 +2283,6 @@ def draw_sidebar(state, renderer, window=None):
         if changed_sheen:
             state.scanner_light_sheen = float(new_sheen)
             lighting_changed = True
-        if changed_compare:
-            state.scanner_light_preview_compare = bool(new_compare)
         if imgui.small_button("Reset scanner lighting##scanner_light_reset"):
             state.scanner_lighting_enabled = True
             state.scanner_light_azimuth = -35.0
@@ -2350,9 +2300,8 @@ def draw_sidebar(state, renderer, window=None):
                     embedded.close()
                 except Exception:
                     pass
-                state.embedded_scanner = None
+            state.embedded_scanner = None
             state.scanner_status = "Scanner lighting changed; press Start Scanner to rebuild"
-        _draw_scanner_lighting_preview(state, renderer)
 
         # -- Scanning section: robot camera modes and execution controls -------
         capture_mode = str(state.get('scanner_capture_mode', 'natural'))
@@ -2604,46 +2553,71 @@ def draw_sidebar(state, renderer, window=None):
                 selected_r, selected_c = next(iter(cells_by_pos.keys()))
             state.scanner_analysis_selected_cell = [selected_r, selected_c]
 
-            imgui.text("Average color grid")
-            cell_size = max(24.0, min(48.0, (imgui.get_content_region_avail().x - max(0, cols - 1) * 4.0) / max(cols, 1)))
-            imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(4, 4))
-            for r in range(rows):
-                for c in range(cols):
-                    cell = cells_by_pos.get((r, c))
-                    if cell is None:
-                        rgba = (0.10, 0.10, 0.10, 1.0)
-                    else:
-                        rgb = [float(v) for v in cell["overall_rgb"]]
-                        rgba = (
-                            np.clip(rgb[0] / 255.0, 0.0, 1.0),
-                            np.clip(rgb[1] / 255.0, 0.0, 1.0),
-                            np.clip(rgb[2] / 255.0, 0.0, 1.0),
+            estimate_by_pos = {
+                (int(item.get("row", 0)), int(item.get("col", 0))): item
+                for item in _scanner_estimated_cell_colors(state)
+            }
+            for pos, cell in cells_by_pos.items():
+                estimate_by_pos[pos] = {
+                    **estimate_by_pos.get(pos, {}),
+                    "row": int(pos[0]),
+                    "col": int(pos[1]),
+                    "rgb": [float(v) for v in cell.get("estimated_rgb", [26.0, 26.0, 26.0])[:3]],
+                    "active_ratio": float(cell.get("estimated_active_ratio", estimate_by_pos.get(pos, {}).get("active_ratio", 0.0))),
+                }
+            grid_gap = imgui.get_style().item_spacing.x
+            available_w = max(180.0, float(imgui.get_content_region_avail().x))
+            panel_w = max(86.0, (available_w - grid_gap) * 0.5)
+            cell_size = max(12.0, min(36.0, (panel_w - max(0, cols - 1) * 3.0) / max(cols, 1)))
+
+            def color_rgba(rgb):
+                return (
+                    float(np.clip(float(rgb[0]) / 255.0, 0.0, 1.0)),
+                    float(np.clip(float(rgb[1]) / 255.0, 0.0, 1.0)),
+                    float(np.clip(float(rgb[2]) / 255.0, 0.0, 1.0)),
+                    1.0,
+                )
+
+            def draw_analysis_grid(title, source_by_pos, rgb_key, id_prefix):
+                nonlocal selected_r, selected_c
+                imgui.begin_group()
+                imgui.text(title)
+                imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(3, 3))
+                for r in range(rows):
+                    for c in range(cols):
+                        cell = source_by_pos.get((r, c))
+                        rgb = cell.get(rgb_key, [26.0, 26.0, 26.0]) if cell is not None else [26.0, 26.0, 26.0]
+                        rgba = color_rgba(rgb)
+                        imgui.push_style_color(imgui.Col_.button, rgba)
+                        imgui.push_style_color(imgui.Col_.button_hovered, (
+                            min(float(rgba[0]) + 0.12, 1.0),
+                            min(float(rgba[1]) + 0.12, 1.0),
+                            min(float(rgba[2]) + 0.12, 1.0),
                             1.0,
-                        )
-                    imgui.push_style_color(imgui.Col_.button, rgba)
-                    imgui.push_style_color(imgui.Col_.button_hovered, (
-                        min(float(rgba[0]) + 0.12, 1.0),
-                        min(float(rgba[1]) + 0.12, 1.0),
-                        min(float(rgba[2]) + 0.12, 1.0),
-                        1.0,
-                    ))
-                    border_selected = r == selected_r and c == selected_c
-                    if border_selected:
-                        imgui.push_style_color(imgui.Col_.border, (1.0, 0.78, 0.15, 1.0))
-                        imgui.push_style_var(imgui.StyleVar_.frame_border_size, 2.0)
-                    clicked = imgui.button(f"##rgb_result_{r}_{c}", imgui.ImVec2(cell_size, cell_size))
-                    if border_selected:
-                        imgui.pop_style_var()
-                        imgui.pop_style_color()
-                    imgui.pop_style_color(2)
-                    if clicked and cell is not None:
-                        selected_r, selected_c = r, c
-                        state.scanner_analysis_selected_cell = [r, c]
-                    if c < cols - 1:
-                        imgui.same_line()
-                if r < rows - 1:
-                    imgui.spacing()
-            imgui.pop_style_var()
+                        ))
+                        border_selected = r == selected_r and c == selected_c
+                        if border_selected:
+                            imgui.push_style_color(imgui.Col_.border, (1.0, 0.78, 0.15, 1.0))
+                            imgui.push_style_var(imgui.StyleVar_.frame_border_size, 2.0)
+                        clicked = imgui.button(f"##{id_prefix}_{r}_{c}", imgui.ImVec2(cell_size, cell_size))
+                        if border_selected:
+                            imgui.pop_style_var()
+                            imgui.pop_style_color()
+                        imgui.pop_style_color(2)
+                        if clicked and cell is not None:
+                            selected_r, selected_c = r, c
+                            state.scanner_analysis_selected_cell = [r, c]
+                        if c < cols - 1:
+                            imgui.same_line()
+                    if r < rows - 1:
+                        imgui.spacing()
+                imgui.pop_style_var()
+                imgui.end_group()
+
+            draw_analysis_grid("Estimated Color Grid", estimate_by_pos, "rgb", "estimated_rgb_result")
+            imgui.same_line()
+            draw_analysis_grid("Average RGB Color Grid", cells_by_pos, "overall_rgb", "actual_rgb_result")
+            state.scanner_analysis_selected_cell = [selected_r, selected_c]
 
             selected_cell = cells_by_pos.get((selected_r, selected_c))
             if selected_cell is not None:
@@ -2928,9 +2902,44 @@ def draw_viewport(state, renderer, ref_tex, window):
         py = int(np.clip(round((1.0 - float(uv[1])) * (h - 1)), 0, h - 1))
         return pixels[py, px, :3].astype(np.float32)
 
+    material_uniforms = dict(state.get_material_uniforms())
+    if scanner_stage_active:
+        lighting = _scanner_lighting_settings(state)
+        if float(lighting.get("enabled", 1.0)) < 0.5:
+            material_uniforms.update({
+                "light_color": (1.0, 1.0, 1.0),
+                "light_dir": (0.0, 0.0, 1.0),
+                "light_intensity": 1.0,
+                "ao_strength": 0.0,
+                "texture_gloss_strength": 0.0,
+                "texture_center_shadow": 0.0,
+                "texture_groove_darkness": 0.0,
+            })
+        else:
+            sun = float(lighting.get("sun_intensity", 0.68))
+            shadow = float(lighting.get("shadow", 0.20))
+            sheen = float(lighting.get("sheen", 0.025))
+            az = np.deg2rad(float(lighting.get("azimuth", -35.0)))
+            el = np.deg2rad(float(lighting.get("elevation", 48.0)))
+            light_dir = (
+                float(np.cos(az) * np.cos(el)),
+                float(np.sin(az) * np.cos(el)),
+                float(np.sin(el)),
+            )
+            material_uniforms.update({
+                "light_color": (1.0, 0.96, 0.88),
+                "light_dir": light_dir,
+                "light_intensity": float(np.clip(0.65 + sun * 0.55, 0.30, 1.35)),
+                "ao_strength": float(np.clip(0.22 + shadow * 1.35, 0.0, 0.85)),
+                "ao_radius": float(np.clip(0.08 + shadow * 0.35, 0.02, 0.35)),
+                "texture_gloss_strength": float(np.clip(0.08 + sheen * 3.8, 0.0, 0.55)),
+                "texture_center_shadow": float(np.clip(0.12 + shadow * 0.55, 0.0, 0.55)),
+                "texture_groove_darkness": float(np.clip(0.06 + shadow * 0.45, 0.0, 0.45)),
+            })
+
     renderer.render(
         mvp, mv,
-        state.get_material_uniforms(),
+        material_uniforms,
         render_hover_idx, render_selected_idx,
         hover_mesh_idx=state.hover_mesh_idx,
         selected_mesh_idx=state.selected_mesh_idx,

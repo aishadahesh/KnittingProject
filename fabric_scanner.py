@@ -1257,11 +1257,12 @@ def _view_angle_degrees(view_name: str) -> float:
 
 
 def _apply_scanner_lighting(texture: Image.Image, view_name: str, focused: bool, lighting_settings=None) -> Image.Image:
-    """Apply lightweight lighting to the assembled repeated fabric image.
+    """Apply the scanner's image-space lighting to a rendered fabric texture.
 
-    The source texture is already the full repeated fabric layout. Lighting is
-    applied once across that full image, so all repeated copies share one
-    continuous asymmetric light field instead of each tile looking separately lit.
+    Focused captures call this on one rendered pattern unit before image tiling.
+    Full-layout captures may call it on the assembled preview image when that
+    preview has not already been lit. Preview and saved images use this same
+    function, so the selected lighting mode stays consistent.
     """
     src = texture.convert("RGB")
     arr = np.asarray(src, dtype=np.float32) / 255.0
@@ -1341,15 +1342,14 @@ def _apply_scanner_lighting(texture: Image.Image, view_name: str, focused: bool,
 
 
 def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool, view_name: str) -> Image.Image | None:
-    texture = _rendered_texture_for_camera(plan, row, col, focused)
-    if texture is None:
-        return None
     repeat_rows = max(1, int(plan.pattern_repeat_rows))
     repeat_cols = max(1, int(plan.pattern_repeat_cols))
     spacing_x = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45))
     spacing_y = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45))
     lighting = _normalize_scanner_lighting(getattr(plan, "scanner_lighting", None))
     lighting_key = tuple((key, round(float(lighting[key]), 4)) for key in sorted(lighting))
+    batch_w = int(np.clip(int(getattr(plan, "batch_texture_width", 420)), 160, 2048))
+    batch_h = int(np.clip(int(getattr(plan, "batch_texture_height", 340)), 120, 1660))
     cache_key = (
         "lit",
         "cell" if focused else "full",
@@ -1361,6 +1361,8 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
         round(spacing_y, 3),
         str(view_name),
         bool(focused),
+        batch_w,
+        batch_h,
         lighting_key,
     )
     cache = getattr(plan, "_rendered_texture_cache", None)
@@ -1368,7 +1370,21 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
         cache = {}
         setattr(plan, "_rendered_texture_cache", cache)
     if cache_key not in cache:
-        cache[cache_key] = _apply_scanner_lighting(texture, view_name, focused, lighting)
+        if focused:
+            # Focused scanner captures use the requested workflow:
+            # render one selected pattern unit, apply lighting to that unit,
+            # then duplicate the lit image by the repeat sliders.
+            cell_texture = _render_cell_pattern_texture(plan, row, col, batch_w, batch_h)
+            lit_cell = _apply_scanner_lighting(cell_texture, view_name, focused, lighting)
+            cache[cache_key] = _tile_rendered_texture(lit_cell, repeat_rows, repeat_cols, spacing_x, spacing_y)
+        else:
+            texture = _rendered_texture_for_camera(plan, row, col, focused)
+            if texture is None:
+                return None
+            if bool(getattr(plan, "rendered_fabric_image_lit", False)):
+                cache[cache_key] = texture
+            else:
+                cache[cache_key] = _apply_scanner_lighting(texture, view_name, focused, lighting)
     return cache[cache_key]
 
 

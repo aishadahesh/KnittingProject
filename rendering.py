@@ -65,6 +65,7 @@ uniform float texture_micro_fiber_scale;
 uniform float texture_twist;
 uniform vec3  light_color;
 uniform float light_intensity;
+uniform vec3  light_dir;
 uniform float model_alpha;
 
 uniform sampler2D depth_tex;
@@ -93,7 +94,7 @@ vec3 apply_saturation(vec3 c, float saturation) {
 }
 
 void main() {
-    vec3  L    = normalize(vec3(0.5, 1.0, 0.8));
+    vec3  L    = normalize(light_dir);
     float diff = clamp(dot(normalize(v_norm), L), 0.0, 1.0);
     vec2 uv_p = vec2(
         (v_uv.x + texture_twist * (v_uv.y - 0.5)) * texture_scale_x,
@@ -123,7 +124,7 @@ void main() {
     base_color = clamp((base_color - 0.5) * texture_contrast + 0.5, 0.0, 1.0);
     vec3 lit = base_color * ridge * fiber * noise * groove * center * light_color * light_intensity;
     float gloss_power = mix(96.0, 8.0, texture_highlight_width);
-    float spec = pow(clamp(dot(normalize(v_norm), normalize(vec3(-0.25, 0.35, 1.0))), 0.0, 1.0), gloss_power);
+    float spec = pow(clamp(dot(normalize(v_norm), L), 0.0, 1.0), gloss_power);
     lit += vec3(spec * texture_gloss_strength) * light_color;
     
     float occlusion = 0.0;
@@ -692,6 +693,8 @@ class MeshRenderer:
         # Write matrices and common uniforms once per pass
         self.prog['mvp'].write(mvp.T.tobytes())
         self.prog['mv'].write(mv.T.tobytes())
+        if 'light_dir' in self.prog and 'light_dir' not in material_uniforms:
+            self.prog['light_dir'].value = (0.5, 1.0, 0.8)
         self._set_program_uniforms(self.prog, material_uniforms)
 
         for mesh_idx, (vao, outline_vao, depth_vao, n_idx, color, row_idx) in enumerate(self.meshes):
