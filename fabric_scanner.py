@@ -237,6 +237,8 @@ class FabricPlan:
     pattern_repeat_cols: int = 1
     pattern_repeat_spacing_x: float = 1.0
     pattern_repeat_spacing_y: float = 1.0
+    batch_texture_width: int = 420
+    batch_texture_height: int = 340
     scanner_lighting: dict[str, float] | None = None
     display_batch_colors: list[tuple[float, float, float, float]] | None = None
 
@@ -715,6 +717,8 @@ def build_plan(args) -> FabricPlan:
         pattern_repeat_cols=max(1, int(getattr(args, "pattern_repeat_cols", 1))),
         pattern_repeat_spacing_x=float(np.clip(float(getattr(args, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45)),
         pattern_repeat_spacing_y=float(np.clip(float(getattr(args, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45)),
+        batch_texture_width=int(np.clip(int(getattr(args, "batch_texture_width", 420)), 160, 2048)),
+        batch_texture_height=int(np.clip(int(getattr(args, "batch_texture_height", 340)), 120, 1660)),
         scanner_lighting=_scanner_lighting_from_args(args),
         display_batch_colors=_normalize_batch_display_colors(getattr(args, "display_batch_colors", None), args.rows * args.cols),
     )
@@ -982,39 +986,6 @@ def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z:
         )
 
 
-def _add_color_picker_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z: float, highlight=False) -> None:
-    cell_w = plan.fabric_size[0] / plan.grid_cols
-    cell_l = plan.fabric_size[1] / plan.grid_rows
-    center_x = plan.fabric_origin[0] + cell_w * (col + 0.5)
-    center_y = plan.fabric_origin[1] + cell_l * (row + 0.5)
-    color = _cell_color_set(plan, row, col)[0]
-    rgba = (float(color[0]), float(color[1]), float(color[2]), 1.0)
-    _add_box(
-        mujoco,
-        scn,
-        [center_x, center_y, z],
-        [cell_w * 0.492, cell_l * 0.492, FABRIC_THICKNESS * 0.20],
-        rgba,
-    )
-    border = (0.92, 0.94, 0.98, 0.75)
-    corners = [
-        np.array([center_x - cell_w * 0.50, center_y - cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
-        np.array([center_x + cell_w * 0.50, center_y - cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
-        np.array([center_x + cell_w * 0.50, center_y + cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
-        np.array([center_x - cell_w * 0.50, center_y + cell_l * 0.50, z + FABRIC_THICKNESS * 0.18]),
-    ]
-    for a, b in zip(corners, corners[1:] + corners[:1]):
-        _add_segment(mujoco, scn, a, b, border, max(min(cell_w, cell_l) * 0.006, 0.0008))
-    if highlight:
-        _add_box(
-            mujoco,
-            scn,
-            [center_x, center_y, z + FABRIC_THICKNESS * 0.24],
-            [cell_w * 0.50, cell_l * 0.50, FABRIC_THICKNESS * 0.10],
-            (0.1, 1.0, 0.3, 0.24),
-        )
-
-
 def _add_rendered_fabric_proxy(mujoco, scn, plan: FabricPlan, z: float, view_name: str = "angle 0") -> bool:
     texture = _lit_rendered_texture_for_camera(plan, 0, 0, focused=False, view_name=view_name)
     if texture is None:
@@ -1225,6 +1196,56 @@ def _tile_rendered_texture(
     return canvas
 
 
+def _render_cell_pattern_texture(plan: FabricPlan, row: int, col: int, width: int = 420, height: int = 340) -> Image.Image:
+    """Render one knitted fabric sample before image-based repetition."""
+    from PIL import ImageDraw
+
+    scale = 3
+    width = max(96, int(width))
+    height = max(80, int(height))
+    canvas = Image.new("RGB", (width * scale, height * scale), (18, 23, 31))
+    draw = ImageDraw.Draw(canvas)
+    colors = _cell_color_set(plan, row, col)
+    curves = _smoothed_cell_model_curves(plan, row, col)
+    if not curves:
+        return canvas.resize((width, height), getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS))
+
+    all_pts = np.vstack([curve[:, :2] for curve in curves if len(curve) > 1])
+    min_xy = all_pts.min(axis=0)
+    max_xy = all_pts.max(axis=0)
+    center = (min_xy + max_xy) * 0.5
+    span = np.maximum(max_xy - min_xy, 1e-6)
+    usable_w = width * scale * 0.84
+    usable_h = height * scale * 0.84
+    px_scale = min(usable_w / float(span[0]), usable_h / float(span[1]))
+    origin = np.array([width * scale * 0.5, height * scale * 0.5], dtype=np.float32)
+    line_w = max(2, int(min(width, height) * scale * 0.030))
+    shade_w = max(line_w + 2, int(line_w * 1.65))
+
+    for curve_idx, curve in enumerate(curves):
+        if len(curve) < 2:
+            continue
+        rgba = colors[curve_idx % len(colors)]
+        color = tuple(int(255 * float(v)) for v in rgba[:3])
+        shadow = tuple(max(0, int(channel * 0.32)) for channel in color)
+        highlight = tuple(min(255, int(channel * 1.18 + 18)) for channel in color)
+        pts = [
+            (
+                int(round(origin[0] + (float(p[0]) - center[0]) * px_scale)),
+                int(round(origin[1] - (float(p[1]) - center[1]) * px_scale)),
+            )
+            for p in curve
+        ]
+        draw.line(pts, fill=shadow, width=shade_w, joint="curve")
+        draw.line(pts, fill=color, width=line_w, joint="curve")
+        if line_w >= 5:
+            offset_pts = [(x - max(1, line_w // 5), y - max(1, line_w // 5)) for x, y in pts]
+            draw.line(offset_pts, fill=highlight, width=max(1, line_w // 4), joint="curve")
+
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+    return canvas.resize((width, height), resample)
+
+
 def _view_angle_degrees(view_name: str) -> float:
     text = str(view_name).lower()
     if "angle" not in text:
@@ -1353,15 +1374,19 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
 
 def _rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool) -> Image.Image | None:
     texture = getattr(plan, "rendered_fabric_image", None)
-    if texture is None:
-        return None
-    texture = texture.convert("RGB")
+    if texture is not None:
+        texture = texture.convert("RGB")
+    source_is_full_layout = bool(getattr(plan, "rendered_fabric_image_is_full_layout", False))
     repeat_rows = max(1, int(plan.pattern_repeat_rows))
     repeat_cols = max(1, int(plan.pattern_repeat_cols))
     spacing_x = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45))
     spacing_y = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_y", 1.0)), 0.55, 1.45))
     if not focused:
-        cache_key = ("full", repeat_rows, repeat_cols, round(spacing_x, 3), round(spacing_y, 3))
+        if texture is None:
+            return None
+        if source_is_full_layout:
+            return texture
+        cache_key = ("full", bool(source_is_full_layout), repeat_rows, repeat_cols, round(spacing_x, 3), round(spacing_y, 3))
         cache = getattr(plan, "_rendered_texture_cache", None)
         if cache is None:
             cache = {}
@@ -1369,20 +1394,26 @@ def _rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: 
         if cache_key not in cache:
             cache[cache_key] = _tile_rendered_texture(texture, repeat_rows, repeat_cols, spacing_x, spacing_y)
         return cache[cache_key]
-    rows = max(1, int(plan.grid_rows))
-    cols = max(1, int(plan.grid_cols))
-    w, h = texture.size
-    x0 = int(np.clip(round(col * w / cols), 0, w - 1))
-    x1 = int(np.clip(round((col + 1) * w / cols), x0 + 1, w))
-    y0 = int(np.clip(round(row * h / rows), 0, h - 1))
-    y1 = int(np.clip(round((row + 1) * h / rows), y0 + 1, h))
-    cache_key = ("cell", int(row), int(col), repeat_rows, repeat_cols, round(spacing_x, 3), round(spacing_y, 3))
+    batch_w = int(np.clip(int(getattr(plan, "batch_texture_width", 420)), 160, 2048))
+    batch_h = int(np.clip(int(getattr(plan, "batch_texture_height", 340)), 120, 1660))
+    cache_key = (
+        "cell_direct",
+        int(row),
+        int(col),
+        repeat_rows,
+        repeat_cols,
+        round(spacing_x, 3),
+        round(spacing_y, 3),
+        batch_w,
+        batch_h,
+    )
     cache = getattr(plan, "_rendered_texture_cache", None)
     if cache is None:
         cache = {}
         setattr(plan, "_rendered_texture_cache", cache)
     if cache_key not in cache:
-        cache[cache_key] = _tile_rendered_texture(texture.crop((x0, y0, x1, y1)), repeat_rows, repeat_cols, spacing_x, spacing_y)
+        cell_texture = _render_cell_pattern_texture(plan, row, col, batch_w, batch_h)
+        cache[cache_key] = _tile_rendered_texture(cell_texture, repeat_rows, repeat_cols, spacing_x, spacing_y)
     return cache[cache_key]
 
 
@@ -1397,7 +1428,6 @@ def draw_scene(
     target_pose: np.ndarray | None = None,
     clear_scene: bool = True,
     simplified: bool = False,
-    color_picker_mode: bool = False,
 ) -> None:
     scn = handle.user_scn
     if clear_scene:
@@ -1424,12 +1454,10 @@ def draw_scene(
     station_id = plan.station_ids[min(target_index, len(plan.station_ids) - 1)]
     active_cell = plan.station_cells[station_id]
     view_name = plan.view_names[min(target_index, len(plan.view_names) - 1)] if plan.view_names else "angle 0"
-    rendered_proxy = False if color_picker_mode else _add_rendered_fabric_proxy(mujoco, scn, plan, z, view_name=view_name)
+    rendered_proxy = _add_rendered_fabric_proxy(mujoco, scn, plan, z, view_name=view_name)
     for row in range(plan.grid_rows):
         for col in range(plan.grid_cols):
-            if color_picker_mode:
-                _add_color_picker_cell_fabric(mujoco, scn, plan, row, col, z, highlight=(row, col) == active_cell)
-            elif not rendered_proxy:
+            if not rendered_proxy:
                 _add_model_cell_fabric(mujoco, scn, plan, row, col, z, highlight=(row, col) == active_cell, simplified=simplified)
             elif (row, col) == active_cell:
                 cell_w = plan.fabric_size[0] / plan.grid_cols
@@ -1444,8 +1472,7 @@ def draw_scene(
                     (0.1, 1.0, 0.3, 0.18),
                 )
 
-    if not color_picker_mode:
-        _add_batch_result_overlay(mujoco, scn, plan, z, active_cell)
+    _add_batch_result_overlay(mujoco, scn, plan, z, active_cell)
 
     path_step = max(1, int(math.ceil(len(plan.mapped_points) / 80))) if simplified else 1
     for i in range(0, len(plan.mapped_points) - 1, path_step):
@@ -1494,11 +1521,15 @@ def render_camera_image(
     station_id: int,
     view_name: str,
     target_pose: np.ndarray | None = None,
-    color_picker_mode: bool = False,
     capture_mode: str = CAMERA_CAPTURE_NATURAL,
     camera_zoom: float = 1.0,
+    image_size: tuple[int, int] | None = None,
 ) -> Image.Image:
-    width_px, height_px = CAMERA_IMAGE_SIZE
+    if image_size is None:
+        width_px, height_px = CAMERA_IMAGE_SIZE
+    else:
+        width_px = int(np.clip(int(image_size[0]), 320, 4096))
+        height_px = int(np.clip(int(image_size[1]), 240, 3072))
     station = plan.mapped_stations[station_id]
     cell_w = plan.fabric_size[0] / plan.grid_cols
     cell_l = plan.fabric_size[1] / plan.grid_rows
@@ -1617,7 +1648,7 @@ def render_camera_image(
 
     draw = ImageDraw.Draw(img)
     fabric_z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.48
-    rendered_texture = None if color_picker_mode else _lit_rendered_texture_for_camera(
+    rendered_texture = _lit_rendered_texture_for_camera(
         plan,
         active_row,
         active_col,
@@ -1663,60 +1694,37 @@ def render_camera_image(
                     project_camera(np.array([x0, y1, fabric_z])),
                 ]
                 if all(p is not None for p in cell_poly):
-                    if color_picker_mode:
-                        fill_rgba = colors[0]
-                        fill = tuple(int(255 * c) for c in fill_rgba[:3])
-                    else:
-                        fill = (18, 23, 31)
-                    draw.polygon([(p[0], p[1]) for p in cell_poly if p is not None], fill=fill)
+                    draw.polygon([(p[0], p[1]) for p in cell_poly if p is not None], fill=(18, 23, 31))
                 depth_to_cell = max(float(np.dot(np.array([x0 + cell_w * 0.5, y0 + cell_l * 0.5, fabric_z]) - lens_pos, forward)), near)
                 yarn_px = max(3, min(18, int(focal * max(min(cell_w, cell_l) * 0.030, 0.0014) / depth_to_cell)))
                 repeat_rows = max(1, int(plan.pattern_repeat_rows))
                 repeat_cols = max(1, int(plan.pattern_repeat_cols))
                 tile_w = cell_w / repeat_cols
                 tile_l = cell_l / repeat_rows
-                if color_picker_mode:
-                    fill_rgba = colors[0]
-                    fill = tuple(int(255 * c) for c in fill_rgba[:3])
-                    for tr in range(repeat_rows):
-                        for tc in range(repeat_cols):
-                            tx0 = x0 + tc * tile_w
-                            ty0 = y0 + tr * tile_l
-                            tx1 = tx0 + tile_w
-                            ty1 = ty0 + tile_l
-                            tile_poly = [
-                                project_camera(np.array([tx0, ty0, fabric_z + 0.00035])),
-                                project_camera(np.array([tx1, ty0, fabric_z + 0.00035])),
-                                project_camera(np.array([tx1, ty1, fabric_z + 0.00035])),
-                                project_camera(np.array([tx0, ty1, fabric_z + 0.00035])),
+                curves = _smoothed_cell_model_curves(plan, row, col)
+                for tr in range(repeat_rows):
+                    for tc in range(repeat_cols):
+                        tile_x0 = x0 + tc * tile_w
+                        tile_y0 = y0 + tr * tile_l
+                        tile_cx = tile_x0 + tile_w * 0.5
+                        tile_cy = tile_y0 + tile_l * 0.5
+                        for curve_idx, curve in enumerate(curves):
+                            rgba = colors[curve_idx % len(colors)]
+                            color = tuple(int(255 * c) for c in rgba[:3])
+                            shade = tuple(max(0, int(channel * 0.45)) for channel in color)
+                            z = fabric_z + curve_idx * max(FABRIC_THICKNESS * 0.08, 0.00045)
+                            pts = [
+                                np.array([
+                                    tile_cx + float(p[0]) * tile_w * IMAGE_REPEAT_OVERLAP,
+                                    tile_cy + float(p[1]) * tile_l * IMAGE_REPEAT_OVERLAP,
+                                    z,
+                                ])
+                                for p in curve
                             ]
-                            if all(p is not None for p in tile_poly):
-                                draw.polygon([(p[0], p[1]) for p in tile_poly if p is not None], fill=fill)
-                else:
-                    curves = _smoothed_cell_model_curves(plan, row, col)
-                    for tr in range(repeat_rows):
-                        for tc in range(repeat_cols):
-                            tile_x0 = x0 + tc * tile_w
-                            tile_y0 = y0 + tr * tile_l
-                            tile_cx = tile_x0 + tile_w * 0.5
-                            tile_cy = tile_y0 + tile_l * 0.5
-                            for curve_idx, curve in enumerate(curves):
-                                rgba = colors[curve_idx % len(colors)]
-                                color = tuple(int(255 * c) for c in rgba[:3])
-                                shade = tuple(max(0, int(channel * 0.45)) for channel in color)
-                                z = fabric_z + curve_idx * max(FABRIC_THICKNESS * 0.08, 0.00045)
-                                pts = [
-                                    np.array([
-                                        tile_cx + float(p[0]) * tile_w * IMAGE_REPEAT_OVERLAP,
-                                        tile_cy + float(p[1]) * tile_l * IMAGE_REPEAT_OVERLAP,
-                                        z,
-                                    ])
-                                    for p in curve
-                                ]
-                                pts2d = visible_line(pts)
-                                if len(pts2d) >= 2:
-                                    draw.line(pts2d, fill=shade, width=max(1, yarn_px // max(repeat_rows, repeat_cols)) + 2, joint="curve")
-                                    draw.line(pts2d, fill=color, width=max(1, yarn_px // max(repeat_rows, repeat_cols)), joint="curve")
+                            pts2d = visible_line(pts)
+                            if len(pts2d) >= 2:
+                                draw.line(pts2d, fill=shade, width=max(1, yarn_px // max(repeat_rows, repeat_cols)) + 2, joint="curve")
+                                draw.line(pts2d, fill=color, width=max(1, yarn_px // max(repeat_rows, repeat_cols)), joint="curve")
                 outline = (60, 255, 120) if (row, col) == (active_row, active_col) else (245, 245, 240)
                 width = 4 if (row, col) == (active_row, active_col) else 1
                 poly = [

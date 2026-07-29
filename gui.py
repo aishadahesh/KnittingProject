@@ -139,55 +139,9 @@ def _scanner_default_batch_colors(state):
     return _scanner_base_palette(state)
 
 
-def _batch_color_from_saved_cell(saved_cell, fallback):
-    if isinstance(saved_cell, np.ndarray):
-        saved_cell = saved_cell.tolist()
-    if not isinstance(saved_cell, (list, tuple)) or not saved_cell:
-        return list(fallback)
-    if (
-        len(saved_cell) >= 3
-        and all(isinstance(v, (int, float, np.integer, np.floating)) for v in saved_cell[:3])
-    ):
-        return _as_rgba(saved_cell, fallback)
-    return _as_rgba(saved_cell[0], fallback)
-
-
-def _ensure_scanner_batch_colors(state):
+def _clamp_scanner_selected_cell(state):
     rows = max(1, int(state.scanner_rows))
     cols = max(1, int(state.scanner_cols))
-    total = rows * cols
-    defaults = _scanner_default_batch_colors(state)
-    raw = state.get('scanner_cell_color_sets', [])
-    colors = []
-    for cell in range(total):
-        fallback = defaults[cell % len(defaults)]
-        if isinstance(raw, list) and cell < len(raw) and raw[cell]:
-            src = _batch_color_from_saved_cell(raw[cell], fallback)
-        else:
-            src = fallback
-        colors.append(_as_rgba(src, fallback))
-    return colors
-
-
-def _ensure_scanner_cell_color_sets(state):
-    rows = max(1, int(state.scanner_rows))
-    cols = max(1, int(state.scanner_cols))
-    total = rows * cols
-    base = _scanner_base_palette(state)
-    batch_colors = _ensure_scanner_batch_colors(state)
-    sets = []
-    for cell in range(total):
-        batch_color = batch_colors[cell]
-        cell_palette = []
-        for i in range(len(base)):
-            cell_palette.append([
-                float(batch_color[0]),
-                float(batch_color[1]),
-                float(batch_color[2]),
-                float(batch_color[3]) if len(batch_color) > 3 else 1.0,
-            ])
-        sets.append(cell_palette)
-    state.scanner_cell_color_sets = sets
     selected = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
     selected_r = int(selected[0]) if selected.size > 0 else 0
     selected_c = int(selected[1]) if selected.size > 1 else 0
@@ -195,7 +149,7 @@ def _ensure_scanner_cell_color_sets(state):
         int(np.clip(selected_r, 0, rows - 1)),
         int(np.clip(selected_c, 0, cols - 1)),
     ]
-    return sets
+    return tuple(state.scanner_selected_cell)
 
 
 def _scanner_shared_cell_color_sets(state):
@@ -218,6 +172,7 @@ def _scanner_estimated_cell_colors(state):
     if palette.size == 0:
         palette = np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32)
     hidden_weight = 0.10
+    raw_overrides = state.get('scanner_estimated_color_overrides', [])
     estimates = []
     for cell_index in range(rows * cols):
         try:
@@ -232,15 +187,40 @@ def _scanner_estimated_cell_colors(state):
         weighted = weights[:, :, None] * row_colors[:, None, :]
         total_weight = max(float(weights.sum()), 1e-6)
         rgb = np.clip(weighted.sum(axis=(0, 1)) / total_weight, 0.0, 1.0)
+        overridden = False
+        if isinstance(raw_overrides, list) and cell_index < len(raw_overrides):
+            override = raw_overrides[cell_index]
+            if isinstance(override, (list, tuple, np.ndarray)) and len(override) >= 3:
+                try:
+                    rgb = np.clip(np.asarray(override[:3], dtype=np.float32), 0.0, 1.0)
+                    overridden = True
+                except Exception:
+                    pass
         active_ratio = float(np.mean(bitmap > 0.5))
         estimates.append({
             "row": int(cell_index // cols),
             "col": int(cell_index % cols),
             "rgb": [float(v * 255.0) for v in rgb],
             "active_ratio": active_ratio,
+            "overridden": overridden,
             "bitmap": bitmap.astype(int).tolist(),
         })
     return estimates
+
+
+def _set_scanner_estimated_batch_color(state, row: int, col: int, rgb) -> None:
+    rows = max(1, int(state.scanner_rows))
+    cols = max(1, int(state.scanner_cols))
+    index = int(np.clip(row, 0, rows - 1)) * cols + int(np.clip(col, 0, cols - 1))
+    overrides = state.get('scanner_estimated_color_overrides', [])
+    if not isinstance(overrides, list):
+        overrides = []
+    while len(overrides) < rows * cols:
+        overrides.append(None)
+    rgba = _as_rgba(rgb, [0.5, 0.5, 0.5, 1.0])
+    overrides[index] = [float(rgba[0]), float(rgba[1]), float(rgba[2]), 1.0]
+    state.scanner_estimated_color_overrides = overrides[:rows * cols]
+    _refresh_embedded_scanner_display_colors(state)
 
 
 def _draw_scanner_batch_color_grid(state, title=None):
@@ -388,6 +368,20 @@ def _scanner_repeat_spacing(state):
     return spacing_x, spacing_y
 
 
+def _scanner_batch_texture_size(state):
+    width = int(np.clip(int(state.get('scanner_batch_texture_width', 420)), 160, 2048))
+    height = int(round(width * 340.0 / 420.0))
+    height = int(np.clip(height, 120, 1660))
+    return width, height
+
+
+def _scanner_capture_image_size(state, key='scanner_capture_width'):
+    width = int(np.clip(int(state.get(key, 1024)), 320, 4096))
+    height = int(round(width * 0.75))
+    height = int(np.clip(height, 240, 3072))
+    return width, height
+
+
 def _scanner_lighting_settings(state):
     return {
         "enabled": 1.0 if bool(state.get('scanner_lighting_enabled', True)) else 0.0,
@@ -436,7 +430,6 @@ def _scanner_full_layout_preview_image(state):
         cols = max(1, int(state.scanner_cols))
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         spacing_x, spacing_y = _scanner_repeat_spacing(state)
-        realistic_mode = str(state.get('scanner_color_mode', 'realistic')) == 'realistic'
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         cache_key = (
             rows,
@@ -445,19 +438,17 @@ def _scanner_full_layout_preview_image(state):
             repeat_cols,
             round(spacing_x, 3),
             round(spacing_y, 3),
-            realistic_mode,
             pattern_rows,
             pattern_cols,
             round(float(state.get('scanner_pattern_density', 0.62)), 4),
             int(state.get('scanner_random_seed', 1)),
             json.dumps(state.get('scanner_color_variants', []), sort_keys=True),
-            json.dumps(state.get('scanner_cell_color_sets', []), sort_keys=True),
         )
         if state.__dict__.get("_scanner_full_layout_preview_key") == cache_key:
             cached = state.__dict__.get("_scanner_full_layout_preview_image")
             if cached is not None:
                 return cached.copy()
-        cell_sets = _scanner_shared_cell_color_sets(state) if realistic_mode else _ensure_scanner_cell_color_sets(state)
+        cell_sets = _scanner_shared_cell_color_sets(state)
         curves_by_cell = _generate_scanner_random_patterns(state)
     except Exception:
         return None
@@ -482,12 +473,6 @@ def _scanner_full_layout_preview_image(state):
             x0 = col * cell_w
             y0 = row * cell_h
             colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else _scanner_base_palette(state)
-            if not realistic_mode:
-                rgba = colors[0]
-                fill = tuple(int(255 * float(v)) for v in rgba[:3])
-                draw.rectangle([x0, y0, x0 + cell_w, y0 + cell_h], fill=fill)
-                continue
-
             curves = curves_by_cell[cell_index % len(curves_by_cell)] if curves_by_cell else []
             tile_w = cell_w / max(1.0, 1.0 + (repeat_cols - 1) * spacing_x)
             tile_h = cell_h / max(1.0, 1.0 + (repeat_rows - 1) * spacing_y)
@@ -524,9 +509,6 @@ def _scanner_full_layout_preview_image(state):
 
 
 def _draw_scanner_lighting_preview(state, renderer):
-    if str(state.get('scanner_color_mode', 'realistic')) != 'realistic':
-        imgui.text_disabled("Lighting preview is shown for realistic fabric preview mode.")
-        return
     try:
         import fabric_scanner as scanner
     except Exception as exc:
@@ -588,39 +570,6 @@ def _normalize_scanner_curves(curves):
     span = np.maximum(max_xy - min_xy, 1e-6)
     scale = 1.08 / float(max(span[0], span[1]))
     return [((curve - center) * scale).astype(np.float32) for curve in valid]
-
-
-def _capture_scan_preview_image(renderer):
-    tex = getattr(renderer, "color_tex", None)
-    if tex is None:
-        return None
-    try:
-        raw = tex.read(alignment=1)
-    except Exception:
-        return None
-    width, height = int(renderer.vp_w), int(renderer.vp_h)
-    if width <= 1 or height <= 1:
-        return None
-    rgba = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))
-    rgb = np.flipud(rgba[:, :, :3])
-    edge = np.concatenate([
-        rgb[:8, :, :].reshape(-1, 3),
-        rgb[-8:, :, :].reshape(-1, 3),
-        rgb[:, :8, :].reshape(-1, 3),
-        rgb[:, -8:, :].reshape(-1, 3),
-    ])
-    bg = np.median(edge, axis=0)
-    diff = np.linalg.norm(rgb.astype(np.float32) - bg.astype(np.float32), axis=2)
-    mask = (diff > 20.0) | (rgb.max(axis=2) > 70)
-    ys, xs = np.where(mask)
-    if xs.size < 32 or ys.size < 32:
-        return Image.fromarray(rgb.copy(), "RGB")
-    pad = 0
-    x0 = max(0, int(xs.min()) - pad)
-    x1 = min(width, int(xs.max()) + pad + 1)
-    y0 = max(0, int(ys.min()) - pad)
-    y1 = min(height, int(ys.max()) + pad + 1)
-    return Image.fromarray(rgb[y0:y1, x0:x1].copy(), "RGB")
 
 
 def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density, repeat_rows=3, repeat_cols=3):
@@ -701,15 +650,17 @@ class EmbeddedMujocoScanner:
         self.camera_texture = None
         self.camera_preview_width = int(scanner.CAMERA_IMAGE_SIZE[0])
         self.camera_preview_height = int(scanner.CAMERA_IMAGE_SIZE[1])
-        self.color_picker_mode = str(state.get('scanner_color_mode', 'realistic')) == 'picker'
         palette = _scanner_base_palette(state)
-        cell_sets = _ensure_scanner_cell_color_sets(state) if self.color_picker_mode else _scanner_shared_cell_color_sets(state)
+        cell_sets = _scanner_shared_cell_color_sets(state)
         self.estimated_cell_colors = _scanner_estimated_cell_colors(state)
         cell_model_curves = _generate_scanner_random_patterns(state)
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         spacing_x, spacing_y = _scanner_repeat_spacing(state)
         lighting_settings = _scanner_lighting_settings(state)
+        batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
+        capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
+        single_capture_width, single_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
         self.args = SimpleNamespace(
             rows=int(state.scanner_rows),
             cols=int(state.scanner_cols),
@@ -734,6 +685,8 @@ class EmbeddedMujocoScanner:
             image_every=str(state.scanner_image_every),
             capture_mode=str(state.get('scanner_capture_mode', 'natural')),
             camera_zoom=float(state.get('scanner_camera_zoom', 1.0)),
+            capture_image_size=(int(capture_width), int(capture_height)),
+            single_capture_image_size=(single_capture_width, single_capture_height),
             palette=palette,
             cell_color_sets=cell_sets,
             model_json=str(state.save_path),
@@ -743,9 +696,10 @@ class EmbeddedMujocoScanner:
             pattern_repeat_cols=int(repeat_cols),
             pattern_repeat_spacing_x=float(spacing_x),
             pattern_repeat_spacing_y=float(spacing_y),
+            batch_texture_width=int(batch_texture_width),
+            batch_texture_height=int(batch_texture_height),
             scanner_lighting=lighting_settings,
             display_batch_colors=_scanner_batch_colors_for_simulator(state),
-            color_picker_mode=self.color_picker_mode,
         )
         # The embedded viewer only needs the true scan targets. Keeping the
         # intermediate densified path for the GUI makes scanning much slower
@@ -753,6 +707,7 @@ class EmbeddedMujocoScanner:
         self.plan = scanner.build_plan(self.args)
         if preview_image is not None:
             self.plan.rendered_fabric_image = preview_image.convert("RGB")
+            self.plan.rendered_fabric_image_is_full_layout = True
         self.mujoco, self.model, self.data, self.site_id = scanner.load_ur5e_model_data()
         self.mj_context = None
         self.renderer = None
@@ -899,6 +854,33 @@ class EmbeddedMujocoScanner:
 
     # -- Robot camera preview and image capture -------------------------------
 
+    def _capture_image_size(self):
+        width, height = getattr(self.args, "capture_image_size", self.scanner.CAMERA_IMAGE_SIZE)
+        width = int(np.clip(int(width), 320, 4096))
+        height = int(np.clip(int(height), 240, 3072))
+        return width, height
+
+    def set_capture_resolution(self, width):
+        width = int(np.clip(int(width), 320, 4096))
+        height = int(round(width * 0.75))
+        self.args.capture_image_size = (width, height)
+        self._camera_preview_dirty = True
+
+    def _single_capture_image_size(self):
+        width, height = getattr(self.args, "single_capture_image_size", self.scanner.CAMERA_IMAGE_SIZE)
+        width = int(np.clip(int(width), 320, 4096))
+        height = int(np.clip(int(height), 240, 3072))
+        return width, height
+
+    def _active_camera_image_size(self):
+        return self._single_capture_image_size() if self.single_capture_mode else self._capture_image_size()
+
+    def set_single_capture_resolution(self, width):
+        width = int(np.clip(int(width), 320, 4096))
+        height = int(round(width * 0.75))
+        self.args.single_capture_image_size = (width, height)
+        self._camera_preview_dirty = True
+
     def _camera_from_gripper(self, tcp_pos, look_at):
         cam = self.mujoco.MjvCamera()
         self.mujoco.mjv_defaultFreeCamera(self.model, cam)
@@ -924,9 +906,9 @@ class EmbeddedMujocoScanner:
             station_id,
             self.plan.view_names[target_index],
             target_pose=target_pose,
-            color_picker_mode=self.color_picker_mode,
             capture_mode=capture_mode,
             camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
+            image_size=self._capture_image_size(),
         )
         self._upload_camera_preview(image)
         self.latest_camera_image = image
@@ -1269,9 +1251,9 @@ class EmbeddedMujocoScanner:
             station_id,
             self.plan.view_names[target_index],
             target_pose=target_pose,
-            color_picker_mode=self.color_picker_mode,
             capture_mode=str(getattr(self.args, "capture_mode", "natural")),
             camera_zoom=float(camera_zoom),
+            image_size=self._single_capture_image_size(),
         )
         self.latest_camera_image = image
         self._upload_camera_preview(image)
@@ -1387,7 +1369,7 @@ class EmbeddedMujocoScanner:
             int(target_index),
             str(getattr(self.args, "capture_mode", "natural")),
             round(float(getattr(self.args, "camera_zoom", 1.0)), 3),
-            bool(self.color_picker_mode),
+            self._active_camera_image_size(),
         )
         now = time.monotonic()
         force = self._camera_preview_dirty or preview_key != self._last_camera_preview_key or self.single_capture_mode
@@ -1401,9 +1383,9 @@ class EmbeddedMujocoScanner:
             station,
             self.plan.view_names[min(target_index, len(self.plan.view_names) - 1)],
             target_pose=target_pose,
-            color_picker_mode=self.color_picker_mode,
             capture_mode=str(getattr(self.args, "capture_mode", "natural")),
             camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
+            image_size=self._active_camera_image_size(),
         )
         self._upload_camera_preview(image)
         self.latest_camera_image = image
@@ -1489,7 +1471,6 @@ class EmbeddedMujocoScanner:
             target_pose=target_pose,
             clear_scene=False,
             simplified=True,
-            color_picker_mode=self.color_picker_mode,
         )
         frame = self.renderer.render()
         self._upload_frame(frame)
@@ -1592,7 +1573,7 @@ def _set_app_mode(state, mode):
         state.scanner_preview_grid_enabled = True
         state.scanner_preview_rows = max(1, int(state.scanner_rows))
         state.scanner_preview_cols = max(1, int(state.scanner_cols))
-        _ensure_scanner_cell_color_sets(state)
+        _clamp_scanner_selected_cell(state)
     else:
         state.workflow_step = 0
         state.scanner_preview_grid_enabled = False
@@ -1630,7 +1611,7 @@ def draw_sidebar(state, renderer, window=None):
     def ensure_embedded_robot_viewer(auto_start=False):
         if not auto_start and bool(state.get('_embedded_scanner_viewer_failed', False)):
             return None
-        _ensure_scanner_cell_color_sets(state)
+        _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
         embedded = state.get('embedded_scanner')
         if embedded is not None:
@@ -1647,11 +1628,7 @@ def draw_sidebar(state, renderer, window=None):
                 state,
                 renderer.ctx,
                 window,
-                preview_image=(
-                    _capture_scan_preview_image(renderer)
-                    if auto_start
-                    else _scanner_full_layout_preview_image(state)
-                ),
+                preview_image=_scanner_full_layout_preview_image(state),
                 auto_start=auto_start,
             )
             state.embedded_scanner = embedded
@@ -1685,7 +1662,7 @@ def draw_sidebar(state, renderer, window=None):
             except Exception:
                 pass
             state.embedded_scanner = None
-        _ensure_scanner_cell_color_sets(state)
+        _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
         if mode == "simulation":
             embedded = ensure_embedded_robot_viewer(auto_start=True)
@@ -1693,11 +1670,12 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_status = "Embedded MuJoCo scanner running"
             return
 
-        cell_color_sets = _ensure_scanner_cell_color_sets(state) if str(state.get('scanner_color_mode', 'realistic')) == 'picker' else _scanner_shared_cell_color_sets(state)
+        cell_color_sets = _scanner_shared_cell_color_sets(state)
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         spacing_x, spacing_y = _scanner_repeat_spacing(state)
         lighting = _scanner_lighting_settings(state)
+        batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
         try:
             import fabric_scanner as scanner
 
@@ -1727,6 +1705,8 @@ def draw_sidebar(state, renderer, window=None):
                 pattern_repeat_cols=int(repeat_cols),
                 pattern_repeat_spacing_x=float(spacing_x),
                 pattern_repeat_spacing_y=float(spacing_y),
+                batch_texture_width=int(batch_texture_width),
+                batch_texture_height=int(batch_texture_height),
                 pattern_density=float(state.get('scanner_pattern_density', 0.62)),
                 random_seed=int(state.get('scanner_random_seed', 1)),
                 scanner_lighting=lighting,
@@ -1758,7 +1738,7 @@ def draw_sidebar(state, renderer, window=None):
         state.scanner_status = "Scanner idle"
 
     def ensure_embedded_single_capture():
-        _ensure_scanner_cell_color_sets(state)
+        _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
         embedded = state.get('embedded_scanner')
         if embedded is None:
@@ -1767,7 +1747,7 @@ def draw_sidebar(state, renderer, window=None):
                     state,
                     renderer.ctx,
                     window,
-                    preview_image=_capture_scan_preview_image(renderer),
+                    preview_image=_scanner_full_layout_preview_image(state),
                     auto_start=False,
                 )
                 state.embedded_scanner = embedded
@@ -2128,10 +2108,18 @@ def draw_sidebar(state, renderer, window=None):
         pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
         spacing_x, spacing_y = _scanner_repeat_spacing(state)
+        batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
         imgui.text(f"Template bitmap: {pattern_rows} rows x {pattern_cols} cols")
         imgui.text_disabled("Loaded from initial_params.json; Scan Mode randomizes only 0/1 bitmap values.")
         changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
         changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
+        changed_tex_res, new_tex_res = imgui.slider_int(
+            "Batch texture resolution##scanner_batch_texture_width",
+            batch_texture_width,
+            160,
+            2048,
+        )
+        new_tex_res = int(np.clip(int(round(float(new_tex_res) / 32.0) * 32), 160, 2048))
         changed_sx, new_sx = imgui.slider_float(
             "X repeat spacing##scanner_repeat_spacing_x",
             spacing_x,
@@ -2146,6 +2134,10 @@ def draw_sidebar(state, renderer, window=None):
             1.45,
             "%.2f",
         )
+        imgui.text_disabled(
+            f"Batch source image: {batch_texture_width} x {batch_texture_height}. "
+            "Higher is sharper but heavier."
+        )
         imgui.text_disabled("1.00 = edge-to-edge, below 1.00 overlaps copies, above 1.00 adds space.")
         changed_density, new_density = imgui.slider_float(
             "Active stitch probability##scanner_density",
@@ -2155,11 +2147,13 @@ def draw_sidebar(state, renderer, window=None):
             "%.2f",
         )
         changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
-        random_changed = changed_rr or changed_rc or changed_sx or changed_sy or changed_density or changed_seed
+        random_changed = changed_rr or changed_rc or changed_tex_res or changed_sx or changed_sy or changed_density or changed_seed
         if changed_rr:
             state.scanner_pattern_repeat_rows = int(new_rr)
         if changed_rc:
             state.scanner_pattern_repeat_cols = int(new_rc)
+        if changed_tex_res:
+            state.scanner_batch_texture_width = int(new_tex_res)
         if changed_sx:
             state.scanner_repeat_spacing_x = float(new_sx)
         if changed_sy:
@@ -2178,35 +2172,20 @@ def draw_sidebar(state, renderer, window=None):
                     pass
                 state.embedded_scanner = None
             state.scanner_status = "Random pattern settings changed; press Start Scanner to rebuild"
-        _draw_scanner_batch_color_grid(state)
-        imgui.separator()
         imgui.text("Preview mode")
         if not state.get('scanner_color_mode'):
             state.scanner_color_mode = 'realistic'
-        realistic_mode = str(state.get('scanner_color_mode', 'realistic')) == 'realistic'
+        estimate_mode = str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
+        realistic_mode = not estimate_mode
         if imgui.radio_button("Random fabric preview##scanner_preview_realistic", realistic_mode):
-            if not realistic_mode:
+            if estimate_mode:
                 state.scanner_color_mode = 'realistic'
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception:
-                        pass
-                    state.embedded_scanner = None
-                state.scanner_status = "Preview mode changed; press Start Scanner to rebuild"
+                state.scanner_status = "Showing actual generated fabric preview"
         imgui.same_line()
-        if imgui.radio_button("Color picker mode##scanner_preview_picker", not realistic_mode):
+        if imgui.radio_button("Estimated color picker##scanner_preview_picker", estimate_mode):
             if realistic_mode:
-                state.scanner_color_mode = 'picker'
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception:
-                        pass
-                    state.embedded_scanner = None
-                state.scanner_status = "Preview mode changed; press Start Scanner to rebuild"
+                state.scanner_color_mode = 'estimated'
+                state.scanner_status = "Click a batch and edit its estimated display color"
 
         imgui.separator()
         imgui.text("Shared fabric colors")
@@ -2237,10 +2216,7 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_color_variants = [list(c) for c in palette]
                 palette_changed = True
         if palette_changed:
-            if realistic_mode:
-                state.scanner_cell_color_sets = []
-            else:
-                _ensure_scanner_cell_color_sets(state)
+            state.scanner_estimated_color_overrides = []
             embedded = state.get('embedded_scanner')
             if embedded is not None:
                 try:
@@ -2250,32 +2226,37 @@ def draw_sidebar(state, renderer, window=None):
                 state.embedded_scanner = None
             state.scanner_status = "Shared scanner colors changed; press Start Scanner to rebuild"
             state.rebuild_spline_mesh(preserve_model_placement=False)
-        if not realistic_mode:
-            cell_sets = _ensure_scanner_cell_color_sets(state)
+        if estimate_mode:
+            _draw_scanner_batch_color_grid(state)
             rows = max(1, int(state.scanner_rows))
             cols = max(1, int(state.scanner_cols))
             selected = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
             selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
             selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
             selected_index = selected_r * cols + selected_c
-            selected_color = cell_sets[selected_index][0]
-            imgui.text(f"Selected mini-grid: R{selected_r + 1} C{selected_c + 1}")
+            estimates = _scanner_estimated_cell_colors(state)
+            selected_rgb = [float(v) / 255.0 for v in estimates[selected_index].get("rgb", [128.0, 128.0, 128.0])[:3]]
+            imgui.text(f"Selected estimated batch: R{selected_r + 1} C{selected_c + 1}")
+            imgui.text_disabled("This edits only the estimated-color swatch, not the knitted model colors.")
             changed_batch_color, batch_color = imgui.color_edit3(
-                "Mini-grid color##scanner_selected_batch_color",
-                (float(selected_color[0]), float(selected_color[1]), float(selected_color[2])),
+                "Estimated batch color##scanner_selected_estimated_color",
+                (float(selected_rgb[0]), float(selected_rgb[1]), float(selected_rgb[2])),
             )
             if changed_batch_color:
-                new_rgba = [float(batch_color[0]), float(batch_color[1]), float(batch_color[2]), 1.0]
-                base_count = max(1, len(_scanner_base_palette(state)))
-                state.scanner_cell_color_sets[selected_index] = [list(new_rgba) for _ in range(base_count)]
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception:
-                        pass
-                    state.embedded_scanner = None
-                state.scanner_status = f"Updated mini-grid R{selected_r + 1} C{selected_c + 1} color"
+                _set_scanner_estimated_batch_color(state, selected_r, selected_c, batch_color)
+                state.scanner_status = f"Updated estimated color for R{selected_r + 1} C{selected_c + 1}"
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+            if imgui.small_button("Reset selected estimate##scanner_reset_selected_estimate"):
+                overrides = state.get('scanner_estimated_color_overrides', [])
+                if isinstance(overrides, list) and selected_index < len(overrides):
+                    overrides[selected_index] = None
+                    state.scanner_estimated_color_overrides = overrides
+                    _refresh_embedded_scanner_display_colors(state)
+                    state.rebuild_spline_mesh(preserve_model_placement=False)
+            imgui.same_line()
+            if imgui.small_button("Reset all estimates##scanner_reset_all_estimates"):
+                state.scanner_estimated_color_overrides = []
+                _refresh_embedded_scanner_display_colors(state)
                 state.rebuild_spline_mesh(preserve_model_placement=False)
         imgui.separator()
         # -- Lighting section: scanner lighting controls and preview -----------
@@ -2413,6 +2394,21 @@ def draw_sidebar(state, renderer, window=None):
                 changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
                 if changed_every:
                     state.scanner_image_every = "view" if every_view else "station"
+                capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
+                changed_scan_res, scan_capture_width = imgui.slider_int(
+                    "Full scan capture resolution##scanner_capture_resolution",
+                    capture_width,
+                    320,
+                    4096,
+                )
+                scan_capture_width = int(np.clip(int(round(float(scan_capture_width) / 64.0) * 64), 320, 4096))
+                scan_capture_height = int(round(scan_capture_width * 0.75))
+                if changed_scan_res:
+                    state.scanner_capture_width = scan_capture_width
+                    embedded = state.get('embedded_scanner')
+                    if embedded is not None:
+                        embedded.set_capture_resolution(scan_capture_width)
+                imgui.text_disabled(f"Full scanner output: {scan_capture_width} x {scan_capture_height}")
         imgui.separator()
         single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
         if single_workflow:
@@ -2481,9 +2477,32 @@ def draw_sidebar(state, renderer, window=None):
                         int(state.get('scanner_single_angle', 1)) - 1,
                         float(state.get('scanner_camera_zoom', 1.0)),
                     )
+            current_capture_width, _current_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
+            current_capture_width = int(np.clip(current_capture_width, 320, 2048))
+            changed_capture_res, capture_width = imgui.slider_int(
+                "Capture resolution##single_capture_resolution",
+                current_capture_width,
+                320,
+                2048,
+            )
+            capture_width = int(np.clip(int(round(float(capture_width) / 64.0) * 64), 320, 2048))
+            capture_height = int(round(capture_width * 0.75))
+            if changed_capture_res:
+                state.scanner_single_capture_width = capture_width
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    embedded.set_single_capture_resolution(capture_width)
+                    embedded.preview_single_target(
+                        int(state.get('scanner_single_row', 1)) - 1,
+                        int(state.get('scanner_single_col', 1)) - 1,
+                        int(state.get('scanner_single_angle', 1)) - 1,
+                        float(state.get('scanner_camera_zoom', 1.0)),
+                    )
+            imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
             if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
                 embedded = ensure_embedded_single_capture()
                 if embedded is not None:
+                    embedded.set_single_capture_resolution(capture_width)
                     embedded.preview_single_target(
                         int(state.get('scanner_single_row', 1)) - 1,
                         int(state.get('scanner_single_col', 1)) - 1,
@@ -2494,6 +2513,7 @@ def draw_sidebar(state, renderer, window=None):
             if imgui.button("Capture Image##single_capture_save", (-1, 0)):
                 embedded = ensure_embedded_single_capture()
                 if embedded is not None:
+                    embedded.set_single_capture_resolution(capture_width)
                     path = embedded.capture_single_target(
                         int(state.get('scanner_single_row', 1)) - 1,
                         int(state.get('scanner_single_col', 1)) - 1,
@@ -2822,7 +2842,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     mv  = (state.camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
     bg_zoom = state.camera.zoom_factor()
     scanner_stage_active = str(state.get('app_mode', 'edit')) == 'scan'
-    scanner_picker_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'picker'
+    scanner_estimate_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
     edit_controls_active = not scanner_stage_active
     if scanner_stage_active:
         state.bbox_active_handle = -1
@@ -2914,7 +2934,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         render_hover_idx, render_selected_idx,
         hover_mesh_idx=state.hover_mesh_idx,
         selected_mesh_idx=state.selected_mesh_idx,
-        visible_rows=np.zeros(max(1, len(state.row_visible)), dtype=bool) if scanner_picker_mode else state.row_visible,
+        visible_rows=np.zeros(max(1, len(state.row_visible)), dtype=bool) if scanner_estimate_mode else state.row_visible,
         bg_tex      = None if scanner_stage_active else (ref_tex if state.show_ref_bg else None),
         bg_alpha    = 0.0 if scanner_stage_active else state.ref_bg_alpha,
         bg_uniforms = bg_uniforms,
@@ -3025,7 +3045,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         cols = max(1, int(getattr(state, 'scanner_cols', 1)))
         base_rows = max(1, int(state.bitmap_size[0]))
 
-        if scanner_picker_mode:
+        if scanner_estimate_mode:
             overall = projected_mesh_bounds(model_matrix)
             if overall is None:
                 fallback_w = min(float(disp_w) * 0.68, float(disp_h) * 0.68)
@@ -3141,8 +3161,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             fill_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.055))
             selected_fill = imgui.get_color_u32((1.0, 0.78, 0.18, 0.18))
             selected_line = imgui.get_color_u32((1.0, 0.78, 0.18, 0.92))
-            cell_sets = _ensure_scanner_cell_color_sets(state) if scanner_picker_mode else []
-            display_colors, display_stage = _scanner_display_batch_colors(state) if not scanner_picker_mode else ([], "picker")
+            display_colors, display_stage = _scanner_display_batch_colors(state)
             for r in range(rows):
                 for c in range(cols):
                     cell_bounds = scanner_cell_bounds[r * cols + c]
@@ -3150,12 +3169,13 @@ def draw_viewport(state, renderer, ref_tex, window):
                         continue
                     cx0, cy0, cx1, cy1 = cell_bounds
                     selected_cell = r == selected_r and c == selected_c
-                    if scanner_picker_mode:
-                        batch_color = cell_sets[r * cols + c][0]
+                    if scanner_estimate_mode:
+                        color_idx = r * cols + c
+                        batch_rgb = display_colors[color_idx] if color_idx < len(display_colors) else [42.0, 42.0, 42.0]
                         batch_fill = imgui.get_color_u32((
-                            float(batch_color[0]),
-                            float(batch_color[1]),
-                            float(batch_color[2]),
+                            float(np.clip(float(batch_rgb[0]) / 255.0, 0.0, 1.0)),
+                            float(np.clip(float(batch_rgb[1]) / 255.0, 0.0, 1.0)),
+                            float(np.clip(float(batch_rgb[2]) / 255.0, 0.0, 1.0)),
                             0.96,
                         ))
                         batch_line = selected_line if selected_cell else imgui.get_color_u32((0.08, 0.08, 0.08, 0.85))
@@ -3689,3 +3709,4 @@ def draw_reference_image_panel(state, ref_tex):
         avail_y,
     )
     imgui.end()
+

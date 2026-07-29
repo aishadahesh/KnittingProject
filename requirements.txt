@@ -27,3 +27,8 @@ ur-rtde>=1.6.0
 
 # Test runner
 pytest>=8.0.0
+
+
+# mujoco and robot descriptions
+mujoco==3.2.7
+robot_descriptions>=1.12
