@@ -10,3 +10,7 @@ __pycache__/
 # Local config & outputs
 imgui_layout.ini
 opt_outputs/
+scanner_data/
+scanner_images/
+scanner_images_old/
+scan_*.png

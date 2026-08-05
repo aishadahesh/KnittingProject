@@ -32,6 +32,7 @@ with open(os.path.join(project_root, "config.json"), "r") as f:
 
 from rendering import Camera, MeshRenderer, pil_to_texture
 from app_state import AppState
+from scanner_storage import ScannerStorage
 from gui import (
      draw_menu_bar,
      draw_sidebar,
@@ -109,6 +110,15 @@ def main():
             state.restore_snapshot(state._initial_snapshot)
     state.load_path = work_params_path
     state.save_path = work_params_path
+    scanner_storage = ScannerStorage(project_root)
+    object.__setattr__(state, "scanner_storage", scanner_storage)
+    if scanner_storage.restore_scanner_state(state):
+        state.scanner_status = "Restored previous scanner database state"
+        if str(state.get("app_mode", "edit")) == "scan":
+            state.scanner_preview_grid_enabled = True
+            state.scanner_preview_rows = max(1, int(state.scanner_rows))
+            state.scanner_preview_cols = max(1, int(state.scanner_cols))
+            state.rebuild_spline_mesh(preserve_model_placement=False)
 
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
@@ -171,7 +181,8 @@ def main():
         ctx.screen.use()
 
         # ── 3D Viewport ───────────────────────────────────────────────────────
-        draw_viewport(state, renderer, ref_tex, window)
+        if str(state.get("app_mode", "edit")) != "database":
+            draw_viewport(state, renderer, ref_tex, window)
 
 
 

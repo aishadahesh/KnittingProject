@@ -1610,7 +1610,7 @@ def render_camera_image(
             except (IndexError, ValueError):
                 angle_deg = 0.0
         theta = math.radians(angle_deg)
-        camera_standoff = max(0.105, max(cell_w, cell_l) * 1.35)
+        camera_standoff = max(0.03, max(cell_w, cell_l) * 1.35)
         orbit = max(min(cell_w, cell_l) * 0.22, camera_standoff * 0.18)
         horizontal = np.array([math.cos(theta), math.sin(theta), 0.0], dtype=float)
         lens_pos = focus + horizontal * orbit + np.array([0.0, 0.0, camera_standoff], dtype=float)
@@ -1641,13 +1641,20 @@ def render_camera_image(
             + abs(float(np.dot(y_axis, up))) * cell_l
         )
         aspect = float(width_px) / max(float(height_px), 1.0)
-        framing_pad = 1.08
+        # Fill the frame with fabric ("cover" fit: the shorter projected axis
+        # sets the zoom) rather than fitting the whole cell with margin on
+        # whichever axis doesn't match the image's aspect ratio ("contain"
+        # fit). A cell's true aspect rarely matches the capture's fixed 4:3
+        # frame, so "contain" always left a visible background gap on one
+        # axis; a small amount of edge cropping on the other axis is a much
+        # better trade for RGB-analysis accuracy than background pixels are.
+        framing_pad = 1.02
         fov_y = 2.0 * math.atan(
             framing_pad
-            * max(half_view_h, half_view_w / max(aspect, 1e-6))
+            * min(half_view_h, half_view_w / max(aspect, 1e-6))
             / max(camera_standoff, 1e-6)
         )
-        fov_y = float(np.clip(fov_y, math.radians(16.0), math.radians(58.0)))
+        fov_y = float(np.clip(fov_y, math.radians(4.0), math.radians(58.0)))
     else:
         fov_y = math.radians(74.0)
     fov_y = float(np.clip(fov_y / camera_zoom, math.radians(12.0), math.radians(86.0)))
@@ -1702,9 +1709,6 @@ def render_camera_image(
         ]
         _paste_projected_texture(img, rendered_texture, tex_quad)
         draw = ImageDraw.Draw(img)
-        if all(p is not None for p in tex_quad):
-            quad2d = [(p[0], p[1]) for p in tex_quad if p is not None]
-            draw.line(quad2d + [quad2d[0]], fill=(60, 255, 120), width=4)
 
     render_rows = [active_row] if focused_capture else range(plan.grid_rows)
     render_cols = [active_col] if focused_capture else range(plan.grid_cols)
@@ -1753,17 +1757,6 @@ def render_camera_image(
                             if len(pts2d) >= 2:
                                 draw.line(pts2d, fill=shade, width=max(1, yarn_px // max(repeat_rows, repeat_cols)) + 2, joint="curve")
                                 draw.line(pts2d, fill=color, width=max(1, yarn_px // max(repeat_rows, repeat_cols)), joint="curve")
-                outline = (60, 255, 120) if (row, col) == (active_row, active_col) else (245, 245, 240)
-                width = 4 if (row, col) == (active_row, active_col) else 1
-                poly = [
-                    project_camera(np.array([x0, y0, fabric_z + 0.0002])),
-                    project_camera(np.array([x1, y0, fabric_z + 0.0002])),
-                    project_camera(np.array([x1, y1, fabric_z + 0.0002])),
-                    project_camera(np.array([x0, y1, fabric_z + 0.0002])),
-                ]
-                if all(p is not None for p in poly):
-                    poly2d = [(p[0], p[1]) for p in poly if p is not None]
-                    draw.line(poly2d + [poly2d[0]], fill=outline, width=width)
 
     overlay = Image.new("L", (width_px, height_px), 0)
     mask_draw = ImageDraw.Draw(overlay)
