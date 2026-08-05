@@ -90,6 +90,8 @@ class AppState:
             'scanner_lighting_enabled', 'scanner_light_azimuth', 'scanner_light_elevation', 'scanner_light_sun_intensity',
             'scanner_light_shadow', 'scanner_light_sheen',
             'scanner_camera_workflow', 'scanner_single_row', 'scanner_single_col', 'scanner_single_angle', 'scanner_camera_zoom',
+            'puzzle_copies_x', 'puzzle_copies_y', 'puzzle_capture_width', 'puzzle_capture_height', 'puzzle_detect_color_count',
+            'puzzle_capture_rect',
         )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
@@ -158,6 +160,12 @@ class AppState:
             'scanner_single_col': 1,
             'scanner_single_angle': 1,
             'scanner_camera_zoom': 1.0,
+            'puzzle_copies_x': 5,
+            'puzzle_copies_y': 5,
+            'puzzle_capture_width': 960,
+            'puzzle_capture_height': 680,
+            'puzzle_detect_color_count': 6,
+            'puzzle_capture_rect': [0.08, 0.08, 0.84, 0.84],
             'ui_theme': 'dark',
             'loop_heights': np.full((3, config_data['knit_parameters']['bitmap_loops']), 3.0, dtype=np.float32),
             'mesh_center': np.zeros(3, dtype=np.float32),

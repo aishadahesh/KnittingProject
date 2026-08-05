@@ -1,5 +1,6 @@
 import os
 import json
+import copy
 import numpy as np
 import glfw
 import time
@@ -14,8 +15,8 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 from PIL import Image, ImageDraw
 
-from rendering import draw_fitted_texture, transform_points
-from knitting_core import build_parametric_control_rows
+from rendering import draw_fitted_texture, pil_to_texture, transform_points
+from knitting_core import build_parametric_control_rows, build_spline_mesh
 
 # %% FILE PICKER HELPERS ───────────────────────────────────────────────────────
 
@@ -382,6 +383,527 @@ def _scanner_capture_image_size(state, key='scanner_capture_width'):
     return width, height
 
 
+def _puzzle_target_copies(state):
+    copies_x = int(np.clip(int(state.get('puzzle_copies_x', 5)), 1, 9))
+    copies_y = int(np.clip(int(state.get('puzzle_copies_y', 5)), 1, 9))
+    if copies_x % 2 == 0:
+        copies_x += 1
+    if copies_y % 2 == 0:
+        copies_y += 1
+    return copies_x, copies_y
+
+
+def _puzzle_apply_geometry_copies(state, preserve=True):
+    copies_x, copies_y = _puzzle_target_copies(state)
+    state.display_copies = np.array([(copies_x - 1) // 2, (copies_y - 1) // 2], dtype=np.int32)
+    state.scanner_preview_grid_enabled = False
+    state.rebuild_spline_mesh(preserve_model_placement=preserve)
+
+
+def _puzzle_capture_rect(state):
+    rect = np.asarray(state.get('puzzle_capture_rect', [0.08, 0.08, 0.84, 0.84]), dtype=np.float32).reshape(-1)
+    if rect.size < 4:
+        rect = np.array([0.08, 0.08, 0.84, 0.84], dtype=np.float32)
+    x = float(np.clip(rect[0], 0.0, 0.95))
+    y = float(np.clip(rect[1], 0.0, 0.95))
+    w = float(np.clip(rect[2], 0.05, 1.0 - x))
+    h = float(np.clip(rect[3], 0.05, 1.0 - y))
+    return [x, y, w, h]
+
+
+def _set_puzzle_capture_rect(state, rect):
+    x, y, w, h = [float(v) for v in rect]
+    x = float(np.clip(x, 0.0, 0.95))
+    y = float(np.clip(y, 0.0, 0.95))
+    w = float(np.clip(w, 0.05, 1.0 - x))
+    h = float(np.clip(h, 0.05, 1.0 - y))
+    state.puzzle_capture_rect = [x, y, w, h]
+
+
+def _puzzle_project_points(pts, mvp, vp_w, vp_h):
+    """Projects world-space points through mvp into (top-down) pixel coordinates."""
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    homog = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float32)], axis=1)
+    clip = homog @ mvp.T
+    w = np.where(np.abs(clip[:, 3]) > 1e-8, clip[:, 3], 1.0)
+    ndc = clip[:, :3] / w[:, None]
+    px = (ndc[:, 0] + 1.0) * 0.5 * vp_w
+    py = (1.0 - ndc[:, 1]) * 0.5 * vp_h
+    return np.stack([px, py], axis=1)
+
+
+def _puzzle_tiled_control_points(state):
+    """Rebuilds the real per-stitch spline control points, tiled across the same
+    X/Y display copies baked into the rendered mesh, in world (pre-model-matrix) space."""
+    if not state.ctrl_rows:
+        return []
+    state._ensure_spline_radius_rows()
+    radius = max(float(state.params[state._pidx['radius']]), 1e-6)
+    radius_profiles = [np.asarray(row, dtype=np.float32) for row in state.spline_radius_rows]
+    base_vl = build_spline_mesh(
+        state.ctrl_rows,
+        state.params,
+        state.config,
+        state._pidx,
+        np.asarray(state.period_offset, dtype=np.float32),
+        radius_ctrl_rows=radius_profiles,
+    )
+    x_period = state._display_copy_x_period(base_vl, radius)
+    y_period = state._display_copy_y_period(base_vl, radius)
+    depth_gap = max(radius * 2.4, 1e-6)
+    z_period = state._display_copy_z_period(base_vl, depth_gap)
+    copies_x = int(state.display_copies[0])
+    copies_y = int(state.display_copies[1])
+
+    tiled = []
+    for row_idx, row in enumerate(state.ctrl_rows):
+        row = np.asarray(row, dtype=np.float32)
+        if row.shape[0] == 0:
+            continue
+        for y_tile in range(-copies_y, copies_y + 1):
+            y_shift = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+            for x_tile in range(-copies_x, copies_x + 1):
+                shift = y_shift + np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
+                tiled.append((row + shift[None, :], row_idx))
+    return tiled
+
+
+def _puzzle_capture_geometry_image(state, renderer):
+    """Reads back the actual rendered 3D viewport (same pixels shown behind the
+    'Puzzle capture area' frame) and overlays real spline control points projected
+    with the same camera/model matrices used to render that frame."""
+    vp_w = int(getattr(renderer, "vp_w", 0))
+    vp_h = int(getattr(renderer, "vp_h", 0))
+    if vp_w < 2 or vp_h < 2 or getattr(renderer, "color_tex", None) is None:
+        return None, [], []
+
+    raw = renderer.color_tex.read()
+    full_image = Image.frombytes("RGBA", (vp_w, vp_h), raw).convert("RGB")
+    full_image = full_image.transpose(Image.FLIP_TOP_BOTTOM)
+
+    model_mat = state.current_model_matrix()
+    mvp = (state.camera.mvp(vp_w, vp_h) @ model_mat).astype(np.float32)
+
+    projected_points = []
+    for verts, row_idx in _puzzle_tiled_control_points(state):
+        pix = _puzzle_project_points(verts, mvp, vp_w, vp_h)
+        for px, py in pix:
+            projected_points.append({"x": int(round(float(px))), "y": int(round(float(py))), "row": int(row_idx)})
+
+    landmarks = []
+    if projected_points:
+        xs = np.array([p["x"] for p in projected_points], dtype=np.float32)
+        ys = np.array([p["y"] for p in projected_points], dtype=np.float32)
+        x_min, x_max = float(xs.min()), float(xs.max())
+        y_min, y_max = float(ys.min()), float(ys.max())
+        for x in (x_min, x_max):
+            for y in np.linspace(y_min, y_max, 9):
+                landmarks.append({"x": int(round(x)), "y": int(round(float(y))), "kind": "x-edge"})
+        for y in (y_min, y_max):
+            for x in np.linspace(x_min, x_max, 9):
+                landmarks.append({"x": int(round(float(x))), "y": int(round(y)), "kind": "y-edge"})
+
+    rx, ry, rw, rh = _puzzle_capture_rect(state)
+    crop_box = (
+        int(round(rx * vp_w)),
+        int(round(ry * vp_h)),
+        int(round((rx + rw) * vp_w)),
+        int(round((ry + rh) * vp_h)),
+    )
+    crop_box = (
+        int(np.clip(crop_box[0], 0, vp_w - 1)),
+        int(np.clip(crop_box[1], 0, vp_h - 1)),
+        int(np.clip(crop_box[2], crop_box[0] + 1, vp_w)),
+        int(np.clip(crop_box[3], crop_box[1] + 1, vp_h)),
+    )
+    cropped = full_image.crop(crop_box)
+    x0, y0, x1, y1 = crop_box
+
+    def adjust_points(items):
+        adjusted = []
+        for item in items:
+            px = int(item.get("x", -1))
+            py = int(item.get("y", -1))
+            if x0 <= px < x1 and y0 <= py < y1:
+                out = dict(item)
+                out["x"] = px - x0
+                out["y"] = py - y0
+                adjusted.append(out)
+        return adjusted
+
+    return cropped, adjust_points(projected_points), adjust_points(landmarks)
+
+
+def _puzzle_detect_colors(image, count=6):
+    if image is None:
+        return []
+    count = max(1, int(count))
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8).reshape(-1, 3)
+    bg = np.array([18, 23, 31], dtype=np.int16)
+    mask = np.linalg.norm(arr.astype(np.int16) - bg[None, :], axis=1) > 24.0
+    pixels = arr[mask]
+    if pixels.size == 0:
+        return []
+    quantized = (pixels // 16) * 16
+    unique, counts = np.unique(quantized, axis=0, return_counts=True)
+    order = np.argsort(-counts)[:count]
+    return [
+        {"rgb": [int(v) for v in unique[i].tolist()], "count": int(counts[i])}
+        for i in order
+    ]
+
+
+def _puzzle_period_pixel_vectors(state, renderer):
+    """Computes the exact pixel-space translation for one X repeat and one Y repeat,
+    using the same world-space periods and camera/model matrix as the mesh tiling.
+    Because the camera is orthographic, a constant world-space offset always maps
+    to a constant pixel-space offset, independent of position."""
+    if not state.ctrl_rows:
+        return None
+    vp_w = int(getattr(renderer, "vp_w", 0))
+    vp_h = int(getattr(renderer, "vp_h", 0))
+    if vp_w < 2 or vp_h < 2:
+        return None
+
+    state._ensure_spline_radius_rows()
+    radius = max(float(state.params[state._pidx['radius']]), 1e-6)
+    radius_profiles = [np.asarray(row, dtype=np.float32) for row in state.spline_radius_rows]
+    base_vl = build_spline_mesh(
+        state.ctrl_rows,
+        state.params,
+        state.config,
+        state._pidx,
+        np.asarray(state.period_offset, dtype=np.float32),
+        radius_ctrl_rows=radius_profiles,
+    )
+    x_period = state._display_copy_x_period(base_vl, radius)
+    y_period = state._display_copy_y_period(base_vl, radius)
+    depth_gap = max(radius * 2.4, 1e-6)
+    z_period = state._display_copy_z_period(base_vl, depth_gap)
+
+    model_mat = state.current_model_matrix()
+    mvp = (state.camera.mvp(vp_w, vp_h) @ model_mat).astype(np.float32)
+    ref_pts = np.array([
+        [0.0, 0.0, 0.0],
+        [x_period, 0.0, 0.0],
+        [0.0, y_period, -z_period],
+    ], dtype=np.float32)
+    pix = _puzzle_project_points(ref_pts, mvp, vp_w, vp_h)
+    return {
+        "x_step": pix[1] - pix[0],
+        "y_step": pix[2] - pix[0],
+        "x_period": float(x_period),
+        "y_period": float(y_period),
+        "z_period": float(z_period),
+        "vp_w": vp_w,
+        "vp_h": vp_h,
+    }
+
+
+def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None):
+    """Extracts one exact repeat-period tile from the live render and glues `cols` x
+    `rows` copies of it edge-to-edge. Because the tile size equals the true geometric
+    repeat period in pixels, adjacent copies connect without search-based alignment.
+
+    `crop_rect`, if given, is an (rx, ry, rw, rh) fraction whose (rx, ry) anchors the
+    tile's top-left corner (rw/rh are unused -- the tile is always exactly one period
+    wide/tall). Defaults to Puzzle Mode's manual `_puzzle_capture_rect`, but Scan Mode's
+    automated capture passes its own auto-detected tight anchor instead."""
+    vp_w = int(getattr(renderer, "vp_w", 0))
+    vp_h = int(getattr(renderer, "vp_h", 0))
+    if vp_w < 2 or vp_h < 2 or getattr(renderer, "color_tex", None) is None:
+        return None, None, {}
+
+    periods = _puzzle_period_pixel_vectors(state, renderer)
+    if periods is None:
+        return None, None, {}
+
+    x_step = periods["x_step"]
+    y_step = periods["y_step"]
+    tile_w = max(4, int(round(abs(float(x_step[0])))))
+    tile_h = max(4, int(round(abs(float(y_step[1])))))
+    tile_w = min(tile_w, vp_w)
+    tile_h = min(tile_h, vp_h)
+
+    raw = renderer.color_tex.read()
+    full_image = Image.frombytes("RGBA", (vp_w, vp_h), raw).convert("RGB")
+    full_image = full_image.transpose(Image.FLIP_TOP_BOTTOM)
+
+    rx, ry, _rw, _rh = crop_rect if crop_rect is not None else _puzzle_capture_rect(state)
+    x0 = int(np.clip(round(rx * vp_w), 0, vp_w - tile_w))
+    y0 = int(np.clip(round(ry * vp_h), 0, vp_h - tile_h))
+    tile_box = (x0, y0, x0 + tile_w, y0 + tile_h)
+    tile = full_image.crop(tile_box)
+
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+    # Guard against exceeding typical GL max texture size (and runaway memory use)
+    # when the user pushes the copy count high.
+    max_canvas_dim = 8192
+    if tile_w * cols > max_canvas_dim:
+        cols = max(1, max_canvas_dim // tile_w)
+    if tile_h * rows > max_canvas_dim:
+        rows = max(1, max_canvas_dim // tile_h)
+
+    canvas = Image.new("RGB", (tile_w * cols, tile_h * rows), (18, 23, 31))
+    for row_i in range(rows):
+        for col_i in range(cols):
+            canvas.paste(tile, (col_i * tile_w, row_i * tile_h))
+
+    info = {
+        "tile_box": tile_box,
+        "tile_w": tile_w,
+        "tile_h": tile_h,
+        "cols": cols,
+        "rows": rows,
+        "skew_x_px": float(x_step[1]),
+        "skew_y_px": float(y_step[0]),
+        "x_period_world": periods["x_period"],
+        "y_period_world": periods["y_period"],
+    }
+    return tile, canvas, info
+
+
+_SCAN_TILE_SNAPSHOT_FIELDS = (
+    'params', 'bitmap', 'bitmap_size', 'loop_heights',
+    'row_colors', 'use_row_colors', 'display_copies',
+    'scanner_preview_grid_enabled', 'mesh_center', 'model_t',
+    # Fully-derived spline state, snapshotted and restored verbatim (not
+    # regenerated from bitmap+params) so any manually-edited control points on
+    # the live model survive round-tripping through a temporary scan pattern.
+    'ctrl_rows', 'period_offset', 'spline_radius_rows', 'param_ref_radius',
+    'flat_pts', '_row_starts', 'param_ref_ctrl_rows',
+)
+
+
+def _scan_snapshot_state(state):
+    snap = {key: copy.deepcopy(state.get(key)) for key in _SCAN_TILE_SNAPSHOT_FIELDS}
+    snap['camera'] = {
+        'target': np.array(state.camera.target, dtype=np.float32).copy(),
+        'dist': float(state.camera.dist),
+        'az': float(state.camera.az),
+        'el': float(state.camera.el),
+        'fov_deg': float(state.camera.fov_deg),
+    }
+    return snap
+
+
+def _scan_restore_state(state, snap):
+    for key in _SCAN_TILE_SNAPSHOT_FIELDS:
+        setattr(state, key, snap[key])
+    cam = snap['camera']
+    state.camera.target = cam['target']
+    state.camera.dist = cam['dist']
+    state.camera.az = cam['az']
+    state.camera.el = cam['el']
+    state.camera.fov_deg = cam['fov_deg']
+
+
+def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480):
+    """Renders one Scan Mode pattern with the real 3D pipeline and tiles it using
+    Puzzle Mode's exact-period capture/glue logic -- automated per pattern, with no
+    Puzzle Mode UI shown. Temporarily takes over the shared live model/camera/renderer
+    (duplicate -> auto-frame -> capture -> exact-period crop -> glue), then restores
+    everything so the user's own edited model/3D View is left exactly as it was."""
+    snap = _scan_snapshot_state(state)
+    try:
+        state.params = state._scanner_template_params()
+        state.bitmap = np.asarray(bitmap, dtype=np.float32)
+        state.bitmap_size = np.array(state.bitmap.shape, dtype=np.int32)
+        state.loop_heights = np.asarray(loop_heights, dtype=np.float32)
+        state.row_colors = [list(np.asarray(c, dtype=np.float32)[:3]) for c in colors] if colors else state.row_colors
+        state.use_row_colors = True
+        copies = max(1, int(copies))
+        state.display_copies = np.array([copies, copies], dtype=np.int32)
+        state.scanner_preview_grid_enabled = False
+
+        state.rebuild_spline_from_params()
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+
+        mesh_data = getattr(renderer, "mesh_pick_data", [])
+        state.camera.az = 0.0
+        state.camera.el = 0.0
+        if mesh_data:
+            all_v = np.vstack([np.asarray(v, dtype=np.float32) for v, _ in mesh_data if len(v)])
+            bounds_min = all_v.min(axis=0)
+            bounds_max = all_v.max(axis=0)
+            half_w = max(float(bounds_max[0] - bounds_min[0]) * 0.5 * 1.15, 1e-3)
+            half_h = max(float(bounds_max[1] - bounds_min[1]) * 0.5 * 1.15, 1e-3)
+        else:
+            half_w = half_h = 1.0
+
+        target_h = max(240, min(960, int(round(target_w * (half_h / max(half_w, 1e-6))))))
+        aspect = float(target_w) / float(target_h)
+        half_fov = np.radians(max(1.0, float(state.camera.fov_deg)) * 0.5)
+        tan_half_fov = max(np.tan(half_fov), 1e-6)
+        dist_for_h = half_h / tan_half_fov
+        dist_for_w = half_w / (tan_half_fov * aspect)
+        state.camera.dist = max(dist_for_h, dist_for_w, 1e-3)
+
+        renderer.resize(target_w, target_h)
+        model_mat = state.current_model_matrix()
+        mvp = (state.camera.mvp(target_w, target_h) @ model_mat).astype(np.float32)
+        mv = (state.camera.mv(target_w, target_h) @ model_mat).astype(np.float32)
+        material_uniforms = _scanner_material_uniforms(state)
+        renderer.render(mvp, mv, material_uniforms)
+
+        # Zoom/crop so no unnecessary background is visible: derive the crop
+        # anchor from the actual projected content bounding box, instead of a
+        # manually-tuned fraction (there is no user available to tune one here).
+        crop_rect = None
+        tiled_points = _puzzle_tiled_control_points(state)
+        if tiled_points:
+            all_proj = []
+            for verts, _row_idx in tiled_points:
+                all_proj.append(_puzzle_project_points(verts, mvp, target_w, target_h))
+            all_proj = np.vstack(all_proj)
+            x_min, y_min = all_proj.min(axis=0)
+            x_max, y_max = all_proj.max(axis=0)
+            margin_x = (x_max - x_min) * 0.04
+            margin_y = (y_max - y_min) * 0.04
+            rx = float(np.clip((x_min - margin_x) / target_w, 0.0, 0.95))
+            ry = float(np.clip((y_min - margin_y) / target_h, 0.0, 0.95))
+            rw = float(np.clip((x_max + margin_x) / target_w - rx, 0.05, 1.0 - rx))
+            rh = float(np.clip((y_max + margin_y) / target_h - ry, 0.05, 1.0 - ry))
+            crop_rect = [rx, ry, rw, rh]
+
+        _tile, canvas, _info = _puzzle_build_seamless_tile(
+            state, renderer, repeat_cols, repeat_rows, crop_rect=crop_rect,
+        )
+        return canvas
+    finally:
+        _scan_restore_state(state, snap)
+        state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+def _upload_puzzle_capture_texture(state, renderer):
+    image = state.get('puzzle_capture_image', None)
+    if image is None:
+        return None
+    texture = state.get('puzzle_capture_texture', None)
+    key = (id(image), image.size)
+    if texture is not None and state.get('puzzle_capture_texture_key') == key:
+        return texture
+    if texture is not None:
+        try:
+            texture.release()
+        except Exception:
+            pass
+    texture = pil_to_texture(renderer.ctx, image)
+    state.puzzle_capture_texture = texture
+    state.puzzle_capture_texture_key = key
+    return texture
+
+
+def _upload_puzzle_glued_texture(state, renderer):
+    image = state.get('puzzle_glued_image', None)
+    if image is None:
+        return None
+    texture = state.get('puzzle_glued_texture', None)
+    key = (id(image), image.size)
+    if texture is not None and state.get('puzzle_glued_texture_key') == key:
+        return texture
+    if texture is not None:
+        try:
+            texture.release()
+        except Exception:
+            pass
+    texture = pil_to_texture(renderer.ctx, image)
+    state.puzzle_glued_texture = texture
+    state.puzzle_glued_texture_key = key
+    return texture
+
+
+def _draw_puzzle_capture_overlay(state, image, rect):
+    if image is None or rect is None:
+        return
+    x, y, w, h = rect
+    sx = float(w) / max(float(image.size[0]), 1.0)
+    sy = float(h) / max(float(image.size[1]), 1.0)
+    dl = imgui.get_window_draw_list()
+
+    for point in state.get('puzzle_edge_landmarks', []):
+        px = x + float(point.get("x", 0)) * sx
+        py = y + float(point.get("y", 0)) * sy
+        color = imgui.get_color_u32((0.0, 1.0, 0.55, 0.95))
+        dl.add_circle_filled(imgui.ImVec2(px, py), 3.2, color)
+
+    for point in state.get('puzzle_projected_points', []):
+        px = x + float(point.get("x", 0)) * sx
+        py = y + float(point.get("y", 0)) * sy
+        color = imgui.get_color_u32((1.0, 1.0, 1.0, 0.90))
+        dl.add_circle_filled(imgui.ImVec2(px, py), 2.4, color)
+
+    selected = state.get('puzzle_selected_pixel', None)
+    if selected is not None:
+        px = x + float(selected.get("x", 0)) * sx
+        py = y + float(selected.get("y", 0)) * sy
+        color = imgui.get_color_u32((1.0, 0.80, 0.10, 1.0))
+        dl.add_circle(imgui.ImVec2(px, py), 7.0, color, 16, 2.0)
+        dl.add_line(imgui.ImVec2(px - 10.0, py), imgui.ImVec2(px + 10.0, py), color, 1.5)
+        dl.add_line(imgui.ImVec2(px, py - 10.0), imgui.ImVec2(px, py + 10.0), color, 1.5)
+
+
+def _draw_puzzle_glue_edge_overlay(image, rect, info):
+    """Draws a line at every pasted tile boundary so individual copies (and any
+    seam mismatch between them) are visible for a sanity check."""
+    if image is None or rect is None or not info:
+        return
+    tile_w = int(info.get("tile_w", 0))
+    tile_h = int(info.get("tile_h", 0))
+    cols = int(info.get("cols", 1))
+    rows = int(info.get("rows", 1))
+    if tile_w <= 0 or tile_h <= 0:
+        return
+    x, y, w, h = rect
+    sx = float(w) / max(float(image.size[0]), 1.0)
+    sy = float(h) / max(float(image.size[1]), 1.0)
+    dl = imgui.get_window_draw_list()
+    color = imgui.get_color_u32((1.0, 0.15, 0.75, 0.85))
+
+    for col_i in range(cols + 1):
+        px = x + float(col_i * tile_w) * sx
+        dl.add_line(imgui.ImVec2(px, y), imgui.ImVec2(px, y + h), color, 1.5)
+    for row_i in range(rows + 1):
+        py = y + float(row_i * tile_h) * sy
+        dl.add_line(imgui.ImVec2(x, py), imgui.ImVec2(x + w, py), color, 1.5)
+
+
+def _draw_puzzle_capture_widget(state, image, texture, avail_w, avail_h):
+    rect = draw_fitted_texture(texture.glo, image.size[0], image.size[1], avail_w, avail_h, flip_y=True)
+    if rect is None:
+        return
+    _draw_puzzle_capture_overlay(state, image, rect)
+    x, y, w, h = rect
+    io = imgui.get_io()
+    mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
+    hovered = imgui.is_item_hovered() and x <= mx <= x + w and y <= my <= y + h
+    if hovered and imgui.is_mouse_clicked(0):
+        px = int(np.clip(round((mx - x) / max(w, 1.0) * (image.size[0] - 1)), 0, image.size[0] - 1))
+        py = int(np.clip(round((my - y) / max(h, 1.0) * (image.size[1] - 1)), 0, image.size[1] - 1))
+        rgb = image.getpixel((px, py))[:3]
+        state.puzzle_selected_pixel = {"x": px, "y": py, "rgb": [int(v) for v in rgb]}
+
+    selected = state.get('puzzle_selected_pixel', None)
+    if selected is not None:
+        rgb = selected.get("rgb", [0, 0, 0])
+        imgui.color_button(
+            "##puzzle_selected_pixel_color",
+            (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
+            imgui.ColorEditFlags_.no_tooltip,
+            imgui.ImVec2(34, 22),
+        )
+        imgui.same_line()
+        imgui.text(
+            f"Pixel ({int(selected.get('x', 0))}, {int(selected.get('y', 0))}) "
+            f"RGB {rgb[0]}, {rgb[1]}, {rgb[2]}"
+        )
+    else:
+        imgui.text_disabled("Click the captured image to inspect a pixel RGB value.")
+
+
 def _scanner_lighting_settings(state):
     return {
         "enabled": 1.0 if bool(state.get('scanner_lighting_enabled', True)) else 0.0,
@@ -393,105 +915,146 @@ def _scanner_lighting_settings(state):
     }
 
 
-def _scanner_full_layout_preview_image(state):
+def _scanner_material_uniforms(state):
+    """Base material uniforms with Scan Mode's lighting settings applied -- the
+    same real-3D-shader lighting used by the live viewport, reused so automated
+    scan-pattern captures are lit consistently with what the user configured."""
+    material_uniforms = dict(state.get_material_uniforms())
+    lighting = _scanner_lighting_settings(state)
+    if float(lighting.get("enabled", 1.0)) < 0.5:
+        material_uniforms.update({
+            "light_color": (1.0, 1.0, 1.0),
+            "light_dir": (0.0, 0.0, 1.0),
+            "light_intensity": 1.0,
+            "ao_strength": 0.0,
+            "texture_gloss_strength": 0.0,
+            "texture_center_shadow": 0.0,
+            "texture_groove_darkness": 0.0,
+        })
+    else:
+        sun = float(lighting.get("sun_intensity", 0.68))
+        shadow = float(lighting.get("shadow", 0.20))
+        sheen = float(lighting.get("sheen", 0.025))
+        az = np.deg2rad(float(lighting.get("azimuth", -35.0)))
+        el = np.deg2rad(float(lighting.get("elevation", 48.0)))
+        light_dir = (
+            float(np.cos(az) * np.cos(el)),
+            float(np.sin(az) * np.cos(el)),
+            float(np.sin(el)),
+        )
+        material_uniforms.update({
+            "light_color": (1.0, 0.96, 0.88),
+            "light_dir": light_dir,
+            "light_intensity": float(np.clip(0.65 + sun * 0.55, 0.30, 1.35)),
+            "ao_strength": float(np.clip(0.22 + shadow * 1.35, 0.0, 0.85)),
+            "ao_radius": float(np.clip(0.08 + shadow * 0.35, 0.02, 0.35)),
+            "texture_gloss_strength": float(np.clip(0.08 + sheen * 3.8, 0.0, 0.55)),
+            "texture_center_shadow": float(np.clip(0.12 + shadow * 0.55, 0.0, 0.55)),
+            "texture_groove_darkness": float(np.clip(0.06 + shadow * 0.45, 0.0, 0.45)),
+        })
+    return material_uniforms
+
+
+def _scanner_tiled_layout_cache_key(state):
+    rows = max(1, int(state.scanner_rows))
+    cols = max(1, int(state.scanner_cols))
+    repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+    pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+    lighting_settings = _scanner_lighting_settings(state)
+    lighting_key = tuple((key, round(float(lighting_settings[key]), 4)) for key in sorted(lighting_settings))
+    return (
+        rows,
+        cols,
+        repeat_rows,
+        repeat_cols,
+        pattern_rows,
+        pattern_cols,
+        round(float(state.get('scanner_pattern_density', 0.62)), 4),
+        int(state.get('scanner_random_seed', 1)),
+        json.dumps(state.get('scanner_color_variants', []), sort_keys=True),
+        lighting_key,
+    )
+
+
+def _scanner_generate_tiled_layout(state, renderer):
+    """Builds Scan Mode's per-pattern fabric imagery automatically, using the same
+    real-3D-render + exact-period capture/glue pipeline validated in Puzzle Mode
+    (duplicate the real model -> auto-frame -> capture -> exact-period crop -> glue
+    by Image Repeat X/Y), once per grid cell. Cached like the old preview was, so
+    this only re-renders when a relevant setting actually changes."""
     try:
+        # Normalizes scanner_color_variants (e.g. RGB -> RGBA) as a side effect the
+        # first time it runs each session -- must happen before computing the cache
+        # key, or the key would change out from under an already-stored cache entry.
+        cell_sets = _scanner_shared_cell_color_sets(state)
+        cache_key = _scanner_tiled_layout_cache_key(state)
+        cached_key = state.__dict__.get("_scanner_tiled_layout_key")
+        if cached_key == cache_key:
+            cached = state.__dict__.get("_scanner_tiled_layout_result")
+            if cached is not None:
+                full_image, per_cell = cached
+                return full_image.copy(), list(per_cell)
+
         rows = max(1, int(state.scanner_rows))
         cols = max(1, int(state.scanner_cols))
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-        spacing_x, spacing_y = _scanner_repeat_spacing(state)
-        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-        lighting_settings = _scanner_lighting_settings(state)
-        lighting_key = tuple((key, round(float(lighting_settings[key]), 4)) for key in sorted(lighting_settings))
-        cache_key = (
-            rows,
-            cols,
-            repeat_rows,
-            repeat_cols,
-            round(spacing_x, 3),
-            round(spacing_y, 3),
-            pattern_rows,
-            pattern_cols,
-            round(float(state.get('scanner_pattern_density', 0.62)), 4),
-            int(state.get('scanner_random_seed', 1)),
-            json.dumps(state.get('scanner_color_variants', []), sort_keys=True),
-            lighting_key,
-        )
-        if state.__dict__.get("_scanner_full_layout_preview_key") == cache_key:
-            cached = state.__dict__.get("_scanner_full_layout_preview_image")
-            if cached is not None:
-                return cached.copy()
-        cell_sets = _scanner_shared_cell_color_sets(state)
-        curves_by_cell = _generate_scanner_random_patterns(state)
     except Exception:
-        return None
+        return None, []
 
-    cell_w = 220
-    cell_h = 180
-    max_dim = 1400
-    canvas_w = max(1, cols * cell_w)
-    canvas_h = max(1, rows * cell_h)
-    scale = min(1.0, max_dim / max(float(canvas_w), 1.0), max_dim / max(float(canvas_h), 1.0))
-    if scale < 1.0:
-        cell_w = max(36, int(cell_w * scale))
-        cell_h = max(32, int(cell_h * scale))
-        canvas_w = max(1, cols * cell_w)
-        canvas_h = max(1, rows * cell_h)
+    per_cell_images = []
+    for cell_index in range(rows * cols):
+        try:
+            bitmap = state._scanner_random_bitmap(cell_index)
+            loop_heights = state._scanner_loop_heights_for_bitmap(bitmap)
+            colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else None
+            tile_image = _scan_render_tiled_pattern_image(
+                state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows,
+            )
+        except Exception:
+            tile_image = None
+        if tile_image is None:
+            tile_image = Image.new("RGB", (64, 64), (18, 23, 31))
+        per_cell_images.append(tile_image)
 
-    image = Image.new("RGB", (canvas_w, canvas_h), (18, 23, 31))
-
-    def render_unit_image(curves, colors, unit_w, unit_h):
-        unit_w = max(8, int(unit_w))
-        unit_h = max(8, int(unit_h))
-        tile = Image.new("RGB", (unit_w, unit_h), (18, 23, 31))
-        tile_draw = ImageDraw.Draw(tile)
-        line_w = max(1, int(min(unit_w, unit_h) * 0.035))
-        shade_w = max(line_w + 2, int(line_w * 1.8))
-        for curve_idx, curve in enumerate(curves):
-            if len(curve) < 2:
-                continue
-            rgba = colors[curve_idx % len(colors)]
-            color = tuple(int(255 * float(v)) for v in rgba[:3])
-            shadow = tuple(max(0, int(channel * 0.34)) for channel in color)
-            pts = [
-                (
-                    int(round(unit_w * 0.5 + float(p[0]) * unit_w * 0.37)),
-                    int(round(unit_h * 0.5 - float(p[1]) * unit_h * 0.37)),
-                )
-                for p in curve
-            ]
-            tile_draw.line(pts, fill=shadow, width=shade_w, joint="curve")
-            tile_draw.line(pts, fill=color, width=line_w, joint="curve")
-        if float(lighting_settings.get("enabled", 1.0)) >= 0.5:
-            try:
-                import fabric_scanner as scanner
-                tile = scanner._apply_scanner_lighting(tile, "angle 0", True, lighting_settings)
-            except Exception:
-                pass
-        return tile
-
-    draw = ImageDraw.Draw(image)
+    cell_w = max((img.size[0] for img in per_cell_images), default=64)
+    cell_h = max((img.size[1] for img in per_cell_images), default=64)
+    full_image = Image.new("RGB", (max(1, cols * cell_w), max(1, rows * cell_h)), (18, 23, 31))
+    draw = ImageDraw.Draw(full_image)
+    border = (38, 124, 137)
     for row in range(rows):
         for col in range(cols):
             cell_index = row * cols + col
+            cell_img = per_cell_images[cell_index]
             x0 = col * cell_w
             y0 = row * cell_h
-            colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else _scanner_base_palette(state)
-            curves = curves_by_cell[cell_index % len(curves_by_cell)] if curves_by_cell else []
-            tile_w = cell_w / max(1.0, 1.0 + (repeat_cols - 1) * spacing_x)
-            tile_h = cell_h / max(1.0, 1.0 + (repeat_rows - 1) * spacing_y)
-            step_w = tile_w * spacing_x
-            step_h = tile_h * spacing_y
-            unit = render_unit_image(curves, colors, int(round(tile_w)), int(round(tile_h)))
-            for tr in range(repeat_rows):
-                for tc in range(repeat_cols):
-                    tx = int(round(x0 + tc * step_w))
-                    ty = int(round(y0 + tr * step_h))
-                    image.paste(unit, (tx, ty))
-            border = (38, 124, 137)
-            draw.rectangle([x0, y0, x0 + cell_w - 1, y0 + cell_h - 1], outline=border, width=1)
-    object.__setattr__(state, "_scanner_full_layout_preview_key", cache_key)
-    object.__setattr__(state, "_scanner_full_layout_preview_image", image.copy())
-    return image
+            full_image.paste(cell_img, (x0, y0))
+            draw.rectangle(
+                [x0, y0, x0 + cell_img.size[0] - 1, y0 + cell_img.size[1] - 1],
+                outline=border,
+                width=1,
+            )
+
+    max_dim = 1400
+    scale = min(1.0, max_dim / max(float(full_image.size[0]), 1.0), max_dim / max(float(full_image.size[1]), 1.0))
+    if scale < 1.0:
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+        full_image = full_image.resize(
+            (max(1, int(full_image.size[0] * scale)), max(1, int(full_image.size[1] * scale))), resample,
+        )
+
+    object.__setattr__(state, "_scanner_tiled_layout_key", cache_key)
+    object.__setattr__(state, "_scanner_tiled_layout_result", (full_image.copy(), list(per_cell_images)))
+    return full_image, per_cell_images
+
+
+def _scanner_full_layout_preview_image(state, renderer):
+    full_image, _per_cell = _scanner_generate_tiled_layout(state, renderer)
+    return full_image
+
+
+def _scanner_per_cell_tiled_images(state, renderer):
+    _full_image, per_cell = _scanner_generate_tiled_layout(state, renderer)
+    return per_cell
 
 
 # ============================================================================
@@ -577,7 +1140,7 @@ class EmbeddedMujocoScanner:
     CAMERA_PREVIEW_INTERVAL = 0.18
     MAX_EXECUTED_TRAIL_POINTS = 300
 
-    def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None, auto_start=True):
+    def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None, per_cell_images=None, auto_start=True):
         import fabric_scanner as scanner
 
         self.scanner = scanner
@@ -648,6 +1211,8 @@ class EmbeddedMujocoScanner:
             self.plan.rendered_fabric_image = preview_image.convert("RGB")
             self.plan.rendered_fabric_image_is_full_layout = True
             self.plan.rendered_fabric_image_lit = True
+        if per_cell_images:
+            self.plan.scan_tiled_pattern_images = [img.convert("RGB") for img in per_cell_images]
         self.mujoco, self.model, self.data, self.site_id = scanner.load_ur5e_model_data()
         self.mj_context = None
         self.renderer = None
@@ -1521,28 +2086,32 @@ def draw_workflow_header(state):
 
 
 def _set_app_mode(state, mode):
-    mode = 'scan' if mode == 'scan' else 'edit'
+    mode = mode if mode in ('edit', 'scan', 'puzzle') else 'edit'
     if str(state.get('app_mode', 'edit')) == mode:
         return
     state.app_mode = mode
     scanner_idx = next((i for i, item in enumerate(state.workflow_stages) if item[0] == 'Scanner'), 0)
+    embedded = state.get('embedded_scanner')
+    if embedded is not None:
+        try:
+            embedded.close()
+        except Exception:
+            pass
+        state.embedded_scanner = None
     if mode == 'scan':
         state.workflow_step = scanner_idx
         state.scanner_preview_grid_enabled = True
         state.scanner_preview_rows = max(1, int(state.scanner_rows))
         state.scanner_preview_cols = max(1, int(state.scanner_cols))
         _clamp_scanner_selected_cell(state)
+    elif mode == 'puzzle':
+        state.workflow_step = scanner_idx
+        state.scanner_preview_grid_enabled = False
+        _puzzle_apply_geometry_copies(state, preserve=False)
     else:
         state.workflow_step = 0
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
-        embedded = state.get('embedded_scanner')
-        if embedded is not None:
-            try:
-                embedded.close()
-            except Exception:
-                pass
-            state.embedded_scanner = None
     state.rebuild_spline_mesh(preserve_model_placement=False)
 
 
@@ -1555,6 +2124,43 @@ def _apply_ui_theme(state):
     else:
         imgui.style_colors_dark()
     state._applied_ui_theme = theme
+
+
+def _draw_bitmap_editor(state, id_suffix=""):
+    """Editable 0/1 stitch bitmap grid: resize rows/columns and toggle each cell.
+    Shared by the main Pattern panel and Puzzle Mode so both edit the same
+    state.bitmap that drives ctrl_rows / the knitted model geometry."""
+    max_rows = int(state.config['knit_parameters']['bitmap_rows'])
+    ch_r, new_rows = imgui.slider_int(f"Rows##bres{id_suffix}", int(state.bitmap_size[0]), 1, max_rows)
+    ch_c, new_cols = imgui.slider_int(f"Columns##bres{id_suffix}", int(state.bitmap_size[1]), 1, 32)
+    if ch_r or ch_c:
+        state.push_undo("Bitmap size")
+        state.on_bitmap_resize(new_rows, new_cols)
+    if imgui.small_button(f"All active##bmap{id_suffix}"):
+        state.push_undo("Pattern reset")
+        state.bitmap[:] = 1.0
+        state.on_bitmap_change()
+    nr, nc = state.bitmap.shape
+    cell_w, cell_h = 22, 16
+    imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(2, 2))
+    changed_bitmap = False
+    for r in range(nr):
+        for c in range(nc):
+            active = float(state.bitmap[r, c]) > 0.5
+            imgui.push_style_color(imgui.Col_.button, (0.18, 0.62, 0.28, 1.0) if active else (0.22, 0.22, 0.22, 1.0))
+            imgui.push_style_color(imgui.Col_.button_hovered, (0.28, 0.72, 0.38, 1.0) if active else (0.35, 0.35, 0.35, 1.0))
+            if imgui.button(f"##bm{id_suffix}_{r}_{c}", imgui.ImVec2(cell_w, cell_h)):
+                if not changed_bitmap:
+                    state.push_undo("Pattern")
+                state.bitmap[r, c] = 0.0 if active else 1.0
+                changed_bitmap = True
+            imgui.pop_style_color(2)
+            if c < nc - 1:
+                imgui.same_line()
+    imgui.pop_style_var()
+    if changed_bitmap:
+        state.on_bitmap_change()
+    return changed_bitmap
 
 
 def draw_sidebar(state, renderer, window=None):
@@ -1582,11 +2188,13 @@ def draw_sidebar(state, renderer, window=None):
             else:
                 return embedded
         try:
+            tiled_full_image, tiled_per_cell = _scanner_generate_tiled_layout(state, renderer)
             embedded = EmbeddedMujocoScanner(
                 state,
                 renderer.ctx,
                 window,
-                preview_image=_scanner_full_layout_preview_image(state),
+                preview_image=tiled_full_image,
+                per_cell_images=tiled_per_cell,
                 auto_start=auto_start,
             )
             state.embedded_scanner = embedded
@@ -1701,11 +2309,13 @@ def draw_sidebar(state, renderer, window=None):
         embedded = state.get('embedded_scanner')
         if embedded is None:
             try:
+                tiled_full_image, tiled_per_cell = _scanner_generate_tiled_layout(state, renderer)
                 embedded = EmbeddedMujocoScanner(
                     state,
                     renderer.ctx,
                     window,
-                    preview_image=_scanner_full_layout_preview_image(state),
+                    preview_image=tiled_full_image,
+                    per_cell_images=tiled_per_cell,
                     auto_start=False,
                 )
                 state.embedded_scanner = embedded
@@ -1720,18 +2330,26 @@ def draw_sidebar(state, renderer, window=None):
         return embedded
 
     current_mode = str(state.get('app_mode', 'edit'))
-    edit_active = current_mode != 'scan'
-    button_w = max(120, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
+    edit_active = current_mode == 'edit'
+    scan_active = current_mode == 'scan'
+    puzzle_active = current_mode == 'puzzle'
+    button_w = max(88, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x * 2.0) / 3.0)
     imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if edit_active else (0.20, 0.20, 0.20, 1.0))
     if imgui.button("Edit Mode##mode_edit", (button_w, 0)):
         _set_app_mode(state, 'edit')
     imgui.pop_style_color()
     imgui.same_line()
-    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if not edit_active else (0.20, 0.20, 0.20, 1.0))
+    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if scan_active else (0.20, 0.20, 0.20, 1.0))
     if imgui.button("Scan Mode##mode_scan", (button_w, 0)):
         _set_app_mode(state, 'scan')
     imgui.pop_style_color()
+    imgui.same_line()
+    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if puzzle_active else (0.20, 0.20, 0.20, 1.0))
+    if imgui.button("Puzzle Mode##mode_puzzle", (button_w, 0)):
+        _set_app_mode(state, 'puzzle')
+    imgui.pop_style_color()
     imgui.separator()
+    action_w = max(120, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
 
     light_theme = str(state.get('ui_theme', 'dark')) == 'light'
     changed_theme, light_theme = imgui.checkbox("Light mode##ui_theme", light_theme)
@@ -1745,12 +2363,12 @@ def draw_sidebar(state, renderer, window=None):
     undo_disabled = not state.undo_stack
     if undo_disabled:
         imgui.begin_disabled()
-    if imgui.button("Undo##main", (button_w, 0)):
+    if imgui.button("Undo##main", (action_w, 0)):
         state.undo_last()
     if undo_disabled:
         imgui.end_disabled()
     imgui.same_line()
-    if imgui.button("Reset initial##reset_saved_initial_global", (button_w, 0)):
+    if imgui.button("Reset initial##reset_saved_initial_global", (action_w, 0)):
         state.reset_to_initial()
     imgui.separator()
 
@@ -1761,36 +2379,7 @@ def draw_sidebar(state, renderer, window=None):
             state.rebuild_spline_mesh(preserve_model_placement=False)
 
         if imgui.collapsing_header("Pattern", imgui.TreeNodeFlags_.default_open):
-            max_rows = int(state.config['knit_parameters']['bitmap_rows'])
-            ch_r, new_rows = imgui.slider_int("Rows##bres", int(state.bitmap_size[0]), 1, max_rows)
-            ch_c, new_cols = imgui.slider_int("Columns##bres", int(state.bitmap_size[1]), 1, 32)
-            if ch_r or ch_c:
-                state.push_undo("Bitmap size")
-                state.on_bitmap_resize(new_rows, new_cols)
-            if imgui.small_button("All active##bmap"):
-                state.push_undo("Pattern reset")
-                state.bitmap[:] = 1.0
-                state.on_bitmap_change()
-            nr, nc = state.bitmap.shape
-            cell_w, cell_h = 22, 16
-            imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(2, 2))
-            changed_bitmap = False
-            for r in range(nr):
-                for c in range(nc):
-                    active = float(state.bitmap[r, c]) > 0.5
-                    imgui.push_style_color(imgui.Col_.button, (0.18, 0.62, 0.28, 1.0) if active else (0.22, 0.22, 0.22, 1.0))
-                    imgui.push_style_color(imgui.Col_.button_hovered, (0.28, 0.72, 0.38, 1.0) if active else (0.35, 0.35, 0.35, 1.0))
-                    if imgui.button(f"##bm_{r}_{c}", imgui.ImVec2(cell_w, cell_h)):
-                        if not changed_bitmap:
-                            state.push_undo("Pattern")
-                        state.bitmap[r, c] = 0.0 if active else 1.0
-                        changed_bitmap = True
-                    imgui.pop_style_color(2)
-                    if c < nc - 1:
-                        imgui.same_line()
-            imgui.pop_style_var()
-            if changed_bitmap:
-                state.on_bitmap_change()
+            _draw_bitmap_editor(state)
 
         if imgui.collapsing_header("Loop Heights", imgui.TreeNodeFlags_.default_open):
             state._sync_loop_heights()
@@ -2014,7 +2603,7 @@ def draw_sidebar(state, renderer, window=None):
             if changed_auto:
                 state.autosave_enabled = bool(new_auto)
 
-    else:
+    elif scan_active:
         imgui.text("Scanner")
         # -- Scanning section: scan layout, random patterns, and capture setup --
         rows = max(1, int(state.scanner_rows))
@@ -2673,6 +3262,167 @@ def draw_sidebar(state, renderer, window=None):
                     )
         imgui.text_wrapped(str(state.scanner_status))
 
+    elif puzzle_active:
+        imgui.text("Puzzle Mode")
+        imgui.text_wrapped(
+            "Manual workflow for testing seamless repeat logic before automation: duplicate real geometry, capture it, detect colors, and inspect edge landmarks."
+        )
+        if imgui.collapsing_header("Stitch pattern (bitmap)##puzzle_pattern", imgui.TreeNodeFlags_.default_open):
+            imgui.text_disabled(
+                f"Editing the small {int(state.bitmap_size[0])} x {int(state.bitmap_size[1])} stitch bitmap "
+                "used to build the model this test tiles and captures."
+            )
+            _draw_bitmap_editor(state, id_suffix="_puzzle")
+        imgui.separator()
+        copies_x, copies_y = _puzzle_target_copies(state)
+        changed_px, new_px = imgui.slider_int("Real geometry copies X##puzzle_copies_x", copies_x, 1, 9)
+        changed_py, new_py = imgui.slider_int("Real geometry copies Y##puzzle_copies_y", copies_y, 1, 9)
+        if changed_px:
+            if int(new_px) % 2 == 0:
+                new_px += 1
+            state.puzzle_copies_x = int(np.clip(new_px, 1, 9))
+        if changed_py:
+            if int(new_py) % 2 == 0:
+                new_py += 1
+            state.puzzle_copies_y = int(np.clip(new_py, 1, 9))
+        if changed_px or changed_py:
+            _puzzle_apply_geometry_copies(state, preserve=True)
+            state.status_msg = f"Puzzle geometry set to {int(state.puzzle_copies_x)} x {int(state.puzzle_copies_y)}"
+        if imgui.button("Apply 5 x 5 geometry##puzzle_apply_5x5", (-1, 0)):
+            state.puzzle_copies_x = 5
+            state.puzzle_copies_y = 5
+            _puzzle_apply_geometry_copies(state, preserve=True)
+            state.status_msg = "Puzzle geometry set to 5 x 5"
+        if imgui.button("Apply current copy settings##puzzle_apply", (-1, 0)):
+            _puzzle_apply_geometry_copies(state, preserve=True)
+            state.status_msg = "Puzzle geometry copies applied"
+        imgui.separator()
+        imgui.text("Screenshot capture frame")
+        rx, ry, rw, rh = _puzzle_capture_rect(state)
+        changed_rx, rx = imgui.slider_float("Frame X##puzzle_capture_rect_x", rx, 0.0, 0.95, "%.2f")
+        changed_ry, ry = imgui.slider_float("Frame Y##puzzle_capture_rect_y", ry, 0.0, 0.95, "%.2f")
+        changed_rw, rw = imgui.slider_float("Frame width##puzzle_capture_rect_w", rw, 0.05, 1.0, "%.2f")
+        changed_rh, rh = imgui.slider_float("Frame height##puzzle_capture_rect_h", rh, 0.05, 1.0, "%.2f")
+        if changed_rx or changed_ry or changed_rw or changed_rh:
+            _set_puzzle_capture_rect(state, [rx, ry, rw, rh])
+        imgui.text_disabled("Yellow frame in the 3D viewport shows the region that will be captured.")
+        imgui.separator()
+        changed_count, new_count = imgui.slider_int("Detected colors##puzzle_detect_color_count", int(state.get('puzzle_detect_color_count', 6)), 1, 12)
+        if changed_count:
+            state.puzzle_detect_color_count = int(new_count)
+        if imgui.button("Capture geometry preview##puzzle_capture", (-1, 0)):
+            image, points, landmarks = _puzzle_capture_geometry_image(state, renderer)
+            state.puzzle_capture_image = image
+            state.puzzle_projected_points = points
+            state.puzzle_edge_landmarks = landmarks
+            state.puzzle_detected_colors = _puzzle_detect_colors(image, int(state.get('puzzle_detect_color_count', 6))) if image is not None else []
+            state.puzzle_capture_texture_key = None
+            if image is not None:
+                state.status_msg = f"Puzzle capture: {len(points)} control points, {len(landmarks)} edge landmarks"
+            else:
+                state.status_msg = "Puzzle capture failed: 3D viewport has not rendered yet"
+        image = state.get('puzzle_capture_image', None)
+        if image is not None:
+            if imgui.button("Save puzzle capture##puzzle_save_capture", (-1, 0)):
+                output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path = output_dir / f"puzzle_capture_{int(time.time())}.png"
+                image.save(output_path)
+                state.status_msg = f"Saved {output_path.name}"
+            imgui.text(f"Captured image: {image.size[0]} x {image.size[1]}")
+            colors = state.get('puzzle_detected_colors', [])
+            if colors:
+                imgui.text("Detected colors")
+                for idx, item in enumerate(colors):
+                    rgb = item.get("rgb", [0, 0, 0])
+                    imgui.color_button(
+                        f"##puzzle_color_{idx}",
+                        (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
+                        imgui.ColorEditFlags_.no_tooltip,
+                        imgui.ImVec2(34, 22),
+                    )
+                    imgui.same_line()
+                    imgui.text(f"{rgb[0]}, {rgb[1]}, {rgb[2]} | px {int(item.get('count', 0))}")
+            imgui.text(f"Control points: {len(state.get('puzzle_projected_points', []))}")
+            imgui.text(f"Edge landmarks: {len(state.get('puzzle_edge_landmarks', []))}")
+            texture = _upload_puzzle_capture_texture(state, renderer)
+            if texture is not None:
+                avail_w = max(120, int(imgui.get_content_region_avail().x))
+                preview_h = int(avail_w * image.size[1] / max(image.size[0], 1))
+                _draw_puzzle_capture_widget(state, image, texture, avail_w, preview_h)
+        else:
+            imgui.text_disabled("Capture a geometry preview to inspect colors and edge landmarks.")
+
+        imgui.separator()
+        imgui.text("Seamless tile / glue preview")
+        imgui.text_disabled(
+            "Crops one exact repeat period from the capture area and stitches copies "
+            "edge-to-edge to verify seamless tiling."
+        )
+        glue_cols = int(state.get('puzzle_glue_cols', 3))
+        glue_rows = int(state.get('puzzle_glue_rows', 3))
+        changed_gc, new_gc = imgui.slider_int("Glue copies X##puzzle_glue_cols", glue_cols, 1, 100)
+        changed_gr, new_gr = imgui.slider_int("Glue copies Y##puzzle_glue_rows", glue_rows, 1, 100)
+        if changed_gc:
+            state.puzzle_glue_cols = int(new_gc)
+        if changed_gr:
+            state.puzzle_glue_rows = int(new_gr)
+        changed_hl, new_hl = imgui.checkbox("Highlight tile edges##puzzle_glue_highlight", bool(state.get('puzzle_glue_highlight_edges', False)))
+        if changed_hl:
+            state.puzzle_glue_highlight_edges = bool(new_hl)
+        if imgui.button("Build seamless tile##puzzle_build_glue", (-1, 0)):
+            tile, glued, info = _puzzle_build_seamless_tile(
+                state, renderer,
+                int(state.get('puzzle_glue_cols', 3)),
+                int(state.get('puzzle_glue_rows', 3)),
+            )
+            state.puzzle_tile_image = tile
+            state.puzzle_glued_image = glued
+            state.puzzle_glue_info = info
+            state.puzzle_glued_texture_key = None
+            if glued is not None:
+                state.status_msg = (
+                    f"Glued {info.get('cols', 0)} x {info.get('rows', 0)} "
+                    f"tiles ({info.get('tile_w', 0)} x {info.get('tile_h', 0)} px each)"
+                )
+            else:
+                state.status_msg = "Seamless tile build failed: capture the 3D viewport first"
+        glued_image = state.get('puzzle_glued_image', None)
+        info = state.get('puzzle_glue_info', {}) or {}
+        if glued_image is not None:
+            skew_x = float(info.get('skew_x_px', 0.0))
+            skew_y = float(info.get('skew_y_px', 0.0))
+            imgui.text(f"Tile size: {info.get('tile_w', 0)} x {info.get('tile_h', 0)} px")
+            imgui.text(
+                f"World period X/Y: {info.get('x_period_world', 0.0):.2f} / {info.get('y_period_world', 0.0):.2f}"
+            )
+            skew_color = (1.0, 0.55, 0.2, 1.0) if (abs(skew_x) > 1.5 or abs(skew_y) > 1.5) else (0.6, 0.9, 0.6, 1.0)
+            imgui.text_colored(skew_color, f"Seam skew (should be ~0): x={skew_x:.2f}px, y={skew_y:.2f}px")
+            if abs(skew_x) > 1.5 or abs(skew_y) > 1.5:
+                imgui.text_wrapped(
+                    "Skew is non-trivial: the camera view is not axis-aligned with the repeat "
+                    "directions, so straight grid gluing will show a slight seam drift. "
+                    "Rotate the camera to a top-down view for a perfect seam."
+                )
+            if imgui.button("Save seamless tile##puzzle_save_glue", (-1, 0)):
+                output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                stamp = int(time.time())
+                tile_image = state.get('puzzle_tile_image', None)
+                if tile_image is not None:
+                    tile_image.save(output_dir / f"puzzle_tile_{stamp}.png")
+                glued_image.save(output_dir / f"puzzle_glued_{stamp}.png")
+                state.status_msg = f"Saved puzzle_tile_{stamp}.png and puzzle_glued_{stamp}.png"
+            glue_texture = _upload_puzzle_glued_texture(state, renderer)
+            if glue_texture is not None:
+                avail_w = max(120, int(imgui.get_content_region_avail().x))
+                preview_h = int(min(avail_w * glued_image.size[1] / max(glued_image.size[0], 1), 480))
+                glue_rect = draw_fitted_texture(glue_texture.glo, glued_image.size[0], glued_image.size[1], avail_w, preview_h, flip_y=True)
+                if bool(state.get('puzzle_glue_highlight_edges', False)):
+                    _draw_puzzle_glue_edge_overlay(glued_image, glue_rect, info)
+        else:
+            imgui.text_disabled("Build a seamless tile to preview the glued, repeated fabric.")
+
     if (
         str(state.get('app_mode', 'edit')) == 'scan'
         and str(state.get('scanner_execution_mode', 'simulation')) == 'simulation'
@@ -2796,6 +3546,20 @@ def draw_sidebar(state, renderer, window=None):
             embedded._render_frame()
         imgui.end()
 
+    if str(state.get('app_mode', 'edit')) == 'puzzle' and state.get('puzzle_capture_image', None) is not None:
+        image = state.get('puzzle_capture_image')
+        texture = _upload_puzzle_capture_texture(state, renderer)
+        if image is not None and texture is not None:
+            imgui.set_next_window_size((760, 620), cond=imgui.Cond_.first_use_ever)
+            imgui.begin("Puzzle Capture Inspector")
+            imgui.text("Captured Image")
+            imgui.text_disabled("White dots are real loop control points. Green dots are detected X/Y edge landmarks. Click the image to inspect pixel RGB.")
+            avail = imgui.get_content_region_avail()
+            inspector_w = max(240, int(avail.x))
+            inspector_h = max(240, int(avail.y - 40))
+            _draw_puzzle_capture_widget(state, image, texture, inspector_w, inspector_h)
+            imgui.end()
+
 def draw_viewport(state, renderer, ref_tex, window):
     imgui.set_next_window_pos((360, 20), cond=imgui.Cond_.first_use_ever)
     imgui.set_next_window_size((840, 820), cond=imgui.Cond_.first_use_ever)
@@ -2902,40 +3666,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         py = int(np.clip(round((1.0 - float(uv[1])) * (h - 1)), 0, h - 1))
         return pixels[py, px, :3].astype(np.float32)
 
-    material_uniforms = dict(state.get_material_uniforms())
-    if scanner_stage_active:
-        lighting = _scanner_lighting_settings(state)
-        if float(lighting.get("enabled", 1.0)) < 0.5:
-            material_uniforms.update({
-                "light_color": (1.0, 1.0, 1.0),
-                "light_dir": (0.0, 0.0, 1.0),
-                "light_intensity": 1.0,
-                "ao_strength": 0.0,
-                "texture_gloss_strength": 0.0,
-                "texture_center_shadow": 0.0,
-                "texture_groove_darkness": 0.0,
-            })
-        else:
-            sun = float(lighting.get("sun_intensity", 0.68))
-            shadow = float(lighting.get("shadow", 0.20))
-            sheen = float(lighting.get("sheen", 0.025))
-            az = np.deg2rad(float(lighting.get("azimuth", -35.0)))
-            el = np.deg2rad(float(lighting.get("elevation", 48.0)))
-            light_dir = (
-                float(np.cos(az) * np.cos(el)),
-                float(np.sin(az) * np.cos(el)),
-                float(np.sin(el)),
-            )
-            material_uniforms.update({
-                "light_color": (1.0, 0.96, 0.88),
-                "light_dir": light_dir,
-                "light_intensity": float(np.clip(0.65 + sun * 0.55, 0.30, 1.35)),
-                "ao_strength": float(np.clip(0.22 + shadow * 1.35, 0.0, 0.85)),
-                "ao_radius": float(np.clip(0.08 + shadow * 0.35, 0.02, 0.35)),
-                "texture_gloss_strength": float(np.clip(0.08 + sheen * 3.8, 0.0, 0.55)),
-                "texture_center_shadow": float(np.clip(0.12 + shadow * 0.55, 0.0, 0.55)),
-                "texture_groove_darkness": float(np.clip(0.06 + shadow * 0.45, 0.0, 0.45)),
-            })
+    material_uniforms = _scanner_material_uniforms(state) if scanner_stage_active else dict(state.get_material_uniforms())
 
     renderer.render(
         mvp, mv,
@@ -2966,6 +3697,24 @@ def draw_viewport(state, renderer, ref_tex, window):
         origin_x, origin_y, draw_w, _ = drawn_rect
         state.vp_origin = np.array([origin_x, origin_y], dtype=np.float32)
         state.vp_scale = float(draw_w / max(float(disp_w), 1.0))
+        if str(state.get('app_mode', 'edit')) == 'puzzle':
+            x, y, w, h = drawn_rect
+            rx, ry, rw, rh = _puzzle_capture_rect(state)
+            fx0 = x + rx * w
+            fy0 = y + ry * h
+            fx1 = x + (rx + rw) * w
+            fy1 = y + (ry + rh) * h
+            dl = imgui.get_window_draw_list()
+            shade = imgui.get_color_u32((0.0, 0.0, 0.0, 0.34))
+            frame = imgui.get_color_u32((1.0, 0.78, 0.08, 1.0))
+            dl.add_rect_filled(imgui.ImVec2(x, y), imgui.ImVec2(x + w, fy0), shade)
+            dl.add_rect_filled(imgui.ImVec2(x, fy1), imgui.ImVec2(x + w, y + h), shade)
+            dl.add_rect_filled(imgui.ImVec2(x, fy0), imgui.ImVec2(fx0, fy1), shade)
+            dl.add_rect_filled(imgui.ImVec2(fx1, fy0), imgui.ImVec2(x + w, fy1), shade)
+            dl.add_rect(imgui.ImVec2(fx0, fy0), imgui.ImVec2(fx1, fy1), frame, 0.0, 2.5, 0)
+            label_bg = imgui.get_color_u32((0.0, 0.0, 0.0, 0.70))
+            dl.add_rect_filled(imgui.ImVec2(fx0, fy0 - 22.0), imgui.ImVec2(fx0 + 148.0, fy0), label_bg)
+            dl.add_text(imgui.ImVec2(fx0 + 6.0, fy0 - 18.0), frame, "Puzzle capture area")
     is_hovered = imgui.is_item_hovered()
     state.mouse_in_vp = is_hovered
     mx, my = imgui.get_mouse_pos()

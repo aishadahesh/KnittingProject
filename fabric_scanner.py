@@ -1371,12 +1371,24 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
         setattr(plan, "_rendered_texture_cache", cache)
     if cache_key not in cache:
         if focused:
-            # Focused scanner captures use the requested workflow:
-            # render one selected pattern unit, apply lighting to that unit,
-            # then duplicate the lit image by the repeat sliders.
-            cell_texture = _render_cell_pattern_texture(plan, row, col, batch_w, batch_h)
-            lit_cell = _apply_scanner_lighting(cell_texture, view_name, focused, lighting)
-            cache[cache_key] = _tile_rendered_texture(lit_cell, repeat_rows, repeat_cols, spacing_x, spacing_y)
+            # Real per-pattern tiles (duplicated real model -> exact-period
+            # capture/glue, the Puzzle Mode workflow automated in gui.py) take
+            # priority when available -- they are already tiled by the repeat
+            # sliders and already lit by the real 3D shader, so no further
+            # tiling or 2D lighting post-process is applied. Falls back to the
+            # 2D curve-drawing path when no live GL renderer produced these
+            # (e.g. standalone/CLI use of this module).
+            scan_tiles = getattr(plan, "scan_tiled_pattern_images", None)
+            tile_idx = row * plan.grid_cols + col
+            if scan_tiles and 0 <= tile_idx < len(scan_tiles):
+                cache[cache_key] = scan_tiles[tile_idx]
+            else:
+                # Focused scanner captures use the requested workflow:
+                # render one selected pattern unit, apply lighting to that unit,
+                # then duplicate the lit image by the repeat sliders.
+                cell_texture = _render_cell_pattern_texture(plan, row, col, batch_w, batch_h)
+                lit_cell = _apply_scanner_lighting(cell_texture, view_name, focused, lighting)
+                cache[cache_key] = _tile_rendered_texture(lit_cell, repeat_rows, repeat_cols, spacing_x, spacing_y)
         else:
             texture = _rendered_texture_for_camera(plan, row, col, focused)
             if texture is None:
