@@ -193,6 +193,93 @@ def build_surface_fiber_meshes(
 
 
 
+def eval_centerline(cp, D, nout, t=None, to=None):
+    """Samples one periodic row centreline.
+
+    The row is closed by appending cp[0] + D, then "detrended" by subtracting the
+    linear ramp along D before fitting, so a periodic cubic spline is valid; the
+    ramp is added back afterwards. That is what makes tiled copies join smoothly
+    across the period boundary instead of kinking.
+
+    `t`/`to` may be supplied to reuse a parameterisation across calls -- the
+    Jacobian builder relies on that to hold the knot vector fixed while varying
+    one control point at a time.
+    """
+    cp = np.asarray(cp, dtype=float)
+    if len(cp) <= 1:
+        return np.repeat(cp, nout, axis=0)
+    cp_aug = np.concatenate((cp, (cp[0] + D)[None, :]), axis=0)
+    if t is None or to is None:
+        t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6))))
+        to = np.linspace(t[0], t[-1], nout)
+    cp_detrended = cp_aug - D[None, :] * (t / t[-1])[:, None]
+    if len(cp) == 2:
+        pts_detrended = np.column_stack([np.interp(to, t, cp_detrended[:, i]) for i in range(3)])
+    else:
+        pts_detrended = np.column_stack([CubicSpline(t, cp_detrended[:, i], bc_type="periodic")(to) for i in range(3)])
+    return pts_detrended + D[None, :] * (to / t[-1])[:, None]
+
+
+def _centerline_sample_count(period_offset_x, config):
+    """Samples per row. Shared so the mesh, the simulation centrelines and the
+    Jacobian all agree on nout -- if they disagree the Jacobian silently stops
+    matching the geometry it is supposed to differentiate."""
+    D = np.asarray(period_offset_x, dtype=float)
+    if D.ndim == 0:
+        bitmap_width = float(D)
+    else:
+        bitmap_width = float(np.linalg.norm(D))
+    res = config["knit_parameters"]["loop_res"]
+    return max(3, res * int(round(bitmap_width)) + 1)
+
+
+def evaluate_centerlines(ctrl_rows, period_offset_x, config):
+    """Centreline vertices + per-row edge topology, as the yarn simulation wants
+    them: one flat V array of shape (rows * nout, 3) and the index pairs joining
+    consecutive samples within each row."""
+    D = np.asarray(period_offset_x, dtype=float)
+    nout = _centerline_sample_count(D, config)
+
+    V_list = [eval_centerline(np.asarray(r, dtype=float), D, nout) for r in ctrl_rows]
+    if not V_list:
+        return np.empty((0, 3)), np.empty((0, 2), dtype=np.int32), D, nout
+
+    V = np.vstack(V_list)
+    edges_list = []
+    row_offset = 0
+    for _ in range(len(ctrl_rows)):
+        row_edges = np.column_stack((np.arange(nout - 1), np.arange(1, nout))).astype(np.int32) + row_offset
+        edges_list.append(row_edges)
+        row_offset += nout
+    edges = np.vstack(edges_list) if edges_list else np.empty((0, 2), dtype=np.int32)
+    return V, edges, D, nout
+
+
+def build_row_spline_jacobian(cp, D, nout):
+    """d(sampled points) / d(control points) for one row.
+
+    The map from control points to samples is linear once the knot vector is
+    fixed, so each column is recovered by evaluating a unit impulse control
+    point through the same parameterisation. Passing t/to keeps that
+    parameterisation identical across columns, which is what makes the columns
+    combine into a valid Jacobian.
+    """
+    cp = np.asarray(cp, dtype=float)
+    num_ctrl = len(cp)
+    if num_ctrl <= 1:
+        return np.ones((nout, 1))
+    cp_aug = np.concatenate((cp, (cp[0] + D)[None, :]), axis=0)
+    t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6))))
+    to = np.linspace(t[0], t[-1], nout)
+    cols = []
+    for k in range(num_ctrl):
+        cp_dummy = np.zeros((num_ctrl, 3))
+        cp_dummy[k, 0] = 1.0
+        pts = eval_centerline(cp_dummy, np.zeros(3), nout, t=t, to=to)
+        cols.append(pts[:, 0])
+    return np.column_stack(cols)
+
+
 def build_spline_mesh(
     ctrl_rows,
     params,
@@ -203,16 +290,14 @@ def build_spline_mesh(
 ):
     p = np.asarray(params)
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
-    seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
-    
+    seg = config["knit_parameters"]["segments"]
+
     if isinstance(period_offset_x, (int, float, np.integer, np.floating)):
         D = np.array([float(period_offset_x), 0.0, 0.0], dtype=float)
-        bitmap_width = float(period_offset_x)
     else:
         D = np.asarray(period_offset_x, dtype=float)
-        bitmap_width = float(np.linalg.norm(D))
-        
-    nout = max(3, res * int(round(bitmap_width)) + 1)
+
+    nout = _centerline_sample_count(period_offset_x, config)
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ca, sa = np.cos(a)[None, :, None], np.sin(a)[None, :, None]
     out = []
@@ -220,19 +305,10 @@ def build_spline_mesh(
         cp = np.asarray(r, dtype=float)
         if len(cp) == 0:
             continue
+        pts = eval_centerline(cp, D, nout)
         if len(cp) <= 1:
-            pts = np.repeat(cp, nout, axis=0)
             ctrl_sample_idx = np.zeros(nout, dtype=float)
         else:
-            cp_aug = np.concatenate((cp, (cp[0] + D)[None, :]), axis=0)
-            t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6))))
-            to = np.linspace(t[0], t[-1], nout)
-            cp_detrended = cp_aug - D[None, :] * (t / t[-1])[:, None]
-            if len(cp) == 2:
-                pts_detrended = np.column_stack([np.interp(to, t, cp_detrended[:, i]) for i in range(3)])
-            else:
-                pts_detrended = np.column_stack([CubicSpline(t, cp_detrended[:, i], bc_type="periodic")(to) for i in range(3)])
-            pts = pts_detrended + D[None, :] * (to / t[-1])[:, None]
             ctrl_sample_idx = np.linspace(0.0, len(cp), nout, dtype=float)
 
         if radius_ctrl_rows is not None and row_idx < len(radius_ctrl_rows):
