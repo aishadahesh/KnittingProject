@@ -34,6 +34,7 @@ FORCE_ARROW_SCALE = 5.0
 # elsewhere in gui.py stay unchanged.
 from scanner_core import (
     _as_rgba,
+    _scan_measure_pattern_frame,
     _ensure_scanner_shared_colors,
     _generate_scanner_random_patterns,
     _puzzle_build_seamless_tile,
@@ -541,6 +542,19 @@ def _scanner_generate_tiled_layout(state, renderer):
     except Exception:
         return None, []
 
+    # Measure the framing once, from a pattern with every loop active, and reuse
+    # it for all cells. Auto-framing per cell sized each tile to the loops that
+    # cell's random bitmap happened to switch on, so cells came out at different
+    # heights and the composite below tiled them into a ragged staircase with
+    # gaps. Every scanned square is the same piece of fabric, so they belong in
+    # identically sized frames.
+    shared_frame = None
+    try:
+        probe_bitmap = state._scanner_random_bitmap(0)
+        shared_frame = _scan_measure_pattern_frame(state, renderer, probe_bitmap.shape)
+    except Exception:
+        shared_frame = None
+
     per_cell_images = []
     for cell_index in range(rows * cols):
         try:
@@ -549,6 +563,7 @@ def _scanner_generate_tiled_layout(state, renderer):
             colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else None
             tile_image = _scan_render_tiled_pattern_image(
                 state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows,
+                frame=shared_frame,
             )
         except Exception:
             tile_image = None
@@ -558,6 +573,12 @@ def _scanner_generate_tiled_layout(state, renderer):
 
     cell_w = max((img.size[0] for img in per_cell_images), default=64)
     cell_h = max((img.size[1] for img in per_cell_images), default=64)
+    # Any cell that still came back a different size (a failed render falling
+    # back to the placeholder) is centred in its slot rather than pasted at the
+    # corner, so it cannot masquerade as fabric that stops halfway.
+    def _cell_origin(img, col, row):
+        return (col * cell_w + (cell_w - img.size[0]) // 2,
+                row * cell_h + (cell_h - img.size[1]) // 2)
     full_image = Image.new("RGB", (max(1, cols * cell_w), max(1, rows * cell_h)), (18, 23, 31))
     draw = ImageDraw.Draw(full_image)
     border = (38, 124, 137)
@@ -565,11 +586,13 @@ def _scanner_generate_tiled_layout(state, renderer):
         for col in range(cols):
             cell_index = row * cols + col
             cell_img = per_cell_images[cell_index]
-            x0 = col * cell_w
-            y0 = row * cell_h
+            x0, y0 = _cell_origin(cell_img, col, row)
             full_image.paste(cell_img, (x0, y0))
+            # Border follows the cell slot, not the pasted image, so the grid
+            # reads as a regular grid even if one cell had to fall back.
             draw.rectangle(
-                [x0, y0, x0 + cell_img.size[0] - 1, y0 + cell_img.size[1] - 1],
+                [col * cell_w, row * cell_h,
+                 col * cell_w + cell_w - 1, row * cell_h + cell_h - 1],
                 outline=border,
                 width=1,
             )

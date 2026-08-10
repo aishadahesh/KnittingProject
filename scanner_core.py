@@ -351,7 +351,7 @@ def _puzzle_period_pixel_vectors(state, renderer):
     }
 
 
-def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None):
+def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, periods=None):
     """Extracts one exact repeat-period tile from the live render and glues `cols` x
     `rows` copies of it edge-to-edge. Because the tile size equals the true geometric
     repeat period in pixels, adjacent copies connect without search-based alignment.
@@ -365,7 +365,11 @@ def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None):
     if vp_w < 2 or vp_h < 2 or getattr(renderer, "color_tex", None) is None:
         return None, None, {}
 
-    periods = _puzzle_period_pixel_vectors(state, renderer)
+    # `periods` may be supplied so a batch of renders all use one repeat
+    # period and therefore come out the same pixel size; otherwise it is
+    # measured from the geometry currently in `state`.
+    if periods is None:
+        periods = _puzzle_period_pixel_vectors(state, renderer)
     if periods is None:
         return None, None, {}
 
@@ -453,7 +457,106 @@ def _scan_restore_state(state, snap):
     state.camera.fov_deg = cam['fov_deg']
 
 
-def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480, camera_az_deg=0.0, camera_el_deg=0.0, zoom=1.0):
+def _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom):
+    """Fits the camera to the geometry currently uploaded to `renderer` and
+    returns the framing as a dict of target_h / camera_dist / crop_rect.
+
+    Assumes the mesh has already been rebuilt. crop_rect is normalised against
+    (target_w, target_h), so reusing a frame across renders keeps their output
+    identical in size.
+    """
+    mesh_verts = [
+        np.asarray(v, dtype=np.float32)
+        for v, _row_idx in getattr(renderer, "mesh_pick_data", [])
+        if len(v)
+    ]
+    if not mesh_verts:
+        return None
+
+    state.camera.az = float(np.radians(camera_az_deg))
+    state.camera.el = float(np.radians(camera_el_deg))
+    all_v = np.vstack(mesh_verts)
+    bounds_min = all_v.min(axis=0)
+    bounds_max = all_v.max(axis=0)
+    half_w = max(float(bounds_max[0] - bounds_min[0]) * 0.5 * 1.15, 1e-3)
+    half_h = max(float(bounds_max[1] - bounds_min[1]) * 0.5 * 1.15, 1e-3)
+
+    target_h = max(240, min(960, int(round(target_w * (half_h / max(half_w, 1e-6))))))
+    aspect = float(target_w) / float(target_h)
+    half_fov = np.radians(max(1.0, float(state.camera.fov_deg)) * 0.5)
+    tan_half_fov = max(np.tan(half_fov), 1e-6)
+    dist_for_h = half_h / tan_half_fov
+    dist_for_w = half_w / (tan_half_fov * aspect)
+    camera_dist = max(dist_for_h, dist_for_w, 1e-3) / max(0.1, float(zoom))
+    state.camera.dist = camera_dist
+
+    # Crop so no unnecessary background is visible: the anchor comes from the
+    # actual projected content bounding box rather than a hand-tuned fraction,
+    # since there is no user available to tune one here.
+    crop_rect = None
+    model_mat = state.current_model_matrix()
+    mvp = (state.camera.mvp(target_w, target_h) @ model_mat).astype(np.float32)
+    tiled_points = _puzzle_tiled_control_points(state)
+    if tiled_points:
+        all_proj = np.vstack([
+            _puzzle_project_points(verts, mvp, target_w, target_h)
+            for verts, _row_idx in tiled_points
+        ])
+        x_min, y_min = all_proj.min(axis=0)
+        x_max, y_max = all_proj.max(axis=0)
+        margin_x = (x_max - x_min) * 0.04
+        margin_y = (y_max - y_min) * 0.04
+        rx = float(np.clip((x_min - margin_x) / target_w, 0.0, 0.95))
+        ry = float(np.clip((y_min - margin_y) / target_h, 0.0, 0.95))
+        rw = float(np.clip((x_max + margin_x) / target_w - rx, 0.05, 1.0 - rx))
+        rh = float(np.clip((y_max + margin_y) / target_h - ry, 0.05, 1.0 - ry))
+        crop_rect = [rx, ry, rw, rh]
+
+    return {'target_h': target_h, 'camera_dist': camera_dist, 'crop_rect': crop_rect}
+
+
+def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, camera_az_deg=0.0, camera_el_deg=0.0, zoom=1.0):
+    """Measures one framing for a whole grid of scan patterns.
+
+    Uses an all-loops-active pattern of the given shape, so the frame describes
+    the full fabric square rather than whichever loops a particular random
+    bitmap happened to switch on. Feed the result to every cell's
+    _scan_render_tiled_pattern_image call to get a uniform grid.
+    """
+    rows, cols = (int(v) for v in bitmap_shape)
+    full_bitmap = np.ones((max(1, rows), max(1, cols)), dtype=np.float32)
+    snap = _scan_snapshot_state(state)
+    prev_renderer = state.renderer
+    state.renderer = renderer
+    try:
+        state.params = state._scanner_template_params()
+        state.bitmap = full_bitmap
+        state.bitmap_size = np.array(full_bitmap.shape, dtype=np.int32)
+        state.loop_heights = state._scanner_loop_heights_for_bitmap(full_bitmap)
+        state.display_copies = np.array([1, 1], dtype=np.int32)
+        state.scanner_preview_grid_enabled = False
+        state.rebuild_spline_from_params()
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+        frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
+        if frame is None:
+            return None
+        # The tile's pixel size is the repeat period, and that is measured from
+        # the mesh bounds -- which also shrink when loops are switched off. So
+        # the period has to be measured here too, on the fully active pattern,
+        # or cells would still come out at different sizes despite sharing a
+        # crop. Needs the viewport at its final size first.
+        renderer.resize(target_w, int(frame['target_h']))
+        frame['periods'] = _puzzle_period_pixel_vectors(state, renderer)
+        return frame
+    except Exception:
+        return None
+    finally:
+        state.renderer = prev_renderer
+        _scan_restore_state(state, snap)
+        state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480, camera_az_deg=0.0, camera_el_deg=0.0, zoom=1.0, frame=None):
     """Renders one Scan Mode pattern with the real 3D pipeline and tiles it using
     Puzzle Mode's exact-period capture/glue logic -- automated per pattern, with no
     Puzzle Mode UI shown. Temporarily takes over the shared live model/camera/renderer
@@ -471,7 +574,16 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
     that vary az per capture should keep az modest and/or accept a mild
     seam between internal repeat copies as a worthwhile trade for genuinely
     different per-angle shading. `zoom` scales the auto-fit camera distance
-    (>1 = closer/more zoomed in)."""
+    (>1 = closer/more zoomed in).
+
+    `frame` overrides the automatic framing with one measured elsewhere. Auto-
+    framing sizes the image from the geometry actually present, and a scan
+    pattern's random bitmap switches loops off, which physically shortens the
+    fabric -- so cells with fewer active loops came out shorter than their
+    neighbours and the grid composite went ragged. Passing a shared frame (see
+    _scan_measure_pattern_frame) makes every cell the same pixel size, which is
+    also the physically honest reading: every scanned square is the same piece
+    of fabric, just with a different pattern printed on it."""
     snap = _scan_snapshot_state(state)
     # state.rebuild_spline_mesh() always uploads the mesh to `state.renderer`,
     # so the renderer we draw with has to *be* state.renderer for the duration.
@@ -497,31 +609,22 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         state.rebuild_spline_from_params()
         state.rebuild_spline_mesh(preserve_model_placement=False)
 
-        mesh_verts = [
-            np.asarray(v, dtype=np.float32)
-            for v, _row_idx in getattr(renderer, "mesh_pick_data", [])
-            if len(v)
-        ]
-        if not mesh_verts:
-            # Nothing was uploaded to draw: rendering anyway would hand back a
-            # flat clear-color frame that looks like a real (but black) capture.
-            # Report failure instead so callers use their fallback imagery.
-            return None
-        state.camera.az = float(np.radians(camera_az_deg))
-        state.camera.el = float(np.radians(camera_el_deg))
-        all_v = np.vstack(mesh_verts)
-        bounds_min = all_v.min(axis=0)
-        bounds_max = all_v.max(axis=0)
-        half_w = max(float(bounds_max[0] - bounds_min[0]) * 0.5 * 1.15, 1e-3)
-        half_h = max(float(bounds_max[1] - bounds_min[1]) * 0.5 * 1.15, 1e-3)
-
-        target_h = max(240, min(960, int(round(target_w * (half_h / max(half_w, 1e-6))))))
-        aspect = float(target_w) / float(target_h)
-        half_fov = np.radians(max(1.0, float(state.camera.fov_deg)) * 0.5)
-        tan_half_fov = max(np.tan(half_fov), 1e-6)
-        dist_for_h = half_h / tan_half_fov
-        dist_for_w = half_w / (tan_half_fov * aspect)
-        state.camera.dist = max(dist_for_h, dist_for_w, 1e-3) / max(0.1, float(zoom))
+        if frame is None:
+            frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
+            if frame is None:
+                # Nothing was uploaded to draw: rendering anyway would hand back
+                # a flat clear-color frame that looks like a real (but black)
+                # capture. Report failure so callers use their fallback imagery.
+                return None
+        else:
+            # A shared frame still needs the camera pointed the same way it was
+            # when the frame was measured, or the crop would not line up.
+            state.camera.az = float(np.radians(camera_az_deg))
+            state.camera.el = float(np.radians(camera_el_deg))
+            state.camera.dist = float(frame['camera_dist'])
+        target_h = int(frame['target_h'])
+        crop_rect = frame.get('crop_rect')
+        shared_periods = frame.get('periods')
 
         renderer.resize(target_w, target_h)
         model_mat = state.current_model_matrix()
@@ -530,28 +633,9 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         material_uniforms = _scanner_material_uniforms(state)
         renderer.render(mvp, mv, material_uniforms)
 
-        # Zoom/crop so no unnecessary background is visible: derive the crop
-        # anchor from the actual projected content bounding box, instead of a
-        # manually-tuned fraction (there is no user available to tune one here).
-        crop_rect = None
-        tiled_points = _puzzle_tiled_control_points(state)
-        if tiled_points:
-            all_proj = []
-            for verts, _row_idx in tiled_points:
-                all_proj.append(_puzzle_project_points(verts, mvp, target_w, target_h))
-            all_proj = np.vstack(all_proj)
-            x_min, y_min = all_proj.min(axis=0)
-            x_max, y_max = all_proj.max(axis=0)
-            margin_x = (x_max - x_min) * 0.04
-            margin_y = (y_max - y_min) * 0.04
-            rx = float(np.clip((x_min - margin_x) / target_w, 0.0, 0.95))
-            ry = float(np.clip((y_min - margin_y) / target_h, 0.0, 0.95))
-            rw = float(np.clip((x_max + margin_x) / target_w - rx, 0.05, 1.0 - rx))
-            rh = float(np.clip((y_max + margin_y) / target_h - ry, 0.05, 1.0 - ry))
-            crop_rect = [rx, ry, rw, rh]
-
         _tile, canvas, _info = _puzzle_build_seamless_tile(
             state, renderer, repeat_cols, repeat_rows, crop_rect=crop_rect,
+            periods=shared_periods,
         )
         if not _tile_is_usable(canvas, target_w):
             # The exact-period crop only works while the fabric is seen close to
