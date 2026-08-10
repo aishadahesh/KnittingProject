@@ -810,16 +810,30 @@ class AppState:
     def flat_pts_all(self):
         if not self.ctrl_rows:
             return np.empty((0, 3), dtype=np.float32)
-        virtual_pts = np.array([row[0] + self.period_offset_x for row in self.ctrl_rows], dtype=np.float32)
-        return np.concatenate((self.flat_pts, virtual_pts), axis=0)
+        # Layout: [ real control points | one X-period handle per row |
+        #           one Y-period handle per row ]. The virtual handles are not
+        #           part of the model; dragging one edits the period vector.
+        virtual_pts_x = np.array([row[0] + self.period_offset_x for row in self.ctrl_rows], dtype=np.float32)
+        virtual_pts_y = np.array([row[0] + self.period_offset_y for row in self.ctrl_rows], dtype=np.float32)
+        return np.concatenate((self.flat_pts, virtual_pts_x, virtual_pts_y), axis=0)
 
     def move_ctrl_pt(self, flat_idx, pos):
         n_real = len(self.flat_pts)
         if flat_idx >= n_real:
-            row_idx = flat_idx - n_real
-            if 0 <= row_idx < len(self.ctrl_rows):
+            n_rows = len(self.ctrl_rows)
+            virtual_idx = flat_idx - n_real
+            row_idx = virtual_idx % n_rows if n_rows else 0
+            if not (0 <= row_idx < n_rows):
+                return
+            if virtual_idx < n_rows:
                 self.period_offset_x = pos - self.ctrl_rows[row_idx][0]
                 self.rebuild_spline_mesh()
+            else:
+                # Y period feeds only the simulation's periodic collision
+                # topology, so the drawn mesh does not change.
+                self.period_offset_y = pos - self.ctrl_rows[row_idx][0]
+            with self.sim_lock:
+                self.sim_needs_jacobian_rebuild = True
         else:
             r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
             if 0 <= r < len(self.ctrl_rows):

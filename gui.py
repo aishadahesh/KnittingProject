@@ -26,6 +26,10 @@ from PIL import Image, ImageDraw
 
 from rendering import draw_fitted_texture, pil_to_texture, transform_points
 
+# Per-step solver displacements are tiny next to the model, so the force overlay
+# exaggerates them to stay visible. Display only -- never fed back into state.
+FORCE_ARROW_SCALE = 5.0
+
 # Split out of this file; imported under their original names so call sites
 # elsewhere in gui.py stay unchanged.
 from scanner_core import (
@@ -677,6 +681,88 @@ def draw_workflow_header(state):
     imgui.separator()
 
 
+def _mark_sim_geometry_dirty(state):
+    """Invalidate the solver's cached Jacobian after the UI moves geometry.
+
+    Taken under sim_lock so the flag cannot be set in the middle of a step's
+    write-back, which would let a solve computed against the old layout land on
+    top of the new one."""
+    with state.sim_lock:
+        state.sim_needs_jacobian_rebuild = True
+
+
+def _draw_yarn_simulation_panel(state):
+    """Edit-Mode yarn simulation controls. The solver itself runs on the
+    background thread started in app.py; this only reads and writes state."""
+    sim_allowed = str(state.get('app_mode', 'edit')) == 'edit'
+    if not sim_allowed:
+        imgui.text_disabled("Available in Edit Mode only.")
+        return
+
+    changed_active, active = imgui.checkbox("Run simulation##run_sim", bool(state.sim_active))
+    if changed_active:
+        if active:
+            # Treat the shape at switch-on as the relaxed state, so stretch is
+            # measured against what the user is looking at.
+            state._refresh_sim_rest_lengths()
+            _mark_sim_geometry_dirty(state)
+        state.sim_active = bool(active)
+
+    changed_ks, val_ks = imgui.slider_float("Stretch stiffness##sim_ks", float(state.sim_k_s), 0.0, 5000.0, "%.1f")
+    if changed_ks:
+        state.sim_k_s = float(val_ks)
+    changed_kb, val_kb = imgui.slider_float("Bending stiffness##sim_kb", float(state.sim_k_b), 0.0, 500.0, "%.1f")
+    if changed_kb:
+        state.sim_k_b = float(val_kb)
+    changed_kc, val_kc = imgui.slider_float("Collision stiffness##sim_kc", float(state.sim_k_c), 0.0, 100.0, "%.1f")
+    if changed_kc:
+        state.sim_k_c = float(val_kc)
+    changed_dhat, val_dhat = imgui.slider_float("Yarn thickness##sim_dhat", float(state.sim_dhat), 0.005, 1.0, "%.3f")
+    if changed_dhat:
+        state.sim_dhat = float(val_dhat)
+
+    if imgui.small_button("Reset to rest state##sim_reset"):
+        state.push_undo("Simulation reset")
+        state.sim_active = False
+        state.rebuild_spline_from_params()
+    imgui.same_line()
+    if imgui.small_button("Verify derivatives##sim_fd"):
+        # Uses the same implementation the solver runs, not knitting_core's
+        # older copy, so the check reflects what is actually being solved.
+        from yarn_simulation import check_gradients_and_hessians_fd
+        with state.sim_lock:
+            if state.sim_needs_jacobian_rebuild:
+                state.rebuild_cached_jacobian()
+            if state.J_cached is None:
+                state.status_msg = "Nothing to verify: no control rows."
+            else:
+                res = check_gradients_and_hessians_fd(
+                    state.ctrl_rows, state.period_offset_x, state.period_offset_y,
+                    state.config, state.J_cached,
+                    state.sim_k_s, state.sim_k_b, state.sim_k_c, state.sim_dhat,
+                )
+                state.status_msg = str(res).replace("\n", " | ")
+
+    imgui.separator()
+    imgui.text("Energy")
+    with state.sim_lock:
+        e_el, e_b, e_col = float(state.sim_e_el), float(state.sim_e_b), float(state.sim_e_col)
+        delta_P = state.sim_delta_P
+    imgui.text(f"Stretch:   {e_el:.6e}")
+    imgui.text(f"Bending:   {e_b:.6e}")
+    imgui.text(f"Collision: {e_col:.6e}")
+    imgui.text(f"Total:     {e_el + e_b + e_col:.6e}")
+    if delta_P is not None and len(delta_P):
+        imgui.text(f"Max force: {float(np.max(np.linalg.norm(delta_P, axis=1))):.6e}")
+    else:
+        imgui.text("Max force: n/a")
+
+    imgui.separator()
+    changed_forces, val_forces = imgui.checkbox("Visualize forces##sim_forces", bool(state.sim_show_forces))
+    if changed_forces:
+        state.sim_show_forces = bool(val_forces)
+
+
 def _set_app_mode(state, mode):
     mode = mode if mode in ('edit', 'scan', 'puzzle', 'database') else 'edit'
     if str(state.get('app_mode', 'edit')) == mode:
@@ -1166,6 +1252,45 @@ def draw_sidebar(state, renderer, window=None):
             if imgui.small_button("Center model##display_center"):
                 state.push_undo("Center model")
                 state.center_model_on_view()
+
+        if imgui.collapsing_header("Tiling Period"):
+            imgui.text_disabled("Vectors a tiled copy is offset by. X drives the")
+            imgui.text_disabled("spline period; Y is used by the yarn simulation.")
+            changed_px = False
+            px = np.asarray(state.period_offset_x, dtype=np.float32).copy()
+            for axis, label in enumerate(("Period X.x", "Period X.y", "Period X.z")):
+                ch, val = imgui.slider_float(f"{label}##period_x_{axis}", float(px[axis]), -10.0, 10.0, "%.2f")
+                if ch:
+                    px[axis] = float(val)
+                    changed_px = True
+            if changed_px:
+                state.push_undo("Period X")
+                state.period_offset_x = px
+                _mark_sim_geometry_dirty(state)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+
+            changed_py = False
+            py = np.asarray(state.period_offset_y, dtype=np.float32).copy()
+            for axis, label in enumerate(("Period Y.x", "Period Y.y", "Period Y.z")):
+                ch, val = imgui.slider_float(f"{label}##period_y_{axis}", float(py[axis]), -10.0, 10.0, "%.2f")
+                if ch:
+                    py[axis] = float(val)
+                    changed_py = True
+            if changed_py:
+                state.push_undo("Period Y")
+                state.period_offset_y = py
+                # Y only feeds the simulation's periodic collision topology, so
+                # this needs no mesh rebuild -- just a fresh Jacobian.
+                _mark_sim_geometry_dirty(state)
+            if imgui.small_button("Re-derive from model##period_resync"):
+                state.push_undo("Period resync")
+                state.sync_period_offset_to_model_width()
+                state.sync_period_offset_y_to_row_count()
+                _mark_sim_geometry_dirty(state)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+
+        if imgui.collapsing_header("Yarn Simulation"):
+            _draw_yarn_simulation_panel(state)
 
         if imgui.collapsing_header("Lighting", imgui.TreeNodeFlags_.default_open):
             changed_light, new_light = imgui.color_edit3(
@@ -2229,6 +2354,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     visible_ctrl_index_map = {}
     if state.mode == 'spline' and edit_controls_active:
         n_real_total = len(state.flat_pts)
+        n_rows_total = len(state.ctrl_rows)
         real_chunks = []
         virtual_indices = []
         for row_idx, row in enumerate(state.ctrl_rows):
@@ -2237,7 +2363,10 @@ def draw_viewport(state, renderer, ref_tex, window):
             start = state._row_starts[row_idx]
             end = start + len(row)
             real_chunks.append(np.arange(start, end, dtype=np.int32))
+            # Two period handles per row, matching AppState.flat_pts_all's
+            # [real | X handles | Y handles] layout.
             virtual_indices.append(n_real_total + row_idx)
+            virtual_indices.append(n_real_total + n_rows_total + row_idx)
         if real_chunks:
             visible_ctrl_indices = np.concatenate(real_chunks + [np.array(virtual_indices, dtype=np.int32)])
             visible_ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
@@ -2655,6 +2784,48 @@ def draw_viewport(state, renderer, ref_tex, window):
             state.rebuild_spline_mesh()
         elif state.gizmo_edit_active and not imguizmo.im_guizmo.is_using():
             state.gizmo_edit_active = False
+
+    # Simulation force vectors: per-control-point displacement from the last
+    # solver step, drawn in model space so they track the model's transform.
+    if (
+        edit_controls_active
+        and bool(state.get('sim_show_forces', False))
+        and len(visible_ctrl_indices) > 0
+    ):
+        with state.sim_lock:
+            delta_P = state.sim_delta_P
+            delta_P = None if delta_P is None else np.asarray(delta_P, dtype=np.float32).copy()
+        if delta_P is not None and len(delta_P) > 0:
+            dl = imgui.get_window_draw_list()
+            view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+            force_color = imgui.get_color_u32((1.0, 0.2, 0.2, 1.0))
+            # Read the viewport origin here rather than reusing ox/oy from the
+            # bounding-box block above: that block only runs when gizmo_bounds
+            # exists, so those names are not always bound at this point.
+            origin_x, origin_y = float(state.vp_origin[0]), float(state.vp_origin[1])
+
+            def project_to_screen(pt_world):
+                h = np.array([pt_world[0], pt_world[1], pt_world[2], 1.0], dtype=np.float32) @ view_proj.T
+                if h[3] < 1e-6:
+                    return None
+                ndc = h[:3] / h[3]
+                return (
+                    origin_x + (float(ndc[0]) * 0.5 + 0.5) * disp_w,
+                    origin_y + (1.0 - (float(ndc[1]) * 0.5 + 0.5)) * disp_h,
+                )
+
+            for idx in visible_ctrl_indices:
+                idx = int(idx)
+                # Virtual (period) control points have no simulated counterpart.
+                if idx >= len(delta_P):
+                    continue
+                p0_local = state.flat_pts_all[idx].astype(np.float32)
+                p1_local = p0_local + delta_P[idx] * FORCE_ARROW_SCALE
+                p0 = project_to_screen(transform_points([p0_local], model_mat)[0])
+                p1 = project_to_screen(transform_points([p1_local], model_mat)[0])
+                if p0 and p1:
+                    dl.add_line(p0, p1, force_color, 2.0)
+                    dl.add_circle_filled(p1, 3.0, force_color)
 
     # Mouse interaction inside the viewport
     alignment_locked = bool(state.show_ref_bg and state.ref_bg_lock_zoom)
