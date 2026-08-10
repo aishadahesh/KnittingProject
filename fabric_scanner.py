@@ -1341,7 +1341,7 @@ def _apply_scanner_lighting(texture: Image.Image, view_name: str, focused: bool,
     return Image.fromarray(out, "RGB")
 
 
-def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool, view_name: str) -> Image.Image | None:
+def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool, view_name: str, camera_zoom: float = 1.0) -> Image.Image | None:
     repeat_rows = max(1, int(plan.pattern_repeat_rows))
     repeat_cols = max(1, int(plan.pattern_repeat_cols))
     spacing_x = float(np.clip(float(getattr(plan, "pattern_repeat_spacing_x", 1.0)), 0.55, 1.45))
@@ -1350,6 +1350,7 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
     lighting_key = tuple((key, round(float(lighting[key]), 4)) for key in sorted(lighting))
     batch_w = int(np.clip(int(getattr(plan, "batch_texture_width", 420)), 160, 2048))
     batch_h = int(np.clip(int(getattr(plan, "batch_texture_height", 340)), 120, 1660))
+    camera_zoom = float(np.clip(float(camera_zoom), 0.2, 8.0))
     cache_key = (
         "lit",
         "cell" if focused else "full",
@@ -1364,6 +1365,7 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
         batch_w,
         batch_h,
         lighting_key,
+        round(camera_zoom, 3),
     )
     cache = getattr(plan, "_rendered_texture_cache", None)
     if cache is None:
@@ -1371,24 +1373,34 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
         setattr(plan, "_rendered_texture_cache", cache)
     if cache_key not in cache:
         if focused:
-            # Real per-pattern tiles (duplicated real model -> exact-period
-            # capture/glue, the Puzzle Mode workflow automated in gui.py) take
-            # priority when available -- they are already tiled by the repeat
-            # sliders and already lit by the real 3D shader, so no further
-            # tiling or 2D lighting post-process is applied. Falls back to the
-            # 2D curve-drawing path when no live GL renderer produced these
-            # (e.g. standalone/CLI use of this module).
-            scan_tiles = getattr(plan, "scan_tiled_pattern_images", None)
-            tile_idx = row * plan.grid_cols + col
-            if scan_tiles and 0 <= tile_idx < len(scan_tiles):
-                cache[cache_key] = scan_tiles[tile_idx]
+            # A fresh, angle-specific real render (real 3D model duplicated,
+            # captured, and exact-period tiled -- the Puzzle Mode workflow
+            # automated in gui.py) takes priority when a live renderer is
+            # available: rendered once per (row, col, angle, zoom) and cached
+            # here exactly like every other case, so live preview during
+            # robot travel doesn't re-render every frame, but a genuinely new
+            # angle does. This replaces reusing one static front-on render
+            # for every angle, which is why different angles used to produce
+            # near-identical average colors (same pixels, only the 2D
+            # projection quad differed). Falls back to the 2D curve-drawing
+            # path when no live renderer is attached (e.g. standalone/CLI use
+            # of this module, which has no GL context to render with).
+            render_fn = getattr(plan, "scan_render_capture_fn", None)
+            fresh = render_fn(row, col, _view_angle_degrees(view_name), camera_zoom) if render_fn is not None else None
+            if fresh is not None:
+                cache[cache_key] = fresh
             else:
-                # Focused scanner captures use the requested workflow:
-                # render one selected pattern unit, apply lighting to that unit,
-                # then duplicate the lit image by the repeat sliders.
-                cell_texture = _render_cell_pattern_texture(plan, row, col, batch_w, batch_h)
-                lit_cell = _apply_scanner_lighting(cell_texture, view_name, focused, lighting)
-                cache[cache_key] = _tile_rendered_texture(lit_cell, repeat_rows, repeat_cols, spacing_x, spacing_y)
+                scan_tiles = getattr(plan, "scan_tiled_pattern_images", None)
+                tile_idx = row * plan.grid_cols + col
+                if scan_tiles and 0 <= tile_idx < len(scan_tiles):
+                    cache[cache_key] = scan_tiles[tile_idx]
+                else:
+                    # Focused scanner captures use the requested workflow:
+                    # render one selected pattern unit, apply lighting to that unit,
+                    # then duplicate the lit image by the repeat sliders.
+                    cell_texture = _render_cell_pattern_texture(plan, row, col, batch_w, batch_h)
+                    lit_cell = _apply_scanner_lighting(cell_texture, view_name, focused, lighting)
+                    cache[cache_key] = _tile_rendered_texture(lit_cell, repeat_rows, repeat_cols, spacing_x, spacing_y)
         else:
             texture = _rendered_texture_for_camera(plan, row, col, focused)
             if texture is None:
@@ -1542,6 +1554,64 @@ def draw_scene(
 # Scanning Section: Robot Camera Capture
 # ============================================================================
 
+def _detect_knitting_patch(full_image: Image.Image) -> tuple[tuple[int, int, int, int], float]:
+    """Dynamically locates the knitting patch within a captured image instead
+    of assuming it always sits in the same predefined region: estimates the
+    background from the image border, masks pixels that differ from it and
+    look yarn-like (bright + saturated), then takes the largest connected
+    component's bounding box.
+
+    Returns ((x0, y0, x1, y1), confidence). confidence in [0, 1] is
+    fill_ratio * size_ratio: fill_ratio is how much of the bounding box the
+    detected blob actually fills (near 1.0 for a clean solid rectangular
+    patch, lower for a scattered/noisy detection), size_ratio penalizes
+    implausibly tiny detections relative to the frame. A low score flags an
+    unreliable detection for review rather than silently trusting a bad crop.
+    """
+    rgb = np.asarray(full_image.convert("RGB"), dtype=np.float32)
+    h, w = rgb.shape[:2]
+    if h < 8 or w < 8:
+        return (0, 0, w, h), 0.0
+
+    edge = np.concatenate([
+        rgb[:8, :, :].reshape(-1, 3),
+        rgb[-8:, :, :].reshape(-1, 3),
+        rgb[:, :8, :].reshape(-1, 3),
+        rgb[:, -8:, :].reshape(-1, 3),
+    ])
+    bg = np.median(edge, axis=0)
+    diff = np.linalg.norm(rgb - bg[None, None, :], axis=2)
+    brightness = rgb.max(axis=2)
+    saturation = rgb.max(axis=2) - rgb.min(axis=2)
+    mask = (diff > 30.0) & (brightness > 42.0) & (saturation > 16.0)
+    if int(mask.sum()) < 32:
+        mask = (diff > 18.0) & (brightness > 26.0) & (saturation > 8.0)
+    if int(mask.sum()) < 1:
+        return (0, 0, w, h), 0.0
+
+    blob = mask
+    try:
+        from scipy import ndimage
+        labeled, num_labels = ndimage.label(mask)
+        if num_labels >= 1:
+            sizes = ndimage.sum(mask, labeled, index=range(1, num_labels + 1))
+            largest_label = int(np.argmax(sizes)) + 1
+            blob = labeled == largest_label
+    except Exception:
+        pass
+
+    ys, xs = np.where(blob)
+    if xs.size < 1:
+        return (0, 0, w, h), 0.0
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    bbox_area = max(1, (x1 - x0) * (y1 - y0))
+    fill_ratio = float(blob[y0:y1, x0:x1].sum()) / float(bbox_area)
+    size_ratio = min(1.0, bbox_area / max(1.0, 0.15 * h * w))
+    confidence = float(np.clip(fill_ratio * size_ratio, 0.0, 1.0))
+    return (x0, y0, x1, y1), confidence
+
+
 def render_camera_image(
     plan: FabricPlan,
     tcp_pos: np.ndarray,
@@ -1552,7 +1622,8 @@ def render_camera_image(
     capture_mode: str = CAMERA_CAPTURE_NATURAL,
     camera_zoom: float = 1.0,
     image_size: tuple[int, int] | None = None,
-) -> Image.Image:
+    detect_patch: bool = False,
+) -> Image.Image | dict:
     if image_size is None:
         width_px, height_px = CAMERA_IMAGE_SIZE
     else:
@@ -1689,6 +1760,7 @@ def render_camera_image(
         active_col,
         focused_capture,
         view_name,
+        camera_zoom=camera_zoom,
     )
     if rendered_texture is not None:
         if focused_capture:
@@ -1773,7 +1845,49 @@ def render_camera_image(
         fill=(210, 230, 255),
     )
 
-    return img
+    if not detect_patch:
+        return img
+
+    # Detect the patch from the full image itself (not a fixed assumed
+    # region), independently for this specific position/angle/zoom capture.
+    (x0, y0, x1, y1), confidence = _detect_knitting_patch(img)
+    pad_x = max(2, int(round((x1 - x0) * 0.03)))
+    pad_y = max(2, int(round((y1 - y0) * 0.03)))
+    crop_box = (
+        max(0, x0 - pad_x), max(0, y0 - pad_y),
+        min(width_px, x1 + pad_x), min(height_px, y1 + pad_y),
+    )
+    patch_image = img.crop(crop_box)
+
+    # Debug visualization goes on a *separate* copy -- never on the images
+    # used for analysis. Magenta is deliberately distinct from the green
+    # debug outline that used to be (mistakenly) baked into saved images.
+    debug_image = img.copy()
+    debug_draw = ImageDraw.Draw(debug_image)
+    debug_color = (255, 40, 200)
+    debug_draw.rectangle([x0, y0, max(x0, x1 - 1), max(y0, y1 - 1)], outline=debug_color, width=3)
+    debug_draw.text((x0 + 4, max(0, y0 - 16)), f"confidence {confidence:.2f}", fill=debug_color)
+
+    return {
+        "full_image": img,
+        "patch_image": patch_image,
+        "debug_image": debug_image,
+        "detection": {
+            "bbox": [int(x0), int(y0), int(x1), int(y1)],
+            "crop_box": [int(v) for v in crop_box],
+            "confidence": float(confidence),
+            "zoom": float(camera_zoom),
+            "angle_deg": float(_view_angle_degrees(view_name)),
+            "camera_pose": {
+                "lens_pos": [float(v) for v in lens_pos],
+                "forward": [float(v) for v in forward],
+                "right": [float(v) for v in right],
+                "up": [float(v) for v in up],
+                "fov_y_deg": float(math.degrees(fov_y)),
+                "standoff": float(camera_standoff),
+            },
+        },
+    }
 
 
 # ============================================================================

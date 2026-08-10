@@ -434,6 +434,15 @@ class ScannerStorage:
                 "estimated_color": estimate_cell.get("rgb"),
                 "capture_settings": settings,
                 "created_at": str(row[12]),
+                # Dynamic per-capture patch detection metadata (may be absent
+                # on captures made before this was tracked).
+                "patch_bbox": record.get("patch_bbox"),
+                "patch_confidence": record.get("patch_confidence"),
+                "camera_zoom_level": record.get("camera_zoom_level"),
+                "camera_angle_deg": record.get("camera_angle_deg"),
+                "camera_pose": record.get("camera_pose"),
+                "patch_image_path": record.get("patch_image_path"),
+                "debug_image_path": record.get("debug_image_path"),
             }
             captures.append(capture)
 

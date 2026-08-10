@@ -15,7 +15,7 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 from PIL import Image, ImageDraw
 
-from rendering import draw_fitted_texture, pil_to_texture, transform_points
+from rendering import draw_fitted_texture, pil_to_texture, transform_points, MeshRenderer
 from knitting_core import build_parametric_control_rows, build_spline_mesh
 
 # %% FILE PICKER HELPERS ───────────────────────────────────────────────────────
@@ -675,6 +675,11 @@ def _draw_database_image_card(state, renderer, item, *, card_w=192, card_h=246):
     imgui.text_disabled(f"{item.get('batch_id', '')}  |  angle {item.get('camera_angle', '')}")
     imgui.text_disabled(str(item.get("lighting_mode", "")))
     imgui.text_disabled(f"Run: {item.get('scan_run', '')}")
+    confidence = item.get("patch_confidence")
+    if confidence is not None:
+        conf = float(confidence)
+        conf_color = (0.35, 0.85, 0.45, 1.0) if conf >= 0.6 else ((0.90, 0.70, 0.20, 1.0) if conf >= 0.3 else (0.90, 0.35, 0.30, 1.0))
+        imgui.text_colored(conf_color, f"Patch confidence: {conf:.2f}")
 
     if missing:
         imgui.text_disabled("Removed from disk since last scan.")
@@ -801,7 +806,22 @@ def _draw_database_image_preview(state, renderer, item):
     if missing:
         imgui.text_colored((0.90, 0.45, 0.40, 1.0), "This image file is missing from disk (it was likely deleted after the scan).")
     else:
-        texture = _database_image_texture(state, renderer, item.get("image_path"), max_side=1400)
+        view_options = [("Full image", "image_path")]
+        if item.get("patch_image_path"):
+            view_options.append(("Detected patch", "patch_image_path"))
+        if item.get("debug_image_path"):
+            view_options.append(("Debug (patch boundary)", "debug_image_path"))
+        view_labels = [label for label, _key in view_options]
+        current_view = str(state.get("database_image_source", "image_path"))
+        current_view_idx = next((i for i, (_l, k) in enumerate(view_options) if k == current_view), 0)
+        if len(view_options) > 1:
+            imgui.set_next_item_width(220)
+            changed_view, new_view_idx = imgui.combo("##db_image_source", current_view_idx, view_labels)
+            if changed_view:
+                state.database_image_source = view_options[new_view_idx][1]
+                current_view_idx = new_view_idx
+        image_path_key = view_options[current_view_idx][1]
+        texture = _database_image_texture(state, renderer, item.get(image_path_key) or item.get("image_path"), max_side=1400)
         if texture is not None:
             tex, w, h = texture
             if imgui.small_button("Zoom out##db_zoom_out"):
@@ -863,6 +883,25 @@ def _draw_database_image_preview(state, renderer, item):
     if est and avg:
         delta = float(np.linalg.norm(np.asarray(avg[:3], dtype=np.float32) - np.asarray(est[:3], dtype=np.float32)))
         imgui.text(f"Estimated vs actual delta: {delta:.1f}")
+
+    if item.get("patch_confidence") is not None or item.get("patch_bbox"):
+        imgui.separator()
+        imgui.text("Patch detection (debugging / evaluation)")
+        confidence = item.get("patch_confidence")
+        if confidence is not None:
+            conf = float(confidence)
+            conf_color = (0.35, 0.85, 0.45, 1.0) if conf >= 0.6 else ((0.90, 0.70, 0.20, 1.0) if conf >= 0.3 else (0.90, 0.35, 0.30, 1.0))
+            imgui.text_colored(conf_color, f"Confidence: {conf:.2f}")
+        bbox = item.get("patch_bbox")
+        if bbox:
+            imgui.text(f"Detected bbox (full image px): {bbox}")
+        zoom_level = item.get("camera_zoom_level")
+        angle_deg = item.get("camera_angle_deg")
+        if zoom_level is not None or angle_deg is not None:
+            imgui.text(f"Camera zoom: {float(zoom_level or 1.0):.2f}x   Angle used: {float(angle_deg or 0.0):.1f} deg")
+        pose = item.get("camera_pose")
+        if pose:
+            imgui.text_disabled(f"Standoff: {float(pose.get('standoff', 0.0)):.3f} m   FOV: {float(pose.get('fov_y_deg', 0.0)):.1f} deg")
 
     imgui.separator()
     if imgui.tree_node("Details: file path, capture settings, raw record##db_image_details"):
@@ -1474,13 +1513,36 @@ def _scan_restore_state(state, snap):
     state.camera.fov_deg = cam['fov_deg']
 
 
-def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480):
+def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480, camera_az_deg=0.0, camera_el_deg=0.0, zoom=1.0):
     """Renders one Scan Mode pattern with the real 3D pipeline and tiles it using
     Puzzle Mode's exact-period capture/glue logic -- automated per pattern, with no
     Puzzle Mode UI shown. Temporarily takes over the shared live model/camera/renderer
     (duplicate -> auto-frame -> capture -> exact-period crop -> glue), then restores
-    everything so the user's own edited model/3D View is left exactly as it was."""
+    everything so the user's own edited model/3D View is left exactly as it was.
+
+    `camera_az_deg`/`camera_el_deg` let a caller request a genuinely different
+    viewing angle (used for per-capture-angle scan renders): rotating azimuth
+    about the world Y axis (the fabric's own row axis) reveals different yarn
+    surface facets under the scene's fixed light direction -- a real
+    diffuse-shading difference, not just a reprojection of the same pixels.
+    This does introduce some Y-tiling skew when repeat_rows > 1 (the Y-repeat
+    offset used to avoid z-fighting between duplicated rows has a small Z
+    component, which becomes a real parallax shift once az != 0) -- callers
+    that vary az per capture should keep az modest and/or accept a mild
+    seam between internal repeat copies as a worthwhile trade for genuinely
+    different per-angle shading. `zoom` scales the auto-fit camera distance
+    (>1 = closer/more zoomed in)."""
     snap = _scan_snapshot_state(state)
+    # state.rebuild_spline_mesh() always uploads the mesh to `state.renderer`,
+    # so the renderer we draw with has to *be* state.renderer for the duration.
+    # Otherwise a caller that passes its own renderer (EmbeddedMujocoScanner's
+    # dedicated _pattern_renderer) draws a scene that was never given any
+    # meshes: the render is just the clear color, and the capture comes back a
+    # flat dark frame. Binding it here (rather than forcing callers to pass the
+    # main renderer) keeps the dedicated-renderer isolation that avoids fighting
+    # the live "3D View" viewport over resize().
+    prev_renderer = state.renderer
+    state.renderer = renderer
     try:
         state.params = state._scanner_template_params()
         state.bitmap = np.asarray(bitmap, dtype=np.float32)
@@ -1495,17 +1557,23 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         state.rebuild_spline_from_params()
         state.rebuild_spline_mesh(preserve_model_placement=False)
 
-        mesh_data = getattr(renderer, "mesh_pick_data", [])
-        state.camera.az = 0.0
-        state.camera.el = 0.0
-        if mesh_data:
-            all_v = np.vstack([np.asarray(v, dtype=np.float32) for v, _ in mesh_data if len(v)])
-            bounds_min = all_v.min(axis=0)
-            bounds_max = all_v.max(axis=0)
-            half_w = max(float(bounds_max[0] - bounds_min[0]) * 0.5 * 1.15, 1e-3)
-            half_h = max(float(bounds_max[1] - bounds_min[1]) * 0.5 * 1.15, 1e-3)
-        else:
-            half_w = half_h = 1.0
+        mesh_verts = [
+            np.asarray(v, dtype=np.float32)
+            for v, _row_idx in getattr(renderer, "mesh_pick_data", [])
+            if len(v)
+        ]
+        if not mesh_verts:
+            # Nothing was uploaded to draw: rendering anyway would hand back a
+            # flat clear-color frame that looks like a real (but black) capture.
+            # Report failure instead so callers use their fallback imagery.
+            return None
+        state.camera.az = float(np.radians(camera_az_deg))
+        state.camera.el = float(np.radians(camera_el_deg))
+        all_v = np.vstack(mesh_verts)
+        bounds_min = all_v.min(axis=0)
+        bounds_max = all_v.max(axis=0)
+        half_w = max(float(bounds_max[0] - bounds_min[0]) * 0.5 * 1.15, 1e-3)
+        half_h = max(float(bounds_max[1] - bounds_min[1]) * 0.5 * 1.15, 1e-3)
 
         target_h = max(240, min(960, int(round(target_w * (half_h / max(half_w, 1e-6))))))
         aspect = float(target_w) / float(target_h)
@@ -1513,7 +1581,7 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         tan_half_fov = max(np.tan(half_fov), 1e-6)
         dist_for_h = half_h / tan_half_fov
         dist_for_w = half_w / (tan_half_fov * aspect)
-        state.camera.dist = max(dist_for_h, dist_for_w, 1e-3)
+        state.camera.dist = max(dist_for_h, dist_for_w, 1e-3) / max(0.1, float(zoom))
 
         renderer.resize(target_w, target_h)
         model_mat = state.current_model_matrix()
@@ -1547,6 +1615,9 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         )
         return canvas
     finally:
+        # Restore the real renderer first, so the rebuild below re-uploads the
+        # user's own model to the viewport renderer (and not to a temporary one).
+        state.renderer = prev_renderer
         _scan_restore_state(state, snap)
         state.rebuild_spline_mesh(preserve_model_placement=True)
 
@@ -1922,6 +1993,11 @@ class EmbeddedMujocoScanner:
         self.height = int(height)
         self.gl_ctx = gl_ctx
         self.window = window
+        # A private renderer dedicated to per-capture pattern re-renders (see
+        # _render_fresh_focused_capture), so repeatedly resizing/rendering it
+        # for scan captures never fights over renderer.resize() with the main
+        # "3D View" viewport, which is resized to that panel's size every frame.
+        self._pattern_renderer = MeshRenderer(gl_ctx, 480, 360)
         self.texture = None
         self.camera_texture = None
         self.camera_preview_width = int(scanner.CAMERA_IMAGE_SIZE[0])
@@ -1987,6 +2063,11 @@ class EmbeddedMujocoScanner:
             self.plan.rendered_fabric_image_lit = True
         if per_cell_images:
             self.plan.scan_tiled_pattern_images = [img.convert("RGB") for img in per_cell_images]
+        # A plain callable, not a gui.py import, so fabric_scanner.py can stay
+        # free of any gui.py dependency: it just calls whatever is attached
+        # here (falling back to the static per_cell_images/2D-curve paths when
+        # absent, e.g. standalone/CLI use with no live renderer).
+        self.plan.scan_render_capture_fn = self._render_fresh_focused_capture
         self.pattern_signature = _persist_scanner_state(
             state,
             patterns=_scanner_pattern_database_payload(state),
@@ -2193,7 +2274,43 @@ class EmbeddedMujocoScanner:
         lighting = self.scanner._normalize_scanner_lighting(getattr(self.plan, "scanner_lighting", None))
         return tuple((key, round(float(lighting[key]), 4)) for key in sorted(lighting))
 
-    def _render_robot_camera_image(self, tcp_pos, target_index, station_id=None, target_pose=None, image_size=None):
+    def _render_fresh_focused_capture(self, row, col, angle_deg, zoom):
+        """Renders a genuinely fresh, angle-specific view of one scan pattern's
+        stitch tile for a focused capture. Previously every angle reused one
+        static front-on render (identical pixels, only the 2D projection quad
+        differed), which is why different angles produced near-identical
+        average colors. Uses the dedicated _pattern_renderer so this never
+        disturbs the live "3D View" panel's own renderer/resize."""
+        state = self.app_state
+        cols = max(1, int(state.get("scanner_cols", 1)))
+        cell_index = int(row) * cols + int(col)
+        try:
+            bitmap = state._scanner_random_bitmap(cell_index)
+            loop_heights = state._scanner_loop_heights_for_bitmap(bitmap)
+            cell_sets = _scanner_shared_cell_color_sets(state)
+            colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else None
+            repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+
+            # Compress the full requested sweep into a modest +-45deg azimuth
+            # range: enough to reveal genuinely different yarn facets under
+            # the fixed light (fixing the "identical across angles" bug),
+            # while keeping the Y-repeat-tiling skew tradeoff (see
+            # _scan_render_tiled_pattern_image's docstring) mild rather than
+            # severe. Normalize first so e.g. "angle 300" doesn't collapse
+            # onto the same azimuth as "angle 60".
+            normalized = ((float(angle_deg) + 180.0) % 360.0) - 180.0
+            az_deg = normalized * (45.0 / 180.0)
+
+            target_w = max(160, int(round(480 * float(np.clip(zoom, 0.3, 3.0)))))
+            return _scan_render_tiled_pattern_image(
+                state, self._pattern_renderer, bitmap, loop_heights, colors,
+                repeat_cols, repeat_rows, copies=1, target_w=target_w,
+                camera_az_deg=az_deg, camera_el_deg=0.0, zoom=float(zoom),
+            )
+        except Exception:
+            return None
+
+    def _render_robot_camera_image(self, tcp_pos, target_index, station_id=None, target_pose=None, image_size=None, detect_patch=False):
         target_index = min(int(target_index), len(self.plan.poses) - 1)
         if station_id is None:
             station_id = self.plan.station_ids[target_index]
@@ -2210,6 +2327,7 @@ class EmbeddedMujocoScanner:
             capture_mode=str(getattr(self.args, "capture_mode", "natural")),
             camera_zoom=float(getattr(self.args, "camera_zoom", 1.0)),
             image_size=image_size if image_size is not None else self._active_camera_image_size(),
+            detect_patch=detect_patch,
         )
 
     def _show_robot_camera_image(self, image, *, hold_seconds=0.0):
@@ -2226,24 +2344,52 @@ class EmbeddedMujocoScanner:
         output_dir.mkdir(parents=True, exist_ok=True)
         target_pose = self.plan.poses[min(target_index, len(self.plan.poses) - 1)]
         capture_mode = str(getattr(self.args, "capture_mode", "natural"))
-        image = self._render_robot_camera_image(
+        result = self._render_robot_camera_image(
             tcp_pos,
             target_index,
             station_id=station_id,
             target_pose=target_pose,
             image_size=self._capture_image_size(),
+            detect_patch=True,
         )
+        image, patch_image, debug_image, detection = self._unpack_capture_result(result)
         self._show_robot_camera_image(image, hold_seconds=0.45)
         active_row, active_col = self.plan.station_cells[station_id]
         clean_view = self.plan.view_names[target_index].replace(" ", "_")
         clean_mode = "focused_batch" if capture_mode == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
-        path = output_dir / (
+        stem = (
             f"scan_{target_index + 1:04d}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_"
-            f"station_{station_id + 1:03d}_{clean_view}.png"
+            f"station_{station_id + 1:03d}_{clean_view}"
         )
-        self._record_capture_analysis(image, path, target_index, station_id)
+        # The full image keeps its original name/contract (existing DB records
+        # and analyses reference it); the patch and debug-boundary images are
+        # new, additional files saved alongside it.
+        path = output_dir / f"{stem}.png"
+        patch_path = output_dir / f"{stem}_patch.png" if patch_image is not None else None
+        debug_path = output_dir / f"{stem}_debug.png" if debug_image is not None else None
+        self._record_capture_analysis(
+            image, path, target_index, station_id,
+            detection=detection, patch_image=patch_image, patch_path=patch_path, debug_path=debug_path,
+        )
         self._queue_image_save(image, path)
+        if patch_image is not None:
+            self._queue_image_save(patch_image, patch_path)
+        if debug_image is not None:
+            self._queue_image_save(debug_image, debug_path)
         return path
+
+    @staticmethod
+    def _unpack_capture_result(result):
+        """render_camera_image returns a plain Image normally, or a dict with
+        full/patch/debug images + detection metadata when detect_patch=True."""
+        if isinstance(result, dict):
+            return (
+                result.get("full_image"),
+                result.get("patch_image"),
+                result.get("debug_image"),
+                result.get("detection"),
+            )
+        return result, None, None, None
 
     def _save_worker(self):
         while not self._save_stop.is_set() or not self._save_queue.empty():
@@ -2380,10 +2526,15 @@ class EmbeddedMujocoScanner:
             return finish(np.ones((h, w), dtype=bool), "full frame fallback")
         return finish(mask, "background mask")
 
-    def _record_capture_analysis(self, image, path, target_index, station_id):
+    def _record_capture_analysis(self, image, path, target_index, station_id, detection=None, patch_image=None, patch_path=None, debug_path=None):
         row, col = self.plan.station_cells[station_id]
         view_name = str(self.plan.view_names[target_index])
-        stats = self._fabric_rgb_stats(image)
+        # Prefer averaging the already-detected, already-tightly-cropped patch
+        # (dynamically located from this specific capture's full image) over
+        # re-guessing the fabric region from scratch on the wide frame -- the
+        # patch still gets its own brightness/saturation mask applied so any
+        # residual background at the crop's small padding border is excluded.
+        stats = self._fabric_rgb_stats(patch_image if patch_image is not None else image)
         avg = np.asarray(stats["rgb"], dtype=np.float32)
         record = {
             "row": int(row),
@@ -2397,6 +2548,16 @@ class EmbeddedMujocoScanner:
             "analysis_total_pixels": int(stats["total_pixels"]),
             "analysis_mask": str(stats["method"]),
         }
+        if patch_path is not None:
+            record["patch_image_path"] = str(patch_path)
+        if debug_path is not None:
+            record["debug_image_path"] = str(debug_path)
+        if detection:
+            record["patch_bbox"] = detection.get("bbox")
+            record["patch_confidence"] = detection.get("confidence")
+            record["camera_zoom_level"] = detection.get("zoom")
+            record["camera_angle_deg"] = detection.get("angle_deg")
+            record["camera_pose"] = detection.get("camera_pose")
         self.capture_records.append(record)
         try:
             storage = _scanner_storage(self.app_state)
@@ -2579,13 +2740,15 @@ class EmbeddedMujocoScanner:
         tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
         target_pose = self.plan.poses[target_index]
         self.args.camera_zoom = float(camera_zoom)
-        image = self._render_robot_camera_image(
+        result = self._render_robot_camera_image(
             tcp,
             target_index,
             station_id=station_id,
             target_pose=target_pose,
             image_size=self._single_capture_image_size(),
+            detect_patch=True,
         )
+        image, patch_image, debug_image, detection = self._unpack_capture_result(result)
         self._show_robot_camera_image(image, hold_seconds=0.0)
         output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2593,12 +2756,22 @@ class EmbeddedMujocoScanner:
         clean_view = self.plan.view_names[target_index].replace(" ", "_")
         clean_mode = "focused_batch" if str(getattr(self.args, "capture_mode", "natural")) == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = output_dir / (
+        stem = (
             f"single_capture_{stamp}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_"
-            f"station_{station_id + 1:03d}_{clean_view}.png"
+            f"station_{station_id + 1:03d}_{clean_view}"
         )
+        path = output_dir / f"{stem}.png"
+        patch_path = output_dir / f"{stem}_patch.png" if patch_image is not None else None
+        debug_path = output_dir / f"{stem}_debug.png" if debug_image is not None else None
         image.save(path)
-        self._record_capture_analysis(image, path, target_index, station_id)
+        if patch_image is not None:
+            patch_image.save(patch_path)
+        if debug_image is not None:
+            debug_image.save(debug_path)
+        self._record_capture_analysis(
+            image, path, target_index, station_id,
+            detection=detection, patch_image=patch_image, patch_path=patch_path, debug_path=debug_path,
+        )
         self.saved_count += 1
         self.status = f"Captured single target: {path.name}"
         return path
@@ -2631,6 +2804,19 @@ class EmbeddedMujocoScanner:
             if self.camera_texture is not None:
                 self.camera_texture.release()
                 self.camera_texture = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_pattern_renderer", None) is not None:
+                if self._pattern_renderer.fbo is not None:
+                    self._pattern_renderer.fbo.release()
+                    self._pattern_renderer.color_tex.release()
+                    if self._pattern_renderer.depth_tex is not None:
+                        self._pattern_renderer.depth_tex.release()
+                self._pattern_renderer = None
+                # Any cached fresh renders belong to the renderer just released.
+                if getattr(self, "plan", None) is not None:
+                    self.plan.scan_render_capture_fn = None
         except Exception:
             pass
         try:
