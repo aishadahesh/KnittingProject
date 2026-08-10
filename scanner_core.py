@@ -553,6 +553,13 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         _tile, canvas, _info = _puzzle_build_seamless_tile(
             state, renderer, repeat_cols, repeat_rows, crop_rect=crop_rect,
         )
+        if not _tile_is_usable(canvas, target_w):
+            # The exact-period crop only works while the fabric is seen close to
+            # face-on. Viewed edge-on the X period projects to almost nothing and
+            # the crop degenerates into a sliver, which glues into a smear rather
+            # than fabric. Report failure so the caller falls back to a tile that
+            # was built at an angle where the period is measurable.
+            return None
         return canvas
     finally:
         # Restore the real renderer first, so the rebuild below re-uploads the
@@ -560,6 +567,31 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
         state.renderer = prev_renderer
         _scan_restore_state(state, snap)
         state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+# A usable glued tile has to be wide enough to actually be fabric and to carry
+# some structure. Both failure modes show up together at oblique azimuths: the
+# crop collapses to a sliver and/or the result is a flat single colour.
+#
+# The width test is relative to the width that was asked for, which separates
+# the cases far more cleanly than any absolute pixel count: a healthy tile came
+# back at ~86% of target_w (276/320, 414/480) while a collapsed one was ~4%
+# (12/320). An absolute floor would have to sit somewhere in between and would
+# misjudge small models.
+_MIN_TILE_WIDTH_FRACTION = 0.15
+_MIN_TILE_SIDE_PX = 24
+_MIN_TILE_STDDEV = 1.0
+
+
+def _tile_is_usable(canvas, target_w):
+    if canvas is None:
+        return False
+    width, height = canvas.size
+    if width < max(_MIN_TILE_SIDE_PX, _MIN_TILE_WIDTH_FRACTION * float(target_w)):
+        return False
+    if height < _MIN_TILE_SIDE_PX:
+        return False
+    return float(np.asarray(canvas.convert("RGB"), dtype=np.float32).std()) >= _MIN_TILE_STDDEV
 
 
 def _scanner_lighting_settings(state):
