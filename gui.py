@@ -3269,3 +3269,79 @@ def draw_reference_image_panel(state, ref_tex):
     )
     imgui.end()
 
+
+
+def draw_orbit_viewport(state, window):
+    """Second, freely-orbitable view of the same model, over a ground grid.
+
+    The main viewport locks the camera and only lets the model be transformed;
+    this one is the opposite, so the fabric can be inspected from any angle
+    without disturbing the edit view's framing.
+    """
+    imgui.set_next_window_pos((1220, 20), cond=imgui.Cond_.first_use_ever)
+    imgui.set_next_window_size((360, 370), cond=imgui.Cond_.first_use_ever)
+    imgui.begin("3D Orbit View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
+
+    # getattr, not state.get(): orbit_camera/orbit_renderer are live objects
+    # held on the instance and deliberately kept out of state._data, so the
+    # dict-style accessor would always report them as missing.
+    orbit_renderer = getattr(state, 'orbit_renderer', None)
+    orbit_camera = getattr(state, 'orbit_camera', None)
+    if orbit_renderer is None or orbit_camera is None:
+        imgui.text_disabled("No orbit renderer attached.")
+        imgui.end()
+        return
+
+    avail_x, avail_y = imgui.get_content_region_avail()
+    disp_w = max(1, int(avail_x))
+    disp_h = max(1, int(avail_y))
+    orbit_renderer.resize(disp_w, disp_h)
+    orbit_camera.target = (np.asarray(state.mesh_center, dtype=np.float32)
+                           + np.asarray(state.model_t, dtype=np.float32)).astype(np.float32)
+
+    model_mat = state.current_model_matrix()
+    mvp = (orbit_camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
+    mv = (orbit_camera.mv(disp_w, disp_h) @ model_mat).astype(np.float32)
+    orbit_renderer.render(
+        mvp, mv,
+        state.get_material_uniforms(),
+        camera=orbit_camera,
+        visible_rows=state.row_visible,
+        model_mat=model_mat,
+        show_grid=True,
+    )
+
+    draw_fitted_texture(
+        orbit_renderer.texture_id,
+        disp_w,
+        disp_h,
+        avail_x,
+        avail_y,
+        flip_y=True,
+    )
+
+    is_hovered = imgui.is_item_hovered()
+    mx, my = imgui.get_mouse_pos()
+
+    if is_hovered:
+        wheel = float(imgui.get_io().mouse_wheel)
+        if wheel != 0.0:
+            zoom_factor = float(np.exp(wheel * 0.12))
+            orbit_camera.dist = float(np.clip(float(orbit_camera.dist) / zoom_factor, 1.0, 200.0))
+
+    # Drag continues once started even if the cursor leaves the window, so a
+    # fast orbit does not stop dead at the edge.
+    if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+        if state.get('orbit_dragging', False):
+            prev = state.get('prev_orbit_mouse', None)
+            if prev is not None:
+                orbit_camera.orbit(mx - prev[0], my - prev[1])
+            state.prev_orbit_mouse = (mx, my)
+        elif is_hovered:
+            state.orbit_dragging = True
+            state.prev_orbit_mouse = (mx, my)
+    else:
+        state.orbit_dragging = False
+        state.prev_orbit_mouse = None
+
+    imgui.end()

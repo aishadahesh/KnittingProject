@@ -38,6 +38,7 @@ from app_state import AppState
 from scanner_storage import ScannerStorage
 from gui import (
      draw_menu_bar,
+     draw_orbit_viewport,
      draw_sidebar,
      draw_viewport,
 )
@@ -86,12 +87,16 @@ def main():
     # ── Scene objects ─────────────────────────────────────────────────────────
     camera   = Camera()
     renderer = MeshRenderer(ctx, 960, 720)
+    # Second view with its own camera and framebuffer, so orbiting it never
+    # disturbs the main viewport's fixed framing.
+    orbit_camera   = Camera()
+    orbit_renderer = MeshRenderer(ctx, 960, 720)
     # Create meshes/renders output directories
     for d in ("meshes", "renders"):
         os.makedirs(os.path.join(resolve_project_path(config["rendering"]["output_dir"]), d), exist_ok=True)
 
     # ── App state ─────────────────────────────────────────────────────────────
-    state = AppState(camera, renderer)
+    state = AppState(camera, renderer, orbit_camera=orbit_camera, orbit_renderer=orbit_renderer)
     state.reference_image_pixels = np.asarray(ref_pil, dtype=np.float32) / 255.0
 
     # initial_params.json is the frozen reset baseline.
@@ -266,6 +271,10 @@ def main():
         # ── 3D Viewport ───────────────────────────────────────────────────────
         if str(state.get("app_mode", "edit")) != "database":
             draw_viewport(state, renderer, ref_tex, window)
+            # Edit Mode only: the other modes drive the shared model/camera
+            # themselves, and a second live view of it would fight them.
+            if str(state.get('app_mode', 'edit')) == 'edit':
+                draw_orbit_viewport(state, window)
 
 
 

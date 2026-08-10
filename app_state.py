@@ -37,9 +37,15 @@ class AppState:
             return {k: AppState._clone(x) for k, x in v.items()}
         return v
 
-    def __init__(self, camera, renderer):
+    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None):
         self.camera = camera
         self.renderer = renderer
+        # Optional second view. rebuild_spline_mesh uploads to state.renderer
+        # only, so the orbit renderer has to be fed explicitly there -- without
+        # that it draws an empty scene, which is the same failure mode as a
+        # scan capture rendered through a renderer that was never given meshes.
+        self.orbit_camera = orbit_camera
+        self.orbit_renderer = orbit_renderer
 
         # Project root and configurations
         project_root = os.path.dirname(os.path.abspath(__file__))
@@ -246,8 +252,12 @@ class AppState:
         except KeyError:
             raise AttributeError(f"'AppState' object has no attribute '{name}'") from None
 
+    # Live objects rather than state: they must bypass _data so they are never
+    # cloned, snapshotted, undone or written to params.json.
+    _DIRECT_ATTRS = ('camera', 'optimizer', 'renderer', 'orbit_camera', 'orbit_renderer', '_data')
+
     def __setattr__(self, name, value):
-        if name in ('camera', 'optimizer', 'renderer', '_data') or name in self.__dict__:
+        if name in self._DIRECT_ATTRS or name in self.__dict__:
             super().__setattr__(name, value)
         else:
             self._data[name] = value
@@ -752,8 +762,14 @@ class AppState:
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
-        self.renderer.set_meshes(display_vl, display_fl, colors=self.active_colors(), meta=meta)
+        colors = self.active_colors()
+        self.renderer.set_meshes(display_vl, display_fl, colors=colors, meta=meta)
         self.renderer.set_ctrl_pts(self.flat_pts)
+        # Same meshes into the orbit view. Note this uploads to a second
+        # renderer, so it costs a duplicate GL upload per rebuild; skipped
+        # entirely when no orbit renderer is attached (e.g. headless callers).
+        if self.orbit_renderer is not None and self.orbit_renderer is not self.renderer:
+            self.orbit_renderer.set_meshes(display_vl, display_fl, colors=colors, meta=meta)
         if preserve_model_placement:
             self.mesh_center = old_center
             self.model_t = old_model_t

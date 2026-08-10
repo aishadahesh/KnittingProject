@@ -147,6 +147,86 @@ void main() {
 }
 """
 
+# ── Yarn-simulation debug overlays ────────────────────────────────────────────
+# Raw centreline segments and the contact points the collision barrier is acting
+# on, drawn straight from the solver's own geometry rather than the display mesh.
+
+LINE_VERT = """
+#version 330
+in  vec3 in_pos;
+uniform mat4 mvp;
+void main() {
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+LINE_FRAG = """
+#version 330
+uniform vec3 line_color;
+out vec4 f_color;
+void main() {
+    f_color = vec4(line_color, 1.0);
+}
+"""
+
+COLLISION_PT_VERT = """
+#version 330
+in  vec3 in_pos;
+uniform mat4 mvp;
+void main() {
+    gl_Position = mvp * vec4(in_pos, 1.0);
+    gl_PointSize = 18.0;
+}
+"""
+
+COLLISION_PT_FRAG = """
+#version 330
+out vec4 f_color;
+void main() {
+    vec2 c = gl_PointCoord * 2.0 - 1.0;
+    if (dot(c, c) > 1.0) discard;
+    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+}
+"""
+
+# Ground plane for the orbit view: an analytic grid shaded in the fragment
+# stage, so line density stays even regardless of how far the camera is.
+GRID_VERT = """
+#version 330
+in vec3 in_pos;
+uniform mat4 mvp;
+out vec3 v_world_pos;
+void main() {
+    v_world_pos = in_pos;
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+GRID_FRAG = """
+#version 330
+in vec3 v_world_pos;
+out vec4 f_color;
+void main() {
+    vec2 coord = v_world_pos.xy;
+    vec2 grid = abs(fract(coord - 0.5) - 0.5) / fwidth(coord);
+    float line = min(grid.x, grid.y);
+    float color_intensity = 1.0 - min(line, 1.0);
+
+    vec2 major_grid = abs(fract(coord * 0.1 - 0.5) - 0.5) / fwidth(coord * 0.1);
+    float major_line = min(major_grid.x, major_grid.y);
+    float major_intensity = 1.0 - min(major_line, 1.0);
+
+    vec4 final_color = vec4(0.32, 0.32, 0.32, 0.28) * color_intensity + vec4(0.48, 0.48, 0.48, 0.6) * major_intensity;
+
+    float dist = length(coord);
+    float fade = clamp(1.0 - dist / 80.0, 0.0, 1.0);
+    final_color.a *= fade;
+
+    if (final_color.a < 0.01) discard;
+    f_color = final_color;
+}
+"""
+
 PT_VERT = """
 #version 330
 in  vec3 in_pos;
@@ -447,6 +527,25 @@ class MeshRenderer:
             self.bg_prog,
             [(ctx.buffer(quad.tobytes()), '2f', 'in_pos')],
         )
+        # Grid plane: one large quad, with the grid itself drawn analytically in
+        # the fragment shader (see GRID_FRAG). Only drawn when show_grid is set,
+        # which in practice means the orbit view.
+        self.grid_prog = ctx.program(vertex_shader=GRID_VERT, fragment_shader=GRID_FRAG)
+        grid_vertices = np.array([
+            [-150.0, -150.0, 0.0],
+            [150.0, -150.0, 0.0],
+            [-150.0, 150.0, 0.0],
+            [150.0, 150.0, 0.0],
+        ], dtype=np.float32)
+        grid_indices = np.array([0, 2, 1, 1, 2, 3], dtype=np.int32)
+        self.grid_vbo = ctx.buffer(grid_vertices.tobytes())
+        self.grid_ibo = ctx.buffer(grid_indices.tobytes())
+        self.grid_vao = ctx.vertex_array(
+            self.grid_prog,
+            [(self.grid_vbo, '3f', 'in_pos')],
+            self.grid_ibo,
+        )
+
         self.vp_w    = 1
         self.vp_h    = 1
         self.color_tex = None
@@ -456,6 +555,14 @@ class MeshRenderer:
         self.mesh_pick_data = []
         self.pt_vao = None
         self.n_pts  = 0
+        # Simulation debug overlays; stay empty unless set_debug_lines /
+        # set_collision_pts are fed.
+        self.line_prog = ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
+        self.line_vao  = None
+        self.n_lines   = 0
+        self.collision_pt_prog = ctx.program(vertex_shader=COLLISION_PT_VERT, fragment_shader=COLLISION_PT_FRAG)
+        self.collision_pt_vao  = None
+        self.n_collision_pts   = 0
         self.resize(vp_w, vp_h)
 
     @property
@@ -576,6 +683,36 @@ class MeshRenderer:
 
         return best_idx
 
+    def set_debug_lines(self, V, edges):
+        """Upload the solver's raw centreline (vertices + edge pairs) for the
+        debug overlay. Pass empty/None to clear it."""
+        if self.line_vao is not None:
+            self.line_vao.release()
+            self.line_vao = None
+        self.n_lines = 0
+        if V is None or edges is None or len(V) == 0 or len(edges) == 0:
+            return
+        edges = np.asarray(edges)
+        # Two endpoints per edge, expanded into a flat segment list for GL_LINES.
+        seg_verts = np.asarray(V, dtype=np.float32)[edges.flatten()]
+        vbo = self.ctx.buffer(seg_verts.tobytes())
+        self.line_vao = self.ctx.vertex_array(self.line_prog, [(vbo, '3f', 'in_pos')])
+        self.n_lines = len(edges) * 2
+
+    def set_collision_pts(self, pts):
+        """Upload contact points (N, 3) for the debug overlay. Pass empty/None
+        to clear it."""
+        if self.collision_pt_vao is not None:
+            self.collision_pt_vao.release()
+            self.collision_pt_vao = None
+        self.n_collision_pts = 0
+        if pts is None or len(pts) == 0:
+            return
+        pts = np.asarray(pts, dtype=np.float32)
+        vbo = self.ctx.buffer(pts.tobytes())
+        self.collision_pt_vao = self.ctx.vertex_array(self.collision_pt_prog, [(vbo, '3f', 'in_pos')])
+        self.n_collision_pts = len(pts)
+
     def set_ctrl_pts(self, flat_pts):
         if self.pt_vao:
             self.pt_vao.release()
@@ -618,7 +755,7 @@ class MeshRenderer:
                hover_mesh_idx=-1, selected_mesh_idx=-1,
                visible_rows=None,
                bg_tex=None, bg_alpha=0.5, bg_uniforms=None,
-               camera=None, n_real_pts=-1):
+               camera=None, n_real_pts=-1, model_mat=None, show_grid=False):
         self.fbo.use()
         self.ctx.viewport = (0, 0, self.vp_w, self.vp_h)
         
@@ -732,6 +869,24 @@ class MeshRenderer:
         if use_model_blend:
             self.ctx.disable(moderngl.BLEND)
 
+        # ── Ground grid ──────────────────────────────────────────────────────
+        # Depth-tested but not depth-written, so the model always reads clearly
+        # against it and the grid never occludes geometry behind it.
+        if show_grid and camera is not None and model_mat is not None:
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            self.fbo.depth_mask = False
+            self.ctx.disable(moderngl.CULL_FACE)
+
+            view_proj = camera.proj(self.vp_w, self.vp_h) @ camera.view()
+            grid_mvp = view_proj @ model_mat
+            self.grid_prog['mvp'].write(grid_mvp.astype(np.float32).T.tobytes())
+            self.grid_vao.render(moderngl.TRIANGLES)
+
+            self.fbo.depth_mask = True
+            self.ctx.disable(moderngl.BLEND)
+
         if self.pt_vao:
             self.ctx.disable(moderngl.DEPTH_TEST)
             self.ctx.disable(moderngl.CULL_FACE)
@@ -742,6 +897,21 @@ class MeshRenderer:
             if 'n_real' in self.pt_prog:
                 self.pt_prog['n_real'].value   = n_real_pts if n_real_pts >= 0 else self.n_pts
             self.pt_vao.render(moderngl.POINTS, vertices=self.n_pts)
+
+        # ── Simulation debug overlays ────────────────────────────────────────
+        if self.line_vao is not None and self.n_lines > 0:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.CULL_FACE)
+            self.line_prog['mvp'].write(mvp.T.tobytes())
+            self.line_prog['line_color'].value = (0.0, 1.0, 0.8)
+            self.line_vao.render(moderngl.LINES, vertices=self.n_lines)
+
+        if self.collision_pt_vao is not None and self.n_collision_pts > 0:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.CULL_FACE)
+            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+            self.collision_pt_prog['mvp'].write(mvp.T.tobytes())
+            self.collision_pt_vao.render(moderngl.POINTS, vertices=self.n_collision_pts)
 
         self.ctx.screen.use()
 
