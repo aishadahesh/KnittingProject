@@ -13,6 +13,9 @@ if sys.platform.startswith("linux"):
     os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 # %% IMPORTS
+import threading
+import time
+
 import numpy as np
 import glfw
 import moderngl
@@ -120,6 +123,79 @@ def main():
             state.scanner_preview_cols = max(1, int(state.scanner_cols))
             state.rebuild_spline_mesh(preserve_model_placement=False)
 
+    # ── Background simulation thread ──────────────────────────────────────────
+    def sim_may_run(state):
+        """The solver rewrites ctrl_rows, which Scan, Puzzle and Database all
+        snapshot and replace with their own temporary geometry. Restricting it
+        to Edit Mode keeps the two from writing to the same state."""
+        return bool(state.sim_active) and str(state.get('app_mode', 'edit')) == 'edit'
+
+    def start_simulation_thread(state):
+        from yarn_simulation import run_simulation_step, eval_energy
+
+        def run_loop():
+            while True:
+                if not sim_may_run(state):
+                    time.sleep(0.05)
+                    continue
+
+                with state.sim_lock:
+                    if state.sim_needs_jacobian_rebuild:
+                        state.rebuild_cached_jacobian()
+                    if state.J_cached is None:
+                        time.sleep(0.01)
+                        continue
+                    ctrl_rows = [cp.copy() for cp in state.ctrl_rows]
+                    period_offset_x = state.period_offset_x.copy()
+                    period_offset_y = state.period_offset_y.copy()
+                    config = state.config
+                    J_cached = state.J_cached
+                    L0_array = state.sim_L0
+                    ks, kb = state.sim_k_s, state.sim_k_b
+                    kc, dhat = state.sim_k_c, state.sim_dhat
+
+                if L0_array is None or len(L0_array) == 0:
+                    time.sleep(0.01)
+                    continue
+
+                # Solved outside the lock: a step takes ~0.15s and the UI thread
+                # must not block on it.
+                new_ctrl_rows = run_simulation_step(
+                    ctrl_rows, period_offset_x, period_offset_y, config,
+                    J_cached, L0_array, ks, kb, kc, dhat,
+                )
+
+                flat_P_old = np.concatenate(ctrl_rows).astype(float) if ctrl_rows else np.empty((0, 3), float)
+                flat_P = np.concatenate(new_ctrl_rows).astype(float) if new_ctrl_rows else np.empty((0, 3), float)
+                if len(flat_P) > 0:
+                    e_el, e_b, e_col = eval_energy(
+                        flat_P, new_ctrl_rows, period_offset_x, period_offset_y,
+                        config, L0_array, dhat,
+                    )
+                else:
+                    e_el, e_b, e_col = 0.0, 0.0, 0.0
+                delta_P = flat_P - flat_P_old if len(flat_P_old) == len(flat_P) and len(flat_P) else None
+
+                with state.sim_lock:
+                    state.sim_e_el, state.sim_e_b, state.sim_e_col = float(e_el), float(e_b), float(e_col)
+                    if delta_P is not None:
+                        state.sim_delta_P = delta_P.copy()
+                    # Re-checked under the lock: the mode may have changed while
+                    # this step was solving, and writing scan-time geometry back
+                    # from a stale solve would corrupt the capture.
+                    if sim_may_run(state) and not state.sim_needs_jacobian_rebuild:
+                        state.ctrl_rows = new_ctrl_rows
+                        state.flat_pts = (
+                            np.concatenate(new_ctrl_rows).astype(np.float32)
+                            if new_ctrl_rows else np.empty((0, 3), np.float32)
+                        )
+                        state.sim_mesh_dirty = True
+                time.sleep(0.01)
+
+        threading.Thread(target=run_loop, daemon=True, name="yarn-sim").start()
+
+    start_simulation_thread(state)
+
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
 
@@ -128,6 +204,13 @@ def main():
     while not glfw.window_should_close(window):
         glfw.poll_events()
         impl.process_inputs()
+        # Upload whatever the solver produced since the last frame. GL work has
+        # to happen on this thread, so the solver only flags that it moved.
+        with state.sim_lock:
+            if state.get('sim_mesh_dirty', False):
+                state.sim_mesh_dirty = False
+                if sim_may_run(state):
+                    state.rebuild_spline_mesh(preserve_model_placement=True)
         imgui.new_frame()
         imguizmo.im_guizmo.begin_frame()
 

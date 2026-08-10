@@ -681,6 +681,13 @@ def _set_app_mode(state, mode):
     mode = mode if mode in ('edit', 'scan', 'puzzle', 'database') else 'edit'
     if str(state.get('app_mode', 'edit')) == mode:
         return
+    if mode != 'edit' and bool(state.get('sim_active', False)):
+        # Stop the solver before handing the model to Scan/Puzzle/Database.
+        # Those snapshot ctrl_rows and swap in their own geometry, so a solver
+        # still writing to it would fight them. Taken under sim_lock so a step
+        # already in flight finishes and sees sim_active False on write-back.
+        with state.sim_lock:
+            state.sim_active = False
     state.app_mode = mode
     scanner_idx = next((i for i, item in enumerate(state.workflow_stages) if item[0] == 'Scanner'), 0)
     embedded = state.get('embedded_scanner')

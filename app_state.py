@@ -184,6 +184,28 @@ class AppState:
                 [0.0, 3.0 * (float(config_data['knit_parameters']['parameters'][pidx['dy']]['initial']) if 'dy' in pidx else 1.0), 0.0],
                 dtype=np.float32,
             ),
+            # ── Yarn simulation ──────────────────────────────────────────────
+            # Edit Mode only. The solver runs on a background thread and mutates
+            # ctrl_rows, so it must stay off in Scan/Puzzle/Database, which
+            # snapshot and rewrite that same geometry.
+            'sim_active': False,
+            'sim_k_s': 1000.0,
+            'sim_k_b': 10.0,
+            'sim_k_c': 1.0,
+            'sim_dhat': 0.1,
+            'sim_show_forces': True,
+            'sim_needs_jacobian_rebuild': True,
+            # Kept separate from sim_needs_jacobian_rebuild: one means "the
+            # cached Jacobian is stale", the other "the solver moved geometry
+            # that the GL thread still has to upload". feat/simulation used a
+            # single flag for both, which made every solver step also refresh
+            # the rest lengths and so hold the stretch energy near zero.
+            'sim_mesh_dirty': False,
+            'sim_L0': np.array([]),
+            'sim_e_el': 0.0,
+            'sim_e_b': 0.0,
+            'sim_e_col': 0.0,
+            'sim_delta_P': None,
         }
         for k, v in computed_defaults.items():
             state_defaults[k] = AppState._clone(_coerce(v))
@@ -196,6 +218,11 @@ class AppState:
         super().__setattr__('scanner_process', None)
         super().__setattr__('scanner_status', 'Scanner idle')
         super().__setattr__('scanner_started_at', 0.0)
+        # Guards every cross-thread read/write of the simulation's view of the
+        # model (ctrl_rows, flat_pts, the cached Jacobian and the energy
+        # readouts). Not part of _data: it must never be cloned or snapshotted.
+        super().__setattr__('sim_lock', threading.Lock())
+        super().__setattr__('J_cached', None)
 
     # ── DICTIONARY INTERFACE ──────────────────────────────────────────────────
 
@@ -674,6 +701,42 @@ class AppState:
         updated = base * (1.0 - weights) + target * weights
         self.spline_radius_rows[row_idx] = updated.astype(np.float32)
 
+    def rebuild_cached_jacobian(self):
+        """Caches d(centreline samples)/d(control points) for the whole model.
+
+        The solver works in control-point space but its energies are defined on
+        the sampled centreline, so it needs this to map gradients back. It only
+        depends on the control-point layout and the X period, so it is rebuilt
+        when those change rather than every step.
+
+        Callers must already hold sim_lock.
+        """
+        import scipy.sparse
+        from knitting_core import build_row_spline_jacobian, _centerline_sample_count
+
+        if not self.ctrl_rows:
+            super().__setattr__('J_cached', None)
+            self.sim_needs_jacobian_rebuild = False
+            return
+        # Shared helper so the Jacobian is built at the same sample count the
+        # mesh and evaluate_centerlines use; a mismatch would leave the solver
+        # differentiating geometry other than what is drawn.
+        nout = _centerline_sample_count(self.period_offset_x, self.config)
+        J_blocks = [build_row_spline_jacobian(cp, self.period_offset_x, nout) for cp in self.ctrl_rows]
+        J_base = scipy.sparse.block_diag(J_blocks, format="csr")
+        super().__setattr__('J_cached', scipy.sparse.kron(J_base, scipy.sparse.identity(3), format="csr"))
+        self.sim_needs_jacobian_rebuild = False
+
+    def _refresh_sim_rest_lengths(self):
+        """Rest edge lengths the stretch energy is measured against. Recomputed
+        with the mesh so the current shape is treated as the relaxed state."""
+        from knitting_core import evaluate_centerlines
+        V, edges, _, _ = evaluate_centerlines(self.ctrl_rows, self.period_offset_x, self.config)
+        if len(edges) > 0:
+            self.sim_L0 = np.linalg.norm(V[edges[:, 1]] - V[edges[:, 0]], axis=1)
+        else:
+            self.sim_L0 = np.array([])
+
     def rebuild_spline_mesh(self, preserve_model_placement=True):
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
@@ -811,6 +874,14 @@ class AppState:
         self.ctrl_rows = self._fresh_rebuild_rows()
         self.sync_period_offset_to_model_width()
         self.sync_period_offset_y_to_row_count()
+        # Rebuilding from parameters defines a new relaxed shape, so this is one
+        # of the two moments rest lengths are (re)captured -- the other is when
+        # the simulation is switched on. Deliberately NOT done on every
+        # rebuild_spline_mesh: that runs after each solver step, and refreshing
+        # rest lengths there would keep resetting the rest state to the deformed
+        # shape, leaving the stretch energy permanently near zero.
+        self._refresh_sim_rest_lengths()
+        self.sim_needs_jacobian_rebuild = True
         base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
         self.spline_radius_rows = [
             np.full(len(row), base_radius, dtype=np.float32)
