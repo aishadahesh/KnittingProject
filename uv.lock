@@ -295,6 +295,32 @@ wheels = [
 ]
 
 [[package]]
+name = "ipctk"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e7/11/7458c0d25291eb584fd562db5d229c04219bc11e324c72a6a5bc5a0c87b9/ipctk-1.6.0.tar.gz", hash = "sha256:4fe7d655d68429134c051c1243f8996017ecc393af831a97a73c18c92165fadc", size = 335311, upload-time = "2026-07-15T15:17:31.735Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/f0/3a75f96ef0c0cf65f6ed58555f3e4db12c8e722fc05cbff1a313637c3796/ipctk-1.6.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:e2734de7e94fa40ffe8da6aaac1d6d5c5aa9456c64dd777777f40e10f1cf5a7c", size = 2181209, upload-time = "2026-07-15T15:17:13.606Z" },
+    { url = "https://files.pythonhosted.org/packages/12/21/684ed2e89bd74307a3785ee038dd47a4d32518825d927d7a188c457bf02b/ipctk-1.6.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9613bd776300f271752da48f493115842b197df6e04f77f042e59dad2c423524", size = 2897226, upload-time = "2026-07-15T15:17:15.045Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/14/4812f24d4b3ecb1c59d68203f6bed180dc761e17161c5cfd8e74d811c177/ipctk-1.6.0-cp311-cp311-win_amd64.whl", hash = "sha256:17569e3dfe7f1d0aeba131a981087ff4d791a714f0e75ad97496e6c040c38ea6", size = 2131263, upload-time = "2026-07-15T15:17:16.443Z" },
+    { url = "https://files.pythonhosted.org/packages/96/a7/7d9a3645b401dc7121e90c361d8759839f1d94a5496f075da7dea77c3bb1/ipctk-1.6.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:7f01c82853b44fcd14ee444195fba87373dedced852c0457ebf2ca211063e7b5", size = 2185241, upload-time = "2026-07-15T15:17:17.78Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/75/83c70da456f42800d27db9c54f03627e1c22767d13f8328ae6126fc8acf0/ipctk-1.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:581f0bc2ad1d89143750a714a6327606d367089765eb02913f5f02f3306a9055", size = 2908577, upload-time = "2026-07-15T15:17:19.107Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/12/8edb08487bd4ea839cddbf940ea3c3b76de055b18c5f4911837d91baf29f/ipctk-1.6.0-cp312-cp312-win_amd64.whl", hash = "sha256:3793531598fa5803beee0aa9f467178ece5b770b4c136187a2ec0f987a3a918e", size = 2133630, upload-time = "2026-07-15T15:17:20.753Z" },
+    { url = "https://files.pythonhosted.org/packages/22/01/76fe0e55975d004f25459e2ef3cbb60352794ceb1c21c067b47d96453a7c/ipctk-1.6.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:b02d0166f6d262d5490d627132bcdf85ff3b3ee97871b0abb8ce47ec94aacf83", size = 2185188, upload-time = "2026-07-15T15:17:22.415Z" },
+    { url = "https://files.pythonhosted.org/packages/48/ac/612b30cce3cef03047147072de6651b9e029c7c623d447ab4034488d065a/ipctk-1.6.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f1318e7dea3d0c582b8dc75c28deebbb0e6ce587fefa9212ca9190aca83991ba", size = 2908451, upload-time = "2026-07-15T15:17:24.206Z" },
+    { url = "https://files.pythonhosted.org/packages/65/36/2763886bacac32ed1019751944aca1bc0b5a2eac0c7f61449136284f3afb/ipctk-1.6.0-cp313-cp313-win_amd64.whl", hash = "sha256:1fedc46d77f0e2d2bb08eb218cacb3cc75cd5480d68bed4d2c351a8022b2b3e0", size = 2134178, upload-time = "2026-07-15T15:17:25.58Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/22/d955413871f049d51bb8e6db1027f1ae5f4ba0c40b2773eae2f36a58ba93/ipctk-1.6.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:d35bd3961602ab78d73804158e8bae25a90583fbb95c660b544ac77c6898f426", size = 2187376, upload-time = "2026-07-15T15:17:27.55Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/ce/b54ca5856bc683fe68f1e8c1ec77f42cbde63360251fc684b89caa19be28/ipctk-1.6.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5af307df9da2e1e1353b5730b350200ff651ff18995ebe806f9ced2792b2322a", size = 2909527, upload-time = "2026-07-15T15:17:29.257Z" },
+    { url = "https://files.pythonhosted.org/packages/31/6a/2426ac9917c3f7167ea7271a49bb171c83cf5309d17028dab071f78a2d6a/ipctk-1.6.0-cp314-cp314-win_amd64.whl", hash = "sha256:cef20676bf5b58820a161c399985587b476021328b61313d80eea2b3796afe79", size = 2188824, upload-time = "2026-07-15T15:17:30.588Z" },
+]
+
+[[package]]
 name = "jax"
 version = "0.10.2"
 source = { registry = "https://pypi.org/simple" }
@@ -515,6 +541,7 @@ dependencies = [
     { name = "drjit" },
     { name = "glfw" },
     { name = "imgui-bundle" },
+    { name = "ipctk" },
     { name = "jax" },
     { name = "mitsuba" },
     { name = "moderngl" },
@@ -541,6 +568,7 @@ requires-dist = [
     { name = "drjit", specifier = ">=1.3.1" },
     { name = "glfw", specifier = ">=2.10.0" },
     { name = "imgui-bundle", specifier = ">=1.92.801" },
+    { name = "ipctk", specifier = ">=1.6.0" },
     { name = "jax", specifier = ">=0.10.1" },
     { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux' and extra == 'gpu'" },
     { name = "mitsuba", specifier = ">=3.8.0" },
