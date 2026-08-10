@@ -408,7 +408,6 @@ def get_ccd_topology(nout, num_ctrl_rows, period_offset_x, period_offset_y, M):
 def run_simulation_step(ctrl_rows, period_offset_x, period_offset_y, config, J_cached, L0_array, k_s, k_b, k_c, dhat):
     import time
     t_start = time.perf_counter()
-    print("HI!!!!!!")
     debug = True
     res = config["knit_parameters"]["loop_res"]
     bitmap_width = float(np.linalg.norm(period_offset_x))

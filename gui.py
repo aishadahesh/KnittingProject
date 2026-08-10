@@ -209,7 +209,7 @@ def draw_sidebar(state, renderer):
             state.rebuild_spline_from_params()
         imgui.same_line()
         if imgui.button("FD Verify Derivatives##verify_fd"):
-            from knitting_core import check_gradients_and_hessians_fd
+            from yarn_simulation import check_gradients_and_hessians_fd
             with state.sim_lock:
                 if state.sim_needs_jacobian_rebuild:
                     state.rebuild_cached_jacobian()
@@ -802,12 +802,12 @@ def draw_viewport(state, renderer, ref_tex, window):
     )
 
     # DEBUG: overlay the raw centerline geometry from the last eval_energy call
-    import knitting_core as _kc
-    dbg = _kc._debug_sim_geometry
+    import yarn_simulation as _ys
+    dbg = _ys._debug_sim_geometry
     if dbg is not None:
         renderer.set_debug_lines(dbg[0], dbg[1])
     
-    dbg_cols = getattr(_kc, "_debug_collisions", None)
+    dbg_cols = getattr(_ys, "_debug_collisions", None)
     if dbg_cols is not None:
         renderer.set_collision_pts(dbg_cols)
 
