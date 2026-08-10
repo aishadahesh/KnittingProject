@@ -176,7 +176,14 @@ class AppState:
             'row_visible': np.ones(3, dtype=bool),
             'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
             'mi_cam_fov': float(config_data['rendering']['camera_fov']),
-            'period_offset': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
+            'period_offset_x': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
+            # Y tiling period. Only the yarn simulation reads this (periodic
+            # collision topology); the scanner's display/preview tiling still
+            # derives its own Y spacing from the mesh bounds.
+            'period_offset_y': np.array(
+                [0.0, 3.0 * (float(config_data['knit_parameters']['parameters'][pidx['dy']]['initial']) if 'dy' in pidx else 1.0), 0.0],
+                dtype=np.float32,
+            ),
         }
         for k, v in computed_defaults.items():
             state_defaults[k] = AppState._clone(_coerce(v))
@@ -365,7 +372,7 @@ class AppState:
             self.samples_per_loop,
             loop_heights=loop_heights,
         )
-        period_offset = np.array([float(bitmap.shape[1]), 0.0, 0.0], dtype=np.float32)
+        period_offset_x = np.array([float(bitmap.shape[1]), 0.0, 0.0], dtype=np.float32)
         radius = max(float(params[self._pidx['radius']]), 1e-6)
         radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
         vl = build_spline_mesh(
@@ -373,7 +380,7 @@ class AppState:
             params,
             self.config,
             self._pidx,
-            period_offset,
+            period_offset_x,
             radius_ctrl_rows=radius_profiles,
         )
         vl, meta = build_surface_fiber_meshes(
@@ -550,7 +557,7 @@ class AppState:
             mesh_width = float(max_v[0] - min_v[0])
             if mesh_width > radius:
                 return max(mesh_width - radius * 0.6, radius)
-        period = np.asarray(self.period_offset, dtype=np.float32).reshape(-1) if hasattr(self, 'period_offset') else np.array([])
+        period = np.asarray(self.period_offset_x, dtype=np.float32).reshape(-1) if hasattr(self, 'period_offset_x') else np.array([])
         if period.size > 0 and abs(float(period[0])) > max(float(radius), 1e-6):
             return abs(float(period[0]))
         if self.ctrl_rows:
@@ -677,7 +684,7 @@ class AppState:
             self.params,
             self.config,
             self._pidx,
-            np.asarray(self.period_offset, dtype=np.float32),
+            np.asarray(self.period_offset_x, dtype=np.float32),
             radius_ctrl_rows=radius_profiles,
         )
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
@@ -724,13 +731,23 @@ class AppState:
         return np.array([float(np.median(periods)), 0.0, 0.0], dtype=np.float32)
 
     def sync_period_offset_to_model_width(self):
-        self.period_offset = self._period_offset_from_ctrl_rows()
+        self.period_offset_x = self._period_offset_from_ctrl_rows()
+
+    def sync_period_offset_y_to_row_count(self):
+        """Y period spans the whole stack of rows, so a vertically tiled copy
+        lands exactly one fabric-height above. Only the yarn simulation reads
+        this; display/preview tiling still derives Y spacing from mesh bounds."""
+        dy_idx = self._pidx.get('dy')
+        dy_val = float(self.params[dy_idx]) if dy_idx is not None else 1.0
+        self.period_offset_y = np.array(
+            [0.0, max(1, len(self.ctrl_rows)) * dy_val, 0.0], dtype=np.float32
+        )
 
     @property
     def flat_pts_all(self):
         if not self.ctrl_rows:
             return np.empty((0, 3), dtype=np.float32)
-        virtual_pts = np.array([row[0] + self.period_offset for row in self.ctrl_rows], dtype=np.float32)
+        virtual_pts = np.array([row[0] + self.period_offset_x for row in self.ctrl_rows], dtype=np.float32)
         return np.concatenate((self.flat_pts, virtual_pts), axis=0)
 
     def move_ctrl_pt(self, flat_idx, pos):
@@ -738,7 +755,7 @@ class AppState:
         if flat_idx >= n_real:
             row_idx = flat_idx - n_real
             if 0 <= row_idx < len(self.ctrl_rows):
-                self.period_offset = pos - self.ctrl_rows[row_idx][0]
+                self.period_offset_x = pos - self.ctrl_rows[row_idx][0]
                 self.rebuild_spline_mesh()
         else:
             r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
@@ -793,6 +810,7 @@ class AppState:
     def rebuild_spline_from_params(self):
         self.ctrl_rows = self._fresh_rebuild_rows()
         self.sync_period_offset_to_model_width()
+        self.sync_period_offset_y_to_row_count()
         base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
         self.spline_radius_rows = [
             np.full(len(row), base_radius, dtype=np.float32)
@@ -979,7 +997,7 @@ class AppState:
             'fiber_geometry_twist', 'spline_keyboard_step',
             'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
+            'period_offset_x', 'period_offset_y', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
         )
         for key in reset_keys:
             if key in defaults:
@@ -1021,7 +1039,7 @@ class AppState:
             'fiber_geometry_surface_arc', 'fiber_geometry_randomness',
             'fiber_geometry_twist', 'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
+            'period_offset_x', 'period_offset_y', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
         ):
             if key in defaults:
                 self._data[key] = self._clone(defaults[key])
@@ -1096,7 +1114,8 @@ class AppState:
             'format_version': 2,
             'params': params_to_save,
             'bitmap': self.bitmap.tolist(),
-            'period_offset': self.period_offset.tolist(),
+            'period_offset_x': self.period_offset_x.tolist(),
+            'period_offset_y': self.period_offset_y.tolist(),
             'spline_control_rows': [row.tolist() for row in self.ctrl_rows],
             'spline_radius_rows': [row.tolist() for row in self.spline_radius_rows],
             'gui_state': gui_state,
@@ -1171,7 +1190,17 @@ class AppState:
             self.camera.fov_deg = self.view_fov
             self.load_path = path
             self.status_msg = f'Loaded ← {os.path.basename(path)}'
-            self.period_offset = np.array(data.get('period_offset', [float(self.bitmap_size[1]), 0.0, 0.0]), dtype=np.float32)
+            # 'period_offset' is the pre-split key; keep reading it so params
+            # files written before period_offset_x/_y still load.
+            legacy_period = data.get('period_offset')
+            self.period_offset_x = np.array(
+                data.get('period_offset_x', legacy_period if legacy_period is not None
+                         else [float(self.bitmap_size[1]), 0.0, 0.0]),
+                dtype=np.float32,
+            )
+            saved_period_y = data.get('period_offset_y')
+            if saved_period_y is not None:
+                self.period_offset_y = np.array(saved_period_y, dtype=np.float32)
             self.rebuild_spline_from_params()
             if loaded_spline_rows:
                 self.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]

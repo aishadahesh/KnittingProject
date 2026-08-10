@@ -198,18 +198,18 @@ def build_spline_mesh(
     params,
     config,
     pidx,
-    period_offset,
+    period_offset_x,
     radius_ctrl_rows=None,
 ):
     p = np.asarray(params)
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
     seg, res = config["knit_parameters"]["segments"], config["knit_parameters"]["loop_res"]
     
-    if isinstance(period_offset, (int, float, np.integer, np.floating)):
-        D = np.array([float(period_offset), 0.0, 0.0], dtype=float)
-        bitmap_width = float(period_offset)
+    if isinstance(period_offset_x, (int, float, np.integer, np.floating)):
+        D = np.array([float(period_offset_x), 0.0, 0.0], dtype=float)
+        bitmap_width = float(period_offset_x)
     else:
-        D = np.asarray(period_offset, dtype=float)
+        D = np.asarray(period_offset_x, dtype=float)
         bitmap_width = float(np.linalg.norm(D))
         
     nout = max(3, res * int(round(bitmap_width)) + 1)

@@ -332,7 +332,12 @@ def _load_saved_model_curves(model_json: str | None) -> list[np.ndarray]:
             return _fallback_model_curves()
 
         bitmap = np.asarray(saved.get("bitmap", np.ones((len(ctrl_rows), 1))), dtype=np.float32)
-        period = np.asarray(saved.get("period_offset", [float(max(1, bitmap.shape[1])), 0.0, 0.0]), dtype=np.float32)
+        # "period_offset" is the pre-split key; model files written before the
+        # x/y split still carry it, so fall back to it before the bitmap default.
+        saved_period = saved.get("period_offset_x", saved.get("period_offset"))
+        if saved_period is None:
+            saved_period = [float(max(1, bitmap.shape[1])), 0.0, 0.0]
+        period = np.asarray(saved_period, dtype=np.float32)
 
         curves = []
         for row_idx, row in enumerate(ctrl_rows):

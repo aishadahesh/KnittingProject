@@ -88,7 +88,7 @@ def _pick_file(mode, initial_path):
 
 def _state_scanner_model_curves(state):
     curves = []
-    period = np.asarray(getattr(state, 'period_offset', [1.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+    period = np.asarray(getattr(state, 'period_offset_x', [1.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
     if period.size < 2:
         period = np.array([1.0, 0.0], dtype=np.float32)
     for row in getattr(state, 'ctrl_rows', []) or []:

@@ -281,7 +281,7 @@ def _puzzle_tiled_control_points(state):
         state.params,
         state.config,
         state._pidx,
-        np.asarray(state.period_offset, dtype=np.float32),
+        np.asarray(state.period_offset_x, dtype=np.float32),
         radius_ctrl_rows=radius_profiles,
     )
     x_period = state._display_copy_x_period(base_vl, radius)
@@ -324,7 +324,7 @@ def _puzzle_period_pixel_vectors(state, renderer):
         state.params,
         state.config,
         state._pidx,
-        np.asarray(state.period_offset, dtype=np.float32),
+        np.asarray(state.period_offset_x, dtype=np.float32),
         radius_ctrl_rows=radius_profiles,
     )
     x_period = state._display_copy_x_period(base_vl, radius)
@@ -422,7 +422,10 @@ _SCAN_TILE_SNAPSHOT_FIELDS = (
     # Fully-derived spline state, snapshotted and restored verbatim (not
     # regenerated from bitmap+params) so any manually-edited control points on
     # the live model survive round-tripping through a temporary scan pattern.
-    'ctrl_rows', 'period_offset', 'spline_radius_rows', 'param_ref_radius',
+    # period_offset_y is included because rebuild_spline_from_params() recomputes
+    # it from the row count, and this function calls that against a temporary
+    # scan pattern whose row count differs from the user's model.
+    'ctrl_rows', 'period_offset_x', 'period_offset_y', 'spline_radius_rows', 'param_ref_radius',
     'flat_pts', '_row_starts', 'param_ref_ctrl_rows',
 )
 
