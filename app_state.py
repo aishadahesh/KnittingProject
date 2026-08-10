@@ -1069,6 +1069,21 @@ class AppState:
     def capture_initial_state(self):
         super().__setattr__('_initial_snapshot', self.snapshot_state())
 
+    def reset(self, unit_model=False):
+        """Unified reset entry point, matching feat/simulation's call style.
+
+        Deliberately a wrapper rather than a merged implementation: on this
+        branch reset_to_initial restores the snapshot captured from
+        initial_params.json -- which is also Scan Mode's fabric template --
+        whereas feat/simulation's reset() falls back to bare state defaults.
+        Folding them together would quietly drop that behaviour, so both
+        methods keep their own semantics and this just dispatches.
+        """
+        if unit_model:
+            self.reset_to_unit_model()
+        else:
+            self.reset_to_initial()
+
     def reset_to_initial(self):
         initial_snapshot = getattr(self, '_initial_snapshot', None)
         if initial_snapshot is not None:
@@ -1231,14 +1246,41 @@ class AppState:
         except Exception as e:
             self.status_msg = f'Save error: {e}'
 
+    # Interactions during which a write would both stutter the frame and capture
+    # a half-finished edit. Autosave waits for the user to let go.
+    _AUTOSAVE_DEFER_FLAGS = (
+        'gizmo_edit_active',
+        'spline_grab_active',
+        'radius_grab_active',
+        'model_drag_undo_active',
+        'spline_keyboard_edit_active',
+        'radius_keyboard_edit_active',
+    )
+
+    def autosave_deferred(self):
+        """True while an edit is mid-gesture and autosaving should hold off."""
+        if any(bool(self.get(flag, False)) for flag in self._AUTOSAVE_DEFER_FLAGS):
+            return True
+        return int(self.get('bbox_active_handle', -1)) >= 0
+
     def maybe_autosave(self):
         if not self.autosave_enabled:
+            return
+        if self.autosave_deferred():
             return
         now = time.monotonic()
         if now - float(self.autosave_last_time) < float(self.autosave_interval_sec):
             return
         target_path = self.save_path or os.path.join(self.project_root, 'params.json')
-        self.save_params(target_path, silent=True)
+        # The solver rewrites ctrl_rows/flat_pts from another thread, so hold
+        # sim_lock while serialising to avoid writing a file that mixes geometry
+        # from two different steps. It only ever holds the lock briefly (the
+        # solve itself runs outside it), so this does not stall the frame.
+        if bool(self.get('sim_active', False)):
+            with self.sim_lock:
+                self.save_params(target_path, silent=True)
+        else:
+            self.save_params(target_path, silent=True)
 
     def load_params(self, path):
         try:
