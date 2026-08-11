@@ -1251,24 +1251,6 @@ def _render_cell_pattern_texture(plan: FabricPlan, row: int, col: int, width: in
     return canvas.resize((width, height), resample)
 
 
-# How far from face-on (0 or 180 degrees) a fresh per-angle render may be taken
-# before the exact-period crop stops being trustworthy. Measured: 0 and 180 crop
-# cleanly, 45 is already foreshortened, 90 and 270 collapse to a ~12px sliver.
-MAX_PER_ANGLE_OBLIQUITY_DEG = 25.0
-
-
-def _per_angle_render_allowed(plan, angle_deg: float) -> bool:
-    """Whether a fresh render may replace the pre-glued seamless tile.
-
-    Off unless the plan opts in, and then only near face-on, where the pattern
-    period is still measurable in screen space.
-    """
-    if not bool(getattr(plan, "scan_per_angle_render_enabled", False)):
-        return False
-    obliquity = abs((float(angle_deg) + 90.0) % 180.0 - 90.0)
-    return obliquity <= MAX_PER_ANGLE_OBLIQUITY_DEG
-
-
 def _view_angle_degrees(view_name: str) -> float:
     text = str(view_name).lower()
     if "angle" not in text:
@@ -1396,27 +1378,26 @@ def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focus
         setattr(plan, "_rendered_texture_cache", cache)
     if cache_key not in cache:
         if focused:
-            # Real per-pattern tiles (duplicated real model -> exact-period
-            # capture/glue, the Puzzle Mode workflow automated in gui.py) are
-            # the primary source: they are already tiled by the repeat sliders
+            # A fresh, angle-specific real render (real 3D model duplicated,
+            # captured, and exact-period tiled -- the Puzzle Mode workflow
+            # automated in gui.py) is the primary source when a live renderer
+            # is attached: rendered once per (row, col, angle, zoom) and cached
+            # here like every other case, so live preview during robot travel
+            # does not re-render every frame but a genuinely new angle does.
+            #
+            # It can decline. The exact-period crop measures the pattern period
+            # in screen pixels, which is only meaningful while the fabric is
+            # seen roughly face-on; by ~90 degrees the period projects to almost
+            # nothing and the crop would collapse to a sliver. Scans use angles
+            # of 360*i/n, so with the usual 4 angles 90 and 270 land exactly
+            # there. The renderer returns None for those rather than handing
+            # back a smear, and the pre-glued seamless tile is used instead.
+            render_fn = getattr(plan, "scan_render_capture_fn", None)
+            fresh = render_fn(row, col, _view_angle_degrees(view_name), camera_zoom) if render_fn is not None else None
+
+            # Pre-glued per-pattern tiles: already tiled by the repeat sliders
             # and already lit by the real 3D shader, so no further tiling or 2D
             # lighting post-process is applied.
-            #
-            # A fresh per-angle render can be requested instead, but only near
-            # face-on. The exact-period crop measures the pattern period in
-            # screen pixels, and that measurement is only meaningful while the
-            # fabric is seen roughly face-on; by ~90 degrees the period projects
-            # to almost nothing and the crop collapses to a sliver that glues
-            # into a smear. Scans use angles of 360*i/n -- which for the usual
-            # 4 angles means 90 and 270 land exactly in that degenerate zone --
-            # so this stays off unless explicitly enabled, and is additionally
-            # bounded by the obliquity check and the tile's own usability guard.
-            fresh = None
-            if _per_angle_render_allowed(plan, _view_angle_degrees(view_name)):
-                render_fn = getattr(plan, "scan_render_capture_fn", None)
-                if render_fn is not None:
-                    fresh = render_fn(row, col, _view_angle_degrees(view_name), camera_zoom)
-
             scan_tiles = getattr(plan, "scan_tiled_pattern_images", None)
             tile_idx = row * plan.grid_cols + col
             if fresh is not None:
