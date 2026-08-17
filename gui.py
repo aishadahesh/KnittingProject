@@ -1359,13 +1359,22 @@ def _draw_database_summary_page(state, renderer):
                 cached[0].release()
             except Exception:
                 pass
+        # Refresh is also where the exported JSON map is brought up to date --
+        # it is the control that promises exactly that.
+        try:
+            storage.write_json_index()
+        except Exception:
+            pass
         state.scanner_status = "Dataset refreshed: re-checked saved files against the database"
     imgui.same_line()
     imgui.text_disabled("Re-checks saved image files on disk. JSON map: " + str(storage.json_index_path))
 
     try:
-        summary = storage.database_summary()
-        storage.write_json_index()
+        # This panel is redrawn every frame. Rebuilding the summary and
+        # re-exporting a multi-MB JSON file each time held the whole window at
+        # well under one frame per second whenever the tab was open.
+        summary = storage.cached_database_summary()
+        storage.flush_json_index()
     except Exception as exc:
         imgui.text_wrapped(f"Could not load scanner dataset: {exc}")
         return
@@ -2376,10 +2385,30 @@ class EmbeddedMujocoScanner:
 
     # -- Rendering section: simulator and live camera textures -----------------
 
+    def _flush_capture_index(self):
+        """Writes the deferred captures_index.json export if one is pending.
+
+        record_capture() now only commits to SQLite; the multi-MB JSON export is
+        batched to here, so it costs one write per scan rather than one per
+        captured angle. A no-op when nothing is pending, so the finished-scan
+        branch below can call it on every frame for free.
+        """
+        try:
+            storage = _scanner_storage(self.app_state)
+            if storage is not None:
+                storage.flush_json_index()
+        except Exception:
+            pass
+
     def close(self):
         self.running = False
         self.paused = False
+        self._flush_capture_index()
         try:
+            if hasattr(self, '_compose_stop'):
+                self._compose_stop.set()
+            if hasattr(self, '_compose_thread') and self._compose_thread.is_alive():
+                self._compose_thread.join(timeout=1.5)
             if hasattr(self, '_save_stop'):
                 self._save_stop.set()
             if hasattr(self, '_save_thread') and self._save_thread.is_alive():
@@ -2508,6 +2537,7 @@ class EmbeddedMujocoScanner:
             self.running = False
             self.paused = False
             self.status = f"Finished | saved images: {self.saved_count}"
+            self._flush_capture_index()
             self._render_frame()
             return
 

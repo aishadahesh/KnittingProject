@@ -52,6 +52,16 @@ class ScannerStorage:
         self.db_path = database_path(self.project_root)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        # captures_index.json is a derived export of the entire database, so its
+        # cost scales with all history rather than with the one row just added
+        # (13 MB / 0.6 s at the time of writing, against a 0.2 ms insert).
+        # Writing it per capture made every scan slower than the one before.
+        # Writes are deferred to flush_json_index(); SQLite stays the record of
+        # truth in the meantime, so nothing is at risk.
+        self._index_dirty = False
+        # Bumped by every write, so derived views can be cached against it.
+        self.revision = 0
+        self._summary_cache = None
 
     @property
     def json_index_path(self) -> Path:
@@ -206,7 +216,13 @@ class ScannerStorage:
                 ),
             )
         self.save_scanner_state(state)
-        self.write_json_index()
+        self.revision += 1
+        # Deferred like record_capture: this runs while the scanner is being
+        # constructed, i.e. inside the "Start scanning" click, where a 13 MB
+        # export costs more than everything else in the sequence except the
+        # tile renders. flush_json_index() picks it up at the end of the scan
+        # and whenever the Database panel is drawn.
+        self._index_dirty = True
         return signature
 
     def record_capture(self, state, record: dict[str, Any], capture_settings: dict[str, Any] | None = None) -> None:
@@ -236,7 +252,8 @@ class ScannerStorage:
                     now,
                 ),
             )
-        self.write_json_index()
+        self.revision += 1
+        self._index_dirty = True
 
     def save_analysis(self, state, result: dict[str, Any]) -> None:
         signature = self.pattern_signature(state)
@@ -250,6 +267,7 @@ class ScannerStorage:
                 (signature, json.dumps(_json_ready(result), sort_keys=True), now),
             )
         self.save_scanner_state(state)
+        self.revision += 1
         self.write_json_index()
 
     def captures_for_signature(self, signature: str) -> list[dict[str, Any]]:
@@ -468,9 +486,35 @@ class ScannerStorage:
         }
         return _json_ready(summary)
 
-    def write_json_index(self) -> Path:
+    def cached_database_summary(self) -> dict[str, Any]:
+        """database_summary() memoised against the write counter.
+
+        The Database panel asks for this every frame it is drawn, and building it
+        re-decodes every historical row's JSON blobs. Recomputing only after an
+        actual write is what keeps that panel interactive.
+        """
+        cached = self._summary_cache
+        if cached is not None and cached[0] == self.revision:
+            return cached[1]
         summary = self.database_summary()
+        self._summary_cache = (self.revision, summary)
+        return summary
+
+    def write_json_index(self) -> Path:
+        """Exports the whole database to captures_index.json, unconditionally."""
+        summary = self.cached_database_summary()
         self.json_index_path.parent.mkdir(parents=True, exist_ok=True)
         with self.json_index_path.open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2)
+        self._index_dirty = False
         return self.json_index_path
+
+    def flush_json_index(self, force: bool = False) -> Path | None:
+        """Exports the index only if a capture has been recorded since the last one.
+
+        Free to call repeatedly, so callers can simply invoke it whenever the
+        index might be wanted rather than tracking who owes a write.
+        """
+        if not force and not self._index_dirty:
+            return None
+        return self.write_json_index()
