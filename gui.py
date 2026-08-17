@@ -560,7 +560,9 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
         state.loop_heights = state._scanner_loop_heights_for_bitmap(full_bitmap)
         state.display_copies = np.array([1, 1], dtype=np.int32)
         state.scanner_preview_grid_enabled = False
-        state.rebuild_spline_from_params()
+        # rebuild_mesh=False: the very next line rebuilds and uploads the same
+        # mesh, with the placement flag this pass actually wants.
+        state.rebuild_spline_from_params(rebuild_mesh=False)
         state.rebuild_spline_mesh(preserve_model_placement=False)
         frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
         if frame is None:

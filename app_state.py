@@ -902,7 +902,18 @@ class AppState:
             loop_heights=self.loop_heights,
         )
 
-    def rebuild_spline_from_params(self):
+    def rebuild_spline_from_params(self, rebuild_mesh=True):
+        """Rebuilds the control rows from the current parameters.
+
+        `rebuild_mesh=False` skips the trailing mesh build and GPU upload. It is
+        for callers that follow this immediately with their own
+        rebuild_spline_mesh call and so were paying for two full builds where
+        the second discards the first -- the scan pattern pipeline does exactly
+        that, once per cell. Safe because rebuild_spline_mesh is a pure function
+        of the control rows and params set above, and the only state the skipped
+        call writes is mesh_center/model_t, which with
+        preserve_model_placement=True it just writes back unchanged.
+        """
         self.ctrl_rows = self._fresh_rebuild_rows()
         self.sync_period_offset_to_model_width()
         self.sync_period_offset_y_to_row_count()
@@ -922,7 +933,8 @@ class AppState:
         self.param_ref_radius = base_radius
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
-        self.rebuild_spline_mesh(preserve_model_placement=True)
+        if rebuild_mesh:
+            self.rebuild_spline_mesh(preserve_model_placement=True)
 
     def _ctrl_rows_bounds(self, rows):
         valid = [np.asarray(row, dtype=np.float32) for row in rows if len(row)]
