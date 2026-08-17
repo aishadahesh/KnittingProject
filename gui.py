@@ -332,7 +332,7 @@ def _puzzle_tiled_control_points(state):
     return tiled
 
 
-def _puzzle_period_pixel_vectors(state, renderer):
+def _puzzle_period_pixel_vectors(state, renderer, prefer_stitch_period=False):
     """Computes the exact pixel-space translation for one X repeat and one Y repeat,
     using the same world-space periods and camera/model matrix as the mesh tiling.
     Because the camera is orthographic, a constant world-space offset always maps
@@ -356,6 +356,21 @@ def _puzzle_period_pixel_vectors(state, renderer):
         radius_ctrl_rows=radius_profiles,
     )
     x_period = state._display_copy_x_period(base_vl, radius)
+    if prefer_stitch_period:
+        # _display_copy_x_period measures the display mesh's bounding width, but
+        # build_spline_mesh bakes period_offset_x into that mesh, so for some
+        # models the bounds already span a whole number of repeats and therefore
+        # double-count. Measured on a scan pattern: the bounds gave 3.893 where
+        # the stitch period is 1.936 -- exactly 2x -- which spaced every
+        # duplicate one empty repeat apart and left the gaps between columns.
+        # Where the stitch period divides the measured one, trust the stitches:
+        # that is the distance the pattern actually repeats over. Puzzle Mode
+        # leaves this off, so its hand-framed behaviour is unchanged.
+        stitch = abs(float(np.asarray(state.period_offset_x, dtype=np.float32).reshape(-1)[0]))
+        if stitch > max(radius, 1e-6):
+            multiple = x_period / stitch
+            if abs(multiple - round(multiple)) < 0.05 and round(multiple) >= 2:
+                x_period = stitch
     y_period = state._display_copy_y_period(base_vl, radius)
     depth_gap = max(radius * 2.4, 1e-6)
     z_period = state._display_copy_z_period(base_vl, depth_gap)
@@ -379,7 +394,7 @@ def _puzzle_period_pixel_vectors(state, renderer):
     }
 
 
-def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, periods=None, build_canvas=True):
+def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, periods=None, build_canvas=True, prefer_stitch_period=False):
     """Extracts one exact repeat-period tile from the live render and glues `cols` x
     `rows` copies of it edge-to-edge. Because the tile size equals the true geometric
     repeat period in pixels, adjacent copies connect without search-based alignment.
@@ -402,7 +417,7 @@ def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, per
     # period and therefore come out the same pixel size; otherwise it is
     # measured from the geometry currently in `state`.
     if periods is None:
-        periods = _puzzle_period_pixel_vectors(state, renderer)
+        periods = _puzzle_period_pixel_vectors(state, renderer, prefer_stitch_period=prefer_stitch_period)
     if periods is None:
         return None, None, {}
 
@@ -645,8 +660,22 @@ def _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoo
     state.camera.az = float(np.radians(camera_az_deg))
     state.camera.el = float(np.radians(camera_el_deg))
     all_v = np.vstack(mesh_verts)
-    bounds_min = all_v.min(axis=0)
-    bounds_max = all_v.max(axis=0)
+    # Fit to the geometry as it is actually drawn. mesh_pick_data holds raw
+    # model-space vertices, but the render multiplies them by
+    # current_model_matrix(), which carries the model's scale. Fitting the
+    # unscaled bounds framed a scaled model as if it were unscaled: with a
+    # scale of ~4.5 in X the camera ended up 4.5x too close, so less than one
+    # repeat period fitted across the frame. _puzzle_build_seamless_tile then
+    # clamped its period crop to the viewport width, producing a tile that was
+    # a fraction of a period -- which is why Scan Mode's duplicates did not line
+    # up while Puzzle Mode's, framed by hand, always did.
+    model_mat = state.current_model_matrix()
+    homog = np.concatenate(
+        [all_v, np.ones((len(all_v), 1), dtype=np.float32)], axis=1
+    ).astype(np.float32)
+    drawn_v = (homog @ model_mat.T)[:, :3]
+    bounds_min = drawn_v.min(axis=0)
+    bounds_max = drawn_v.max(axis=0)
     half_w = max(float(bounds_max[0] - bounds_min[0]) * 0.5 * 1.15, 1e-3)
     half_h = max(float(bounds_max[1] - bounds_min[1]) * 0.5 * 1.15, 1e-3)
 
@@ -663,7 +692,6 @@ def _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoo
     # actual projected content bounding box rather than a hand-tuned fraction,
     # since there is no user available to tune one here.
     crop_rect = None
-    model_mat = state.current_model_matrix()
     mvp = (state.camera.mvp(target_w, target_h) @ model_mat).astype(np.float32)
     tiled_points = _puzzle_tiled_control_points(state)
     if tiled_points:
@@ -717,7 +745,7 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
         # or cells would still come out at different sizes despite sharing a
         # crop. Needs the viewport at its final size first.
         renderer.resize(target_w, int(frame['target_h']))
-        frame['periods'] = _puzzle_period_pixel_vectors(state, renderer)
+        frame['periods'] = _puzzle_period_pixel_vectors(state, renderer, prefer_stitch_period=True)
         return frame
     except Exception:
         return None
@@ -764,7 +792,7 @@ def _scan_capture_one_azimuth(state, renderer, repeat_cols, repeat_rows, target_
 
     tile, _canvas, info = _puzzle_build_seamless_tile(
         state, renderer, repeat_cols, repeat_rows, crop_rect=crop_rect,
-        periods=shared_periods, build_canvas=False,
+        periods=shared_periods, build_canvas=False, prefer_stitch_period=True,
     )
     if tile is None:
         return None
