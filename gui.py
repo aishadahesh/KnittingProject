@@ -1990,6 +1990,17 @@ class EmbeddedMujocoScanner:
         self._save_stop = threading.Event()
         self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
         self._save_thread.start()
+        # Composing a capture -- warping the fabric texture into the camera
+        # frame and locating the patch -- is ~280 ms of pure PIL/NumPy with no
+        # OpenGL in it, and it ran on the frame thread, which is what kept the
+        # window at ~3 fps during a scan. It runs here instead. The GL half
+        # (rendering this cell's tiles) stays on the frame thread and always
+        # runs first, so this worker only ever reads an already-rendered tile.
+        self._compose_queue = queue.Queue()
+        self._compose_stop = threading.Event()
+        self._compose_thread = threading.Thread(target=self._compose_worker, daemon=True)
+        self._compose_thread.start()
+        self._gl_thread = threading.current_thread()
         self.status = (
             f"Running 1/{len(self.plan.poses)} | saved 0"
             if self.running
@@ -2230,11 +2241,124 @@ class EmbeddedMujocoScanner:
         if hold_seconds > 0.0:
             self._saved_preview_hold_until = max(self._saved_preview_hold_until, now + float(hold_seconds))
 
+    # -- Staged capture ------------------------------------------------------
+    #
+    # A capture is ~400 ms of work and used to run start-to-finish inside one
+    # update(), so the frame loop could not draw or read input for its whole
+    # duration. It is split here into stages that update() runs one at a time,
+    # returning in between, so the window keeps redrawing while a scan runs.
+    # The stages do exactly the same work in the same order; only when they run
+    # differs, so the saved images are unaffected.
+
+    def _begin_capture(self, tcp_pos, target_index, station_id):
+        self._capture_job = {
+            "stage": 0,
+            "tcp": np.asarray(tcp_pos, dtype=float).copy(),
+            "target_index": int(target_index),
+            "station_id": int(station_id),
+        }
+
+    def _capture_in_progress(self):
+        return getattr(self, "_capture_job", None) is not None
+
+    def _step_capture(self, deadline):
+        """Runs capture stages until `deadline` passes. True when the capture is done."""
+        job = getattr(self, "_capture_job", None)
+        while job is not None:
+            stage = job["stage"]
+            if stage == 0:
+                # GL work, frame thread only: make sure this cell's tiles exist.
+                # Only actually renders when the scan reaches a new cell; the
+                # other angles of that cell are already in the per-cell cache.
+                self._capture_stage_tiles(job)
+                job["stage"] = 1
+            elif stage == 1:
+                # Hand the pure-CPU composition to the worker and yield at once,
+                # so the frame thread is free while it runs.
+                if self._capture_dispatch_image(job):
+                    job["stage"] = 2
+                    return False
+                # Could not hand off safely; do it here instead.
+                self._capture_compose(job)
+                job["stage"] = 3
+            elif stage == 2:
+                if not job["done"].is_set():
+                    return False        # still composing; give the frame back
+                job["stage"] = 3
+            else:
+                self._capture_stage_finish(job)
+                self._capture_job = None
+                return True
+            if time.monotonic() >= deadline:
+                return False
+        return True
+
+    def _capture_stage_tiles(self, job):
+        try:
+            row, col = self.plan.station_cells[job["station_id"]]
+            view = self.plan.view_names[job["target_index"]] if self.plan.view_names else "angle 0"
+            zoom = float(getattr(self.args, "camera_zoom", 1.0))
+            angle_deg = self.scanner._view_angle_degrees(view)
+            job["tile"] = self._render_fresh_focused_capture(int(row), int(col), angle_deg, zoom)
+        except Exception:
+            job["tile"] = None
+
+    def _capture_dispatch_image(self, job):
+        """Queues the composition for the worker. False if it must run inline.
+
+        The worker cannot render, so it is only safe to hand over once the tile
+        this capture needs is already in the per-cell cache. If it is not there
+        -- a failed render, or a fallback path -- the composition stays on this
+        thread, where reaching the renderer is legal.
+        """
+        if job.get("tile") is None:
+            return False
+        job["done"] = threading.Event()
+        self._compose_queue.put(job)
+        return True
+
+    def _compose_worker(self):
+        while not self._compose_stop.is_set():
+            try:
+                job = self._compose_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._capture_compose(job)
+            except Exception as exc:
+                job["result"] = None
+                job["error"] = exc
+            finally:
+                job["done"].set()
+                self._compose_queue.task_done()
+
+    def _capture_compose(self, job):
+        """Projects the fabric texture into the camera frame and finds the patch.
+
+        Pure PIL/NumPy: safe on the worker. Everything that mutates scanner
+        state stays in _capture_stage_finish on the frame thread, so capture
+        records keep their order.
+        """
+        target_pose = self.plan.poses[min(job["target_index"], len(self.plan.poses) - 1)]
+        job["result"] = self._render_robot_camera_image(
+            job["tcp"],
+            job["target_index"],
+            station_id=job["station_id"],
+            target_pose=target_pose,
+            image_size=self._capture_image_size(),
+            detect_patch=True,
+        )
+
+    def _capture_stage_finish(self, job):
+        if job.get("error") is not None:
+            self.status = f"Capture error: {job['error']}"
+        self._write_capture_result(
+            job.get("result"), job["target_index"], job["station_id"],
+        )
+
     def _save_gripper_camera_image(self, tcp_pos, target_index, station_id):
-        output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
-        output_dir.mkdir(parents=True, exist_ok=True)
+        """Renders and saves one capture synchronously (single-target path)."""
         target_pose = self.plan.poses[min(target_index, len(self.plan.poses) - 1)]
-        capture_mode = str(getattr(self.args, "capture_mode", "natural"))
         result = self._render_robot_camera_image(
             tcp_pos,
             target_index,
@@ -2243,7 +2367,15 @@ class EmbeddedMujocoScanner:
             image_size=self._capture_image_size(),
             detect_patch=True,
         )
+        return self._write_capture_result(result, target_index, station_id)
+
+    def _write_capture_result(self, result, target_index, station_id):
+        output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        capture_mode = str(getattr(self.args, "capture_mode", "natural"))
         image, patch_image, debug_image, detection = self._unpack_capture_result(result)
+        if image is None:
+            return None
         self._show_robot_camera_image(image, hold_seconds=0.45)
         active_row, active_col = self.plan.station_cells[station_id]
         clean_view = self.plan.view_names[target_index].replace(" ", "_")
@@ -2842,6 +2974,20 @@ class EmbeddedMujocoScanner:
             else:
                 self.status = f"Moving to target row {active_row + 1}, col {active_col + 1} | pos err {err_pos:.3f} m"
         elif self.running and not self.paused:
+            deadline = time.monotonic() + self.FRAME_BUDGET
+
+            # A capture already under way owns this pass: finish what fits in
+            # the budget, then hand the frame back so the window can redraw.
+            if self._capture_in_progress():
+                if self._step_capture(deadline):
+                    self.saved_count += 1
+                    self._camera_preview_dirty = True
+                    self.target_index += 1
+                    self._camera_preview_dirty = True
+                    self.dwell_until = 0.0
+                self._render_frame()
+                return
+
             tcp = self._step_toward_pose(pose)
 
             err_pos, err_rot = self.scanner.pose_errors(tcp, pose)
@@ -2862,11 +3008,13 @@ class EmbeddedMujocoScanner:
                     ):
                         self.saved_targets.add(self.target_index)
                         self.saved_stations.add(station)
-                        self._save_gripper_camera_image(
-                            tcp,
-                            self.target_index,
-                            station,
-                        )
+                        self._begin_capture(tcp, self.target_index, station)
+                        if not self._step_capture(deadline):
+                            # Stages left to run; the rest of this capture, and
+                            # advancing to the next target, happen on following
+                            # frames.
+                            self._render_frame()
+                            return
                         self.saved_count += 1
                         self._camera_preview_dirty = True
                     self.target_index += 1
