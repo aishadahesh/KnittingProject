@@ -46,6 +46,12 @@
         "delta": 0.01
       },
       {
+        "name": "stitch_width",
+        "initial": 3.706,
+        "range": [0.25, 8.0],
+        "delta": 0.01
+      },
+      {
         "name": "loop_height_1",
         "initial": 3.0,
         "range": [0.1, 6.0],

@@ -94,7 +94,7 @@ class AppState:
         for attr, cast_fn in _SCHEMA_CASTS.items():
             super().__setattr__(attr, cast_fn(app_config[attr]))
         extra_saved_keys = (
-            'app_mode', 'loop_heights', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
+            'app_mode', 'loop_heights', 'loop_height_overrides', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
             'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
             'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols',
             'scanner_repeat_spacing_x', 'scanner_repeat_spacing_y', 'scanner_capture_mode',
@@ -178,7 +178,11 @@ class AppState:
             'puzzle_detect_color_count': 6,
             'puzzle_capture_rect': [0.08, 0.08, 0.84, 0.84],
             'ui_theme': 'dark',
-            'loop_heights': np.full((3, config_data['knit_parameters']['bitmap_loops']), 3.0, dtype=np.float32),
+            # Seeded empty: _sync_loop_heights fills it from loop_height_1..n.
+            # A hard-coded block here became stale the moment those parameters
+            # differed from it, and then outranked them for good.
+            'loop_heights': np.empty((0, 0), dtype=np.float32),
+            'loop_height_overrides': np.zeros((0, 0), dtype=bool),
             'mesh_center': np.zeros(3, dtype=np.float32),
             'row_colors': [
                 list(config_data['knit_parameters']['yarn_colors'][i % len(config_data['knit_parameters']['yarn_colors'])])
@@ -525,11 +529,29 @@ class AppState:
             return display_vl, display_fl, display_meta
 
         for y_tile in y_tiles:
-            y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+            # No depth offset between vertical copies. A copy above is simply
+            # more rows of the same fabric, so it belongs in the same plane and
+            # interlocks with the row below it exactly as the rows within a copy
+            # do. Pushing each copy back by a whole z span instead stacked them
+            # in separate depth layers, so the bottom row of one copy was drawn
+            # behind the top row of the copy beneath -- the brown sitting behind
+            # the red rather than above it, no matter how the heights were set.
+            y_translation = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
             for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
                 rings = np.asarray(verts, dtype=np.float32).reshape(int(n_points), seg, 3)
+                # Copies are strung into one tube, so they have to be visited in
+                # the direction the row itself travels. Rows are knitted
+                # alternately; a right-to-left row finishes at its left edge, so
+                # taking the copies left-to-right joined that finish to the next
+                # copy's start over on the right -- a jump back across the whole
+                # fabric, drawn as a long line behind it. Walking those copies
+                # right-to-left keeps each join between neighbours.
+                row_direction = 1.0
+                if int(n_points) > 1:
+                    row_direction = float(rings[-1, :, 0].mean() - rings[0, :, 0].mean())
+                ordered_tiles = x_tiles if row_direction >= 0.0 else list(reversed(x_tiles))
                 stitched_rings = []
-                for tile_i, x_tile in enumerate(x_tiles):
+                for tile_i, x_tile in enumerate(ordered_tiles):
                     translated = rings + np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
                     if tile_i > 0 and len(translated) > 1:
                         translated = translated[1:]
@@ -635,16 +657,20 @@ class AppState:
         return period.astype(np.float32)
 
     def _display_copy_y_period(self, verts_list, radius):
+        # One copy up is the whole stack of rows: as many row pitches as there
+        # are rows. This measured the pitch between row centres and multiplied
+        # by rows - 1, which is two mistakes at once. Centres move with loop
+        # height, so a tall row shifted the pitch away from dy; and stopping a
+        # pitch short landed the next copy's first row on top of this copy's
+        # last one instead of one row above it, so the copies interleaved and
+        # the bottom row of a copy appeared underneath the top row of the one
+        # below. dy times the row count is the grid's real vertical period, and
+        # it is what sync_period_offset_y_to_row_count already uses.
         if self.ctrl_rows:
-            row_centers = np.array([
-                float(np.mean(row[:, 1]))
-                for row in self.ctrl_rows
-                if len(row)
-            ], dtype=np.float32)
-            if len(row_centers) > 1:
-                row_pitch = abs(float(np.median(np.diff(np.sort(row_centers)))))
-                if row_pitch > 1e-6:
-                    return max(row_pitch * max(1, len(row_centers) - 1), radius)
+            dy = float(self.params[self._pidx['dy']])
+            period = abs(dy) * max(1, len(self.ctrl_rows))
+            if period > 1e-6:
+                return max(period, radius)
 
         bounds = self._display_mesh_bounds(verts_list)
         if bounds is None:
@@ -882,9 +908,34 @@ class AppState:
         idx = self._lh_idx[min(int(row_idx), len(self._lh_idx) - 1)]
         return float(self.params[idx])
 
+    def _loop_height_overrides(self, rows, cols):
+        """Boolean grid marking cells whose height the user set by hand."""
+        stored = self.get('loop_height_overrides', None)
+        grid = np.zeros((rows, cols), dtype=bool)
+        if stored is not None:
+            stored = np.asarray(stored, dtype=bool)
+            if stored.ndim == 2:
+                keep_rows = min(rows, stored.shape[0])
+                keep_cols = min(cols, stored.shape[1])
+                if keep_rows > 0 and keep_cols > 0:
+                    grid[:keep_rows, :keep_cols] = stored[:keep_rows, :keep_cols]
+        return grid
+
     def _sync_loop_heights(self):
+        """Rebuilds the per-cell height grid from the row parameters.
+
+        Only cells the user has actually dragged keep their own value. This grid
+        used to win outright over the parameters, so whatever it happened to
+        hold first became permanent: it starts life as a block of 3.0 that is
+        unrelated to loop_height_1..n, and those 3.0s then survived every later
+        parameter change. A model whose parameters read 1.06/1.84/4.28/4.96
+        would still be built from 3.0/3.0/3.0/4.96 -- only the row added last,
+        which had no stale entry to inherit, ever picked its parameter up. That
+        is why one row stood out against the rest.
+        """
         rows, cols = int(self.bitmap_size[0]), int(self.bitmap_size[1])
         existing = np.asarray(self.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
+        overrides = self._loop_height_overrides(rows, cols)
         synced = np.zeros((rows, cols), dtype=np.float32)
         for row_idx in range(rows):
             synced[row_idx, :] = self._default_loop_height_for_row(row_idx)
@@ -892,8 +943,12 @@ class AppState:
             keep_rows = min(rows, existing.shape[0])
             keep_cols = min(cols, existing.shape[1])
             if keep_rows > 0 and keep_cols > 0:
-                synced[:keep_rows, :keep_cols] = existing[:keep_rows, :keep_cols]
+                kept = overrides[:keep_rows, :keep_cols]
+                synced[:keep_rows, :keep_cols] = np.where(
+                    kept, existing[:keep_rows, :keep_cols], synced[:keep_rows, :keep_cols]
+                )
         self.loop_heights = synced
+        self.loop_height_overrides = overrides
         return synced
 
     def set_loop_height_cell(self, row_idx, col_idx, value):
@@ -905,6 +960,16 @@ class AppState:
             pd = self.config['knit_parameters']['parameters'][self._lh_idx[min(row_idx, len(self._lh_idx) - 1)]]
             lo, hi = float(pd['range'][0]), float(pd['range'][1])
         self.loop_heights[row_idx, col_idx] = float(np.clip(value, lo, hi))
+        # From here this cell is the user's, and no longer follows its row.
+        overrides = np.asarray(self.loop_height_overrides, dtype=bool).copy()
+        overrides[row_idx, col_idx] = True
+        self.loop_height_overrides = overrides
+
+    def clear_loop_height_overrides(self):
+        """Hands every cell back to its row parameter."""
+        rows, cols = int(self.bitmap_size[0]), int(self.bitmap_size[1])
+        self.loop_height_overrides = np.zeros((rows, cols), dtype=bool)
+        return self._sync_loop_heights()
 
     def _fresh_rebuild_rows(self):
         self._sync_loop_heights()
@@ -1142,7 +1207,7 @@ class AppState:
             'fiber_geometry_twist', 'spline_keyboard_step',
             'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset_x', 'period_offset_y', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
+            'period_offset_x', 'period_offset_y', 'app_mode', 'scanner_layout_pattern', 'loop_heights', 'loop_height_overrides',
         )
         for key in reset_keys:
             if key in defaults:
@@ -1184,7 +1249,7 @@ class AppState:
             'fiber_geometry_surface_arc', 'fiber_geometry_randomness',
             'fiber_geometry_twist', 'spline_grab_active', 'radius_grab_active',
             'spline_keyboard_edit_active', 'radius_keyboard_edit_active',
-            'period_offset_x', 'period_offset_y', 'app_mode', 'scanner_layout_pattern', 'loop_heights',
+            'period_offset_x', 'period_offset_y', 'app_mode', 'scanner_layout_pattern', 'loop_heights', 'loop_height_overrides',
         ):
             if key in defaults:
                 self._data[key] = self._clone(defaults[key])
@@ -1241,6 +1306,9 @@ class AppState:
                 idx = self._pidx[name]
                 lo, hi = self.config['knit_parameters']['parameters'][idx]["range"]
                 self.params[idx] = float(np.clip(span * dy, lo, hi))
+        # This retunes every row, so hand the cells back: leaving hand-set ones
+        # pinned would make the fit apply to some rows and not others.
+        self.clear_loop_height_overrides()
         self.on_bitmap_change()
 
     # ── PARAMETER SERIALIZATION ───────────────────────────────────────────────

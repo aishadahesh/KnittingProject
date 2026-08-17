@@ -62,6 +62,14 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5, loop_heig
     stitch_bulge = float(p[pidx["stitch_bulge"]])
     stitch_z = float(p[pidx["stitch_z"]])
     dy = float(p[pidx["dy"]])
+    # How wide one stitch is. This used to be hard-coded at one unit per column
+    # while loop height stayed free, so raising the height gave tall narrow
+    # loops that overlapped their neighbours instead of a proper knit -- which
+    # is why a regenerated model looked nothing like the tuned one saved in
+    # initial_params.json. That saved geometry is this same formula with x
+    # scaled by 3.706, so the width is now a parameter and the automatic build
+    # can reproduce it. Older files simply lack the key and load the default.
+    stitch_width = float(p[pidx["stitch_width"]]) if "stitch_width" in pidx else 1.0
     if loop_heights is None:
         height_grid = _height_grid_from_params(p, bitmap_array, lh_idx)
     else:
@@ -73,9 +81,27 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5, loop_heig
             h_cols = min(fixed.shape[1], height_grid.shape[1])
             fixed[:h_rows, :h_cols] = height_grid[:h_rows, :h_cols]
             height_grid = fixed
+    # What each cell's loop would measure if it were knitted. Clearing a cell
+    # also zeroes its stored height, so height_grid cannot say how tall the
+    # stitch standing in for it has to reach; the row's own loop_height
+    # parameter is that answer. Only ever consulted for cells with no height of
+    # their own, so per-cell edits are respected everywhere else.
+    natural_heights = height_grid.copy()
+    row_defaults = _height_grid_from_params(p, bitmap_array, lh_idx)
+    blank = natural_heights <= 0.0
+    natural_heights[blank] = row_defaults[blank]
+
     scale_factors = compute_bitmap_scale_factors(bitmap_array)
     n_rows, n_cols = scale_factors.shape
     base_t_values = np.linspace(0.0, 2.0 * np.pi, int(spl), endpoint=False, dtype=np.float32)
+    # How much of a loop's height its highest control point actually reaches.
+    # The samples are spread evenly around the loop and never land exactly on
+    # its crown, so at the usual five per loop the top control point sits at
+    # 0.9045 of the height rather than 1.0. A replacement stitch has to clear
+    # the row pitches it crosses in those same units, or it stops fractionally
+    # short of the loop it is standing in for.
+    peak_factor = float(np.max((1.0 - np.cos(base_t_values)) / 2.0)) if int(spl) > 0 else 1.0
+    peak_factor = max(peak_factor, 1e-6)
     rows = []
 
     for row_idx in range(n_rows):
@@ -84,15 +110,54 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5, loop_heig
         t_values = base_t_values if row_idx % 2 == 0 else base_t_values[::-1]
 
         for col_idx in col_indices:
-            has_loop = 1.0 if scale_factors[row_idx, col_idx] > 0.0 else 0.0
-            loop_height = float(height_grid[row_idx, col_idx]) if has_loop else 0.0
+            # A stitch grows upward to take the place of the switched-off cells
+            # above it in its own column, finishing where the topmost one it
+            # replaces would have finished. compute_bitmap_scale_factors already
+            # reports that reach as a span -- 1 normally, one more per
+            # switched-off cell above -- but it was being read as a plain
+            # yes/no flag, so a cleared cell just left a hole.
+            #
+            # The replacement stitch has to end level with the loop it stands in
+            # for, not simply be a multiple of its own height: it rises over the
+            # (span - 1) row pitches it crosses and then forms the loop the top
+            # covered cell would have had. A span of 1 leaves loop_height
+            # exactly as it was, so a fully active bitmap is untouched.
+            span = int(scale_factors[row_idx, col_idx])
+            has_loop = 1.0 if span > 0 else 0.0
+            if has_loop:
+                top_row = min(row_idx + span - 1, n_rows - 1)
+                loop_height = float(natural_heights[top_row, col_idx])
+                loop_height += (span - 1) * dy / peak_factor
+            else:
+                loop_height = 0.0
             for t in t_values:
-                x = col_idx + (stitch_bulge * np.sin(2.0 * t) if has_loop else 0.0) + t / (2.0 * np.pi)
+                # The bulge scales with the stitch too, so its shape stays the
+                # same proportion of a stitch at any width.
+                x = (
+                    col_idx
+                    + (stitch_bulge * np.sin(2.0 * t) if has_loop else 0.0)
+                    + t / (2.0 * np.pi)
+                ) * stitch_width
                 y = row_idx * dy - loop_height * (np.cos(t) - 1.0) / 2.0
                 z = has_loop * stitch_z * (np.cos(2.0 * t) - 1.0) / 2.0
                 row_points.append([x, y, z])
 
-        row_points.append([float(n_cols if row_idx % 2 == 0 else 0.0), row_idx * dy, 0.0])
+        # Carry the row all the way to the right-hand edge of the fabric.
+        #
+        # Sampling a stitch stops one step short of its far side, so a row's
+        # outermost point sits mid-stitch rather than on the edge. Rows are
+        # knitted alternately, and only the left-to-right ones were given this
+        # closing point -- so right-to-left rows began at x=6.050 instead of
+        # 7.412 and ended up shifted a third of a stitch out of line with their
+        # neighbours, their ends landing away from the fabric edge. Whichever
+        # way the row runs, the edge belongs at the end that reaches for it:
+        # appended when the row finishes on the right, prepended when it starts
+        # there. Both then span exactly one period, 0 .. n_cols * stitch_width.
+        edge_point = [float(n_cols) * stitch_width, row_idx * dy, 0.0]
+        if row_idx % 2 == 0:
+            row_points.append(edge_point)
+        else:
+            row_points.insert(0, edge_point)
         rows.append(np.array(row_points, dtype=float))
 
     return rows
@@ -305,7 +370,17 @@ def build_spline_mesh(
         cp = np.asarray(r, dtype=float)
         if len(cp) == 0:
             continue
-        pts = eval_centerline(cp, D, nout)
+        # eval_centerline closes a row periodically by appending cp[0] + D,
+        # which assumes the row runs the same way D points. Rows alternate
+        # direction, so on a right-to-left row cp[0] is already at the far end
+        # and adding D threw the closing point a whole period past it: the row
+        # was drawn out to x=13.46 on a model only 7.41 wide, which is the long
+        # straight tail those rows trailed off to one side. Point the period the
+        # way this row actually travels.
+        row_period = D
+        if len(cp) > 1 and float(np.dot(cp[-1] - cp[0], D)) < 0.0:
+            row_period = -D
+        pts = eval_centerline(cp, row_period, nout)
         if len(cp) <= 1:
             ctrl_sample_idx = np.zeros(nout, dtype=float)
         else:
