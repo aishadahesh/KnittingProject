@@ -1778,6 +1778,21 @@ def _draw_database_summary_page(state, renderer):
 
 class EmbeddedMujocoScanner:
     CAMERA_PREVIEW_INTERVAL = 0.18
+    # Robot-viewport redraw rate while a scan is running. A redraw is ~130 ms
+    # (86 ms of it MuJoCo's own offscreen render and readPixels) and it only
+    # shows progress, so it is skipped on most passes.
+    #
+    # Both limits are required. A wall-clock interval alone does nothing here:
+    # a loop pass already takes far longer than any sensible interval, so the
+    # interval has always elapsed and the throttle never fires -- the same trap
+    # the camera-preview throttle falls into. The frame count is what actually
+    # limits it when passes are slow; the interval takes over if they get fast.
+    VIEWPORT_INTERVAL = 0.10
+    VIEWPORT_EVERY_N_UPDATES = 3
+    # How much work update() starts before handing the frame back. Stages are
+    # not interruptible once begun, so this is a "do not start another stage
+    # past here" line rather than a hard cap on the pass.
+    FRAME_BUDGET = 0.015
     MAX_EXECUTED_TRAIL_POINTS = 300
 
     def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None, per_cell_images=None, auto_start=True):
@@ -1796,6 +1811,16 @@ class EmbeddedMujocoScanner:
         self._pattern_renderer = MeshRenderer(gl_ctx, 480, 360)
         self.texture = None
         self.camera_texture = None
+        # Set by the sidebar each frame. The live camera view is produced inside
+        # update() rather than when the widget draws, so without this the render
+        # happens whether or not anyone can see it -- and it costs more per
+        # target than the saved capture does (measured 0.48 s against 0.37 s).
+        self.preview_visible = True
+        # Robot-viewport rate limiting; see _render_frame.
+        self._last_viewport_time = 0.0
+        self._viewport_dirty = True
+        # The capture currently spread across frames; see _step_capture.
+        self._capture_job = None
         self.camera_preview_width = int(scanner.CAMERA_IMAGE_SIZE[0])
         self.camera_preview_height = int(scanner.CAMERA_IMAGE_SIZE[1])
         palette = _scanner_base_palette(state)
@@ -1995,15 +2020,26 @@ class EmbeddedMujocoScanner:
             self.analysis_results = None
             self.scan_run_id = time.strftime("run_%Y%m%d_%H%M%S")
             self.scan_output_dir = Path(self.args.image_dir) / self.scan_run_id
+        # A rerun must not inherit a half-finished capture from the last one.
+        self._capture_job = None
         self.single_capture_mode = False
         self.single_target_active = False
         self.running = True
         self.paused = False
         self.status = f"Running {self.target_index + 1}/{len(self.plan.poses)} | saved {self.saved_count}"
 
+    def _mark_viewport_dirty(self):
+        """Forces the next _render_frame to redraw rather than wait its turn.
+
+        The viewport is rate limited while a scan runs, but a camera change is a
+        direct response to the user, so it must not be held back.
+        """
+        self._viewport_dirty = True
+
     def set_zoom(self, zoom):
         self.view_zoom = float(np.clip(zoom, 0.45, 2.50))
         self.camera.distance = self.base_camera_distance / self.view_zoom
+        self._mark_viewport_dirty()
 
     def zoom_in(self):
         self.set_zoom(self.view_zoom * 1.15)
@@ -2015,14 +2051,17 @@ class EmbeddedMujocoScanner:
         self.set_zoom(1.0)
         self.camera.azimuth = 235.0
         self.camera.elevation = -20.0
+        self._mark_viewport_dirty()
 
     def orbit_view(self, dx, dy):
         self.camera.azimuth = float((self.camera.azimuth - dx * 0.35) % 360.0)
         self.camera.elevation = float(np.clip(self.camera.elevation + dy * 0.25, -80.0, -5.0))
+        self._mark_viewport_dirty()
 
     def rotate_view(self, delta_azimuth=0.0, delta_elevation=0.0):
         self.camera.azimuth = float((self.camera.azimuth + float(delta_azimuth)) % 360.0)
         self.camera.elevation = float(np.clip(self.camera.elevation + float(delta_elevation), -80.0, -5.0))
+        self._mark_viewport_dirty()
 
     def pan_view(self, dx, dy):
         scale = 0.0014 * float(self.camera.distance)
@@ -2030,6 +2069,7 @@ class EmbeddedMujocoScanner:
         right = np.array([np.cos(az), -np.sin(az), 0.0])
         up = np.array([0.0, 0.0, 1.0])
         self.camera.lookat[:] = self.camera.lookat + right * (-dx * scale) + up * (dy * scale)
+        self._mark_viewport_dirty()
 
     # -- Robot camera preview and image capture -------------------------------
 
@@ -2752,6 +2792,11 @@ class EmbeddedMujocoScanner:
             self.camera_texture.write(rgba.tobytes())
 
     def _render_camera_preview(self, tcp_pose, target_index, target_pose):
+        # Nothing on screen is showing this, so do not spend a full camera
+        # render producing it. Saved captures go through
+        # _save_gripper_camera_image and are unaffected.
+        if not getattr(self, "preview_visible", True):
+            return
         if time.monotonic() < self._saved_preview_hold_until and self.latest_camera_image is not None:
             return
         preview_key = (
@@ -2837,27 +2882,53 @@ class EmbeddedMujocoScanner:
         elif self.running:
             self.status = f"Running {self.target_index + 1}/{len(self.plan.poses)} ({pct:.0f}%) | saved {self.saved_count}"
 
-    def _render_frame(self):
+    def _render_frame(self, force=False):
+        """Advances MuJoCo and, when it is due, redraws the robot viewport.
+
+        Rebuilding and rendering the MuJoCo scene costs ~140 ms, and it was run
+        on every pass of the scan loop -- about a quarter of the loop's time
+        spent redrawing a progress view far faster than anyone can read it. The
+        robot pose itself is still advanced every call; only the redraw is rate
+        limited, and a camera change or a paused/finished scan forces it
+        immediately so interaction never feels held back.
+        """
         self.mujoco.mj_forward(self.model, self.data)
-        if self.mj_context is not None:
-            self.mj_context.make_current()
-        self.renderer.update_scene(self.data, self.camera)
         current_pose = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
         target_pose = self.plan.poses[min(self.target_index, len(self.plan.poses) - 1)]
-        self.scanner.draw_scene(
-            self.mujoco,
-            self.scene_handle,
-            self.plan,
-            min(self.target_index, len(self.plan.poses) - 1),
-            self.executed,
-            camera_enabled=bool(self.args.add_camera),
-            current_pose=current_pose,
-            target_pose=target_pose,
-            clear_scene=False,
-            simplified=True,
+
+        now = time.monotonic()
+        self._viewport_skipped = int(getattr(self, "_viewport_skipped", 0)) + 1
+        due = (
+            force
+            or self.texture is None
+            or getattr(self, "_viewport_dirty", False)
+            or not (self.running and not self.paused)
+            or (
+                self._viewport_skipped >= self.VIEWPORT_EVERY_N_UPDATES
+                and (now - float(getattr(self, "_last_viewport_time", 0.0))) >= self.VIEWPORT_INTERVAL
+            )
         )
-        frame = self.renderer.render()
-        self._upload_frame(frame)
+        if due:
+            self._viewport_dirty = False
+            self._viewport_skipped = 0
+            self._last_viewport_time = now
+            if self.mj_context is not None:
+                self.mj_context.make_current()
+            self.renderer.update_scene(self.data, self.camera)
+            self.scanner.draw_scene(
+                self.mujoco,
+                self.scene_handle,
+                self.plan,
+                min(self.target_index, len(self.plan.poses) - 1),
+                self.executed,
+                camera_enabled=bool(self.args.add_camera),
+                current_pose=current_pose,
+                target_pose=target_pose,
+                clear_scene=False,
+                simplified=True,
+            )
+            frame = self.renderer.render()
+            self._upload_frame(frame)
         self._render_camera_preview(
             current_pose,
             min(self.target_index, len(self.plan.poses) - 1),
@@ -5082,26 +5153,34 @@ def draw_sidebar(state, renderer, window=None):
 
     if str(state.get('app_mode', 'edit')) == 'scan':
         imgui.separator()
-        imgui.text("Robot Camera View")
-        imgui.text_disabled("Live image from the UR5 gripper camera")
         embedded = state.get('embedded_scanner')
-        preview_w = max(120, int(imgui.get_content_region_avail().x))
-        preview_h = int(preview_w * 0.75)
-        if embedded is None:
-            imgui.dummy((preview_w, preview_h))
-            imgui.text_wrapped("Camera preview waiting for scan. Press Start Scanner Now.")
-        elif embedded.camera_texture is None:
-            imgui.dummy((preview_w, preview_h))
-            imgui.text_wrapped("Camera preview waiting for the first scanner frame.")
+        # Folding this away genuinely stops the work, not just the drawing: the
+        # live view costs a full camera render per target -- more than the saved
+        # capture -- and the scanner only produces it while this is open.
+        shown = imgui.collapsing_header("Robot Camera View", imgui.TreeNodeFlags_.default_open)
+        if embedded is not None:
+            embedded.preview_visible = bool(shown)
+        if shown:
+            imgui.text_disabled("Live image from the UR5 gripper camera")
+            preview_w = max(120, int(imgui.get_content_region_avail().x))
+            preview_h = int(preview_w * 0.75)
+            if embedded is None:
+                imgui.dummy((preview_w, preview_h))
+                imgui.text_wrapped("Camera preview waiting for scan. Press Start Scanner Now.")
+            elif embedded.camera_texture is None:
+                imgui.dummy((preview_w, preview_h))
+                imgui.text_wrapped("Camera preview waiting for the first scanner frame.")
+            else:
+                draw_fitted_texture(
+                    embedded.camera_texture.glo,
+                    embedded.camera_preview_width,
+                    embedded.camera_preview_height,
+                    preview_w,
+                    preview_h,
+                    flip_y=False,
+                )
         else:
-            draw_fitted_texture(
-                embedded.camera_texture.glo,
-                embedded.camera_preview_width,
-                embedded.camera_preview_height,
-                preview_w,
-                preview_h,
-                flip_y=False,
-            )
+            imgui.text_disabled("Live view paused -- scanning runs faster while this is closed.")
 
     if state.status_msg:
         imgui.separator()
