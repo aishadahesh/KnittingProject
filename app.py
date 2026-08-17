@@ -22,7 +22,6 @@ import moderngl
 from PIL import Image
 from imgui_bundle import imgui, imguizmo
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
-import jax.numpy as jnp
 
 
 import json

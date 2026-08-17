@@ -3,7 +3,6 @@ import json
 import threading
 import time
 import numpy as np
-import jax.numpy as jnp
 from PIL import Image
 
 from knitting_core import (
