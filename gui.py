@@ -673,9 +673,21 @@ def _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoo
     camera_dist = max(dist_for_h, dist_for_w, 1e-3) / max(0.1, float(zoom))
     state.camera.dist = camera_dist
 
-    # Crop so no unnecessary background is visible: the anchor comes from the
-    # actual projected content bounding box rather than a hand-tuned fraction,
-    # since there is no user available to tune one here.
+    # Anchor the exact-period crop inside the fabric.
+    #
+    # This used to anchor at the projected bounding box's minimum corner, minus
+    # a margin -- i.e. just outside the geometry. The period crop therefore
+    # started on the fabric's top-left boundary, where the edge loops open into
+    # empty space instead of interlocking with a neighbour. Stamping that out
+    # 64x64 reproduced the boundary every repeat, which is what made Scan Mode's
+    # duplicates read as separate motifs while Puzzle Mode, whose capture rect
+    # is an inset the user places over the middle of the fabric, tiled cleanly.
+    #
+    # The centre is interior for any framing that holds more than about two
+    # periods (the fit above gives 3.5 across and ~5 down), and
+    # _puzzle_build_seamless_tile clamps the box back inside the viewport if a
+    # period would overhang. rw/rh stay as the tight content extent; only rx/ry
+    # are read when cropping a period.
     crop_rect = None
     mvp = (state.camera.mvp(target_w, target_h) @ model_mat).astype(np.float32)
     tiled_points = _puzzle_tiled_control_points(state)
@@ -688,8 +700,8 @@ def _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoo
         x_max, y_max = all_proj.max(axis=0)
         margin_x = (x_max - x_min) * 0.04
         margin_y = (y_max - y_min) * 0.04
-        rx = float(np.clip((x_min - margin_x) / target_w, 0.0, 0.95))
-        ry = float(np.clip((y_min - margin_y) / target_h, 0.0, 0.95))
+        rx = float(np.clip((x_min + x_max) * 0.5 / target_w, 0.0, 0.95))
+        ry = float(np.clip((y_min + y_max) * 0.5 / target_h, 0.0, 0.95))
         rw = float(np.clip((x_max + margin_x) / target_w - rx, 0.05, 1.0 - rx))
         rh = float(np.clip((y_max + margin_y) / target_h - ry, 0.05, 1.0 - ry))
         crop_rect = [rx, ry, rw, rh]
@@ -813,8 +825,18 @@ def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, col
     results = {}
     try:
         state.params = state._scanner_template_params()
-        state.bitmap = np.asarray(bitmap, dtype=np.float32)
-        state.bitmap_size = np.array(state.bitmap.shape, dtype=np.int32)
+        # Every stitch exists; the pattern is carried by loop height alone.
+        # build_parametric_control_rows drops a loop outright wherever the
+        # bitmap is zero -- has_loop forces loop_height to 0 there, whatever
+        # height it was given -- and at the usual density that emptied whole
+        # columns, so tiled copies stopped touching and a 64x64 repeat read as a
+        # grid of separate motifs. An all-active bitmap keeps the yarn
+        # continuous across every repeat, the way Puzzle Mode renders the same
+        # model, while _scanner_loop_heights_for_bitmap still distinguishes the
+        # cells as tall and short loops.
+        pattern_bitmap = np.asarray(bitmap, dtype=np.float32)
+        state.bitmap = np.ones_like(pattern_bitmap)
+        state.bitmap_size = np.array(pattern_bitmap.shape, dtype=np.int32)
         state.loop_heights = np.asarray(loop_heights, dtype=np.float32)
         state.row_colors = [list(np.asarray(c, dtype=np.float32)[:3]) for c in colors] if colors else state.row_colors
         state.use_row_colors = True
@@ -826,6 +848,11 @@ def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, col
         # mesh, with the placement flag this pass actually wants.
         state.rebuild_spline_from_params(rebuild_mesh=False)
         state.rebuild_spline_mesh(preserve_model_placement=False)
+        # Control-point markers belong to the editing viewport, not to captured
+        # fabric. rebuild_spline_mesh uploads them to whichever renderer it is
+        # handed, and the period crop samples the middle of the fabric, which is
+        # exactly where they sit -- so they would be stamped into every repeat.
+        renderer.set_ctrl_pts([])
 
         for az in camera_az_degs:
             results[float(az)] = _scan_capture_one_azimuth(
@@ -3543,7 +3570,7 @@ def _draw_puzzle_capture_widget(state, image, texture, avail_w, avail_h):
 # every cell from scratch otherwise -- ~4 s at a 3x4 grid, paid on every launch
 # even when nothing about the pattern changed.
 _TILE_CACHE_DIR_NAME = "tile_cache"
-_TILE_CACHE_VERSION = 1
+_TILE_CACHE_VERSION = 2
 _TILE_CACHE_KEEP = 3
 
 

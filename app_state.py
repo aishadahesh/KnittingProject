@@ -14,6 +14,12 @@ from knitting_core import (
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 
 class AppState:
+    # How tall a scan-pattern loop is where the cell's bitmap is off, as a
+    # fraction of the active height. Not zero: a zero-height loop is no stitch
+    # at all, which breaks the fabric into disconnected motifs once it is tiled.
+    # Low enough that cells still look meaningfully different from one another.
+    SCANNER_INACTIVE_LOOP_HEIGHT_SCALE = 0.45
+
     @staticmethod
     def _json_ready(value):
         if isinstance(value, np.ndarray):
@@ -375,7 +381,16 @@ class AppState:
             keep_rows = min(bitmap.shape[0], source.shape[0])
             keep_cols = min(bitmap.shape[1], source.shape[1])
             heights[:keep_rows, :keep_cols] = source[:keep_rows, :keep_cols]
-        return heights * (bitmap > 0.5)
+        # Cells the pattern switches off are shortened, not removed. Multiplying
+        # by the bitmap collapsed them to zero height, which deleted the stitch
+        # outright: at the usual density that emptied whole columns, so tiled
+        # copies stopped touching and a 64x64 repeat read as a grid of separate
+        # motifs instead of one piece of fabric. Keeping a shorter loop leaves
+        # the yarn continuous across every repeat -- the way Puzzle Mode renders
+        # the same model -- while still giving each scan cell a distinct pattern.
+        active = np.asarray(bitmap > 0.5, dtype=np.float32)
+        scale = active + (1.0 - active) * float(self.SCANNER_INACTIVE_LOOP_HEIGHT_SCALE)
+        return heights * scale
 
     def _fit_vl_to_bounds(self, vl, target_bounds):
         if not vl:
