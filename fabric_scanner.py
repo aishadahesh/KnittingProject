@@ -993,6 +993,9 @@ def _add_model_cell_fabric(mujoco, scn, plan: FabricPlan, row: int, col: int, z:
 
 def _add_rendered_fabric_proxy(mujoco, scn, plan: FabricPlan, z: float, view_name: str = "angle 0") -> bool:
     texture = _lit_rendered_texture_for_camera(plan, 0, 0, focused=False, view_name=view_name)
+    # This path samples the image directly, and only ever asks for a coarse grid
+    # of colours, so a lazy texture is stamped out small.
+    texture = _materialize_texture(texture, 1024)
     if texture is None:
         return False
     tex_w, tex_h = texture.size
@@ -1119,10 +1122,37 @@ def _perspective_coeffs(dst_points, src_points):
     return np.linalg.solve(np.asarray(matrix, dtype=float), np.asarray(vector, dtype=float)).tolist()
 
 
-def _paste_projected_texture(base: Image.Image, texture: Image.Image, projected_quad) -> bool:
+def _materialize_texture(texture, max_dim=None):
+    """Accepts a PIL image, or a lazy tiled-texture descriptor from the GUI.
+
+    Scan Mode hands over one seamless period tile plus its repeat counts rather
+    than a fully glued image -- the glued form is exact integer repetition, so
+    at 64 repeats it is hundreds of MB holding a couple of hundred KB of real
+    content. Asking it for `max_dim` stamps the tile out at that size.
+    """
+    if texture is None:
+        return None
+    rasterize = getattr(texture, "rasterize", None)
+    if rasterize is None:
+        return texture
+    return rasterize(max_dim)
+
+
+def _paste_projected_texture(base: Image.Image, texture, projected_quad) -> bool:
     if any(point is None for point in projected_quad):
         return False
     dst = [(float(point[0]), float(point[1])) for point in projected_quad]
+    # Deliberately materialised at full resolution rather than at the quad's
+    # on-screen size. Pre-filtering the source to roughly what the warp can
+    # resolve is cheaper and, judged on its own, cleaner -- Image.transform
+    # point-samples with a bicubic kernel and does not area-average, so a large
+    # source aliases. But it changes the captured pixels (measured: ~13% of them
+    # by more than 8/255 at a 2x pre-filter), and these captures are the
+    # scanner's output data. Full resolution keeps every saved image identical
+    # to what the glued-image pipeline produced. The memory win is unaffected:
+    # this is one transient rasterisation per capture instead of a permanently
+    # held glued image per cell.
+    texture = _materialize_texture(texture, None)
     src = texture.convert("RGB")
     src_w, src_h = src.size
     if src_w <= 1 or src_h <= 1:

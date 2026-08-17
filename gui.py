@@ -14,6 +14,7 @@ re-imported below, so call sites in this file are unchanged.
 import os
 import json
 import copy
+import contextlib
 import numpy as np
 import glfw
 import time
@@ -376,7 +377,7 @@ def _puzzle_period_pixel_vectors(state, renderer):
     }
 
 
-def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, periods=None):
+def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, periods=None, build_canvas=True):
     """Extracts one exact repeat-period tile from the live render and glues `cols` x
     `rows` copies of it edge-to-edge. Because the tile size equals the true geometric
     repeat period in pixels, adjacent copies connect without search-based alignment.
@@ -384,7 +385,12 @@ def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, per
     `crop_rect`, if given, is an (rx, ry, rw, rh) fraction whose (rx, ry) anchors the
     tile's top-left corner (rw/rh are unused -- the tile is always exactly one period
     wide/tall). Defaults to Puzzle Mode's manual `_puzzle_capture_rect`, but Scan Mode's
-    automated capture passes its own auto-detected tight anchor instead."""
+    automated capture passes its own auto-detected tight anchor instead.
+
+    `build_canvas=False` returns None in place of the glued image and leaves the
+    caller to hold a TiledFabricTexture built from `tile` and info's cols/rows.
+    Puzzle Mode wants the real canvas to display; Scan Mode does not, and at 64
+    repeats that canvas is 165 MB of exact repetition per cell."""
     vp_w = int(getattr(renderer, "vp_w", 0))
     vp_h = int(getattr(renderer, "vp_h", 0))
     if vp_w < 2 or vp_h < 2 or getattr(renderer, "color_tex", None) is None:
@@ -425,10 +431,16 @@ def _puzzle_build_seamless_tile(state, renderer, cols, rows, crop_rect=None, per
     if tile_h * rows > max_canvas_dim:
         rows = max(1, max_canvas_dim // tile_h)
 
-    canvas = Image.new("RGB", (tile_w * cols, tile_h * rows), (18, 23, 31))
-    for row_i in range(rows):
-        for col_i in range(cols):
-            canvas.paste(tile, (col_i * tile_w, row_i * tile_h))
+    if build_canvas:
+        canvas = Image.new("RGB", (tile_w * cols, tile_h * rows), (18, 23, 31))
+        for row_i in range(rows):
+            for col_i in range(cols):
+                canvas.paste(tile, (col_i * tile_w, row_i * tile_h))
+    else:
+        # The caller intends to hold a TiledFabricTexture instead. At high
+        # repeat counts this canvas is hundreds of MB of exact repetition, so
+        # not building it is the entire saving.
+        canvas = None
 
     info = {
         "tile_box": tile_box,
@@ -480,6 +492,136 @@ def _scan_restore_state(state, snap):
     state.camera.az = cam['az']
     state.camera.el = cam['el']
     state.camera.fov_deg = cam['fov_deg']
+
+
+class TiledFabricTexture:
+    """One seamless period tile plus the repeat counts that tile it.
+
+    _puzzle_build_seamless_tile builds its glued image by stamping `tile`
+    cols x rows times edge to edge, so the result is exact integer repetition.
+    Measured on a real scan cell: all 1088 blocks of an 8160x6720 canvas were
+    byte-identical to the 480x105 tile they came from -- 151 KB of actual
+    content stored as 165 MB. Twenty cells of that is 3.9 GB, which is what put
+    the app into swap and made the whole machine stall.
+
+    Keeping the tile and stamping on demand is lossless: `size` reports exactly
+    what the glued image measured, and rasterize() with no cap reproduces it
+    byte for byte. Consumers that only need a smaller version -- a grid-preview
+    slot, or a camera quad a few hundred pixels across -- ask for that size and
+    get a properly filtered image, rather than an aliased bicubic downsample of
+    a giant one.
+
+    Quacks like a PIL image for `size`, `mode` and `convert` so that any caller
+    that was handed the glued image still works.
+    """
+
+    __slots__ = ("tile", "cols", "rows", "_cache")
+
+    # Rasterisations at or above this are not cached; the whole point is to
+    # avoid holding large glued images alive.
+    _CACHE_MAX_DIM = 2600
+    _CACHE_ENTRIES = 2
+
+    def __init__(self, tile, cols, rows):
+        self.tile = tile if tile.mode == "RGB" else tile.convert("RGB")
+        self.cols = max(1, int(cols))
+        self.rows = max(1, int(rows))
+        self._cache = {}
+
+    @property
+    def mode(self):
+        return "RGB"
+
+    @property
+    def size(self):
+        tile_w, tile_h = self.tile.size
+        return (tile_w * self.cols, tile_h * self.rows)
+
+    def _build(self, max_dim):
+        tile_w, tile_h = self.tile.size
+        full_w, full_h = self.size
+        paste_tile, paste_w, paste_h = self.tile, tile_w, tile_h
+        if max_dim is not None and max(full_w, full_h) > int(max_dim):
+            shrink = min(int(max_dim) / full_w, int(max_dim) / full_h)
+            paste_w = max(2, int(round(tile_w * shrink)))
+            paste_h = max(2, int(round(tile_h * shrink)))
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+            paste_tile = self.tile.resize((paste_w, paste_h), resample)
+
+        canvas = Image.new("RGB", (paste_w * self.cols, paste_h * self.rows))
+        for row in range(self.rows):
+            for col in range(self.cols):
+                canvas.paste(paste_tile, (col * paste_w, row * paste_h))
+
+        if (paste_w, paste_h) != (tile_w, tile_h):
+            # Rounding the tile's width and height to whole pixels
+            # independently skews the fabric's aspect ratio, so square it back
+            # up against the full-resolution geometry. Cheap: by this point the
+            # canvas is small.
+            target_h = max(1, int(round(canvas.size[0] * full_h / max(full_w, 1))))
+            if target_h != canvas.size[1]:
+                resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+                canvas = canvas.resize((canvas.size[0], target_h), resample)
+        return canvas
+
+    def rasterize(self, max_dim=None):
+        """Stamps the tile out, capped to `max_dim` on its longest side.
+
+        `max_dim=None` reproduces the full glued image exactly.
+        """
+        full_w, full_h = self.size
+        if max_dim is not None and max(full_w, full_h) <= int(max_dim):
+            max_dim = None
+        key = None if max_dim is None else int(max_dim)
+        if key is not None and key in self._cache:
+            return self._cache[key]
+        canvas = self._build(max_dim)
+        if key is not None and key <= self._CACHE_MAX_DIM:
+            if len(self._cache) >= self._CACHE_ENTRIES:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = canvas
+        return canvas
+
+    def convert(self, mode="RGB"):
+        image = self.rasterize()
+        return image if mode == "RGB" else image.convert(mode)
+
+
+@contextlib.contextmanager
+def _scan_batch(state):
+    """Collapses a run of scan renders down to a single model restore.
+
+    Every _scan_render_tiled_pattern_image call borrows the live model, swaps in
+    a scan pattern, and then puts the user's model back so the 3D View is never
+    left showing a scan pattern. Across a batch that restore is dead work: the
+    next cell overwrites the mesh it just re-uploaded. Twelve cells paid for
+    twelve restores where one suffices.
+
+    The snapshot is taken here, before any cell has touched the state, so what
+    gets restored is still the user's own model. The per-cell inputs
+    (_scanner_random_bitmap, _scanner_loop_heights_for_bitmap) are derived from
+    the cached scanner template rather than live state, so leaving a previous
+    cell's pattern in place between iterations does not affect them.
+    """
+    depth = int(state.__dict__.get('_scan_batch_depth', 0))
+    if depth == 0:
+        object.__setattr__(state, '_scan_batch_snapshot', _scan_snapshot_state(state))
+    object.__setattr__(state, '_scan_batch_depth', depth + 1)
+    try:
+        yield
+    finally:
+        remaining = int(state.__dict__.get('_scan_batch_depth', 1)) - 1
+        object.__setattr__(state, '_scan_batch_depth', remaining)
+        if remaining <= 0:
+            state.__dict__.pop('_scan_batch_depth', None)
+            snapshot = state.__dict__.pop('_scan_batch_snapshot', None)
+            if snapshot is not None:
+                _scan_restore_state(state, snapshot)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+def _scan_batch_active(state):
+    return int(state.__dict__.get('_scan_batch_depth', 0)) > 0
 
 
 def _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom):
@@ -579,8 +721,108 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
         return None
     finally:
         state.renderer = prev_renderer
-        _scan_restore_state(state, snap)
-        state.rebuild_spline_mesh(preserve_model_placement=True)
+        # Inside a _scan_batch the restore is deferred to the end of the batch.
+        if not _scan_batch_active(state):
+            _scan_restore_state(state, snap)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+def _scan_capture_one_azimuth(state, renderer, repeat_cols, repeat_rows, target_w,
+                              camera_az_deg, camera_el_deg, zoom, frame):
+    """Renders the mesh currently uploaded to `renderer` from one azimuth.
+
+    Split out of _scan_render_tiled_pattern_image so a caller can build the
+    pattern's geometry once and then sweep the camera over several angles: the
+    mesh is identical for every angle of a scan cell, only the camera moves.
+    Assumes the caller has already borrowed the state and uploaded the mesh.
+    """
+    if frame is None:
+        frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
+        if frame is None:
+            # Nothing was uploaded to draw: rendering anyway would hand back a
+            # flat clear-color frame that looks like a real (but black) capture.
+            # Report failure so callers use their fallback imagery.
+            return None
+    else:
+        # A shared frame still needs the camera pointed the same way it was when
+        # the frame was measured, or the crop would not line up.
+        state.camera.az = float(np.radians(camera_az_deg))
+        state.camera.el = float(np.radians(camera_el_deg))
+        state.camera.dist = float(frame['camera_dist'])
+    target_h = int(frame['target_h'])
+    crop_rect = frame.get('crop_rect')
+    shared_periods = frame.get('periods')
+
+    renderer.resize(target_w, target_h)
+    model_mat = state.current_model_matrix()
+    mvp = (state.camera.mvp(target_w, target_h) @ model_mat).astype(np.float32)
+    mv = (state.camera.mv(target_w, target_h) @ model_mat).astype(np.float32)
+    material_uniforms = _scanner_material_uniforms(state)
+    renderer.render(mvp, mv, material_uniforms)
+
+    tile, _canvas, info = _puzzle_build_seamless_tile(
+        state, renderer, repeat_cols, repeat_rows, crop_rect=crop_rect,
+        periods=shared_periods, build_canvas=False,
+    )
+    if tile is None:
+        return None
+    texture = TiledFabricTexture(tile, info["cols"], info["rows"])
+    if not _tile_is_usable(texture, target_w, tile=tile):
+        # The exact-period crop only works while the fabric is seen close to
+        # face-on. Viewed edge-on the X period projects to almost nothing and the
+        # crop degenerates into a sliver, which glues into a smear rather than
+        # fabric. Report failure so the caller falls back to a tile that was
+        # built at an angle where the period is measurable.
+        return None
+    return texture
+
+
+def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, colors,
+                                      repeat_cols, repeat_rows, camera_az_degs,
+                                      copies=1, target_w=480, camera_el_deg=0.0,
+                                      zoom=1.0, frame=None):
+    """Renders one scan pattern from several azimuths, building its mesh once.
+
+    A scan visits every angle of a cell consecutively (74 targets, 11 cell
+    changes on a 3x4 grid), and the yarn geometry is identical for all of them
+    -- only the camera azimuth differs. Rendering them one call at a time meant
+    a full rebuild_spline_from_params + rebuild_spline_mesh + GPU upload per
+    angle, which measured 30% of the entire scan loop. Sweeping the camera over
+    the angles inside a single borrow does the same renders off one build.
+
+    Returns {azimuth: TiledFabricTexture or None}.
+    """
+    snap = _scan_snapshot_state(state)
+    prev_renderer = state.renderer
+    state.renderer = renderer
+    results = {}
+    try:
+        state.params = state._scanner_template_params()
+        state.bitmap = np.asarray(bitmap, dtype=np.float32)
+        state.bitmap_size = np.array(state.bitmap.shape, dtype=np.int32)
+        state.loop_heights = np.asarray(loop_heights, dtype=np.float32)
+        state.row_colors = [list(np.asarray(c, dtype=np.float32)[:3]) for c in colors] if colors else state.row_colors
+        state.use_row_colors = True
+        copies = max(1, int(copies))
+        state.display_copies = np.array([copies, copies], dtype=np.int32)
+        state.scanner_preview_grid_enabled = False
+
+        # rebuild_mesh=False: the very next line rebuilds and uploads the same
+        # mesh, with the placement flag this pass actually wants.
+        state.rebuild_spline_from_params(rebuild_mesh=False)
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+
+        for az in camera_az_degs:
+            results[float(az)] = _scan_capture_one_azimuth(
+                state, renderer, repeat_cols, repeat_rows, target_w,
+                float(az), camera_el_deg, zoom, frame,
+            )
+        return results
+    finally:
+        state.renderer = prev_renderer
+        if not _scan_batch_active(state):
+            _scan_restore_state(state, snap)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
 
 
 def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480, camera_az_deg=0.0, camera_el_deg=0.0, zoom=1.0, frame=None):
@@ -611,73 +853,11 @@ def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colo
     _scan_measure_pattern_frame) makes every cell the same pixel size, which is
     also the physically honest reading: every scanned square is the same piece
     of fabric, just with a different pattern printed on it."""
-    snap = _scan_snapshot_state(state)
-    # state.rebuild_spline_mesh() always uploads the mesh to `state.renderer`,
-    # so the renderer we draw with has to *be* state.renderer for the duration.
-    # Otherwise a caller that passes its own renderer (EmbeddedMujocoScanner's
-    # dedicated _pattern_renderer) draws a scene that was never given any
-    # meshes: the render is just the clear color, and the capture comes back a
-    # flat dark frame. Binding it here (rather than forcing callers to pass the
-    # main renderer) keeps the dedicated-renderer isolation that avoids fighting
-    # the live "3D View" viewport over resize().
-    prev_renderer = state.renderer
-    state.renderer = renderer
-    try:
-        state.params = state._scanner_template_params()
-        state.bitmap = np.asarray(bitmap, dtype=np.float32)
-        state.bitmap_size = np.array(state.bitmap.shape, dtype=np.int32)
-        state.loop_heights = np.asarray(loop_heights, dtype=np.float32)
-        state.row_colors = [list(np.asarray(c, dtype=np.float32)[:3]) for c in colors] if colors else state.row_colors
-        state.use_row_colors = True
-        copies = max(1, int(copies))
-        state.display_copies = np.array([copies, copies], dtype=np.int32)
-        state.scanner_preview_grid_enabled = False
-
-        state.rebuild_spline_from_params()
-        state.rebuild_spline_mesh(preserve_model_placement=False)
-
-        if frame is None:
-            frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
-            if frame is None:
-                # Nothing was uploaded to draw: rendering anyway would hand back
-                # a flat clear-color frame that looks like a real (but black)
-                # capture. Report failure so callers use their fallback imagery.
-                return None
-        else:
-            # A shared frame still needs the camera pointed the same way it was
-            # when the frame was measured, or the crop would not line up.
-            state.camera.az = float(np.radians(camera_az_deg))
-            state.camera.el = float(np.radians(camera_el_deg))
-            state.camera.dist = float(frame['camera_dist'])
-        target_h = int(frame['target_h'])
-        crop_rect = frame.get('crop_rect')
-        shared_periods = frame.get('periods')
-
-        renderer.resize(target_w, target_h)
-        model_mat = state.current_model_matrix()
-        mvp = (state.camera.mvp(target_w, target_h) @ model_mat).astype(np.float32)
-        mv = (state.camera.mv(target_w, target_h) @ model_mat).astype(np.float32)
-        material_uniforms = _scanner_material_uniforms(state)
-        renderer.render(mvp, mv, material_uniforms)
-
-        _tile, canvas, _info = _puzzle_build_seamless_tile(
-            state, renderer, repeat_cols, repeat_rows, crop_rect=crop_rect,
-            periods=shared_periods,
-        )
-        if not _tile_is_usable(canvas, target_w):
-            # The exact-period crop only works while the fabric is seen close to
-            # face-on. Viewed edge-on the X period projects to almost nothing and
-            # the crop degenerates into a sliver, which glues into a smear rather
-            # than fabric. Report failure so the caller falls back to a tile that
-            # was built at an angle where the period is measurable.
-            return None
-        return canvas
-    finally:
-        # Restore the real renderer first, so the rebuild below re-uploads the
-        # user's own model to the viewport renderer (and not to a temporary one).
-        state.renderer = prev_renderer
-        _scan_restore_state(state, snap)
-        state.rebuild_spline_mesh(preserve_model_placement=True)
+    return _scan_render_tiled_pattern_images(
+        state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows,
+        camera_az_degs=(float(camera_az_deg),), copies=copies, target_w=target_w,
+        camera_el_deg=camera_el_deg, zoom=zoom, frame=frame,
+    ).get(float(camera_az_deg))
 
 
 # A usable glued tile has to be wide enough to actually be fabric and to carry
@@ -694,7 +874,15 @@ _MIN_TILE_SIDE_PX = 24
 _MIN_TILE_STDDEV = 1.0
 
 
-def _tile_is_usable(canvas, target_w):
+def _tile_is_usable(canvas, target_w, tile=None):
+    """Same predicate as before; `tile` only makes the colour test cheaper.
+
+    The glued canvas is exactly cols x rows edge-to-edge copies of `tile` and
+    nothing else, so the two have the same standard deviation. Passing the tile
+    measures ~136x105 px instead of ~8160x6720 -- 831 ms of float32 .std() per
+    cell, more than the render it was checking. The size test still reads the
+    canvas dimensions, so what the function decides is unchanged.
+    """
     if canvas is None:
         return False
     width, height = canvas.size
@@ -702,7 +890,8 @@ def _tile_is_usable(canvas, target_w):
         return False
     if height < _MIN_TILE_SIDE_PX:
         return False
-    return float(np.asarray(canvas.convert("RGB"), dtype=np.float32).std()) >= _MIN_TILE_STDDEV
+    measured = canvas if tile is None else tile
+    return float(np.asarray(measured.convert("RGB"), dtype=np.float32).std()) >= _MIN_TILE_STDDEV
 
 
 def _scanner_lighting_settings(state):
@@ -1669,7 +1858,14 @@ class EmbeddedMujocoScanner:
             self.plan.rendered_fabric_image_is_full_layout = True
             self.plan.rendered_fabric_image_lit = True
         if per_cell_images:
-            self.plan.scan_tiled_pattern_images = [img.convert("RGB") for img in per_cell_images]
+            # These are TiledFabricTextures (or plain images for a failed cell).
+            # Passed through untouched: converting would materialise every glued
+            # image, which is what put the working set past 10 GB. fabric_scanner
+            # stamps each one out at the resolution its camera quad needs.
+            self.plan.scan_tiled_pattern_images = [
+                img if getattr(img, "mode", None) == "RGB" else img.convert("RGB")
+                for img in per_cell_images
+            ]
         # A plain callable, not a gui.py import, so fabric_scanner.py can stay
         # free of any gui.py dependency: it just calls whatever is attached
         # here (falling back to the static per_cell_images/2D-curve paths when
@@ -1881,14 +2077,61 @@ class EmbeddedMujocoScanner:
         lighting = self.scanner._normalize_scanner_lighting(getattr(self.plan, "scanner_lighting", None))
         return tuple((key, round(float(lighting[key]), 4)) for key in sorted(lighting))
 
+    @staticmethod
+    def _focused_capture_azimuth(angle_deg):
+        """Maps a scan view angle onto the azimuth the pattern is rendered from.
+
+        Compresses the full requested sweep into a modest +-45deg range: enough
+        to reveal genuinely different yarn facets under the fixed light (fixing
+        the "identical across angles" bug), while keeping the Y-repeat-tiling
+        skew tradeoff (see _scan_render_tiled_pattern_images' docstring) mild
+        rather than severe. Normalized first so e.g. "angle 300" doesn't
+        collapse onto the same azimuth as "angle 60".
+        """
+        normalized = ((float(angle_deg) + 180.0) % 360.0) - 180.0
+        return normalized * (45.0 / 180.0)
+
+    def _cell_capture_azimuths(self, row, col):
+        """Every azimuth this scan will ask (row, col) for, in plan order."""
+        wanted = []
+        for target_index, station_id in enumerate(self.plan.station_ids):
+            if tuple(self.plan.station_cells[int(station_id)]) != (int(row), int(col)):
+                continue
+            view = self.plan.view_names[target_index] if self.plan.view_names else "angle 0"
+            az = self._focused_capture_azimuth(self.scanner._view_angle_degrees(view))
+            if az not in wanted:
+                wanted.append(az)
+        return wanted
+
     def _render_fresh_focused_capture(self, row, col, angle_deg, zoom):
-        """Renders a genuinely fresh, angle-specific view of one scan pattern's
-        stitch tile for a focused capture. Previously every angle reused one
-        static front-on render (identical pixels, only the 2D projection quad
-        differed), which is why different angles produced near-identical
-        average colors. Uses the dedicated _pattern_renderer so this never
-        disturbs the live "3D View" panel's own renderer/resize."""
+        """Returns a fresh, angle-specific render of one scan pattern's tile.
+
+        The scan visits every angle of a cell consecutively and the pattern's
+        geometry is the same for all of them, so the first angle asked for
+        builds the mesh once and renders every azimuth this cell will need; the
+        rest are served from that batch. Rebuilding per angle was 30% of the
+        whole scan loop. Uses the dedicated _pattern_renderer so this never
+        disturbs the live "3D View" panel's own renderer/resize.
+        """
         state = self.app_state
+        zoom = float(zoom)
+        az_deg = self._focused_capture_azimuth(angle_deg)
+        cache = getattr(self, "_cell_azimuth_tiles", None)
+        if cache is None:
+            cache = {}
+            self._cell_azimuth_tiles = cache
+        key = (int(row), int(col), round(az_deg, 6), round(zoom, 4))
+        if key in cache:
+            return cache[key]
+
+        if threading.current_thread() is not getattr(self, "_gl_thread", threading.current_thread()):
+            # Rendering needs the OpenGL context, which belongs to the frame
+            # thread. The compose worker must never get here: _capture_stage_tiles
+            # warms this cache on the frame thread first, and _capture_dispatch_image
+            # refuses to hand off unless the tile it needs is present. Returning
+            # None rather than rendering keeps a mistake from crashing the driver.
+            return None
+
         cols = max(1, int(state.get("scanner_cols", 1)))
         cell_index = int(row) * cols + int(col)
         try:
@@ -1898,24 +2141,25 @@ class EmbeddedMujocoScanner:
             colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else None
             repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
 
-            # Compress the full requested sweep into a modest +-45deg azimuth
-            # range: enough to reveal genuinely different yarn facets under
-            # the fixed light (fixing the "identical across angles" bug),
-            # while keeping the Y-repeat-tiling skew tradeoff (see
-            # _scan_render_tiled_pattern_image's docstring) mild rather than
-            # severe. Normalize first so e.g. "angle 300" doesn't collapse
-            # onto the same azimuth as "angle 60".
-            normalized = ((float(angle_deg) + 180.0) % 360.0) - 180.0
-            az_deg = normalized * (45.0 / 180.0)
+            azimuths = self._cell_capture_azimuths(row, col) or [az_deg]
+            if az_deg not in azimuths:
+                azimuths = list(azimuths) + [az_deg]
 
             target_w = max(160, int(round(480 * float(np.clip(zoom, 0.3, 3.0)))))
-            return _scan_render_tiled_pattern_image(
+            rendered = _scan_render_tiled_pattern_images(
                 state, self._pattern_renderer, bitmap, loop_heights, colors,
-                repeat_cols, repeat_rows, copies=1, target_w=target_w,
-                camera_az_deg=az_deg, camera_el_deg=0.0, zoom=float(zoom),
+                repeat_cols, repeat_rows, camera_az_degs=azimuths, copies=1,
+                target_w=target_w, camera_el_deg=0.0, zoom=zoom,
             )
         except Exception:
             return None
+
+        # Only this cell's tiles are worth keeping: the scan finishes a cell
+        # before moving on, and each entry holds a period tile, not a glued image.
+        cache.clear()
+        for az, texture in rendered.items():
+            cache[(int(row), int(col), round(float(az), 6), round(zoom, 4))] = texture
+        return cache.get(key)
 
     def _render_robot_camera_image(self, tcp_pos, target_index, station_id=None, target_pose=None, image_size=None, detect_patch=False):
         target_index = min(int(target_index), len(self.plan.poses) - 1)
@@ -3113,62 +3357,101 @@ def _scanner_generate_tiled_layout(state, renderer):
     # heights and the composite below tiled them into a ragged staircase with
     # gaps. Every scanned square is the same piece of fabric, so they belong in
     # identically sized frames.
-    shared_frame = None
-    try:
-        probe_bitmap = state._scanner_random_bitmap(0)
-        shared_frame = _scan_measure_pattern_frame(state, renderer, probe_bitmap.shape)
-    except Exception:
-        shared_frame = None
-
+    # One borrow of the live model for the whole batch: the framing probe and
+    # every cell render against it, and the user's own model is put back once at
+    # the end instead of after each cell.
     per_cell_images = []
-    for cell_index in range(rows * cols):
+    with _scan_batch(state):
+        shared_frame = None
         try:
-            bitmap = state._scanner_random_bitmap(cell_index)
-            loop_heights = state._scanner_loop_heights_for_bitmap(bitmap)
-            colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else None
-            tile_image = _scan_render_tiled_pattern_image(
-                state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows,
-                frame=shared_frame,
-            )
+            probe_bitmap = state._scanner_random_bitmap(0)
+            shared_frame = _scan_measure_pattern_frame(state, renderer, probe_bitmap.shape)
         except Exception:
-            tile_image = None
-        if tile_image is None:
-            tile_image = Image.new("RGB", (64, 64), (18, 23, 31))
-        per_cell_images.append(tile_image)
+            shared_frame = None
+
+        for cell_index in range(rows * cols):
+            try:
+                bitmap = state._scanner_random_bitmap(cell_index)
+                loop_heights = state._scanner_loop_heights_for_bitmap(bitmap)
+                colors = cell_sets[cell_index % len(cell_sets)] if cell_sets else None
+                tile_image = _scan_render_tiled_pattern_image(
+                    state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows,
+                    frame=shared_frame,
+                )
+            except Exception:
+                tile_image = None
+            if tile_image is None:
+                tile_image = Image.new("RGB", (64, 64), (18, 23, 31))
+            per_cell_images.append(tile_image)
 
     cell_w = max((img.size[0] for img in per_cell_images), default=64)
     cell_h = max((img.size[1] for img in per_cell_images), default=64)
-    # Any cell that still came back a different size (a failed render falling
-    # back to the placeholder) is centred in its slot rather than pasted at the
-    # corner, so it cannot masquerade as fabric that stops halfway.
-    def _cell_origin(img, col, row):
-        return (col * cell_w + (cell_w - img.size[0]) // 2,
-                row * cell_h + (cell_h - img.size[1]) // 2)
-    full_image = Image.new("RGB", (max(1, cols * cell_w), max(1, rows * cell_h)), (18, 23, 31))
-    draw = ImageDraw.Draw(full_image)
-    border = (38, 124, 137)
+
+    # This composite is only ever used as a preview texture capped at max_dim,
+    # so it is assembled at that size directly. Building it at full cell
+    # resolution first meant allocating and filling a 32640x20160 canvas (658 MP,
+    # ~2 GB) and LANCZOS-downscaling all of it to 1400 px -- 3.5 s of resize plus
+    # 1.2 s of allocation to produce a 1.2 MP image. Scaling each cell into its
+    # slot is the same filter over the same pixels, without the intermediate.
+    max_dim = 1400
+    scale = min(
+        1.0,
+        max_dim / max(float(cols * cell_w), 1.0),
+        max_dim / max(float(rows * cell_h), 1.0),
+    )
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+
+    def _scaled(value):
+        return max(1, int(round(value * scale))) if scale < 1.0 else max(1, int(value))
+
+    def _cell_slot_image(source):
+        """The cell at slot size, whether it is an image or a lazy tiled texture."""
+        target = (_scaled(source.size[0]), _scaled(source.size[1]))
+        rasterize = getattr(source, "rasterize", None)
+        if rasterize is not None:
+            # Stamping straight to slot size is not the same picture: at 64
+            # repeats across 288 px each tile lands on ~4.5 px, so rounding it
+            # to whole pixels shifts every repeat slightly, and each one gets
+            # filtered in isolation instead of across its seams. Stamp to a
+            # bounded intermediate first and let the final LANCZOS do the
+            # cross-boundary filtering, exactly as downscaling the full glued
+            # image used to.
+            intermediate = int(np.clip(max(target) * 8, 256, 3072))
+            image = rasterize(intermediate)
+            return image if image.size == target else image.resize(target, resample)
+        return source.resize(target, resample) if scale < 1.0 else source
+
+    slot_w, slot_h = _scaled(cell_w), _scaled(cell_h)
+    full_image = Image.new("RGB", (max(1, cols * slot_w), max(1, rows * slot_h)), (18, 23, 31))
+    # The 1 px border used to be drawn on the full-resolution canvas and then
+    # downscaled by `scale`, so it only ever contributed about that fraction of
+    # a pixel's colour -- a hairline, not a line. Drawing it into an overlay at
+    # the matching alpha keeps the preview looking the way it does today; a
+    # solid 1 px line here would be roughly 23x more prominent than before.
+    border_overlay = Image.new("RGBA", full_image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(border_overlay)
+    border = (38, 124, 137, max(1, int(round(255 * scale))) if scale < 1.0 else 255)
     for row in range(rows):
         for col in range(cols):
             cell_index = row * cols + col
-            cell_img = per_cell_images[cell_index]
-            x0, y0 = _cell_origin(cell_img, col, row)
-            full_image.paste(cell_img, (x0, y0))
+            cell_img = _cell_slot_image(per_cell_images[cell_index])
+            # Any cell that came back a different size (a failed render falling
+            # back to the placeholder) is centred in its slot rather than pasted
+            # at the corner, so it cannot masquerade as fabric that stops halfway.
+            full_image.paste(
+                cell_img,
+                (col * slot_w + (slot_w - cell_img.size[0]) // 2,
+                 row * slot_h + (slot_h - cell_img.size[1]) // 2),
+            )
             # Border follows the cell slot, not the pasted image, so the grid
             # reads as a regular grid even if one cell had to fall back.
             draw.rectangle(
-                [col * cell_w, row * cell_h,
-                 col * cell_w + cell_w - 1, row * cell_h + cell_h - 1],
+                [col * slot_w, row * slot_h,
+                 col * slot_w + slot_w - 1, row * slot_h + slot_h - 1],
                 outline=border,
                 width=1,
             )
-
-    max_dim = 1400
-    scale = min(1.0, max_dim / max(float(full_image.size[0]), 1.0), max_dim / max(float(full_image.size[1]), 1.0))
-    if scale < 1.0:
-        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
-        full_image = full_image.resize(
-            (max(1, int(full_image.size[0] * scale)), max(1, int(full_image.size[1] * scale))), resample,
-        )
+    full_image = Image.alpha_composite(full_image.convert("RGBA"), border_overlay).convert("RGB")
 
     object.__setattr__(state, "_scanner_tiled_layout_key", cache_key)
     object.__setattr__(state, "_scanner_tiled_layout_result", (full_image.copy(), list(per_cell_images)))
