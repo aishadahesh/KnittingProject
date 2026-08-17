@@ -4318,12 +4318,24 @@ def draw_sidebar(state, renderer, window=None):
                     state.apply_texture_preset(preset['preset'])
 
         if imgui.collapsing_header("Display", imgui.TreeNodeFlags_.default_open):
+            # Rebuilt on release, not on every intermediate value. The mesh is
+            # (2n+1)^2 copies of the model, so a rebuild runs from 0.08 s at 1x1
+            # to 7.4 s at 9x9 (16.3 M verts) -- dragging across the range used to
+            # pay every step, ~13 s of rebuilds with the frame loop blocked
+            # throughout, which is what made the window stop responding.
             changed_x, new_x = imgui.slider_int("Copy via X##display_copies_x", int(state.display_copies[0]), 0, 20)
+            released_x = imgui.is_item_deactivated_after_edit()
             changed_y, new_y = imgui.slider_int("Copy via Y##display_copies_y", int(state.display_copies[1]), 0, 20)
+            released_y = imgui.is_item_deactivated_after_edit()
             if changed_x or changed_y:
-                state.push_undo("Display copies")
+                # One undo entry per drag, captured before the first change.
+                if not bool(state.__dict__.get('_display_copies_dragging', False)):
+                    state.push_undo("Display copies")
+                    object.__setattr__(state, '_display_copies_dragging', True)
                 state.scanner_preview_grid_enabled = False
                 state.display_copies = np.array([int(new_x), int(new_y)], dtype=np.int32)
+            if released_x or released_y:
+                object.__setattr__(state, '_display_copies_dragging', False)
                 state.rebuild_spline_mesh(preserve_model_placement=True)
             if imgui.small_button("Single model##display_single"):
                 state.push_undo("Display copies")
@@ -5124,8 +5136,14 @@ def draw_sidebar(state, renderer, window=None):
             _draw_bitmap_editor(state, id_suffix="_puzzle")
         imgui.separator()
         copies_x, copies_y = _puzzle_target_copies(state)
+        # Geometry is rebuilt when the slider is released rather than on every
+        # value it passes through: 9x9 is 81 copies of the model (16.3 M verts,
+        # 7.4 s per rebuild), so rebuilding per step meant a drag across the
+        # range spent ~13 s with the frame loop blocked.
         changed_px, new_px = imgui.slider_int("Real geometry copies X##puzzle_copies_x", copies_x, 1, 9)
+        released_px = imgui.is_item_deactivated_after_edit()
         changed_py, new_py = imgui.slider_int("Real geometry copies Y##puzzle_copies_y", copies_y, 1, 9)
+        released_py = imgui.is_item_deactivated_after_edit()
         if changed_px:
             if int(new_px) % 2 == 0:
                 new_px += 1
@@ -5135,6 +5153,11 @@ def draw_sidebar(state, renderer, window=None):
                 new_py += 1
             state.puzzle_copies_y = int(np.clip(new_py, 1, 9))
         if changed_px or changed_py:
+            state.status_msg = (
+                f"Release to apply {int(state.puzzle_copies_x)} x "
+                f"{int(state.puzzle_copies_y)} geometry"
+            )
+        if released_px or released_py:
             _puzzle_apply_geometry_copies(state, preserve=True)
             state.status_msg = f"Puzzle geometry set to {int(state.puzzle_copies_x)} x {int(state.puzzle_copies_y)}"
         if imgui.button("Apply 5 x 5 geometry##puzzle_apply_5x5", (-1, 0)):
