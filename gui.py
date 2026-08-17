@@ -15,6 +15,8 @@ import os
 import json
 import copy
 import contextlib
+import hashlib
+import shutil
 import numpy as np
 import glfw
 import time
@@ -3524,6 +3526,122 @@ def _draw_puzzle_capture_widget(state, image, texture, avail_w, avail_h):
         imgui.text_disabled("Click the captured image to inspect a pixel RGB value.")
 
 
+# Scan tiles survive between sessions on disk. Entering Scan Mode re-renders
+# every cell from scratch otherwise -- ~4 s at a 3x4 grid, paid on every launch
+# even when nothing about the pattern changed.
+_TILE_CACHE_DIR_NAME = "tile_cache"
+_TILE_CACHE_VERSION = 1
+_TILE_CACHE_KEEP = 3
+
+
+def _scanner_tile_cache_digest(state):
+    """Identity of a persisted set of scan tiles, or None if it cannot be formed.
+
+    Deliberately stricter than the in-memory cache key. A tile held in memory
+    dies with the process, so keying it loosely only risks a stale preview for
+    one session; a tile on disk outlives the settings that produced it, and
+    serving one rendered under different lighting, material or template settings
+    would put wrong pixels into a scan. So this also covers the material
+    uniforms and the scanner template the geometry is built from, and carries a
+    version so a change to the render pipeline invalidates everything written by
+    an older build.
+    """
+    try:
+        template = state._scanner_template()
+        uniforms = _scanner_material_uniforms(state)
+        payload = {
+            "version": _TILE_CACHE_VERSION,
+            "layout": json.dumps(_scanner_tiled_layout_cache_key(state), default=str, sort_keys=True),
+            "uniforms": json.dumps(
+                {str(k): (round(float(v), 6) if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v))
+                 for k, v in uniforms.items()},
+                sort_keys=True,
+            ),
+            "spacing": [round(float(v), 6) for v in _scanner_repeat_spacing(state)],
+            "batch_texture": [int(v) for v in _scanner_batch_texture_size(state)],
+            "params": np.asarray(template.get("params"), dtype=np.float32).round(6).tolist(),
+            "bitmap": np.asarray(template.get("bitmap"), dtype=np.float32).tolist(),
+            "loop_heights": np.asarray(
+                template.get("loop_heights", np.empty((0, 0))), dtype=np.float32).round(6).tolist(),
+        }
+        blob = json.dumps(payload, sort_keys=True, default=str)
+    except Exception:
+        return None
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+def _scanner_tile_cache_root(state):
+    return Path(state.project_root) / "scanner_data" / _TILE_CACHE_DIR_NAME
+
+
+def _scanner_load_cached_tiles(state, digest, rows, cols):
+    """Returns (preview, per_cell) from disk, or None to render fresh."""
+    folder = _scanner_tile_cache_root(state) / digest
+    manifest_path = folder / "manifest.json"
+    try:
+        if not manifest_path.exists():
+            return None
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if int(manifest.get("version", -1)) != _TILE_CACHE_VERSION:
+            return None
+        if manifest.get("digest") != digest:
+            return None
+        cells = manifest.get("cells", [])
+        if len(cells) != rows * cols:
+            return None
+        per_cell = []
+        for index, entry in enumerate(cells):
+            tile_path = folder / f"cell_{index:03d}.png"
+            if not tile_path.exists():
+                return None
+            with Image.open(tile_path) as handle:
+                tile = handle.convert("RGB")
+            per_cell.append(TiledFabricTexture(tile, int(entry["cols"]), int(entry["rows"])))
+        preview_path = folder / "preview.png"
+        if not preview_path.exists():
+            return None
+        with Image.open(preview_path) as handle:
+            preview = handle.convert("RGB")
+        folder.touch(exist_ok=True)
+        return preview, per_cell
+    except Exception:
+        # A damaged or half-written cache must never break Scan Mode; fall back
+        # to rendering, which is what happened before this cache existed.
+        return None
+
+
+def _scanner_store_cached_tiles(state, digest, preview, per_cell):
+    if not digest or preview is None or not per_cell:
+        return
+    # Only a full set of real tiles is worth keeping. A failed cell falls back to
+    # a flat placeholder image, and persisting that would hand the same
+    # placeholder back on every future launch.
+    if any(not isinstance(cell, TiledFabricTexture) for cell in per_cell):
+        return
+    root = _scanner_tile_cache_root(state)
+    folder = root / digest
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        entries = []
+        for index, cell in enumerate(per_cell):
+            cell.tile.save(folder / f"cell_{index:03d}.png")
+            entries.append({"cols": int(cell.cols), "rows": int(cell.rows)})
+        preview.save(folder / "preview.png")
+        with (folder / "manifest.json").open("w", encoding="utf-8") as handle:
+            json.dump({"version": _TILE_CACHE_VERSION, "digest": digest,
+                       "cells": entries}, handle, indent=2)
+        # Keep a few recent settings' worth and drop the rest.
+        folders = sorted(
+            (p for p in root.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        for stale in folders[_TILE_CACHE_KEEP:]:
+            shutil.rmtree(stale, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _scanner_tiled_layout_cache_key(state):
     rows = max(1, int(state.scanner_rows))
     cols = max(1, int(state.scanner_cols))
@@ -3569,6 +3687,17 @@ def _scanner_generate_tiled_layout(state, renderer):
         repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
     except Exception:
         return None, []
+
+    # Tiles written by an earlier session with identical settings, if any. The
+    # digest covers every input the render depends on, so a hit is the same
+    # imagery this function would produce.
+    digest = _scanner_tile_cache_digest(state)
+    restored = _scanner_load_cached_tiles(state, digest, rows, cols) if digest else None
+    if restored is not None:
+        full_image, per_cell_images = restored
+        object.__setattr__(state, "_scanner_tiled_layout_key", cache_key)
+        object.__setattr__(state, "_scanner_tiled_layout_result", (full_image.copy(), list(per_cell_images)))
+        return full_image, per_cell_images
 
     # Measure the framing once, from a pattern with every loop active, and reuse
     # it for all cells. Auto-framing per cell sized each tile to the loops that
@@ -3674,6 +3803,9 @@ def _scanner_generate_tiled_layout(state, renderer):
 
     object.__setattr__(state, "_scanner_tiled_layout_key", cache_key)
     object.__setattr__(state, "_scanner_tiled_layout_result", (full_image.copy(), list(per_cell_images)))
+    # Written only on a fresh render, so what lands on disk always matches the
+    # settings hashed into `digest`.
+    _scanner_store_cached_tiles(state, digest, full_image, per_cell_images)
     return full_image, per_cell_images
 
 
