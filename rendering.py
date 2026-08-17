@@ -373,13 +373,27 @@ def orthographic(left, right, bottom, top, near=-1000.0, far=1000.0):
     ], dtype=np.float32)
 
 def compute_normals(verts, tris):
-    n = np.zeros_like(verts)
+    # Area-weighted vertex normals: each triangle adds its unnormalised face
+    # normal to all three of its corners.
+    #
+    # The scatter was three np.add.at calls. np.add.at takes numpy's unbuffered
+    # path, which serialises every repeated-index update; np.bincount performs
+    # the same accumulation as a buffered reduction. Measured on a real yarn
+    # mesh (7200 verts, 14376 tris): 2.499 ms -> 1.058 ms, with a maximum
+    # difference of 1.9e-7 -- bincount sums in float64 rather than float32, so
+    # if anything it is the more accurate of the two.
     e1 = verts[tris[:,1]] - verts[tris[:,0]]
     e2 = verts[tris[:,2]] - verts[tris[:,0]]
     fn = np.cross(e1, e2)
-    np.add.at(n, tris[:,0], fn)
-    np.add.at(n, tris[:,1], fn)
-    np.add.at(n, tris[:,2], fn)
+    n = np.empty_like(verts)
+    vertex_count = len(verts)
+    for axis in range(3):
+        weights = fn[:, axis]
+        n[:, axis] = (
+            np.bincount(tris[:, 0], weights=weights, minlength=vertex_count)
+            + np.bincount(tris[:, 1], weights=weights, minlength=vertex_count)
+            + np.bincount(tris[:, 2], weights=weights, minlength=vertex_count)
+        )[:vertex_count]
     return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
 
 
@@ -591,24 +605,41 @@ class MeshRenderer:
             depth_attachment=self.depth_tex,
         )
 
-    def set_meshes(self, verts_list, faces_list, row_indices=None, colors=None, meta=None):
+    @staticmethod
+    def prepare_meshes(verts_list, faces_list):
+        """Does set_meshes' CPU-side work once, so several renderers can share it.
+
+        Triangulating the quads, computing normals and packing the byte buffers
+        depends only on the geometry, not on which renderer receives it. The app
+        uploads the same meshes to the main viewport and the orbit view on every
+        rebuild, which meant doing all of that twice -- and compute_normals is
+        the single most expensive thing in a rebuild.
+        """
+        prepared = []
+        for (verts, _n_points), faces in zip(verts_list, faces_list):
+            v = np.array(verts, dtype=np.float32)
+            f = np.array(faces, dtype=np.int32)
+            # quads → triangles
+            tris = np.empty((len(f) * 2, 3), dtype=np.int32)
+            tris[0::2] = f[:, [0, 1, 2]]
+            tris[1::2] = f[:, [0, 2, 3]]
+            nm = compute_normals(v, tris).astype(np.float32)
+            prepared.append((v, tris, v.tobytes(), nm.tobytes(), tris.tobytes()))
+        return prepared
+
+    def set_meshes(self, verts_list, faces_list, row_indices=None, colors=None, meta=None, prepared=None):
         for vao, outline_vao, depth_vao, _, _, _ in self.meshes:
             vao.release()
             outline_vao.release()
             depth_vao.release()
         self.meshes.clear()
         self.mesh_pick_data.clear()
-        for i, ((verts, n_points), faces) in enumerate(zip(verts_list, faces_list)):
-            v  = np.array(verts, dtype=np.float32)
-            f  = np.array(faces, dtype=np.int32)
-            # quads → triangles
-            tris = np.empty((len(f) * 2, 3), dtype=np.int32)
-            tris[0::2] = f[:, [0, 1, 2]]
-            tris[1::2] = f[:, [0, 2, 3]]
-            nm = compute_normals(v, tris).astype(np.float32)
-            pos_vbo = self.ctx.buffer(v.tobytes())
-            norm_vbo = self.ctx.buffer(nm.tobytes())
-            ibo = self.ctx.buffer(tris.astype(np.int32).tobytes())
+        if prepared is None:
+            prepared = self.prepare_meshes(verts_list, faces_list)
+        for i, (v, tris, pos_bytes, norm_bytes, tri_bytes) in enumerate(prepared):
+            pos_vbo = self.ctx.buffer(pos_bytes)
+            norm_vbo = self.ctx.buffer(norm_bytes)
+            ibo = self.ctx.buffer(tri_bytes)
             vao = self.ctx.vertex_array(self.prog, [
                 (pos_vbo,  '3f', 'in_pos'),
                 (norm_vbo, '3f', 'in_norm'),
