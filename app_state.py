@@ -13,6 +13,11 @@ from knitting_core import (
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 
+# Inset of a scan sample inside its grid tile, in yarn radii per side. The tile
+# bounds and the grid spacing must agree on this, or the samples overlap.
+SCANNER_TILE_INSET_X = 0.10
+SCANNER_TILE_INSET_Y = 0.20
+
 class AppState:
     # How tall a scan-pattern loop is where the cell's bitmap is off, as a
     # fraction of the active height. Not zero: a zero-height loop is no stitch
@@ -416,9 +421,17 @@ class AppState:
         return fitted
 
     def _scanner_pattern_meshes(self, cell_index, target_bounds):
-        bitmap = self._scanner_random_bitmap(cell_index)
-        loop_heights = self._scanner_loop_heights_for_bitmap(bitmap)
+        pattern_bitmap = self._scanner_random_bitmap(cell_index)
+        loop_heights = self._scanner_loop_heights_for_bitmap(pattern_bitmap)
         params = self._scanner_template_params()
+        # Same two rules the scan captures use, so the preview grid shows the
+        # fabric that will actually be scanned. Every stitch exists and the
+        # pattern is carried by loop height alone -- a zero in the bitmap
+        # deletes the stitch outright, which broke each sample into disconnected
+        # motifs -- and the row period follows the stitch width rather than a
+        # bare column count, or each row closes on a period several times
+        # narrower than the geometry and runs off the side of its cell.
+        bitmap = np.ones_like(pattern_bitmap)
         ctrl_rows = build_parametric_control_rows(
             params,
             bitmap,
@@ -427,7 +440,10 @@ class AppState:
             self.samples_per_loop,
             loop_heights=loop_heights,
         )
-        period_offset_x = np.array([float(bitmap.shape[1]), 0.0, 0.0], dtype=np.float32)
+        stitch_width = float(params[self._pidx['stitch_width']]) if 'stitch_width' in self._pidx else 1.0
+        period_offset_x = np.array(
+            [float(bitmap.shape[1]) * stitch_width, 0.0, 0.0], dtype=np.float32
+        )
         radius = max(float(params[self._pidx['radius']]), 1e-6)
         radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
         vl = build_spline_mesh(
@@ -471,8 +487,14 @@ class AppState:
                 min_v, max_v = bounds
                 model_w = float(max_v[0] - min_v[0])
                 model_h = float(max_v[1] - min_v[1])
-                x_period = max(model_w - radius * 2.25, radius)
-                y_period = max(model_h - radius * 7.25, radius)
+                # Space the samples by exactly the size each one is fitted to,
+                # so the grid reads as one sheet of fabric divided into squares.
+                # The spacing used to be the model's size less a margin -- 2.25
+                # radii across and 7.25 down -- while every sample is scaled to
+                # fill its whole tile, so each one reached a fifth of a cell into
+                # its neighbour above and the samples grew into each other.
+                x_period = max(model_w - 2.0 * SCANNER_TILE_INSET_X * radius, radius)
+                y_period = max(model_h - 2.0 * SCANNER_TILE_INSET_Y * radius, radius)
         
         seg = int(self.config['knit_parameters']['segments'])
         if scanner_preview:
@@ -489,15 +511,22 @@ class AppState:
             layout_pattern = str(self.get('scanner_layout_pattern', 'grid'))
             base_bounds = self._display_mesh_bounds(verts_list)
             for y_tile in range(scanner_rows):
-                y_translation = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+                # Flat, like the fabric it stands for. Each row of samples was
+                # pushed back a depth layer, so a sample's bottom row was drawn
+                # behind the top row of the sample beneath it.
+                y_translation = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
                 row_offset = 0.5 * x_period if layout_pattern == 'staggered' and (y_tile % 2 == 1) else 0.0
                 for x_tile in range(scanner_cols):
                     cell_index = y_tile * scanner_cols + x_tile
                     x_translation = np.array([x_tile * x_period + row_offset, 0.0, 0.0], dtype=np.float32)
                     if base_bounds is not None:
                         tile_bounds = (
-                            base_bounds[0] + np.array([radius * 0.10, radius * 0.20, 0.0], dtype=np.float32),
-                            base_bounds[1] - np.array([radius * 0.10, radius * 0.20, 0.0], dtype=np.float32),
+                            base_bounds[0] + np.array(
+                                [radius * SCANNER_TILE_INSET_X, radius * SCANNER_TILE_INSET_Y, 0.0],
+                                dtype=np.float32),
+                            base_bounds[1] - np.array(
+                                [radius * SCANNER_TILE_INSET_X, radius * SCANNER_TILE_INSET_Y, 0.0],
+                                dtype=np.float32),
                         )
                         cell_parts, cell_meta = self._scanner_pattern_meshes(cell_index, tile_bounds)
                         for curve_idx, ((verts, n_points), part_meta) in enumerate(zip(cell_parts, cell_meta)):
