@@ -31,7 +31,8 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 from PIL import Image, ImageDraw
 
-from rendering import draw_fitted_texture, pil_to_texture, transform_points, upload_rgb_texture, MeshRenderer
+from rendering import (draw_fitted_texture, pil_to_texture, project_to_screen,
+                       transform_points, upload_rgb_texture, MeshRenderer)
 from knitting_core import build_parametric_control_rows, build_spline_mesh
 from rgb_analysis import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
 import paths
@@ -5525,17 +5526,9 @@ def draw_viewport(state, renderer, ref_tex, window):
             ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
             world_pts = transform_points(ctrl_pts, model_matrix)
             view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
-            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
-            clip = homo @ view_proj.T
-            valid = clip[:, 3] > 1e-6
+            screen, valid, _ = project_to_screen(world_pts, view_proj, disp_w, disp_h)
             if not np.any(valid):
                 return None
-            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
-            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
-            screen = np.column_stack((
-                (ndc[:, 0] * 0.5 + 0.5) * disp_w,
-                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
-            ))
             all_pts = screen[valid]
             x_min, y_min = np.min(all_pts, axis=0)
             x_max, y_max = np.max(all_pts, axis=0)
@@ -5564,17 +5557,9 @@ def draw_viewport(state, renderer, ref_tex, window):
             stride = max(1, len(verts) // 300)
             sample = verts[::stride]
             world_pts = transform_points(sample, model_matrix)
-            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
-            clip = homo @ view_proj.T
-            valid = clip[:, 3] > 1e-6
+            screen, valid, _ = project_to_screen(world_pts, view_proj, disp_w, disp_h)
             if not np.any(valid):
                 continue
-            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
-            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
-            screen = np.column_stack((
-                (ndc[:, 0] * 0.5 + 0.5) * disp_w,
-                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
-            ))
             pts_2d.append(screen[valid])
         if not pts_2d:
             return None
@@ -5643,17 +5628,9 @@ def draw_viewport(state, renderer, ref_tex, window):
             stride = max(1, len(verts) // 300)
             sample = verts[::stride]
             world_pts = transform_points(sample, model_matrix)
-            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
-            clip = homo @ view_proj.T
-            valid = clip[:, 3] > 1e-6
+            screen, valid, _ = project_to_screen(world_pts, view_proj, disp_w, disp_h)
             if not np.any(valid):
                 continue
-            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
-            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
-            screen = np.column_stack((
-                (ndc[:, 0] * 0.5 + 0.5) * disp_w,
-                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
-            ))
             cell_pts[cell_index].append(screen[valid])
 
         bounds = []
@@ -6253,16 +6230,8 @@ def draw_viewport(state, renderer, ref_tex, window):
             if not gizmo_active:
                 visible_ctrl_pts = state.flat_pts_all[visible_ctrl_indices]
                 world_pts = transform_points(visible_ctrl_pts, model_mat)
-                homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
                 view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
-                clip = homo @ view_proj.T
-                valid = clip[:, 3] > 1e-6
-                ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
-                ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
-                screen = np.column_stack((
-                    (ndc[:, 0] * 0.5 + 0.5) * disp_w,
-                    (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
-                ))
+                screen, valid, ndc = project_to_screen(world_pts, view_proj, disp_w, disp_h)
                 in_view = (
                     valid
                     & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0)

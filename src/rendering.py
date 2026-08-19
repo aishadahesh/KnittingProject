@@ -893,6 +893,27 @@ def pil_to_texture(ctx, pil_img):
     return tex
 
 
+def project_to_screen(world_pts, view_proj, disp_w, disp_h):
+    """World points to viewport pixels, with the behind-camera points flagged.
+
+    Returns `(screen, valid, ndc)`. `valid` marks the points in front of the
+    camera; the others hold zeros in `ndc` and meaningless values in `screen`,
+    so every caller must mask with it. `ndc` comes back because hover testing
+    needs it to reject points outside the frustum, not just behind it.
+    """
+    world_pts = np.asarray(world_pts, dtype=np.float32)
+    homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
+    clip = homo @ view_proj.T
+    valid = clip[:, 3] > 1e-6
+    ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
+    ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
+    screen = np.column_stack((
+        (ndc[:, 0] * 0.5 + 0.5) * disp_w,
+        (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * disp_h,
+    ))
+    return screen, valid, ndc
+
+
 def upload_rgb_texture(ctx, texture, rgb):
     """Upload an HxWx3 uint8 array into `texture`, reallocating if the size changed.
 
