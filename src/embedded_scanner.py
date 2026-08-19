@@ -36,6 +36,23 @@ from scanner_core import (
 )
 
 
+def _unique_scan_run_id(image_dir: Path) -> str:
+    """A run folder name that does not already exist.
+
+    Runs are named by the second they started, which is unique enough until the
+    user rescans a configuration straight after scanning it -- then the second
+    run would write its images into the first one's folder and the "keep the old
+    result" half of the duplicate prompt would be a lie.
+    """
+    base = time.strftime("run_%Y%m%d_%H%M%S")
+    candidate = base
+    suffix = 2
+    while (Path(image_dir) / candidate).exists():
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 class EmbeddedMujocoScanner:
     CAMERA_PREVIEW_INTERVAL = 0.18
     # Robot-viewport redraw rate while a scan is running. A redraw is ~130 ms
@@ -234,7 +251,11 @@ class EmbeddedMujocoScanner:
         # results remain fully available in the Database section.
         self.capture_records = []
         self.analysis_results = None
-        self.scan_run_id = time.strftime("run_%Y%m%d_%H%M%S")
+        # Unique per run, so a rescan of a configuration that already exists
+        # writes alongside the old run rather than into it. The timestamp alone
+        # collides when two runs start inside the same second, which is exactly
+        # what "rescan this" invites.
+        self.scan_run_id = _unique_scan_run_id(Path(self.args.image_dir))
         self.scan_output_dir = Path(self.args.image_dir) / self.scan_run_id
         self.running = bool(auto_start)
         self.paused = False

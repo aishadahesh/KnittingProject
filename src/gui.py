@@ -418,6 +418,24 @@ def _set_app_mode(state, mode):
     state.rebuild_spline_mesh(preserve_model_placement=False)
 
 
+def _scan_duplicate_runs(state):
+    """Previous scan runs that used the configuration currently set up.
+
+    Returns None when there are none, or when the check itself cannot be made.
+    A failure here must never block scanning: the point is to save the user a
+    redundant run, which is worth nothing if it can also stop a wanted one.
+    """
+    storage = _scanner_storage(state)
+    if storage is None:
+        return None
+    try:
+        signature = storage.scan_config_signature_for_state(state)
+        runs = storage.find_scan_runs_for_config(signature)
+    except Exception:
+        return None
+    return runs or None
+
+
 def _reference_overlay_active(state):
     """Whether the reference image should be drawn behind the model right now.
 
@@ -532,9 +550,11 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_status = f"Could not start embedded MuJoCo {label}: {exc}"
             return None
 
-    def start_scanner_process():
+    def start_scanner_process(force=False):
         mode = str(state.scanner_execution_mode)
         embedded = state.get('embedded_scanner')
+        # Continuing or already running is not a new scan, so neither reaches
+        # the duplicate check below.
         if embedded is not None and mode == "simulation":
             if getattr(embedded, 'paused', False) and not getattr(embedded, 'single_capture_mode', False):
                 embedded.resume()
@@ -543,9 +563,19 @@ def draw_sidebar(state, renderer, window=None):
             if getattr(embedded, 'running', False):
                 state.scanner_status = "Scanner already running"
                 return
-            embedded.close()
-            state.embedded_scanner = None
-        elif embedded is not None and mode != "simulation":
+
+        # Asked before anything is torn down or written, so cancelling really
+        # does leave everything as it was -- the running scanner is still up and
+        # no images, rows or params have been touched.
+        if not force:
+            existing = _scan_duplicate_runs(state)
+            if existing:
+                state._scan_duplicate_prompt = existing
+                state.scanner_status = "This scan already exists in the database."
+                return
+        state._scan_duplicate_prompt = None
+
+        if embedded is not None:
             try:
                 embedded.close()
             except Exception:
@@ -1480,13 +1510,43 @@ def draw_sidebar(state, renderer, window=None):
         embedded_paused = embedded is not None and getattr(embedded, 'paused', False)
         running = embedded_running
         path_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'path'
-        if not path_workflow:
-            imgui.begin_disabled()
-        if imgui.button("Start Scanner Now##scanner_start", (-1, 0)):
-            start_scanner_process()
-        if not path_workflow:
-            imgui.end_disabled()
-            imgui.text_disabled("Switch to Full scanner path to run the full path.")
+        duplicate_prompt = state.get('_scan_duplicate_prompt')
+        if duplicate_prompt:
+            # Takes the Start button's place rather than sitting beside it, so
+            # the choice has to be made rather than skipped past.
+            imgui.separator()
+            imgui.text_colored((0.95, 0.75, 0.20, 1.0), "This scan already exists in the database.")
+            imgui.text_wrapped("Do you want to rescan it or cancel?")
+            total = sum(int(run.get('capture_count', 0)) for run in duplicate_prompt)
+            imgui.text_disabled(
+                f"{len(duplicate_prompt)} previous run(s), {total} captures, same configuration:"
+            )
+            for run in duplicate_prompt[:4]:
+                imgui.text_disabled(
+                    f"   {run.get('scan_run', '?')} - {int(run.get('capture_count', 0))} captures"
+                    f", {run.get('last_capture_at', '')}"
+                )
+            if len(duplicate_prompt) > 4:
+                imgui.text_disabled(f"   ... and {len(duplicate_prompt) - 4} more")
+            half = max(90.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
+            imgui.push_style_color(imgui.Col_.button, (0.72, 0.42, 0.16, 1.0))
+            if imgui.button("Rescan##scanner_duplicate_rescan", (half, 0)):
+                state._scan_duplicate_prompt = None
+                start_scanner_process(force=True)
+            imgui.pop_style_color()
+            imgui.same_line()
+            if imgui.button("Cancel##scanner_duplicate_cancel", (half, 0)):
+                state._scan_duplicate_prompt = None
+                state.scanner_status = "Scan cancelled; the existing database result was kept"
+            imgui.separator()
+        else:
+            if not path_workflow:
+                imgui.begin_disabled()
+            if imgui.button("Start Scanner Now##scanner_start", (-1, 0)):
+                start_scanner_process()
+            if not path_workflow:
+                imgui.end_disabled()
+                imgui.text_disabled("Switch to Full scanner path to run the full path.")
         if embedded_paused and path_workflow:
             if imgui.button("Continue Scanner##scanner_continue", (-1, 0)):
                 embedded.resume()
