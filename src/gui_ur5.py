@@ -11,9 +11,9 @@ threads inside ``UR5ModeController``, so a move that takes several seconds never
 blocks the frame loop -- which matters most for the stop button, since a stop
 the user cannot click during a move is not a stop at all.
 
-This module deliberately does not import gui at module scope: gui imports it, so
-the plan-building helpers it needs are imported inside the function that needs
-them, once gui has finished loading.
+The scan helpers this panel needs come from scanner_core. They used to live in
+gui.py, which imports this module, so reaching them meant importing gui from
+inside three functions to dodge the cycle -- that is gone.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from PIL import Image
 
 import gaussian_splatting
 import robot_camera
+import scanner_core
 import ur5_robot
 import ur5_scan
 from fabric_scanner import clamp_capture_size
@@ -160,12 +161,11 @@ def build_scan_plan(state):
     same stations, same camera angles.
     """
     import fabric_scanner as scanner
-    import gui  # Late: gui imports this module, so it is only resolvable now.
 
-    pattern_rows, pattern_cols = gui._scanner_pattern_dimensions(state)
-    repeat_rows, repeat_cols = gui._scanner_pattern_repeats(state)
-    spacing_x, spacing_y = gui._scanner_repeat_spacing(state)
-    batch_texture_width, batch_texture_height = gui._scanner_batch_texture_size(state)
+    pattern_rows, pattern_cols = scanner_core._scanner_pattern_dimensions(state)
+    repeat_rows, repeat_cols = scanner_core._scanner_pattern_repeats(state)
+    spacing_x, spacing_y = scanner_core._scanner_repeat_spacing(state)
+    batch_texture_width, batch_texture_height = scanner_core._scanner_batch_texture_size(state)
 
     args = SimpleNamespace(
         rows=int(state.scanner_rows),
@@ -181,11 +181,11 @@ def build_scan_plan(state):
         approach_lift=0.040,
         center=[float(v) for v in state.get("ur5_workspace_center", [-0.45, -0.08, 0.30])],
         max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-        palette=gui._scanner_base_palette(state),
-        cell_color_sets=gui._scanner_shared_cell_color_sets(state),
+        palette=scanner_core._scanner_base_palette(state),
+        cell_color_sets=scanner_core._scanner_shared_cell_color_sets(state),
         model_json=str(state.save_path),
         model_curves=None,
-        cell_model_curves=gui._generate_scanner_random_patterns(state),
+        cell_model_curves=scanner_core._generate_scanner_random_patterns(state),
         random_patterns=True,
         pattern_rows=int(pattern_rows),
         pattern_cols=int(pattern_cols),
@@ -197,25 +197,23 @@ def build_scan_plan(state):
         batch_texture_height=int(batch_texture_height),
         pattern_density=float(state.get("scanner_pattern_density", 0.62)),
         random_seed=int(state.get("scanner_random_seed", 1)),
-        scanner_lighting=gui._scanner_lighting_settings(state),
-        display_batch_colors=gui._scanner_batch_colors_for_simulator(state),
+        scanner_lighting=scanner_core._scanner_lighting_settings(state),
+        display_batch_colors=scanner_core._scanner_batch_colors_for_simulator(state),
     )
     return scanner.build_plan(args)
 
 
 def _make_runner(state, controller):
     """Assembles a run, snapshotting everything it must not read live."""
-    import gui
-
     plan = build_scan_plan(state)
-    storage = gui._scanner_storage(state)
+    storage = scanner_core._scanner_storage(state)
     signature = ""
     settings = {}
     if storage is not None:
         # Taken here on the UI thread. The run thread never touches AppState.
         signature = storage.pattern_signature(state)
         settings = storage.scanner_state_snapshot(state)
-    estimates = gui._scanner_estimated_cell_colors(state)
+    estimates = scanner_core._scanner_estimated_cell_colors(state)
 
     # Clamped like every other capture path. This one derived its height with
     # no bounds at all, so an out-of-range width reached the camera unchecked.
@@ -673,9 +671,7 @@ def _draw_splatting_section(state, controller):
 
 
 def _record_splat_output(state, controller, artifact: Path):
-    import gui
-
-    storage = gui._scanner_storage(state)
+    storage = scanner_core._scanner_storage(state)
     runner = controller.runner
     if storage is None or runner is None or not runner.session_id:
         controller.status = "No scan session to attach the reconstruction to"

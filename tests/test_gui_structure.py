@@ -116,17 +116,12 @@ def test_no_module_imports_a_foreign_mode():
     assert not violations, "modes must not import each other:\n  " + "\n  ".join(violations)
 
 
-@pytest.mark.xfail(
-    reason="gui_ur5 late-imports gui for 11 scan helpers; fixed when those move to "
-           "scanner_core. Remove this marker once it passes.",
-    strict=False,
-)
 def test_no_mode_module_imports_gui():
     """Dependencies point one way: gui -> modes, never back.
 
-    `gui_ur5.py` imports `gui` from inside three functions to dodge the import
-    cycle. Walking function-level imports is what catches that, and what keeps
-    it from quietly returning once removed.
+    `gui_ur5.py` used to import `gui` from inside three functions to dodge the
+    cycle. Walking function-level imports is what caught that, and what keeps it
+    from quietly returning.
     """
     offenders = [
         name for name in _existing(MODE_MODULES)
@@ -150,10 +145,6 @@ def test_core_modules_are_imgui_free(module):
     )
 
 
-@pytest.mark.xfail(
-    reason="the gui <-> gui_ur5 cycle above. Remove this marker once it passes.",
-    strict=False,
-)
 def test_import_graph_is_acyclic():
     """No cycles among the project's own modules, function-level imports included."""
     own = {path.stem for path in SRC.glob("*.py")}
