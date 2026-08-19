@@ -723,6 +723,32 @@ class AppState:
         return base_colors
 
 
+    def display_copy_periods(self):
+        """World-space X, Y and Z spacing between display copies of the model.
+
+        Both scan and puzzle tiling needed these and each rebuilt the spline
+        mesh to derive them, so a single call site was paying for two identical
+        mesh builds. The periods live here because every input to them --
+        control rows, params, radius profiles -- is state.
+        """
+        self._ensure_spline_radius_rows()
+        radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+        radius_profiles = [np.asarray(row, dtype=np.float32) for row in self.spline_radius_rows]
+        base_vl = build_spline_mesh(
+            self.ctrl_rows,
+            self.params,
+            self.config,
+            self._pidx,
+            np.asarray(self.period_offset_x, dtype=np.float32),
+            radius_ctrl_rows=radius_profiles,
+        )
+        depth_gap = max(radius * 2.4, 1e-6)
+        return (
+            self._display_copy_x_period(base_vl, radius),
+            self._display_copy_y_period(base_vl, radius),
+            self._display_copy_z_period(base_vl, depth_gap),
+        )
+
     def _ensure_spline_radius_rows(self):
         base_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
         rows = self.get('spline_radius_rows')

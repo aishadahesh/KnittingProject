@@ -305,21 +305,7 @@ def _puzzle_tiled_control_points(state):
     X/Y display copies baked into the rendered mesh, in world (pre-model-matrix) space."""
     if not state.ctrl_rows:
         return []
-    state._ensure_spline_radius_rows()
-    radius = max(float(state.params[state._pidx['radius']]), 1e-6)
-    radius_profiles = [np.asarray(row, dtype=np.float32) for row in state.spline_radius_rows]
-    base_vl = build_spline_mesh(
-        state.ctrl_rows,
-        state.params,
-        state.config,
-        state._pidx,
-        np.asarray(state.period_offset_x, dtype=np.float32),
-        radius_ctrl_rows=radius_profiles,
-    )
-    x_period = state._display_copy_x_period(base_vl, radius)
-    y_period = state._display_copy_y_period(base_vl, radius)
-    depth_gap = max(radius * 2.4, 1e-6)
-    z_period = state._display_copy_z_period(base_vl, depth_gap)
+    x_period, y_period, z_period = state.display_copy_periods()
     copies_x = int(state.display_copies[0])
     copies_y = int(state.display_copies[1])
 
@@ -348,21 +334,7 @@ def _puzzle_period_pixel_vectors(state, renderer):
     if vp_w < 2 or vp_h < 2:
         return None
 
-    state._ensure_spline_radius_rows()
-    radius = max(float(state.params[state._pidx['radius']]), 1e-6)
-    radius_profiles = [np.asarray(row, dtype=np.float32) for row in state.spline_radius_rows]
-    base_vl = build_spline_mesh(
-        state.ctrl_rows,
-        state.params,
-        state.config,
-        state._pidx,
-        np.asarray(state.period_offset_x, dtype=np.float32),
-        radius_ctrl_rows=radius_profiles,
-    )
-    x_period = state._display_copy_x_period(base_vl, radius)
-    y_period = state._display_copy_y_period(base_vl, radius)
-    depth_gap = max(radius * 2.4, 1e-6)
-    z_period = state._display_copy_z_period(base_vl, depth_gap)
+    x_period, y_period, z_period = state.display_copy_periods()
 
     model_mat = state.current_model_matrix()
     mvp = (state.camera.mvp(vp_w, vp_h) @ model_mat).astype(np.float32)
