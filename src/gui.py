@@ -31,7 +31,7 @@ from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
 from PIL import Image, ImageDraw
 
-from rendering import draw_fitted_texture, pil_to_texture, transform_points, MeshRenderer
+from rendering import draw_fitted_texture, pil_to_texture, transform_points, upload_rgb_texture, MeshRenderer
 from knitting_core import build_parametric_control_rows, build_spline_mesh
 from rgb_analysis import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
 import paths
@@ -1119,10 +1119,7 @@ def _database_image_texture(state, renderer, image_path, max_side=280):
         image.thumbnail((int(max_side), int(max_side)), Image.Resampling.LANCZOS)
         rgb = np.asarray(image, dtype=np.uint8)
         h, w = rgb.shape[:2]
-        rgba = np.dstack((rgb, np.full((h, w), 255, dtype=np.uint8)))
-        rgba = np.ascontiguousarray(np.flipud(rgba))
-        tex = ctx.texture((w, h), 4, rgba.tobytes())
-        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        tex = upload_rgb_texture(ctx, None, rgb)
         cache[key] = (tex, w, h, current_frame)
         _database_prune_texture_cache(cache, current_frame)
         return (tex, w, h)
@@ -2782,13 +2779,10 @@ class EmbeddedMujocoScanner:
         if self.window is not None:
             glfw.make_context_current(self.window)
             self.gl_ctx.screen.use()
-        rgba = np.dstack((frame, np.full(frame.shape[:2], 255, dtype=np.uint8)))
-        rgba = np.ascontiguousarray(np.flipud(rgba))
-        if self.texture is None:
-            self.texture = self.gl_ctx.texture((self.width, self.height), 4, rgba.tobytes())
-            self.texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        else:
-            self.texture.write(rgba.tobytes())
+        # Reallocates when the viewport is resized. The previous version created
+        # the texture once at the initial size and only ever wrote to it after,
+        # so a resize wrote the wrong number of bytes into it.
+        self.texture = upload_rgb_texture(self.gl_ctx, self.texture, frame)
 
     def _upload_camera_preview(self, image):
         if self.window is not None:
@@ -2797,18 +2791,7 @@ class EmbeddedMujocoScanner:
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         self.camera_preview_width = int(rgb.shape[1])
         self.camera_preview_height = int(rgb.shape[0])
-        rgba = np.dstack((rgb, np.full(rgb.shape[:2], 255, dtype=np.uint8)))
-        rgba = np.ascontiguousarray(np.flipud(rgba))
-        if (
-            self.camera_texture is None
-            or self.camera_texture.size != (self.camera_preview_width, self.camera_preview_height)
-        ):
-            if self.camera_texture is not None:
-                self.camera_texture.release()
-            self.camera_texture = self.gl_ctx.texture((self.camera_preview_width, self.camera_preview_height), 4, rgba.tobytes())
-            self.camera_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        else:
-            self.camera_texture.write(rgba.tobytes())
+        self.camera_texture = upload_rgb_texture(self.gl_ctx, self.camera_texture, rgb)
 
     def _render_camera_preview(self, tcp_pose, target_index, target_pose):
         # Nothing on screen is showing this, so do not spend a full camera
@@ -3243,13 +3226,19 @@ def _puzzle_detect_colors(image, count=6):
     ]
 
 
-def _upload_puzzle_capture_texture(state, renderer):
-    image = state.get('puzzle_capture_image', None)
+def _upload_puzzle_texture(state, renderer, slot):
+    """Cache one of Puzzle Mode's preview images as a GL texture.
+
+    `slot` names the pair of state keys -- 'capture' or 'glued'. These were two
+    functions identical but for that word. The cache key is the image's identity
+    and size, so a rebuilt image uploads and an unchanged one does not.
+    """
+    image = state.get(f'puzzle_{slot}_image', None)
     if image is None:
         return None
-    texture = state.get('puzzle_capture_texture', None)
+    texture = state.get(f'puzzle_{slot}_texture', None)
     key = (id(image), image.size)
-    if texture is not None and state.get('puzzle_capture_texture_key') == key:
+    if texture is not None and state.get(f'puzzle_{slot}_texture_key') == key:
         return texture
     if texture is not None:
         try:
@@ -3257,27 +3246,8 @@ def _upload_puzzle_capture_texture(state, renderer):
         except Exception:
             pass
     texture = pil_to_texture(renderer.ctx, image)
-    state.puzzle_capture_texture = texture
-    state.puzzle_capture_texture_key = key
-    return texture
-
-
-def _upload_puzzle_glued_texture(state, renderer):
-    image = state.get('puzzle_glued_image', None)
-    if image is None:
-        return None
-    texture = state.get('puzzle_glued_texture', None)
-    key = (id(image), image.size)
-    if texture is not None and state.get('puzzle_glued_texture_key') == key:
-        return texture
-    if texture is not None:
-        try:
-            texture.release()
-        except Exception:
-            pass
-    texture = pil_to_texture(renderer.ctx, image)
-    state.puzzle_glued_texture = texture
-    state.puzzle_glued_texture_key = key
+    state[f'puzzle_{slot}_texture'] = texture
+    state[f'puzzle_{slot}_texture_key'] = key
     return texture
 
 
@@ -5152,7 +5122,7 @@ def draw_sidebar(state, renderer, window=None):
                     imgui.text(f"{rgb[0]}, {rgb[1]}, {rgb[2]} | px {int(item.get('count', 0))}")
             imgui.text(f"Control points: {len(state.get('puzzle_projected_points', []))}")
             imgui.text(f"Edge landmarks: {len(state.get('puzzle_edge_landmarks', []))}")
-            texture = _upload_puzzle_capture_texture(state, renderer)
+            texture = _upload_puzzle_texture(state, renderer, 'capture')
             if texture is not None:
                 avail_w = max(120, int(imgui.get_content_region_avail().x))
                 preview_h = int(avail_w * image.size[1] / max(image.size[0], 1))
@@ -5220,7 +5190,7 @@ def draw_sidebar(state, renderer, window=None):
                     tile_image.save(output_dir / f"puzzle_tile_{stamp}.png")
                 glued_image.save(output_dir / f"puzzle_glued_{stamp}.png")
                 state.status_msg = f"Saved puzzle_tile_{stamp}.png and puzzle_glued_{stamp}.png"
-            glue_texture = _upload_puzzle_glued_texture(state, renderer)
+            glue_texture = _upload_puzzle_texture(state, renderer, 'glued')
             if glue_texture is not None:
                 avail_w = max(120, int(imgui.get_content_region_avail().x))
                 preview_h = int(min(avail_w * glued_image.size[1] / max(glued_image.size[0], 1), 480))
@@ -5363,7 +5333,7 @@ def draw_sidebar(state, renderer, window=None):
 
     if str(state.get('app_mode', 'edit')) == 'puzzle' and state.get('puzzle_capture_image', None) is not None:
         image = state.get('puzzle_capture_image')
-        texture = _upload_puzzle_capture_texture(state, renderer)
+        texture = _upload_puzzle_texture(state, renderer, 'capture')
         if image is not None and texture is not None:
             imgui.set_next_window_size((760, 620), cond=imgui.Cond_.first_use_ever)
             imgui.begin("Puzzle Capture Inspector")

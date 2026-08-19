@@ -30,7 +30,7 @@ import gaussian_splatting
 import robot_camera
 import ur5_robot
 import ur5_scan
-from rendering import draw_fitted_texture
+from rendering import draw_fitted_texture, upload_rgb_texture
 
 
 # Colours reused for status text, so "safe/attention/danger" reads the same
@@ -82,20 +82,12 @@ class UR5ModeController:
         self._upload_preview(image)
 
     def _upload_preview(self, image: Image.Image) -> None:
+        # Shared helper, which also sets the texture filter -- this uploader
+        # never did, leaving the preview sampling at moderngl's default.
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         height, width = rgb.shape[:2]
-        rgba = np.dstack((rgb, np.full((height, width), 255, dtype=np.uint8)))
-        rgba = np.ascontiguousarray(np.flipud(rgba))
-        if self.preview_texture is None or self._preview_size != (width, height):
-            if self.preview_texture is not None:
-                try:
-                    self.preview_texture.release()
-                except Exception:
-                    pass
-            self.preview_texture = self.gl_ctx.texture((width, height), 4, rgba.tobytes())
-            self._preview_size = (width, height)
-        else:
-            self.preview_texture.write(rgba.tobytes())
+        self.preview_texture = upload_rgb_texture(self.gl_ctx, self.preview_texture, rgb)
+        self._preview_size = (width, height)
 
     # -- camera ------------------------------------------------------------
 

@@ -893,6 +893,37 @@ def pil_to_texture(ctx, pil_img):
     return tex
 
 
+def upload_rgb_texture(ctx, texture, rgb):
+    """Upload an HxWx3 uint8 array into `texture`, reallocating if the size changed.
+
+    Sibling to pil_to_texture rather than a replacement: that one takes a PIL
+    image and always allocates, while the live views here re-upload a numpy
+    frame many times a second and want to keep the texture they have.
+
+    Returns the texture to assign back, which may be a new object. Callers each
+    had their own copy of this and had drifted to different levels of
+    correctness -- one never set the filter, another never handled a size change
+    and would write new bytes into a stale-sized texture.
+    """
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+    height, width = rgb.shape[:2]
+    rgba = np.dstack((rgb, np.full((height, width), 255, dtype=np.uint8)))
+    # Flipped because GL's texture origin is bottom-left and image rows arrive
+    # top-first.
+    rgba = np.ascontiguousarray(np.flipud(rgba))
+    if texture is None or tuple(texture.size) != (width, height):
+        if texture is not None:
+            try:
+                texture.release()
+            except Exception:
+                pass
+        texture = ctx.texture((width, height), 4, rgba.tobytes())
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    else:
+        texture.write(rgba.tobytes())
+    return texture
+
+
 def draw_fitted_texture(texture_id, tex_w, tex_h, avail_w, avail_h, flip_y=False, zoom=1.0, pan=(0.0, 0.0)):
     """Draws a texture centered inside the available region while preserving aspect."""
     if tex_w <= 0 or tex_h <= 0 or avail_w <= 1 or avail_h <= 1:
