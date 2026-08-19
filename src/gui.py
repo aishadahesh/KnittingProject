@@ -418,6 +418,21 @@ def _set_app_mode(state, mode):
     state.rebuild_spline_mesh(preserve_model_placement=False)
 
 
+def _reference_overlay_active(state):
+    """Whether the reference image should be drawn behind the model right now.
+
+    It belongs to Edit Mode alone -- it exists to align the model against a
+    photograph, which is an editing task. Puzzle Mode was showing it because the
+    only gate was "not a scanner mode", so the fabric it lays out sat on top of
+    an unrelated picture.
+
+    Deliberately a display gate rather than a write to `show_ref_bg`: the
+    checkbox stays the user's stored preference, so leaving Edit Mode hides the
+    overlay and returning restores it, with nothing to remember or put back.
+    """
+    return str(state.get('app_mode', 'edit')) == 'edit' and bool(state.get('show_ref_bg', False))
+
+
 def _apply_ui_theme(state):
     theme = str(state.get('ui_theme', 'dark'))
     if state.get('_applied_ui_theme') == theme:
@@ -691,8 +706,18 @@ def draw_sidebar(state, renderer, window=None):
     if undo_disabled:
         imgui.end_disabled()
     imgui.same_line()
+    # Edit Mode only: it replaces the whole model with the saved initial one,
+    # which the other modes are mid-way through building on -- Scan and Puzzle
+    # have swapped in their own geometry, and resetting underneath them leaves
+    # what is on screen describing a model that is no longer there.
+    if not edit_active:
+        imgui.begin_disabled()
     if imgui.button("Reset initial##reset_saved_initial_global", (action_w, 0)):
         state.reset_to_initial()
+    if not edit_active:
+        imgui.end_disabled()
+        if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+            imgui.set_tooltip("Available in Edit Mode only.")
     imgui.separator()
 
     if database_active:
@@ -2102,8 +2127,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         hover_mesh_idx=state.hover_mesh_idx,
         selected_mesh_idx=state.selected_mesh_idx,
         visible_rows=np.zeros(max(1, len(state.row_visible)), dtype=bool) if scanner_estimate_mode else state.row_visible,
-        bg_tex      = None if scanner_stage_active else (ref_tex if state.show_ref_bg else None),
-        bg_alpha    = 0.0 if scanner_stage_active else state.ref_bg_alpha,
+        bg_tex      = ref_tex if _reference_overlay_active(state) else None,
+        bg_alpha    = state.ref_bg_alpha if _reference_overlay_active(state) else 0.0,
         bg_uniforms = bg_uniforms,
         camera      = state.camera,
         n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx])
@@ -2475,7 +2500,10 @@ def draw_viewport(state, renderer, ref_tex, window):
                     dl.add_circle_filled(p1, 3.0, force_color)
 
     # Mouse interaction inside the viewport
-    alignment_locked = bool(state.show_ref_bg and state.ref_bg_lock_zoom)
+    # Follows what is actually on screen, not just the checkbox: the lock exists
+    # to stop the model drifting against the reference image, so it has no job
+    # in a mode that does not draw one.
+    alignment_locked = bool(_reference_overlay_active(state) and state.ref_bg_lock_zoom)
 
     def viewport_pixel_delta_to_world(dx_px, dy_px):
         aspect = max(1.0, disp_w) / max(1.0, disp_h)

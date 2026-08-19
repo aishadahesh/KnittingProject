@@ -1236,6 +1236,12 @@ class AppState:
     _SNAPSHOT_EXCLUDE = frozenset({
         'render_tex', 'render_result', 'undo_stack',
         'ur5_controller', 'embedded_scanner', 'scanner_storage', 'scanner_process',
+        # Which mode the user is looking at is not part of the model, and
+        # restoring it moved them without going through _set_app_mode -- so the
+        # mode they left was never torn down and the one they landed in was
+        # never set up. Reset from Puzzle Mode silently returned to Edit Mode
+        # with Puzzle's geometry still applied, and undo could do the same.
+        'app_mode',
     })
 
     def snapshot_state(self):
