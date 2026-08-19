@@ -190,6 +190,73 @@ def test_row_base_pitch_ignores_loop_height(state):
 # Scan and puzzle tiling agree with the display
 # ---------------------------------------------------------------------------
 
+def test_scan_template_reproduces_its_saved_fabric(state, tmp_path, monkeypatch):
+    """Scan Mode must scan the tuned fabric, not a rebuild of its parameters.
+
+    The template's parameters do not describe the rows saved beside them -- the
+    real file has a 1.106 pitch with near-uniform loops, while its parameters
+    say dy 0.594 with loop heights spanning 4.7:1. Rebuilt from those, rows
+    tower many times their own pitch and pass through the rows above, which is
+    what captures were showing.
+    """
+    import json
+
+    import paths
+
+    # A template whose saved rows sit on a different pitch from its `dy`,
+    # which is the condition the real file is in.
+    rows = build_parametric_control_rows(
+        state.params, state.bitmap, state._pidx, state._lh_idx, state.samples_per_loop
+    )
+    rows = rows[0] if isinstance(rows, tuple) else rows
+    scaled = [
+        np.column_stack((r[:, 0], r[:, 1] * Y_SCALE, r[:, 2])).astype(np.float32)
+        for r in rows
+    ]
+    saved_pitch = row_base_pitch(scaled)
+
+    template_path = tmp_path / "initial_params.json"
+    template_path.write_text(json.dumps({
+        "params": {
+            p["name"]: float(state.params[i])
+            for i, p in enumerate(state.config["knit_parameters"]["parameters"])
+        },
+        "bitmap": np.asarray(state.bitmap, dtype=float).tolist(),
+        "spline_control_rows": [r.tolist() for r in scaled],
+    }), encoding="utf-8")
+    monkeypatch.setattr(paths, "INITIAL_PARAMS_JSON", template_path)
+    # _scanner_template memoises on the file's mtime; drop the cached entry.
+    object.__setattr__(state, "_scanner_template_cache", None)
+
+    state.params = state._scanner_template_params()
+    assert state.apply_scanner_template_base() is True
+    state.nudge_spline_from_params(rebuild_mesh=False)
+
+    assert row_base_pitch(state.ctrl_rows) == pytest.approx(saved_pitch, rel=1e-5)
+    # And emphatically not the pitch a parametric rebuild would have produced.
+    dy = abs(float(state.params[state._pidx["dy"]]))
+    assert row_base_pitch(state.ctrl_rows) != pytest.approx(dy, rel=1e-3)
+
+
+def test_scan_template_falls_back_when_it_has_no_saved_rows(state, tmp_path, monkeypatch):
+    """A template with only parameters keeps the previous behaviour."""
+    import json
+
+    import paths
+
+    template_path = tmp_path / "initial_params.json"
+    template_path.write_text(json.dumps({
+        "params": {
+            p["name"]: float(state.params[i])
+            for i, p in enumerate(state.config["knit_parameters"]["parameters"])
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(paths, "INITIAL_PARAMS_JSON", template_path)
+    object.__setattr__(state, "_scanner_template_cache", None)
+
+    assert state.apply_scanner_template_base() is False
+
+
 def test_puzzle_tiles_carry_no_depth_shift(state):
     """Y copies translate in Y alone, in every one of the three tiling sites.
 

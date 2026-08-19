@@ -688,9 +688,17 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
         state.loop_heights = state._scanner_loop_heights_for_bitmap(full_bitmap)
         state.display_copies = np.array([1, 1], dtype=np.int32)
         state.scanner_preview_grid_enabled = False
+        # Build on the template's own tuned fabric where it has one, nudging
+        # this cell's pattern onto it, rather than rebuilding from parameters
+        # that do not reproduce that fabric. Falls back to the parametric
+        # rebuild when the template carries no saved rows.
+        #
         # rebuild_mesh=False: the very next line rebuilds and uploads the same
         # mesh, with the placement flag this pass actually wants.
-        state.rebuild_spline_from_params(rebuild_mesh=False)
+        if state.apply_scanner_template_base():
+            state.nudge_spline_from_params(rebuild_mesh=False)
+        else:
+            state.rebuild_spline_from_params(rebuild_mesh=False)
         state.rebuild_spline_mesh(preserve_model_placement=False)
         frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
         if frame is None:
@@ -803,9 +811,17 @@ def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, col
         state.display_copies = np.array([copies, copies], dtype=np.int32)
         state.scanner_preview_grid_enabled = False
 
+        # Build on the template's own tuned fabric where it has one, nudging
+        # this cell's pattern onto it, rather than rebuilding from parameters
+        # that do not reproduce that fabric. Falls back to the parametric
+        # rebuild when the template carries no saved rows.
+        #
         # rebuild_mesh=False: the very next line rebuilds and uploads the same
         # mesh, with the placement flag this pass actually wants.
-        state.rebuild_spline_from_params(rebuild_mesh=False)
+        if state.apply_scanner_template_base():
+            state.nudge_spline_from_params(rebuild_mesh=False)
+        else:
+            state.rebuild_spline_from_params(rebuild_mesh=False)
         state.rebuild_spline_mesh(preserve_model_placement=False)
         # Control-point markers belong to the editing viewport, not to captured
         # fabric. rebuild_spline_mesh uploads them to whichever renderer it is
@@ -1213,7 +1229,7 @@ def _upload_puzzle_texture(state, renderer, slot):
 _TILE_CACHE_DIR_NAME = "tile_cache"
 
 
-_TILE_CACHE_VERSION = 2
+_TILE_CACHE_VERSION = 3
 
 
 _TILE_CACHE_KEEP = 3
@@ -1248,6 +1264,13 @@ def _scanner_tile_cache_digest(state):
             "bitmap": np.asarray(template.get("bitmap"), dtype=np.float32).tolist(),
             "loop_heights": np.asarray(
                 template.get("loop_heights", np.empty((0, 0))), dtype=np.float32).round(6).tolist(),
+            # The template's saved rows are the geometry captures are built
+            # from, so editing them has to invalidate tiles rendered from the
+            # old fabric -- the parameters alone no longer identify it.
+            "ctrl_rows": [
+                np.asarray(row, dtype=np.float32).round(6).tolist()
+                for row in (template.get("ctrl_rows") or [])
+            ],
         }
         blob = json.dumps(payload, sort_keys=True, default=str)
     except Exception:

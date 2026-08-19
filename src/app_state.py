@@ -350,6 +350,8 @@ class AppState:
         )
         loop_heights = np.empty((0, 0), dtype=np.float32)
         gui_state = {}
+        ctrl_rows = []
+        radius_rows = []
         try:
             with open(path, 'r') as f:
                 data = json.load(f)
@@ -365,6 +367,21 @@ class AppState:
             loaded_heights = np.asarray(gui_state.get('loop_heights', data.get('loop_heights', loop_heights)), dtype=np.float32)
             if loaded_heights.ndim == 2 and loaded_heights.size:
                 loop_heights = loaded_heights
+            # The tuned fabric itself, not just the parameters it was tuned
+            # from. Rebuilding from the parameters alone does not reproduce it:
+            # the saved rows sit on a 1.106 pitch with near-uniform loops, while
+            # the parameters say dy 0.594 with loop heights spanning 4.7:1, so
+            # the rebuilt rows tower over their own pitch and pass through the
+            # rows above. Scan Mode showed that instead of the real model.
+            ctrl_rows = [
+                np.asarray(row, dtype=np.float32)
+                for row in data.get('spline_control_rows', [])
+                if len(row) > 1
+            ]
+            radius_rows = [
+                np.asarray(row, dtype=np.float32)
+                for row in data.get('spline_radius_rows', [])
+            ]
         except Exception:
             pass
 
@@ -373,6 +390,8 @@ class AppState:
             'bitmap': bitmap,
             'loop_heights': loop_heights,
             'gui_state': gui_state,
+            'ctrl_rows': ctrl_rows,
+            'radius_rows': radius_rows,
         }
         super().__setattr__('_scanner_template_cache', template)
         super().__setattr__('_scanner_template_mtime', mtime)
@@ -380,6 +399,52 @@ class AppState:
 
     def _scanner_template_params(self):
         return np.asarray(self._scanner_template()['params'], dtype=np.float32).copy()
+
+    def apply_scanner_template_base(self):
+        """Install the scan template's own tuned fabric as the working model.
+
+        Scan Mode used to rebuild its fabric from the template's parameters,
+        which do not describe the fabric saved beside them -- so every capture
+        showed geometry the user had never seen. This installs the saved rows
+        instead, and sets param_ref_ctrl_rows to the parametric build those rows
+        correspond to, so a following nudge_spline_from_params applies only the
+        per-cell pattern change on top of the real fabric rather than replacing
+        it.
+
+        Returns False when the template carries no saved rows, or when they do
+        not match the shape the current pattern needs; the caller then falls
+        back to the parametric rebuild, which is the previous behaviour.
+        """
+        template = self._scanner_template()
+        rows = template.get('ctrl_rows') or []
+        if not rows:
+            return False
+
+        reference = build_parametric_control_rows(
+            np.asarray(template['params'], dtype=np.float32),
+            np.asarray(template['bitmap'], dtype=np.float32),
+            self._pidx,
+            self._lh_idx,
+            self.samples_per_loop,
+            loop_heights=(
+                np.asarray(template['loop_heights'], dtype=np.float32)
+                if np.asarray(template['loop_heights']).size else None
+            ),
+        )
+        if len(reference) != len(rows) or any(r.shape != c.shape for r, c in zip(reference, rows)):
+            return False
+
+        self.ctrl_rows = [np.asarray(row, dtype=np.float32).copy() for row in rows]
+        saved_radius = template.get('radius_rows') or []
+        if len(saved_radius) == len(self.ctrl_rows):
+            self.spline_radius_rows = [np.asarray(row, dtype=np.float32).copy() for row in saved_radius]
+        else:
+            self.spline_radius_rows = []
+        self._ensure_spline_radius_rows()
+        self.param_ref_ctrl_rows = [np.asarray(row, dtype=np.float32).copy() for row in reference]
+        self.param_ref_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
+        self._rebuild_spline_points()
+        return True
 
     def _scanner_default_loop_height_for_row(self, params, row_idx):
         if not self._lh_idx:
@@ -1100,7 +1165,15 @@ class AppState:
             for row in rows
         ]
 
-    def nudge_spline_from_params(self, preserve_bounds=False):
+    def nudge_spline_from_params(self, preserve_bounds=False, rebuild_mesh=True):
+        """Apply the parametric change on top of the live rows, keeping edits.
+
+        `rebuild_mesh=False` skips the trailing mesh build and upload, for
+        callers that follow this with their own rebuild_spline_mesh -- the scan
+        pattern pipeline does exactly that, once per cell, and would otherwise
+        pay for two full builds where the second discards the first. Same
+        contract as rebuild_spline_from_params.
+        """
         old_bounds = self._ctrl_rows_bounds(self.ctrl_rows) if preserve_bounds else None
         target_rows = self._fresh_rebuild_rows()
         ref_rows = self.get('param_ref_ctrl_rows')
@@ -1130,7 +1203,11 @@ class AppState:
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
         self.sync_period_offset_to_model_width()
-        self.rebuild_spline_mesh(preserve_model_placement=True)
+        # Y as well as X: nudged rows can change the fabric's height, and the
+        # display and the simulation both read the Y period back.
+        self.sync_period_offset_y_to_row_count()
+        if rebuild_mesh:
+            self.rebuild_spline_mesh(preserve_model_placement=True)
 
     def current_model_matrix(self):
         scale = np.asarray(self.model_scale, dtype=np.float32).reshape(-1)
