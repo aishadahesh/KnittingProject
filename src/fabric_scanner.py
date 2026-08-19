@@ -436,10 +436,16 @@ def _normalize_cell_model_curves(raw_sets, rows: int, cols: int) -> list[list[np
     return normalized if any(normalized) else None
 
 
-def _normalize_model_curves(curves: list[np.ndarray]) -> list[np.ndarray]:
+def normalize_model_curves(curves, *, fallback=None) -> list[np.ndarray]:
+    """Centre a set of 2D curves and scale them to fill the scan pattern cell.
+
+    Shared with Scan Mode's own pattern generation, which wants an empty list
+    rather than the built-in fallback shape when there is nothing to normalize
+    -- that is the only way the two callers differ.
+    """
     valid = [np.asarray(curve, dtype=np.float32)[:, :2] for curve in curves if len(curve) > 1]
     if not valid:
-        return _fallback_model_curves()
+        return _fallback_model_curves() if fallback is None else fallback
     pts = np.vstack(valid)
     min_xy = pts.min(axis=0)
     max_xy = pts.max(axis=0)
@@ -539,7 +545,7 @@ def _random_bitmap_model_curves(
         samples_per_loop,
         loop_heights=loop_heights,
     )
-    return _normalize_model_curves(curves)
+    return normalize_model_curves(curves)
 
 
 def _generate_random_cell_model_curves(args) -> list[list[np.ndarray]]:

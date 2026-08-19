@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 
 from rendering import draw_fitted_texture, pil_to_texture, transform_points, MeshRenderer
 from knitting_core import build_parametric_control_rows, build_spline_mesh
-from rgb_analysis import fabric_rgb_stats
+from rgb_analysis import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
 import paths
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
 # inside the functions that need it, so there is no cycle at load time.
@@ -993,16 +993,14 @@ def _scanner_material_uniforms(state):
 
 
 def _normalize_scanner_curves(curves):
-    valid = [np.asarray(curve, dtype=np.float32)[:, :2] for curve in curves if len(curve) > 1]
-    if not valid:
-        return []
-    pts = np.vstack(valid)
-    min_xy = pts.min(axis=0)
-    max_xy = pts.max(axis=0)
-    center = (min_xy + max_xy) * 0.5
-    span = np.maximum(max_xy - min_xy, 1e-6)
-    scale = 1.08 / float(max(span[0], span[1]))
-    return [((curve - center) * scale).astype(np.float32) for curve in valid]
+    """Scan Mode's pattern curves, normalized by fabric_scanner's own helper.
+
+    This was a second copy of that function; the fill constant it hardcoded was
+    already fabric_scanner.SCAN_PATTERN_FILL to the digit.
+    """
+    import fabric_scanner as scanner
+
+    return scanner.normalize_model_curves(curves, fallback=[])
 
 
 def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density, repeat_rows=3, repeat_cols=3):
@@ -2543,52 +2541,15 @@ class EmbeddedMujocoScanner:
             if stats.get("debug_path"):
                 record["analysis_used_image"] = str(stats["debug_path"])
 
-        grouped = {}
-        for record in self.capture_records:
-            key = (int(record["row"]), int(record["col"]))
-            grouped.setdefault(key, []).append(record)
-
-        cells = []
-        estimates_by_pos = {
-            (int(item.get("row", 0)), int(item.get("col", 0))): item
-            for item in getattr(self, "estimated_cell_colors", [])
-        }
-        for (row, col), records in sorted(grouped.items()):
-            all_rgb = np.asarray([record["rgb"] for record in records], dtype=np.float32)
-            overall = all_rgb.mean(axis=0)
-            estimate = estimates_by_pos.get((int(row), int(col)), {})
-            estimated_rgb = [float(v) for v in estimate.get("rgb", [0.0, 0.0, 0.0])]
-            estimate_delta = float(np.linalg.norm(overall - np.asarray(estimated_rgb, dtype=np.float32)))
-            angle_results = []
-            for angle in sorted({str(record["angle"]) for record in records}):
-                angle_rgb = np.asarray([record["rgb"] for record in records if str(record["angle"]) == angle], dtype=np.float32)
-                angle_results.append({
-                    "angle": angle,
-                    "rgb": [float(v) for v in angle_rgb.mean(axis=0)],
-                    "count": int(len(angle_rgb)),
-                })
-            cells.append({
-                "row": int(row),
-                "col": int(col),
-                "estimated_rgb": estimated_rgb,
-                "estimated_active_ratio": float(estimate.get("active_ratio", 0.0)),
-                "estimate_actual_delta_rgb": estimate_delta,
-                "overall_rgb": [float(v) for v in overall],
-                "count": int(len(records)),
-                "angles": angle_results,
-                "fabric_pixel_count": int(sum(int(record.get("fabric_pixel_count", 0)) for record in records)),
-                "analysis_total_pixels": int(sum(int(record.get("analysis_total_pixels", 0)) for record in records)),
-                "analysis_masks": sorted({str(record.get("analysis_mask", "unknown")) for record in records}),
-            })
-
-        result = {
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "image_count": int(len(self.capture_records)),
-            "pattern_signature": str(getattr(self, "pattern_signature", "")),
-            "cells": cells,
-            "background_ignored": True,
-            "analysis_note": "Average RGB is computed from detected fabric pixels only; scanner background and label areas are ignored.",
-        }
+        # Grouped by the same helper the real UR5 scan uses, so a simulated and
+        # a real analysis of the same fabric are directly comparable rather than
+        # merely similar. This block used to be a hand-rolled copy of it.
+        result = fabric_rgb_summary(
+            self.capture_records,
+            getattr(self, "estimated_cell_colors", []),
+            pattern_signature=str(getattr(self, "pattern_signature", "")),
+        )
+        cells = result["cells"]
         if save_outputs:
             output_dir.mkdir(parents=True, exist_ok=True)
             json_path = output_dir / "per_sample_rgb_analysis.json"
