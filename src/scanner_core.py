@@ -298,7 +298,7 @@ def _puzzle_tiled_control_points(state):
         if row.shape[0] == 0:
             continue
         for y_tile in range(-copies_y, copies_y + 1):
-            y_shift = np.array([0.0, y_tile * y_period, -y_tile * z_period], dtype=np.float32)
+            y_shift = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
             for x_tile in range(-copies_x, copies_x + 1):
                 shift = y_shift + np.array([x_tile * x_period, 0.0, 0.0], dtype=np.float32)
                 tiled.append((row + shift[None, :], row_idx))
@@ -324,7 +324,7 @@ def _puzzle_period_pixel_vectors(state, renderer):
     ref_pts = np.array([
         [0.0, 0.0, 0.0],
         [x_period, 0.0, 0.0],
-        [0.0, y_period, -z_period],
+        [0.0, y_period, 0.0],
     ], dtype=np.float32)
     pix = _puzzle_project_points(ref_pts, mvp, vp_w, vp_h)
     return {

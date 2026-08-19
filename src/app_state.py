@@ -7,7 +7,7 @@ import numpy as np
 import paths
 
 from knitting_core import (
-    compute_knitting_faces,
+    compute_knitting_faces, row_base_pitch,
     build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes
 )
 
@@ -666,27 +666,25 @@ class AppState:
         return max(float(base_bounds[:, 0].max() - base_bounds[:, 0].min()) - radius * 2.0, radius)
 
     def _display_copy_y_period(self, verts_list, radius):
-        # One copy up is the whole stack of rows: as many row pitches as there
-        # are rows. This measured the pitch between row centres and multiplied
-        # by rows - 1, which is two mistakes at once. Centres move with loop
-        # height, so a tall row shifted the pitch away from dy; and stopping a
-        # pitch short landed the next copy's first row on top of this copy's
-        # last one instead of one row above it, so the copies interleaved and
-        # the bottom row of a copy appeared underneath the top row of the one
-        # below. dy times the row count is the grid's real vertical period, and
-        # it is what sync_period_offset_y_to_row_count already uses.
-        if self.ctrl_rows:
-            dy = float(self.params[self._pidx['dy']])
-            period = abs(dy) * max(1, len(self.ctrl_rows))
-            if period > 1e-6:
-                return max(period, radius)
-
+        # A copy above is simply more rows of the same fabric, so it belongs
+        # one whole row lattice above: pitch times row count. Measured from the
+        # rows rather than read from `dy` -- an edited or rescaled model no
+        # longer matches the parameter it was built from, and `dy * n_rows`
+        # then tiles copies at a fraction of the fabric's real height and
+        # overlaps them.
+        #
+        # Neither the row centres nor the mesh bounding box work here: loop
+        # height moves both, so a tall row shifts them away from the lattice
+        # the fabric actually repeats on.
+        period = self._row_lattice_period()
+        if period is not None:
+            return max(period, radius)
+        # No control rows to measure. One bounding box up is the least-wrong
+        # guess left.
         bounds = self._display_mesh_bounds(verts_list)
         if bounds is None:
             return radius
-        min_v, max_v = bounds
-        model_height = float(max_v[1] - min_v[1])
-        return max(model_height * 0.58, radius)
+        return max(float(bounds[1][1] - bounds[0][1]), radius)
 
     def prepare_display_meshes(self, vl, fl):
         vl, meta = build_surface_fiber_meshes(
@@ -890,15 +888,43 @@ class AppState:
     def sync_period_offset_to_model_width(self):
         self.period_offset_x = self._period_offset_from_ctrl_rows()
 
+    def _row_lattice_period(self):
+        """One whole fabric height: the row pitch times the number of rows.
+
+        The single definition of the vertical period. Both the yarn
+        simulation's periodic wrap and the display-copy tiling ask for it here,
+        so the two cannot drift apart -- which is exactly how the copies came
+        to overlap: one derivation trusted `dy` while the geometry had moved on.
+
+        Returns None when there are no rows to measure at all.
+        """
+        n_rows = len(self.ctrl_rows)
+        if n_rows == 0:
+            return None
+        pitch = row_base_pitch(self.ctrl_rows)
+        if pitch is None:
+            # A single row has no step to measure. One parametric pitch up is
+            # the right answer for a one-row fabric.
+            dy_idx = self._pidx.get('dy')
+            pitch = abs(float(self.params[dy_idx])) if dy_idx is not None else 0.0
+        return pitch * n_rows if pitch > 1e-6 else None
+
     def sync_period_offset_y_to_row_count(self):
         """Y period spans the whole stack of rows, so a vertically tiled copy
-        lands exactly one fabric-height above. Only the yarn simulation reads
-        this; display/preview tiling still derives Y spacing from mesh bounds."""
-        dy_idx = self._pidx.get('dy')
-        dy_val = float(self.params[dy_idx]) if dy_idx is not None else 1.0
-        self.period_offset_y = np.array(
-            [0.0, max(1, len(self.ctrl_rows)) * dy_val, 0.0], dtype=np.float32
-        )
+        lands exactly one fabric-height above.
+
+        Measured from the control rows, the same way the X period is, so a
+        rescaled or hand-edited model reports its real height instead of the
+        `dy` it was first built from. Only the yarn simulation reads this;
+        display tiling reaches the same measurement through
+        _display_copy_y_period.
+        """
+        period = self._row_lattice_period()
+        if period is None:
+            dy_idx = self._pidx.get('dy')
+            dy_val = abs(float(self.params[dy_idx])) if dy_idx is not None else 1.0
+            period = dy_val * max(1, len(self.ctrl_rows))
+        self.period_offset_y = np.array([0.0, period, 0.0], dtype=np.float32)
 
     @property
     def flat_pts_all(self):
@@ -1455,6 +1481,11 @@ class AppState:
                 self._ensure_spline_radius_rows()
                 self._rebuild_spline_points()
                 self.sync_period_offset_to_model_width()
+                # Y as well as X. rebuild_spline_from_params above has already
+                # overwritten whatever the file held with a parametric value,
+                # and only X was being re-measured afterwards -- so a saved
+                # model loaded with a stale Y period every time.
+                self.sync_period_offset_y_to_row_count()
                 self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
                 self.rebuild_spline_mesh(preserve_model_placement=False)
         except Exception as e:

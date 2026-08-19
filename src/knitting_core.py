@@ -161,6 +161,39 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5, loop_heig
 
     return rows
 
+
+def row_base_pitch(ctrl_rows):
+    """The row lattice pitch: the Y step from one row's base to the next's.
+
+    Rows are built above as ``y = row_idx * dy - loop_height * (cos t - 1) / 2``.
+    The second term is zero at ``t = 0`` and non-negative everywhere else, so a
+    row's minimum Y is exactly ``row_idx * dy`` no matter how tall its loops
+    are. Minimum Y is therefore the only reading of the pitch that loop height
+    cannot move -- row centres and the mesh bounding box both shift with it,
+    which is how a period built on either ends up wrong by a third or more.
+
+    Measured from the rows rather than read back from ``dy`` because control
+    rows can be scaled or dragged after they are built, at which point ``dy``
+    no longer describes them.
+
+    Median of the consecutive steps rather than a fitted slope, for the same
+    reason the X period next door takes a median: a single hand-dragged point
+    must not move the answer.
+
+    Returns None when there is nothing to measure -- fewer than two rows, or a
+    degenerate result.
+    """
+    bases = [
+        float(np.asarray(row, dtype=np.float32)[:, 1].min())
+        for row in ctrl_rows
+        if len(row)
+    ]
+    if len(bases) < 2:
+        return None
+    pitch = float(np.median(np.abs(np.diff(bases))))
+    return pitch if pitch > 1e-6 else None
+
+
 def compute_knitting_faces(seg, vl):
     if not vl:
         return []
