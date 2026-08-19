@@ -89,19 +89,6 @@ class Objective:
         self.update(V_orig)
         return scipy.sparse.csr_matrix(H_dense)
 
-    def check_gradient(self, eps: float = 1e-5) -> tuple[float, float]:
-        g_anal = self.gradient()
-        g_num = self.numerical_gradient(eps)
-        diff = np.abs(g_anal - g_num)
-        return float(np.max(diff)), float(np.mean(diff))
-
-    def check_hessian(self, eps: float = 1e-5) -> tuple[float, float]:
-        H_anal = self.hessian().toarray()
-        H_num = self.numerical_hessian(eps).toarray()
-        diff = np.abs(H_anal - H_num)
-        return float(np.max(diff)), float(np.mean(diff))
-
-
 class TotalObjective(Objective):
     def __init__(self, objective_weight_pairs: list[tuple[Objective, float]]):
         self.objective_weight_pairs = objective_weight_pairs

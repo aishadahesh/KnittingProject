@@ -2,7 +2,6 @@ import ctypes
 import glob
 import os
 import sys
-import json
 import numpy as np
 from scipy.interpolate import CubicSpline
 

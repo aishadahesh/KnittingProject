@@ -283,10 +283,6 @@ def main():
             if str(state.get('app_mode', 'edit')) == 'edit':
                 draw_orbit_viewport(state, window)
 
-
-
-        # ── Reference Image ───────────────────────────────────────────────────
-
         # ── Final GL clear + imgui draw ───────────────────────────────────────
         ctx.screen.use()
         ctx.clear(0.0, 0.0, 0.0, 1.0)

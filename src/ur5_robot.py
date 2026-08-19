@@ -25,7 +25,6 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 
@@ -625,15 +624,3 @@ class UR5Robot:
         transport = "UR5 over RTDE" if self.is_real else "Dry run (no hardware)"
         return f"{transport} @ {self.ip}" if self.ip else transport
 
-
-def assess_poses(poses, max_step: float | None = None) -> tuple[bool, list[str]]:
-    """Reach/step check for a whole scan path, before any of it is sent.
-
-    Delegates to the scanner's existing workspace assessment so the real robot
-    is held to the same limits the simulated path already is.
-    """
-    import fabric_scanner as scanner
-
-    points = np.asarray(poses, dtype=float)[:, :3]
-    step = scanner.ROBOT_MAX_CARTESIAN_STEP if max_step is None else float(max_step)
-    return scanner.assess_plan_safety(points, max_step=step)

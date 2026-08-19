@@ -2088,26 +2088,6 @@ class EmbeddedMujocoScanner:
             self.paused = False
             self.status = f"Running {self.target_index + 1}/{len(self.plan.poses)} | saved {self.saved_count}"
 
-    def start_path(self):
-        if self.target_index >= len(self.plan.poses) or (self.target_index == 0 and self.capture_records):
-            self.target_index = 0
-            self.dwell_until = 0.0
-            self.executed = []
-            self.saved_targets = set()
-            self.saved_stations = set()
-            self.saved_count = 0
-            self.capture_records = []
-            self.analysis_results = None
-            self.scan_run_id = time.strftime("run_%Y%m%d_%H%M%S")
-            self.scan_output_dir = Path(self.args.image_dir) / self.scan_run_id
-        # A rerun must not inherit a half-finished capture from the last one.
-        self._capture_job = None
-        self.single_capture_mode = False
-        self.single_target_active = False
-        self.running = True
-        self.paused = False
-        self.status = f"Running {self.target_index + 1}/{len(self.plan.poses)} | saved {self.saved_count}"
-
     def _mark_viewport_dirty(self):
         """Forces the next _render_frame to redraw rather than wait its turn.
 
@@ -2179,19 +2159,6 @@ class EmbeddedMujocoScanner:
         height = int(round(width * 0.75))
         self.args.single_capture_image_size = (width, height)
         self._camera_preview_dirty = True
-
-    def _camera_from_gripper(self, tcp_pos, look_at):
-        cam = self.mujoco.MjvCamera()
-        self.mujoco.mjv_defaultFreeCamera(self.model, cam)
-        look_at = np.asarray(look_at, dtype=float)
-        tcp_pos = np.asarray(tcp_pos, dtype=float)
-        rel = tcp_pos - look_at
-        dist = max(float(np.linalg.norm(rel)), 0.025)
-        cam.lookat[:] = look_at
-        cam.distance = dist
-        cam.azimuth = float(np.degrees(np.arctan2(rel[1], rel[0])))
-        cam.elevation = float(np.clip(np.degrees(np.arcsin(rel[2] / dist)), -85.0, 85.0))
-        return cam
 
     def _camera_render_lighting_key(self):
         lighting = self.scanner._normalize_scanner_lighting(getattr(self.plan, "scanner_lighting", None))
@@ -3078,48 +3045,6 @@ def _pick_file(mode, initial_path):
 # ============================================================================
 
 
-def _state_scanner_model_curves(state):
-    curves = []
-    period = np.asarray(getattr(state, 'period_offset_x', [1.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
-    if period.size < 2:
-        period = np.array([1.0, 0.0], dtype=np.float32)
-    for row in getattr(state, 'ctrl_rows', []) or []:
-        row = np.asarray(row, dtype=np.float32)
-        if row.ndim != 2 or row.shape[0] < 2:
-            continue
-        cp = row[:, :2]
-        cp_aug = np.vstack((cp, cp[0] + period[:2]))
-        seg_lens = np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6)
-        t = np.concatenate(([0.0], np.cumsum(seg_lens))).astype(np.float32)
-        samples = max(48, min(120, int(len(cp) * 6)))
-        to = np.linspace(float(t[0]), float(t[-1]), samples, dtype=np.float32)
-        detrended = cp_aug - period[:2][None, :] * (t / max(float(t[-1]), 1e-6))[:, None]
-        if len(cp) == 2:
-            pts = np.column_stack([np.interp(to, t, detrended[:, axis]) for axis in range(2)])
-        else:
-            try:
-                from scipy.interpolate import CubicSpline
-                pts = np.column_stack([CubicSpline(t, detrended[:, axis], bc_type="periodic")(to) for axis in range(2)])
-            except Exception:
-                pts = np.column_stack([np.interp(to, t, detrended[:, axis]) for axis in range(2)])
-        pts = pts + period[:2][None, :] * (to / max(float(t[-1]), 1e-6))[:, None]
-        curves.append(pts.astype(np.float32))
-
-    if not curves:
-        return None
-    all_pts = np.vstack(curves)
-    min_xy = all_pts.min(axis=0)
-    max_xy = all_pts.max(axis=0)
-    span = np.maximum(max_xy - min_xy, 1e-6)
-    scale = 0.92 / float(max(span[0], span[1]))
-    center = (min_xy + max_xy) * 0.5
-    return [((curve - center) * scale).astype(np.float32) for curve in curves]
-
-
-def _scanner_default_batch_colors(state):
-    return _scanner_base_palette(state)
-
-
 def _clamp_scanner_selected_cell(state):
     rows = max(1, int(state.scanner_rows))
     cols = max(1, int(state.scanner_cols))
@@ -3766,41 +3691,7 @@ def _scanner_generate_tiled_layout(state, renderer):
     return full_image, per_cell_images
 
 
-def _scanner_full_layout_preview_image(state, renderer):
-    full_image, _per_cell = _scanner_generate_tiled_layout(state, renderer)
-    return full_image
-
-
-def _scanner_per_cell_tiled_images(state, renderer):
-    _full_image, per_cell = _scanner_generate_tiled_layout(state, renderer)
-    return per_cell
-
-
 # %% GUI DRAWING PANELS ────────────────────────────────────────────────────────
-
-
-def _workflow_stage_title(state, step=None):
-    index = int(np.clip(state.workflow_step if step is None else step, 0, len(state.workflow_stages) - 1))
-    return str(state.workflow_stages[index][0])
-
-
-def _set_workflow_step(state, step):
-    step = int(np.clip(step, 0, len(state.workflow_stages) - 1))
-    old_scanner = _workflow_stage_title(state) == "Scanner"
-    new_scanner = _workflow_stage_title(state, step) == "Scanner"
-    if step == int(state.workflow_step) and old_scanner == new_scanner:
-        return
-
-    state.workflow_step = step
-    if new_scanner:
-        state.scanner_preview_grid_enabled = True
-        state.scanner_preview_rows = max(1, int(state.scanner_rows))
-        state.scanner_preview_cols = max(1, int(state.scanner_cols))
-        state.rebuild_spline_mesh(preserve_model_placement=False)
-    elif old_scanner or bool(state.get('scanner_preview_grid_enabled', False)):
-        state.scanner_preview_grid_enabled = False
-        state.display_copies = np.array([0, 0], dtype=np.int32)
-        state.rebuild_spline_mesh(preserve_model_placement=False)
 
 
 def draw_menu_bar(state):
@@ -3818,50 +3709,6 @@ def draw_menu_bar(state):
                     pass
             imgui.end_menu()
         imgui.end_menu_bar()
-
-
-def draw_workflow_header(state):
-    stage_idx = int(np.clip(state.workflow_step, 0, len(state.workflow_stages) - 1))
-    title, subtitle = state.workflow_stages[stage_idx]
-    imgui.text(f"Step {stage_idx + 1} of {len(state.workflow_stages)}")
-    imgui.text_colored((0.92, 0.74, 0.34, 1.0), title)
-    imgui.text_wrapped(subtitle)
-    imgui.spacing()
-
-    avail_w = imgui.get_content_region_avail().x
-    dot_w = max(18.0, (avail_w - (len(state.workflow_stages) - 1) * 4.0) / len(state.workflow_stages))
-    imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(4, 2))
-    for i, _ in enumerate(state.workflow_stages):
-        active = i == stage_idx
-        color = (0.25, 0.55, 0.85, 1.0) if active else (0.22, 0.22, 0.22, 1.0)
-        hover = (0.35, 0.65, 0.95, 1.0) if active else (0.34, 0.34, 0.34, 1.0)
-        imgui.push_style_color(imgui.Col_.button, color)
-        imgui.push_style_color(imgui.Col_.button_hovered, hover)
-        if imgui.button(f"{i + 1}##stage_{i}", imgui.ImVec2(dot_w, 22)):
-            _set_workflow_step(state, i)
-        imgui.pop_style_color(2)
-        if i < len(state.workflow_stages) - 1:
-            imgui.same_line()
-    imgui.pop_style_var()
-
-    imgui.spacing()
-    back_disabled = stage_idx == 0
-    next_disabled = stage_idx == len(state.workflow_stages) - 1
-    nav_w = max(90, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
-    if back_disabled:
-        imgui.begin_disabled()
-    if imgui.button("Back##workflow", (nav_w, 0)):
-        _set_workflow_step(state, max(0, stage_idx - 1))
-    if back_disabled:
-        imgui.end_disabled()
-    imgui.same_line()
-    if next_disabled:
-        imgui.begin_disabled()
-    if imgui.button("Next##workflow", (nav_w, 0)):
-        _set_workflow_step(state, min(len(state.workflow_stages) - 1, stage_idx + 1))
-    if next_disabled:
-        imgui.end_disabled()
-    imgui.separator()
 
 
 def _mark_sim_geometry_dirty(state):
@@ -6503,25 +6350,6 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.prev_mouse = None
 
     imgui.end()
-
-
-def draw_reference_image_panel(state, ref_tex):
-    if str(state.get('app_mode', 'edit')) in ('scan', 'ur5'):
-        return
-    imgui.set_next_window_pos((1220, 400), cond=imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size((420, 440), cond=imgui.Cond_.first_use_ever)
-    imgui.begin("Reference Image")
-    imgui.text("Reference Image")
-    avail_x, avail_y = imgui.get_content_region_avail()
-    draw_fitted_texture(
-        ref_tex.glo,
-        ref_tex.width,
-        ref_tex.height,
-        avail_x,
-        avail_y,
-    )
-    imgui.end()
-
 
 
 def draw_orbit_viewport(state, window):

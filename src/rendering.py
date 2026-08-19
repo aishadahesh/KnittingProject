@@ -397,33 +397,6 @@ def compute_normals(verts, tris):
     return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
 
 
-def compute_tube_uvs(verts, n_points):
-    """Create UVs for tube meshes: U follows the curve, V wraps the yarn cross-section."""
-    verts = np.asarray(verts, dtype=np.float32)
-    n_points = int(max(n_points, 1))
-    if len(verts) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-    ring_count = max(len(verts) // n_points, 1)
-    u = np.repeat(
-        np.linspace(0.0, 1.0, n_points, dtype=np.float32),
-        ring_count,
-    )[:len(verts)]
-    v = np.tile(
-        np.linspace(0.0, 1.0, ring_count, endpoint=False, dtype=np.float32),
-        n_points,
-    )[:len(verts)]
-    return np.column_stack((u, v)).astype(np.float32)
-
-def rotation_matrix_xyz(rx, ry, rz):
-    """4×4 rotation matrix from XYZ Euler angles (radians), applied as Rz @ Ry @ Rx."""
-    cx, sx = np.cos(rx), np.sin(rx)
-    cy, sy = np.cos(ry), np.sin(ry)
-    cz, sz = np.cos(rz), np.sin(rz)
-    Rx = np.array([[1,0,0,0],[0,cx,-sx,0],[0,sx,cx,0],[0,0,0,1]], dtype=np.float32)
-    Ry = np.array([[cy,0,sy,0],[0,1,0,0],[-sy,0,cy,0],[0,0,0,1]], dtype=np.float32)
-    Rz = np.array([[cz,-sz,0,0],[sz,cz,0,0],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
-    return Rz @ Ry @ Rx
-
 # %% CAMERA ───────────────────────────────────────────────────────────────────
 
 class Camera:
@@ -458,27 +431,6 @@ class Camera:
     def mv(self, w, h):
         return self.view()
 
-    def unproject(self, px, py, vp_w, vp_h):
-        """Constructs a world-space ray (origin, dir) matching the screen pixel coordinate."""
-        x = (2.0 * px) / vp_w - 1.0
-        y = 1.0 - (2.0 * py) / vp_h
-        inv_proj = np.linalg.inv(self.proj(vp_w, vp_h))
-        inv_view = np.linalg.inv(self.view())
-
-        # ray point on near plane (z=-1 in NDC, but projection mapping varies)
-        def pt(z):
-            clip = np.array([x, y, z, 1.0], dtype=np.float32)
-            eye = inv_proj @ clip
-            eye /= eye[3]
-            world = inv_view @ eye
-            return world[:3]
-
-        p0 = pt(-1.0)
-        p1 = pt(1.0)
-        rd = p1 - p0
-        rd /= np.linalg.norm(rd) + 1e-8
-        return p0, rd
-
     def orbit(self, dx, dy):
         self.az -= dx * 0.005
         self.el = np.clip(self.el + dy * 0.005, -np.pi/2 + 0.01, np.pi/2 - 0.01)
@@ -500,22 +452,6 @@ class Camera:
         self.target += (-right * dx + up * dy) * sens
 
 # %% INTERACTION AND RAY MATH ──────────────────────────────────────────────────
-
-def ray_sphere_hit(ro, rd, center, radius):
-    """Returns t of nearest intersection, or np.inf on miss."""
-    oc = ro - center
-    b  = np.dot(rd, oc)
-    c  = np.dot(oc, oc) - radius**2
-    disc = b*b - c
-    if disc < 0: return np.inf
-    return -b - np.sqrt(disc)
-
-def ray_plane_hit(ro, rd, plane_pt, plane_n):
-    """Returns intersection point or None."""
-    denom = np.dot(rd, plane_n)
-    if abs(denom) < 1e-7: return None
-    t = np.dot(plane_pt - ro, plane_n) / denom
-    return (ro + t * rd) if t > 0 else None
 
 def transform_points(points, matrix):
     pts = np.asarray(points)

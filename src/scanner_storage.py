@@ -440,59 +440,6 @@ class ScannerStorage:
         self.revision += 1
         self.write_json_index()
 
-    def captures_for_signature(self, signature: str) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT record_json, image_path, row_index, col_index, station_index,
-                       target_index, angle, rgb_json
-                FROM captures
-                WHERE pattern_signature = ?
-                ORDER BY id
-                """,
-                (signature,),
-            ).fetchall()
-        captures = []
-        for row in rows:
-            if row[0]:
-                try:
-                    captures.append(json.loads(row[0]))
-                    continue
-                except json.JSONDecodeError:
-                    pass
-            try:
-                rgb = json.loads(row[7]) if row[7] else []
-            except json.JSONDecodeError:
-                rgb = []
-            captures.append({
-                "path": row[1],
-                "row": int(row[2]),
-                "col": int(row[3]),
-                "station": int(row[4]),
-                "target_index": int(row[5]),
-                "angle": str(row[6]),
-                "rgb": rgb,
-            })
-        return captures
-
-    def latest_analysis(self, signature: str | None = None) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            if signature is None:
-                row = conn.execute(
-                    "SELECT result_json FROM analyses ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT result_json FROM analyses WHERE pattern_signature = ? ORDER BY id DESC LIMIT 1",
-                    (signature,),
-                ).fetchone()
-        if row is None:
-            return None
-        try:
-            return json.loads(row[0])
-        except json.JSONDecodeError:
-            return None
-
     def _load_json(self, text: str | None, fallback):
         if not text:
             return fallback

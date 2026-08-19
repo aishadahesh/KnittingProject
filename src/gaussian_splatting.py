@@ -57,17 +57,6 @@ class SplatDataset:
     session_id: str = ""
     warnings: list[str] = field(default_factory=list)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "root": str(self.root),
-            "image_count": int(self.image_count),
-            "transforms_path": str(self.transforms_path),
-            "colmap_dir": str(self.colmap_dir),
-            "session_id": str(self.session_id),
-            "warnings": list(self.warnings),
-        }
-
-
 def hand_eye_matrix(offset_m: float = DEFAULT_CAMERA_OFFSET_M, rotation_rotvec=None) -> np.ndarray:
     """Tool-flange to camera transform.
 

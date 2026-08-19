@@ -3,7 +3,6 @@ import json
 import threading
 import time
 import numpy as np
-from PIL import Image
 
 import paths
 
@@ -635,37 +634,6 @@ class AppState:
                 return np.array([float(period[0]), 0.0, 0.0], dtype=np.float32)
         return np.array([self._display_copy_x_period([], radius), 0.0, 0.0], dtype=np.float32)
 
-    def _extended_x_copy_rows(self, radius_profiles):
-        copies_x = int(self.display_copies[0])
-        if copies_x <= 0 or not self.ctrl_rows:
-            return self.ctrl_rows, radius_profiles, 0
-
-        radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        x_tiles = list(range(-copies_x, copies_x + 1))
-        extended_rows = []
-        extended_radius_rows = []
-        for row_idx, row in enumerate(self.ctrl_rows):
-            row = np.asarray(row, dtype=np.float32)
-            if len(row) == 0:
-                extended_rows.append(row)
-                extended_radius_rows.append(np.asarray(radius_profiles[row_idx], dtype=np.float32))
-                continue
-            row_parts = []
-            rad_parts = []
-            radius_row = np.asarray(radius_profiles[row_idx], dtype=np.float32)
-            period = self._x_copy_period_for_ctrl_row(row, radius)
-            for tile_i, tile in enumerate(x_tiles):
-                row_tile = row + tile * period
-                rad_tile = radius_row
-                if tile_i > 0 and len(row_tile) > 1:
-                    row_tile = row_tile[1:]
-                    rad_tile = rad_tile[1:]
-                row_parts.append(row_tile)
-                rad_parts.append(rad_tile)
-            extended_rows.append(np.concatenate(row_parts, axis=0).astype(np.float32))
-            extended_radius_rows.append(np.concatenate(rad_parts, axis=0).astype(np.float32))
-        return extended_rows, extended_radius_rows, copies_x
-
     def _display_copy_z_period(self, verts_list, depth_gap):
         base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
         z_span = float(base_bounds[:, 2].max() - base_bounds[:, 2].min())
@@ -696,20 +664,6 @@ class AppState:
             return radius
         base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
         return max(float(base_bounds[:, 0].max() - base_bounds[:, 0].min()) - radius * 2.0, radius)
-
-    def _display_copy_x_period_for_rings(self, rings, fallback_period, radius):
-        centers = np.asarray(rings, dtype=np.float32).mean(axis=1)
-        if len(centers) < 2:
-            return np.array([fallback_period, 0.0, 0.0], dtype=np.float32)
-
-        period = centers[-1] - centers[0]
-        if abs(float(period[0])) < max(float(radius), 1e-6) * 0.25:
-            period = np.array([fallback_period, 0.0, 0.0], dtype=np.float32)
-        else:
-            # X copies should continue the curve horizontally; keep Y/Z fixed so
-            # edited or twisted rows do not drift upward/downward between tiles.
-            period = np.array([period[0], 0.0, 0.0], dtype=np.float32)
-        return period.astype(np.float32)
 
     def _display_copy_y_period(self, verts_list, radius):
         # One copy up is the whole stack of rows: as many row pitches as there
@@ -1126,37 +1080,6 @@ class AppState:
         self.sync_period_offset_to_model_width()
         self.rebuild_spline_mesh(preserve_model_placement=True)
 
-    def debug_compare_to_fresh_rebuild(self):
-        fresh_rows = self._fresh_rebuild_rows()
-        curr_rows = self.ctrl_rows
-        if len(curr_rows) != len(fresh_rows):
-            return {
-                'ok': False,
-                'reason': 'row_count_mismatch',
-                'curr_rows': len(curr_rows),
-                'fresh_rows': len(fresh_rows),
-            }
-        all_d = []
-        for curr, fresh in zip(curr_rows, fresh_rows):
-            if curr.shape != fresh.shape:
-                return {
-                    'ok': False,
-                    'reason': 'row_shape_mismatch',
-                    'curr_shape': tuple(curr.shape),
-                    'fresh_shape': tuple(fresh.shape),
-                }
-            d = np.linalg.norm(curr - fresh, axis=1)
-            all_d.append(d)
-        all_d = np.concatenate(all_d) if all_d else np.zeros((0,), dtype=np.float32)
-        if all_d.size == 0:
-            return {'ok': True, 'mean': 0.0, 'max': 0.0, 'p95': 0.0}
-        return {
-            'ok': True,
-            'mean': float(np.mean(all_d)),
-            'max': float(np.max(all_d)),
-            'p95': float(np.percentile(all_d, 95.0)),
-        }
-
     def current_model_matrix(self):
         scale = np.asarray(self.model_scale, dtype=np.float32).reshape(-1)
         if scale.size == 1:
@@ -1362,19 +1285,6 @@ class AppState:
             except ValueError:
                 pass
         return None
-
-    def fit_loop_heights_to_rows(self):
-        dy = float(self.params[self._pidx['dy']])
-        for span in range(1, self.bitmap_size[0] + 1):
-            name = f"loop_height_{span}"
-            if name in self._pidx:
-                idx = self._pidx[name]
-                lo, hi = self.config['knit_parameters']['parameters'][idx]["range"]
-                self.params[idx] = float(np.clip(span * dy, lo, hi))
-        # This retunes every row, so hand the cells back: leaving hand-set ones
-        # pinned would make the fit apply to some rows and not others.
-        self.clear_loop_height_overrides()
-        self.on_bitmap_change()
 
     # ── PARAMETER SERIALIZATION ───────────────────────────────────────────────
 
