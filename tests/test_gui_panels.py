@@ -124,6 +124,11 @@ def state(gl_context, tmp_path):
     app_state.save_path = str(tmp_path / "params.json")
     app_state.load_path = str(tmp_path / "params.json")
     app_state.autosave_enabled = False
+    # Build the mesh, as app.py does at startup. Without it the renderer has no
+    # pick data, and draw_viewport's geometry closures all return early -- which
+    # let a NameError inside one of them pass the suite and still crash the app.
+    app_state.rebuild_spline_from_params()
+    assert renderer.mesh_pick_data, "fixture must produce pick data for the viewport paths"
     return app_state, renderer
 
 

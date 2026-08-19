@@ -5802,7 +5802,14 @@ def draw_viewport(state, renderer, ref_tex, window):
             # exists, so those names are not always bound at this point.
             origin_x, origin_y = float(state.vp_origin[0]), float(state.vp_origin[1])
 
-            def project_to_screen(pt_world):
+            def force_point_to_screen(pt_world):
+                """One point to viewport-relative pixels, for the force arrows.
+
+                Distinct from rendering.project_to_screen: it takes a single
+                point and offsets by the viewport origin. It was called
+                project_to_screen, which shadowed the shared helper throughout
+                draw_viewport and broke the closures defined above it.
+                """
                 h = np.array([pt_world[0], pt_world[1], pt_world[2], 1.0], dtype=np.float32) @ view_proj.T
                 if h[3] < 1e-6:
                     return None
@@ -5819,8 +5826,8 @@ def draw_viewport(state, renderer, ref_tex, window):
                     continue
                 p0_local = state.flat_pts_all[idx].astype(np.float32)
                 p1_local = p0_local + delta_P[idx] * FORCE_ARROW_SCALE
-                p0 = project_to_screen(transform_points([p0_local], model_mat)[0])
-                p1 = project_to_screen(transform_points([p1_local], model_mat)[0])
+                p0 = force_point_to_screen(transform_points([p0_local], model_mat)[0])
+                p1 = force_point_to_screen(transform_points([p1_local], model_mat)[0])
                 if p0 and p1:
                     dl.add_line(p0, p1, force_color, 2.0)
                     dl.add_circle_filled(p1, 3.0, force_color)
