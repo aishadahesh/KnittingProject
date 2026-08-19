@@ -5,6 +5,8 @@ import time
 import numpy as np
 from PIL import Image
 
+import paths
+
 from knitting_core import (
     compute_knitting_faces,
     build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes
@@ -57,12 +59,13 @@ class AppState:
         self.orbit_camera = orbit_camera
         self.orbit_renderer = orbit_renderer
 
-        # Project root and configurations
-        project_root = os.path.dirname(os.path.abspath(__file__))
+        # Project root and configurations. Locations come from paths.py so this
+        # module does not carry its own idea of where the tree is laid out.
+        project_root = str(paths.PROJECT_ROOT)
         super().__setattr__('project_root', project_root)
-        super().__setattr__('resolve_project_path', lambda p: p if os.path.isabs(p) else os.path.join(project_root, p))
+        super().__setattr__('resolve_project_path', lambda p: str(paths.resolve(p)))
 
-        with open(os.path.join(project_root, "config.json"), "r") as f:
+        with open(paths.CONFIG_JSON, "r") as f:
             config_data = json.load(f)
         super().__setattr__('config', config_data)
         super().__setattr__('_scanner_template_cache', None)
@@ -79,7 +82,7 @@ class AppState:
         super().__setattr__('_lh_idx', lh_idx)
 
         # Load schema config
-        schema_path = os.path.join(project_root, 'state_schema.json')
+        schema_path = str(paths.STATE_SCHEMA_JSON)
         with open(schema_path, 'r') as handle:
             schema = json.load(handle)
 
@@ -108,6 +111,11 @@ class AppState:
             'scanner_camera_workflow', 'scanner_single_row', 'scanner_single_col', 'scanner_single_angle', 'scanner_camera_zoom',
             'puzzle_copies_x', 'puzzle_copies_y', 'puzzle_capture_width', 'puzzle_capture_height', 'puzzle_detect_color_count',
             'puzzle_capture_rect',
+            # UR5 Robot Mode settings. ur5_controller is deliberately absent: it
+            # holds live threads and GL handles, and is not state to save.
+            'ur5_robot_ip', 'ur5_transport', 'ur5_speed_limit', 'ur5_dwell', 'ur5_save_images',
+            'ur5_capture_width', 'ur5_camera_device', 'ur5_lighting_condition', 'ur5_workspace_center',
+            'ur5_splat_fov', 'ur5_splat_camera_offset', 'ur5_splat_command',
         )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
@@ -138,7 +146,7 @@ class AppState:
         initial_pattern_rows = 4
         initial_pattern_cols = int(config_data['knit_parameters']['bitmap_loops'])
         try:
-            with open(os.path.join(project_root, 'initial_params.json'), 'r') as f:
+            with open(paths.INITIAL_PARAMS_JSON, 'r') as f:
                 initial_data = json.load(f)
             initial_bitmap = np.asarray(initial_data.get('bitmap', []), dtype=np.float32)
             if initial_bitmap.ndim == 2 and initial_bitmap.size:
@@ -148,8 +156,8 @@ class AppState:
 
         # 5. Overlay computed defaults depending on config.json or runtime pathing
         computed_defaults = {
-            'save_path': os.path.join(project_root, 'params.json'),
-            'load_path': os.path.join(project_root, 'params.json'),
+            'save_path': str(paths.PARAMS_JSON),
+            'load_path': str(paths.PARAMS_JSON),
             'params': [p['initial'] for p in config_data['knit_parameters']['parameters']],
             'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
             'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
@@ -176,6 +184,24 @@ class AppState:
             'scanner_single_col': 1,
             'scanner_single_angle': 1,
             'scanner_camera_zoom': 1.0,
+            # ── UR5 Robot Mode ───────────────────────────────────────────────
+            # The real arm. Separate from the scanner_robot_* keys, which drive
+            # Scan Mode's fire-and-forget URScript send: this mode holds a live
+            # RTDE connection and must not inherit that path's settings.
+            # Defaults are deliberately timid -- dry run, quarter speed -- so
+            # opening the mode cannot command hardware by itself.
+            'ur5_robot_ip': '132.74.121.230',
+            'ur5_transport': 'dry_run',
+            'ur5_speed_limit': 0.25,
+            'ur5_dwell': 0.2,
+            'ur5_save_images': True,
+            'ur5_capture_width': 1280,
+            'ur5_camera_device': 0,
+            'ur5_lighting_condition': '',
+            'ur5_workspace_center': [-0.45, -0.08, 0.30],
+            'ur5_splat_fov': 55.0,
+            'ur5_splat_camera_offset': 0.12,
+            'ur5_splat_command': '',
             'puzzle_copies_x': 5,
             'puzzle_copies_y': 5,
             'puzzle_capture_width': 960,
@@ -306,7 +332,7 @@ class AppState:
     # helpers randomize only the bitmap, then build meshes for preview/display.
 
     def _scanner_template(self):
-        path = os.path.join(self.project_root, 'initial_params.json')
+        path = str(paths.INITIAL_PARAMS_JSON)
         try:
             mtime = os.path.getmtime(path)
         except OSError:
@@ -1150,8 +1176,18 @@ class AppState:
 
     # ── UNDO / REDO ───────────────────────────────────────────────────────────
 
+    # Live handles: threads, GL textures, database and robot connections. They
+    # are objects the app owns right now, not values describing the model, and
+    # _clone passes them through by reference -- so an undo would write a stale
+    # handle back over the current one. For the UR5 controller that would orphan
+    # a live robot connection mid-scan, leaving nothing able to stop the arm.
+    _SNAPSHOT_EXCLUDE = frozenset({
+        'render_tex', 'render_result', 'undo_stack',
+        'ur5_controller', 'embedded_scanner', 'scanner_storage', 'scanner_process',
+    })
+
     def snapshot_state(self):
-        exclude = {'render_tex', 'render_result', 'undo_stack'}
+        exclude = self._SNAPSHOT_EXCLUDE
         snap = {k: self._clone(v) for k, v in self._data.items() if k not in exclude}
         for attr in self.camera_attributes:
             snap[f'camera_{attr}'] = self._clone(getattr(self.camera, attr))
@@ -1397,7 +1433,7 @@ class AppState:
         now = time.monotonic()
         if now - float(self.autosave_last_time) < float(self.autosave_interval_sec):
             return
-        target_path = self.save_path or os.path.join(self.project_root, 'params.json')
+        target_path = self.save_path or str(paths.PARAMS_JSON)
         # The solver rewrites ctrl_rows/flat_pts from another thread, so hold
         # sim_lock while serialising to avoid writing a file that mixes geometry
         # from two different steps. It only ever holds the lock briefly (the

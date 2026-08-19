@@ -26,3 +26,8 @@ dependencies = [
 gpu = [
     "jax[cuda12]; sys_platform == 'linux'",
 ]
+# UR5 Robot Mode's gripper camera. Without it the mode still runs, on clearly
+# marked synthetic frames; with it, real cameras can be opened.
+camera = [
+    "opencv-python>=4.10.0",
+]

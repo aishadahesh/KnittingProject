@@ -115,6 +115,24 @@ class ScannerStorage:
                     result_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS robot_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL UNIQUE,
+                    robot_mode TEXT NOT NULL,
+                    robot_ip TEXT,
+                    transport TEXT,
+                    is_real INTEGER NOT NULL DEFAULT 0,
+                    camera_backend TEXT,
+                    camera_is_real INTEGER NOT NULL DEFAULT 0,
+                    pattern_signature TEXT,
+                    settings_json TEXT,
+                    status TEXT,
+                    capture_count INTEGER NOT NULL DEFAULT 0,
+                    splat_output_path TEXT,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             capture_columns = {
@@ -123,6 +141,19 @@ class ScannerStorage:
             }
             if "record_json" not in capture_columns:
                 conn.execute("ALTER TABLE captures ADD COLUMN record_json TEXT")
+            # Real-UR5 columns, added the same way record_json was: existing
+            # databases full of simulation captures keep working and simply read
+            # back the simulation defaults for these.
+            for column, ddl in (
+                ("robot_mode", "ALTER TABLE captures ADD COLUMN robot_mode TEXT DEFAULT 'simulation'"),
+                ("session_id", "ALTER TABLE captures ADD COLUMN session_id TEXT"),
+                ("robot_ip", "ALTER TABLE captures ADD COLUMN robot_ip TEXT"),
+                ("target_position_json", "ALTER TABLE captures ADD COLUMN target_position_json TEXT"),
+                ("lighting_condition", "ALTER TABLE captures ADD COLUMN lighting_condition TEXT"),
+                ("splat_output_path", "ALTER TABLE captures ADD COLUMN splat_output_path TEXT"),
+            ):
+                if column not in capture_columns:
+                    conn.execute(ddl)
 
     def scanner_state_snapshot(self, state) -> dict[str, Any]:
         data = getattr(state, "_data", {})
@@ -225,17 +256,37 @@ class ScannerStorage:
         self._index_dirty = True
         return signature
 
-    def record_capture(self, state, record: dict[str, Any], capture_settings: dict[str, Any] | None = None) -> None:
-        signature = self.pattern_signature(state)
+    def record_capture(
+        self,
+        state,
+        record: dict[str, Any],
+        capture_settings: dict[str, Any] | None = None,
+        signature: str | None = None,
+    ) -> None:
+        """Stores one capture.
+
+        The robot-specific columns are read off the record itself and default to
+        the simulation values, so the existing Scan Mode call site needs no
+        changes and its rows keep reading back exactly as before.
+
+        ``signature`` and ``capture_settings`` may be supplied to avoid reading
+        the live AppState here. The real UR5 scan records from its own thread,
+        where walking that state while the UI thread mutates it would be a race;
+        it snapshots both once when the run starts and passes them in.
+        """
+        signature = self.pattern_signature(state) if signature is None else str(signature)
         settings = capture_settings or self.scanner_state_snapshot(state)
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        target_position = record.get("target_position")
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO captures
                     (pattern_signature, image_path, row_index, col_index, station_index, target_index,
-                     angle, capture_mode, capture_settings_json, rgb_json, record_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     angle, capture_mode, capture_settings_json, rgb_json, record_json, created_at,
+                     robot_mode, session_id, robot_ip, target_position_json, lighting_condition,
+                     splat_output_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signature,
@@ -245,18 +296,134 @@ class ScannerStorage:
                     int(record.get("station", 0)),
                     int(record.get("target_index", 0)),
                     str(record.get("angle", "")),
-                    str(_state_get(state, "scanner_capture_mode", "natural")),
+                    str(record.get("capture_mode", _state_get(state, "scanner_capture_mode", "natural"))),
                     json.dumps(_json_ready(settings), sort_keys=True),
                     json.dumps(_json_ready(record.get("rgb", [])), sort_keys=True),
                     json.dumps(_json_ready(record), sort_keys=True),
                     now,
+                    str(record.get("robot_mode", "simulation")),
+                    str(record.get("session_id", "")) or None,
+                    str(record.get("robot_ip", "")) or None,
+                    json.dumps(_json_ready(target_position)) if target_position is not None else None,
+                    str(record.get("lighting_condition", "")) or None,
+                    str(record.get("splat_output_path", "")) or None,
                 ),
             )
         self.revision += 1
         self._index_dirty = True
 
-    def save_analysis(self, state, result: dict[str, Any]) -> None:
-        signature = self.pattern_signature(state)
+    # -- Real UR5 sessions ---------------------------------------------------
+
+    def start_robot_session(self, session: dict[str, Any]) -> str:
+        """Opens a row for one real-robot scan run and returns its session id.
+
+        A session ties a run's captures together with the hardware that made
+        them -- which arm, at which address, through which camera -- so a scan
+        stays attributable long after the run.
+        """
+        session_id = str(session.get("session_id", ""))
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO robot_sessions
+                    (session_id, robot_mode, robot_ip, transport, is_real, camera_backend,
+                     camera_is_real, pattern_signature, settings_json, status, capture_count,
+                     splat_output_path, started_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    str(session.get("robot_mode", "real_ur5")),
+                    str(session.get("robot_ip", "")),
+                    str(session.get("transport", "")),
+                    1 if session.get("is_real") else 0,
+                    str(session.get("camera_backend", "")),
+                    1 if session.get("camera_is_real") else 0,
+                    str(session.get("pattern_signature", "")),
+                    json.dumps(_json_ready(session.get("settings", {})), sort_keys=True),
+                    str(session.get("status", "running")),
+                    int(session.get("capture_count", 0)),
+                    str(session.get("splat_output_path", "")) or None,
+                    now,
+                    now,
+                ),
+            )
+        self.revision += 1
+        self._index_dirty = True
+        return session_id
+
+    def update_robot_session(self, session_id: str, **fields: Any) -> None:
+        allowed = {
+            "status", "capture_count", "splat_output_path", "robot_ip",
+            "camera_backend", "pattern_signature",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        values = [
+            int(value) if key == "capture_count" else (None if value is None else str(value))
+            for key, value in updates.items()
+        ]
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE robot_sessions SET {assignments}, updated_at = ? WHERE session_id = ?",
+                (*values, time.strftime("%Y-%m-%d %H:%M:%S"), str(session_id)),
+            )
+        self.revision += 1
+        self._index_dirty = True
+
+    def set_session_splat_output(self, session_id: str, output_path: str) -> None:
+        """Records a Gaussian Splatting result against a session and its captures."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE robot_sessions SET splat_output_path = ?, updated_at = ? WHERE session_id = ?",
+                (str(output_path), time.strftime("%Y-%m-%d %H:%M:%S"), str(session_id)),
+            )
+            conn.execute(
+                "UPDATE captures SET splat_output_path = ? WHERE session_id = ?",
+                (str(output_path), str(session_id)),
+            )
+        self.revision += 1
+        self._index_dirty = True
+
+    def robot_sessions(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, robot_mode, robot_ip, transport, is_real, camera_backend,
+                       camera_is_real, pattern_signature, settings_json, status, capture_count,
+                       splat_output_path, started_at, updated_at
+                FROM robot_sessions
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        sessions = []
+        for row in rows:
+            sessions.append({
+                "session_id": str(row[0]),
+                "robot_mode": str(row[1]),
+                "robot_ip": str(row[2] or ""),
+                "transport": str(row[3] or ""),
+                "is_real": bool(row[4]),
+                "camera_backend": str(row[5] or ""),
+                "camera_is_real": bool(row[6]),
+                "pattern_signature": str(row[7] or ""),
+                "settings": self._load_json(row[8], {}),
+                "status": str(row[9] or ""),
+                "capture_count": int(row[10] or 0),
+                "splat_output_path": str(row[11] or ""),
+                "started_at": str(row[12]),
+                "updated_at": str(row[13]),
+            })
+        return sessions
+
+    def save_analysis(self, state, result: dict[str, Any], signature: str | None = None) -> None:
+        signature = self.pattern_signature(state) if signature is None else str(signature)
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         with self._connect() as conn:
             conn.execute(
@@ -266,7 +433,10 @@ class ScannerStorage:
                 """,
                 (signature, json.dumps(_json_ready(result), sort_keys=True), now),
             )
-        self.save_scanner_state(state)
+        # Skipped when state is absent: the real UR5 analysis runs off-thread
+        # and walking the live state there would race the UI.
+        if state is not None:
+            self.save_scanner_state(state)
         self.revision += 1
         self.write_json_index()
 
@@ -361,7 +531,8 @@ class ScannerStorage:
                 """
                 SELECT id, pattern_signature, image_path, row_index, col_index, station_index,
                        target_index, angle, capture_mode, capture_settings_json, rgb_json,
-                       record_json, created_at
+                       record_json, created_at, robot_mode, session_id, robot_ip,
+                       target_position_json, lighting_condition, splat_output_path
                 FROM captures
                 ORDER BY id
                 """
@@ -430,6 +601,9 @@ class ScannerStorage:
                     break
             image_path = str(row[2])
             path = Path(image_path)
+            # Real captures report the lighting they were actually taken under;
+            # simulated ones derive it from the scanner's lighting settings.
+            lighting_condition = str(row[17] or "")
             capture = {
                 "id": int(row[0]),
                 "pattern_id": pattern.get("id"),
@@ -438,7 +612,7 @@ class ScannerStorage:
                 "bitmap": pattern_cell.get("bitmap"),
                 "selected_colors": pattern.get("shared_colors", settings.get("scanner_color_variants", [])),
                 "selected_colors_label": pattern.get("shared_colors_label", self._colors_label(settings.get("scanner_color_variants", []))),
-                "lighting_mode": pattern.get("lighting_mode", self._lighting_label(settings)),
+                "lighting_mode": lighting_condition or pattern.get("lighting_mode", self._lighting_label(settings)),
                 "camera_angle": str(row[7]),
                 "scan_station": int(row[5]) + 1,
                 "target_index": int(row[6]),
@@ -461,8 +635,21 @@ class ScannerStorage:
                 "camera_pose": record.get("camera_pose"),
                 "patch_image_path": record.get("patch_image_path"),
                 "debug_image_path": record.get("debug_image_path"),
+                # Which robot produced this capture, and everything specific to
+                # a real run. Simulation rows report "simulation" and leave the
+                # rest empty.
+                "robot_mode": str(row[13] or "simulation"),
+                "session_id": str(row[14] or ""),
+                "robot_ip": str(row[15] or ""),
+                "target_position": self._load_json(row[16], None),
+                "lighting_condition": lighting_condition,
+                "splat_output_path": str(row[18] or ""),
+                "camera_backend": record.get("camera_backend", ""),
+                "camera_is_real": bool(record.get("camera_is_real", False)),
             }
             captures.append(capture)
+
+        sessions = self.robot_sessions()
 
         summary = {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -471,9 +658,11 @@ class ScannerStorage:
             "pattern_count": len(patterns),
             "capture_count": len(captures),
             "analysis_count": len(analyses),
+            "robot_session_count": len(sessions),
             "patterns": patterns,
             "captures": captures,
             "analyses": analyses,
+            "robot_sessions": sessions,
             "categories": {
                 "patterns": sorted({str(item.get("pattern_name", "Unknown pattern")) for item in captures}),
                 "selected_colors": sorted({str(item.get("selected_colors_label", "")) for item in captures}),
@@ -481,6 +670,8 @@ class ScannerStorage:
                 "camera_angles": sorted({str(item.get("camera_angle", "")) for item in captures}),
                 "batches": sorted({str(item.get("batch_id", "")) for item in captures}),
                 "scan_runs": sorted({str(item.get("scan_run", "")) for item in captures}),
+                "robot_modes": sorted({str(item.get("robot_mode", "simulation")) for item in captures}),
+                "sessions": sorted({str(item.get("session_id", "")) for item in captures if item.get("session_id")}),
             },
             "latest_analysis_by_pattern": latest_analysis_by_signature,
         }

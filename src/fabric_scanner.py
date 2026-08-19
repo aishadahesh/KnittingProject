@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 from scipy.spatial.transform import Rotation
 from knitting_core import build_parametric_control_rows
+import paths
 
 
 # ============================================================================
@@ -449,8 +450,7 @@ def _normalize_model_curves(curves: list[np.ndarray]) -> list[np.ndarray]:
 
 
 def _scanner_param_context(model_json: str | None):
-    project_root = Path(__file__).resolve().parent
-    with (project_root / "config.json").open("r") as handle:
+    with paths.CONFIG_JSON.open("r") as handle:
         config = json.load(handle)
     params = np.asarray([p["initial"] for p in config["knit_parameters"]["parameters"]], dtype=np.float32)
     samples_per_loop = 5

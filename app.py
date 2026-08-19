@@ -12,6 +12,13 @@ import os, sys
 if sys.platform.startswith("linux"):
     os.environ["PYOPENGL_PLATFORM"] = "egl"
 
+# %% MODULE PATH
+# The application modules live in src/ while this entry point stays in the
+# project root. Putting src/ on the path here lets them keep importing each
+# other by plain name (`from app_state import AppState`) rather than every
+# module carrying a package prefix.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
 # %% IMPORTS
 import threading
 import time
@@ -26,10 +33,12 @@ from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 
 import json
 
-project_root = os.path.dirname(os.path.abspath(__file__))
-resolve_project_path = lambda p: p if os.path.isabs(p) else os.path.join(project_root, p)
+import paths
 
-with open(os.path.join(project_root, "config.json"), "r") as f:
+project_root = str(paths.PROJECT_ROOT)
+resolve_project_path = lambda p: str(paths.resolve(p))
+
+with open(paths.CONFIG_JSON, "r") as f:
     config = json.load(f)
 
 from rendering import Camera, MeshRenderer, pil_to_texture
@@ -45,7 +54,6 @@ from gui import (
 # %% MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    project_root = os.path.dirname(os.path.abspath(__file__))
     # ── Reference image ──────────────────────────────────────────────────────
     try:
         ref_pil = Image.open(resolve_project_path(config["ui"]["reference_image"])).convert("RGB")
@@ -71,7 +79,7 @@ def main():
     io.config_windows_move_from_title_bar_only = True
     io.config_flags |= imgui.ConfigFlags_.docking_enable
     io.config_flags |= imgui.ConfigFlags_.viewports_enable
-    io.set_ini_filename(os.path.join(project_root, "imgui_layout.ini"))
+    io.set_ini_filename(str(paths.LAYOUT_INI))
     impl = GlfwRenderer(window)
 
     style = imgui.get_style()
@@ -101,7 +109,7 @@ def main():
     # initial_params.json is the frozen reset baseline.
     # params.json is the working autosave and is loaded for normal resume.
     work_params_path = state.load_path
-    initial_params_path = os.path.join(project_root, "initial_params.json")
+    initial_params_path = str(paths.INITIAL_PARAMS_JSON)
 
     if os.path.exists(initial_params_path):
         state.load_params(initial_params_path)
@@ -301,6 +309,15 @@ def main():
         except Exception:
             pass
         state.embedded_scanner = None
+    # Closing the window must also release the real arm and camera: a scan
+    # thread outliving the UI would keep commanding hardware nobody is watching.
+    ur5_controller = state.get('ur5_controller')
+    if ur5_controller is not None:
+        try:
+            ur5_controller.close()
+        except Exception:
+            pass
+        state.ur5_controller = None
     try:
         glfw.make_context_current(window)
         ctx.screen.use()

@@ -25,6 +25,11 @@ vtk>=9.6.2
 # Robot communication helpers
 ur-rtde>=1.6.0
 
+# Real gripper camera for UR5 Robot Mode. Optional: without it the mode still
+# runs and falls back to clearly-marked synthetic frames, but no physical
+# camera can be opened.
+opencv-python>=4.10.0
+
 # Test runner
 pytest>=8.0.0
 

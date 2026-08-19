@@ -33,6 +33,11 @@ from PIL import Image, ImageDraw
 
 from rendering import draw_fitted_texture, pil_to_texture, transform_points, MeshRenderer
 from knitting_core import build_parametric_control_rows, build_spline_mesh
+from rgb_analysis import fabric_rgb_stats
+import paths
+# UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
+# inside the functions that need it, so there is no cycle at load time.
+import gui_ur5
 
 # Per-step solver displacements are tiny next to the model, so the force overlay
 # exaggerates them to stay visible. Display only -- never fed back into state.
@@ -1169,6 +1174,10 @@ def _database_rgb_category(rgb):
 
 
 def _database_filter_value(item, key):
+    if key == "robot_mode":
+        return "Real UR5" if str(item.get("robot_mode")) == "real_ur5" else "Simulation"
+    if key == "session_id":
+        return str(item.get("session_id") or "No robot session")
     if key == "pattern_id":
         return str(item.get("pattern_name") or item.get("pattern_id") or "Unknown pattern")
     if key == "bitmap":
@@ -1212,6 +1221,10 @@ def _database_matches_filters(item, selected_filters):
 
 def _database_filter_specs():
     return [
+        # First, because "was this scanned by the real arm or the simulator" is
+        # the coarsest split in the dataset once both modes have contributed.
+        ("Robot", "robot_mode"),
+        ("Robot sessions", "session_id"),
         ("Pattern IDs", "pattern_id"),
         ("Bitmaps", "bitmap"),
         ("Selected colors", "selected_colors"),
@@ -1521,6 +1534,20 @@ def _draw_database_image_preview(state, renderer, item):
     imgui.text(f"Capture mode: {item.get('capture_mode')}")
     imgui.text(f"Selected colors: {item.get('selected_colors_label')}")
     imgui.text(f"Bitmap: {_database_bitmap_label(item.get('bitmap'))}")
+    if str(item.get("robot_mode")) == "real_ur5":
+        imgui.separator()
+        imgui.text_colored((0.92, 0.62, 0.28, 1.0), "Captured by the real UR5")
+        imgui.text(f"Robot: {item.get('robot_ip') or 'unknown address'}")
+        imgui.text(f"Session: {item.get('session_id')}")
+        position = item.get("target_position") or []
+        if len(position) >= 3:
+            imgui.text(f"Target position: x {position[0]:+.3f}  y {position[1]:+.3f}  z {position[2]:+.3f} m")
+        if item.get("camera_backend"):
+            imgui.text(f"Camera: {item.get('camera_backend')}")
+        if not item.get("camera_is_real", False):
+            imgui.text_colored((0.95, 0.75, 0.20, 1.0), "Synthetic camera frames - not real imagery")
+        if item.get("splat_output_path"):
+            imgui.text(f"Reconstruction: {Path(str(item['splat_output_path'])).name}")
 
     imgui.separator()
     imgui.text("Color results")
@@ -2477,119 +2504,9 @@ class EmbeddedMujocoScanner:
 
     @staticmethod
     def _fabric_rgb_stats(image, debug_path=None):
-        rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
-        if rgb.ndim != 3 or rgb.shape[0] <= 0 or rgb.shape[1] <= 0:
-            return {
-                "rgb": np.array([0.0, 0.0, 0.0], dtype=np.float32),
-                "pixel_count": 0,
-                "total_pixels": 0,
-                "method": "empty",
-            }
-
-        # Ignore the black label strip and scanner annotations. The analysis is
-        # the perceived fabric color, not UI text/background color.
-        y_offset = 58 if rgb.shape[0] > 70 else 0
-        work = rgb[y_offset:, :, :]
-        h, w = work.shape[:2]
-        total_pixels = int(h * w)
-
-        def finish(mask, method):
-            mask = np.asarray(mask, dtype=bool)
-            if int(mask.sum()) < 1:
-                fabric = work.reshape(-1, 3)
-                mask = np.ones((h, w), dtype=bool)
-                method = "full frame fallback"
-            else:
-                fabric = work[mask]
-
-            saved_debug_path = None
-            if debug_path is not None and int(mask.sum()) > 0:
-                try:
-                    ys_mask, xs_mask = np.where(mask)
-                    x0, x1 = int(xs_mask.min()), int(xs_mask.max()) + 1
-                    y0, y1 = int(ys_mask.min()), int(ys_mask.max()) + 1
-                    crop_rgb = np.clip(work[y0:y1, x0:x1], 0, 255).astype(np.uint8)
-                    crop_mask = mask[y0:y1, x0:x1]
-                    rgba = np.zeros((crop_rgb.shape[0], crop_rgb.shape[1], 4), dtype=np.uint8)
-                    rgba[:, :, :3] = crop_rgb
-                    rgba[:, :, 3] = np.where(crop_mask, 255, 0).astype(np.uint8)
-                    debug_out = Path(debug_path)
-                    debug_out.parent.mkdir(parents=True, exist_ok=True)
-                    Image.fromarray(rgba, "RGBA").save(debug_out)
-                    saved_debug_path = str(debug_out)
-                except Exception:
-                    saved_debug_path = None
-
-            return {
-                "rgb": fabric.mean(axis=0),
-                "pixel_count": int(len(fabric)),
-                "total_pixels": total_pixels,
-                "method": method,
-                "debug_path": saved_debug_path,
-            }
-
-        # Preferred path: saved scan images draw a bright green rectangle around
-        # the target fabric. Use that outline to build an oriented rectangle mask
-        # and average only the pixels inside the fabric area.
-        green = (
-            (work[:, :, 1] > 165.0)
-            & (work[:, :, 0] < 90.0)
-            & (work[:, :, 2] < 135.0)
-        )
-        ys, xs = np.where(green)
-        if xs.size >= 24:
-            pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
-            center = pts.mean(axis=0)
-            centered = pts - center
-            cov = centered.T @ centered / max(float(len(pts) - 1), 1.0)
-            try:
-                _, vecs = np.linalg.eigh(cov)
-                axes = vecs[:, ::-1].astype(np.float32)
-                outline_proj = centered @ axes
-                lo = outline_proj.min(axis=0)
-                hi = outline_proj.max(axis=0)
-                margin = 4.0
-                if np.all((hi - lo) > margin * 3.0):
-                    yy, xx = np.mgrid[0:h, 0:w]
-                    grid = np.column_stack((xx.reshape(-1), yy.reshape(-1))).astype(np.float32)
-                    proj = (grid - center) @ axes
-                    mask = (
-                        (proj[:, 0] >= lo[0] + margin)
-                        & (proj[:, 0] <= hi[0] - margin)
-                        & (proj[:, 1] >= lo[1] + margin)
-                        & (proj[:, 1] <= hi[1] - margin)
-                    ).reshape(h, w)
-                    mask &= ~green
-                    if int(mask.sum()) >= 32:
-                        brightness = work.max(axis=2)
-                        saturation = work.max(axis=2) - work.min(axis=2)
-                        color_mask = mask & (brightness > 42.0) & (saturation > 16.0)
-                        if int(color_mask.sum()) >= 32:
-                            return finish(color_mask, "fabric-outline color mask")
-                        else:
-                            return finish(mask, "fabric-outline mask")
-            except Exception:
-                pass
-
-        # Fallback: estimate the scanner background from image edges and keep
-        # pixels that differ from that background enough to be fabric.
-        edge = np.concatenate([
-            work[:8, :, :].reshape(-1, 3),
-            work[-8:, :, :].reshape(-1, 3),
-            work[:, :8, :].reshape(-1, 3),
-            work[:, -8:, :].reshape(-1, 3),
-        ])
-        bg = np.median(edge, axis=0)
-        diff = np.linalg.norm(work - bg[None, None, :], axis=2)
-        brightness = work.max(axis=2)
-        saturation = work.max(axis=2) - work.min(axis=2)
-        mask = (diff > 30.0) & (brightness > 42.0) & (saturation > 16.0)
-        mask &= ~green
-        if int(mask.sum()) < 32:
-            mask = (diff > 22.0) & (brightness > 28.0) & (saturation > 10.0)
-        if int(mask.sum()) < 1:
-            return finish(np.ones((h, w), dtype=bool), "full frame fallback")
-        return finish(mask, "background mask")
+        """Measured by rgb_analysis so real UR5 captures share this exact
+        definition of "average fabric colour" -- see rgb_analysis.fabric_rgb_stats."""
+        return fabric_rgb_stats(image, debug_path=debug_path)
 
     def _record_capture_analysis(self, image, path, target_index, station_id, detection=None, patch_image=None, patch_path=None, debug_path=None):
         row, col = self.plan.station_cells[station_id]
@@ -3892,7 +3809,11 @@ def draw_menu_bar(state):
             clicked_reset, _ = imgui.menu_item("Reset Layout")
             if clicked_reset:
                 try:
-                    os.remove(os.path.join(os.path.dirname(state.save_path), "imgui_layout.ini"))
+                    # Located via paths, not from save_path's folder: the saved
+                    # parameters live in config/ while the layout file sits in
+                    # the project root, so deriving one from the other deletes
+                    # nothing and silently does not reset the layout.
+                    os.remove(paths.LAYOUT_INI)
                 except FileNotFoundError:
                     pass
             imgui.end_menu()
@@ -4026,9 +3947,20 @@ def _draw_yarn_simulation_panel(state):
 
 
 def _set_app_mode(state, mode):
-    mode = mode if mode in ('edit', 'scan', 'puzzle', 'database') else 'edit'
+    mode = mode if mode in ('edit', 'scan', 'puzzle', 'database', 'ur5') else 'edit'
     if str(state.get('app_mode', 'edit')) == mode:
         return
+    # Leaving UR5 Robot Mode stops the run, releases the arm and closes the
+    # camera. Left connected, a background scan thread would keep moving real
+    # hardware while the user is in a mode that shows none of it.
+    if str(state.get('app_mode', 'edit')) == 'ur5':
+        controller = state.get('ur5_controller')
+        if controller is not None:
+            try:
+                controller.close()
+            except Exception:
+                pass
+            state.ur5_controller = None
     if mode != 'edit' and bool(state.get('sim_active', False)):
         # Stop the solver before handing the model to Scan/Puzzle/Database.
         # Those snapshot ctrl_rows and swap in their own geometry, so a solver
@@ -4059,6 +3991,15 @@ def _set_app_mode(state, mode):
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
         state.database_view_mode = "results"
+    elif mode == 'ur5':
+        # Shows the same fabric grid preview Scan Mode does, since the real
+        # robot scans that same layout -- the 3D View is the plan being sent to
+        # the arm, so the two modes must not disagree about it.
+        state.workflow_step = scanner_idx
+        state.scanner_preview_grid_enabled = True
+        state.scanner_preview_rows = max(1, int(state.scanner_rows))
+        state.scanner_preview_cols = max(1, int(state.scanner_cols))
+        _clamp_scanner_selected_cell(state)
     else:
         state.workflow_step = 0
         state.scanner_preview_grid_enabled = False
@@ -4290,6 +4231,7 @@ def draw_sidebar(state, renderer, window=None):
     scan_active = current_mode == 'scan'
     puzzle_active = current_mode == 'puzzle'
     database_active = current_mode == 'database'
+    ur5_active = current_mode == 'ur5'
     button_w = max(72, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x * 3.0) / 4.0)
     imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if edit_active else (0.20, 0.20, 0.20, 1.0))
     if imgui.button("Edit Mode##mode_edit", (button_w, 0)):
@@ -4310,6 +4252,14 @@ def draw_sidebar(state, renderer, window=None):
     if imgui.button("Database##mode_database", (button_w, 0)):
         _set_app_mode(state, 'database')
     imgui.pop_style_color()
+    # On its own row, and in its own colour: the four above are simulation, this
+    # one drives the physical arm. Crowding it into the same row as the others
+    # would present the two as interchangeable, which they are not.
+    imgui.push_style_color(imgui.Col_.button, (0.72, 0.42, 0.16, 1.0) if ur5_active else (0.24, 0.18, 0.14, 1.0))
+    imgui.push_style_color(imgui.Col_.button_hovered, (0.86, 0.52, 0.20, 1.0))
+    if imgui.button("UR5 Robot Mode (real hardware)##mode_ur5", (-1, 0)):
+        _set_app_mode(state, 'ur5')
+    imgui.pop_style_color(2)
     imgui.separator()
     action_w = max(120, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
 
@@ -4336,6 +4286,11 @@ def draw_sidebar(state, renderer, window=None):
 
     if database_active:
         _draw_database_summary_page(state, renderer)
+        imgui.end()
+        return
+
+    if ur5_active:
+        gui_ur5.draw_ur5_panel(state, renderer, window)
         imgui.end()
         return
 
@@ -5631,7 +5586,12 @@ def draw_viewport(state, renderer, ref_tex, window):
     mvp = (state.camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
     mv  = (state.camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
     bg_zoom = state.camera.zoom_factor()
-    scanner_stage_active = str(state.get('app_mode', 'edit')) == 'scan'
+    # UR5 Robot Mode shows the same scan preview as Scan Mode, and for the same
+    # reason: the viewport is the layout being handed to the robot. Sharing this
+    # flag keeps the two previews identical and, just as importantly, keeps the
+    # model-editing handles off -- editing the fabric mid-scan would leave the
+    # plan the arm is executing describing geometry that no longer exists.
+    scanner_stage_active = str(state.get('app_mode', 'edit')) in ('scan', 'ur5')
     scanner_estimate_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
     edit_controls_active = not scanner_stage_active
     if scanner_stage_active:
@@ -6546,7 +6506,7 @@ def draw_viewport(state, renderer, ref_tex, window):
 
 
 def draw_reference_image_panel(state, ref_tex):
-    if str(state.get('app_mode', 'edit')) == 'scan':
+    if str(state.get('app_mode', 'edit')) in ('scan', 'ur5'):
         return
     imgui.set_next_window_pos((1220, 400), cond=imgui.Cond_.first_use_ever)
     imgui.set_next_window_size((420, 440), cond=imgui.Cond_.first_use_ever)

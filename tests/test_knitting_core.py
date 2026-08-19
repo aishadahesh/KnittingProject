@@ -25,12 +25,19 @@ import numpy as np
 
 @pytest.fixture
 def config_fixture():
-    with open("config.json", "r") as f:
+    # Via paths rather than a bare filename: these were relative to the working
+    # directory, so they only resolved when pytest happened to be run from the
+    # project root, and not at all now that they live in config/.
+    import paths
+
+    with open(paths.CONFIG_JSON, "r") as f:
         return json.load(f)
 
 @pytest.fixture
 def params_fixture():
-    with open("params.json", "r") as f:
+    import paths
+
+    with open(paths.PARAMS_JSON, "r") as f:
         return json.load(f)
 
 def test_fixtures_load(config_fixture, params_fixture):
