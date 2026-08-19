@@ -35,6 +35,7 @@ from rendering import (draw_fitted_texture, pil_to_texture, project_to_screen,
                        transform_points, upload_rgb_texture, MeshRenderer)
 from knitting_core import build_parametric_control_rows, build_spline_mesh
 from rgb_analysis import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
+from fabric_scanner import clamp_capture_size
 import paths
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
 # inside the functions that need it, so there is no cycle at load time.
@@ -271,10 +272,7 @@ def _scanner_batch_texture_size(state):
 
 
 def _scanner_capture_image_size(state, key='scanner_capture_width'):
-    width = int(np.clip(int(state.get(key, 1024)), 320, 4096))
-    height = int(round(width * 0.75))
-    height = int(np.clip(height, 240, 3072))
-    return width, height
+    return clamp_capture_size(state.get(key, 1024))
 
 
 def _puzzle_capture_rect(state):
@@ -2131,29 +2129,21 @@ class EmbeddedMujocoScanner:
 
     def _capture_image_size(self):
         width, height = getattr(self.args, "capture_image_size", self.scanner.CAMERA_IMAGE_SIZE)
-        width = int(np.clip(int(width), 320, 4096))
-        height = int(np.clip(int(height), 240, 3072))
-        return width, height
+        return clamp_capture_size(width, height)
 
     def set_capture_resolution(self, width):
-        width = int(np.clip(int(width), 320, 4096))
-        height = int(round(width * 0.75))
-        self.args.capture_image_size = (width, height)
+        self.args.capture_image_size = clamp_capture_size(width)
         self._camera_preview_dirty = True
 
     def _single_capture_image_size(self):
         width, height = getattr(self.args, "single_capture_image_size", self.scanner.CAMERA_IMAGE_SIZE)
-        width = int(np.clip(int(width), 320, 4096))
-        height = int(np.clip(int(height), 240, 3072))
-        return width, height
+        return clamp_capture_size(width, height)
 
     def _active_camera_image_size(self):
         return self._single_capture_image_size() if self.single_capture_mode else self._capture_image_size()
 
     def set_single_capture_resolution(self, width):
-        width = int(np.clip(int(width), 320, 4096))
-        height = int(round(width * 0.75))
-        self.args.single_capture_image_size = (width, height)
+        self.args.single_capture_image_size = clamp_capture_size(width)
         self._camera_preview_dirty = True
 
     def _camera_render_lighting_key(self):
@@ -4692,7 +4682,7 @@ def draw_sidebar(state, renderer, window=None):
                     4096,
                 )
                 scan_capture_width = int(np.clip(int(round(float(scan_capture_width) / 64.0) * 64), 320, 4096))
-                scan_capture_height = int(round(scan_capture_width * 0.75))
+                scan_capture_width, scan_capture_height = clamp_capture_size(scan_capture_width)
                 if changed_scan_res:
                     state.scanner_capture_width = scan_capture_width
                     embedded = state.get('embedded_scanner')
@@ -4776,7 +4766,7 @@ def draw_sidebar(state, renderer, window=None):
                 2048,
             )
             capture_width = int(np.clip(int(round(float(capture_width) / 64.0) * 64), 320, 2048))
-            capture_height = int(round(capture_width * 0.75))
+            capture_width, capture_height = clamp_capture_size(capture_width)
             if changed_capture_res:
                 state.scanner_single_capture_width = capture_width
                 embedded = state.get('embedded_scanner')

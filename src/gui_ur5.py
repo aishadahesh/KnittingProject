@@ -30,6 +30,7 @@ import gaussian_splatting
 import robot_camera
 import ur5_robot
 import ur5_scan
+from fabric_scanner import clamp_capture_size
 from rendering import draw_fitted_texture, upload_rgb_texture
 
 
@@ -216,8 +217,9 @@ def _make_runner(state, controller):
         settings = storage.scanner_state_snapshot(state)
     estimates = gui._scanner_estimated_cell_colors(state)
 
-    capture_width = int(state.get("ur5_capture_width", 1280))
-    capture_height = int(round(capture_width * 3 / 4))
+    # Clamped like every other capture path. This one derived its height with
+    # no bounds at all, so an out-of-range width reached the camera unchecked.
+    capture_width, capture_height = clamp_capture_size(state.get("ur5_capture_width", 1280))
     return ur5_scan.RealScanRunner(
         controller.robot,
         controller.camera,
@@ -418,8 +420,7 @@ def _draw_camera_section(state, controller):
     else:
         if imgui.button("Start live preview##ur5_camera_start", (-1, 0)):
             spec = controller.devices[selected] if selected < len(controller.devices) else {}
-            capture_width = int(state.get("ur5_capture_width", 1280))
-            controller.start_camera(spec, (capture_width, int(round(capture_width * 3 / 4))))
+            controller.start_camera(spec, clamp_capture_size(state.get("ur5_capture_width", 1280)))
 
     if running:
         camera = controller.camera

@@ -397,6 +397,29 @@ def get_ccd_topology(nout, num_ctrl_rows, period_offset_x, period_offset_y, M):
     return res
 
 
+def _build_objectives(edges, L0_array, period_offset_x, period_offset_y, nout, dhat):
+    """The stretch and bend objectives, for the two callers that build them alike.
+
+    The collision objective is deliberately NOT built here. Three call sites
+    construct one and all three project its Hessian differently:
+    run_simulation_step clamps, eval_energy leaves the default, and the
+    finite-difference check disables projection entirely (and also wants a
+    non-projecting stretch, which is why it does not use this helper at all).
+    Those differences change solver numerics, so they stay visible at each call
+    site rather than hiding behind a shared default.
+    """
+    kwargs = {
+        "edges": edges,
+        "L0_array": L0_array,
+        "period_offset_x": period_offset_x,
+        "period_offset_y": period_offset_y,
+        "nout": nout,
+        "dhat": dhat,
+    }
+    return StretchObjective(**kwargs), BendObjective(**kwargs), kwargs
+
+
+
 def run_simulation_step(ctrl_rows, period_offset_x, period_offset_y, config, J_cached, L0_array, k_s, k_b, k_c, dhat):
     import time
     t_start = time.perf_counter()
@@ -413,17 +436,9 @@ def run_simulation_step(ctrl_rows, period_offset_x, period_offset_y, config, J_c
     M = len(V)
     t_geom = time.perf_counter() - t0
     
-    kwargs = {
-        "edges": edges,
-        "L0_array": L0_array,
-        "period_offset_x": period_offset_x,
-        "period_offset_y": period_offset_y,
-        "nout": nout,
-        "dhat": dhat
-    }
-    
-    stretch = StretchObjective(**kwargs)
-    bend = BendObjective(**kwargs)
+    stretch, bend, kwargs = _build_objectives(edges, L0_array, period_offset_x, period_offset_y, nout, dhat)
+    # CLAMP here but not in eval_energy: the solver needs a positive
+    # semi-definite Hessian, the energy readout does not.
     collision = CollisionObjective(**kwargs, psd_projection=ipctk.PSDProjectionMethod.CLAMP)
 
     total_obj = TotalObjective([(stretch, k_s), (bend, k_b), (collision, k_c)])
@@ -547,17 +562,8 @@ def eval_energy(flat_P, ctrl_rows, period_offset_x, period_offset_y, config, L0_
         
     V, edges, _, nout = evaluate_centerlines(perturbed_ctrl_rows, period_offset_x, config)
 
-    kwargs = {
-        "edges": edges,
-        "L0_array": L0_array,
-        "period_offset_x": period_offset_x,
-        "period_offset_y": period_offset_y,
-        "nout": nout,
-        "dhat": dhat
-    }
-    
-    stretch = StretchObjective(**kwargs)
-    bend = BendObjective(**kwargs)
+    stretch, bend, kwargs = _build_objectives(edges, L0_array, period_offset_x, period_offset_y, nout, dhat)
+    # No psd_projection: this only reads energies back, it does not solve.
     collision = CollisionObjective(**kwargs)
     
     stretch.update(V)

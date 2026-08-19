@@ -46,6 +46,12 @@ IMAGE_REPEAT_OVERLAP = 1.68
 SCAN_PATTERN_FILL = 1.08
 CAMERA_MARKER_SIZE = np.array([0.018, 0.012, 0.010])
 CAMERA_IMAGE_SIZE = (1024, 768)
+# Capture resolution limits and aspect ratio. Declared once because five call
+# sites across the scanner, the sidebar and UR5 Mode each restated them, and the
+# UR5 one had no clamp at all.
+CAPTURE_MIN_WIDTH, CAPTURE_MAX_WIDTH = 320, 4096
+CAPTURE_MIN_HEIGHT, CAPTURE_MAX_HEIGHT = 240, 3072
+CAPTURE_ASPECT = 0.75
 CAMERA_SAVE_EVERY_STATION = "station"
 CAMERA_SAVE_EVERY_VIEW = "view"
 CAMERA_CAPTURE_NATURAL = "natural"
@@ -57,6 +63,15 @@ ROBOT_MAX_CARTESIAN_STEP = 0.040
 # ============================================================================
 # Robot Planning Section
 # ============================================================================
+
+
+def clamp_capture_size(width, height=None):
+    """Clamp a capture resolution, deriving the height from the width if absent."""
+    width = int(np.clip(int(width), CAPTURE_MIN_WIDTH, CAPTURE_MAX_WIDTH))
+    height = round(width * CAPTURE_ASPECT) if height is None else height
+    height = int(np.clip(int(height), CAPTURE_MIN_HEIGHT, CAPTURE_MAX_HEIGHT))
+    return width, height
+
 
 def fit_path_to_workspace(points: np.ndarray, center: np.ndarray, max_span: np.ndarray) -> np.ndarray:
     """Scale and translate local scanner points into the UR5 base workspace."""
