@@ -480,7 +480,15 @@ def _draw_bitmap_editor(state, id_suffix=""):
     cell_w, cell_h = 22, 16
     imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(2, 2))
     changed_bitmap = False
-    for r in range(nr):
+    # Drawn bottom-up so row 1 sits at the bottom of the grid, where it sits in
+    # the fabric: rows are built at y = row_idx * dy, so index 0 is the lowest
+    # row knitted. Iterating 0..n put index 0 at the top instead, leaving the
+    # grid a mirror image of the model -- clearing the third square from the top
+    # opened a gap second from the top, and the wrong stitch appeared to grow.
+    # Bottom-up also matches how a knitting chart is read.
+    for r in reversed(range(nr)):
+        imgui.text_disabled(f"R{r + 1}")
+        imgui.same_line()
         for c in range(nc):
             active = float(state.bitmap[r, c]) > 0.5
             imgui.push_style_color(imgui.Col_.button, (0.18, 0.62, 0.28, 1.0) if active else (0.22, 0.22, 0.22, 1.0))
@@ -494,6 +502,7 @@ def _draw_bitmap_editor(state, id_suffix=""):
             if c < nc - 1:
                 imgui.same_line()
     imgui.pop_style_var()
+    imgui.text_disabled("Row 1 is the bottom row, as knitted.")
     if changed_bitmap:
         state.on_bitmap_change()
     return changed_bitmap
