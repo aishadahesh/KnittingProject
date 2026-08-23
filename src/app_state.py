@@ -7,12 +7,28 @@ import numpy as np
 import paths
 
 from knitting_core import (
-    compute_knitting_faces, row_base_pitch,
+    anchor_bitmap, compute_knitting_faces, row_base_pitch,
     build_parametric_control_rows, build_spline_mesh, build_surface_fiber_meshes
 )
 
 # %% APP STATE ─────────────────────────────────────────────────────────────────
 # %% APP STATE ─────────────────────────────────────────────────────────────────
+
+# Appended to a status message when a pattern had to be repaired on the way in.
+# Short because status_msg is a single unwrapped line with no timeout.
+ANCHOR_NOTE = 'bottom row filled in - a stitch there had nothing to hang from'
+
+
+def _with_anchor_note(message, anchored_columns):
+    """Append the repair note only when a repair actually happened.
+
+    Keeps a clean undo or load reading exactly as it always did, rather than
+    mentioning a rule the user never ran into.
+    """
+    if anchored_columns is None or len(anchored_columns) == 0:
+        return message
+    return f'{message}; {ANCHOR_NOTE}'
+
 
 # Inset of a scan sample inside its grid tile, in yarn radii per side. The tile
 # bounds and the grid spacing must agree on this, or the samples overlap.
@@ -1261,12 +1277,22 @@ class AppState:
             del self.undo_stack[0]
 
     def restore_snapshot(self, snap):
+        """Restore a snapshot. Returns the bottom-row columns it had to repair.
+
+        The return value exists because undo_last and reset_to_initial both set
+        status_msg *after* calling this, so a message written in here would be
+        clobbered. They append a note instead, and only when this reports
+        something -- which is what keeps a clean undo's message unchanged.
+        """
         for k, v in snap.items():
             if not k.startswith('camera_') and k not in ('ctrl_rows', 'spline_radius_rows', 'label'):
                 self._data[k] = self._clone(v)
         for attr in self.camera_attributes:
             setattr(self.camera, attr, self._clone(snap[f'camera_{attr}']))
         self.camera.fov_deg = self.view_fov
+
+        pre_anchor_bitmap = np.asarray(self.bitmap, dtype=np.float32).copy()
+        anchored_columns = self._anchor_bitmap()
 
         self.ctrl_rows = [row.copy() for row in snap['ctrl_rows']]
         self.spline_radius_rows = [row.copy() for row in snap.get('spline_radius_rows', [])]
@@ -1275,13 +1301,18 @@ class AppState:
         self._rebuild_spline_points()
         self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
 
+        if anchored_columns.size:
+            # The snapshot's control rows carry the flat bottom row, same as a
+            # loaded file does.
+            self._reconcile_rows_after_anchor(pre_anchor_bitmap)
         self.rebuild_spline_mesh()
+        return anchored_columns
 
     def undo_last(self):
         if not self.undo_stack:
             return
-        self.restore_snapshot(self.undo_stack.pop())
-        self.status_msg = 'Undid last change'
+        anchored = self.restore_snapshot(self.undo_stack.pop())
+        self.status_msg = _with_anchor_note('Undid last change', anchored)
 
     def capture_initial_state(self):
         super().__setattr__('_initial_snapshot', self.snapshot_state())
@@ -1305,8 +1336,8 @@ class AppState:
         initial_snapshot = getattr(self, '_initial_snapshot', None)
         if initial_snapshot is not None:
             self.push_undo("Reset all")
-            self.restore_snapshot(initial_snapshot)
-            self.status_msg = 'Reset to saved initial model'
+            anchored = self.restore_snapshot(initial_snapshot)
+            self.status_msg = _with_anchor_note('Reset to saved initial model', anchored)
             return
 
         self.push_undo("Reset all")
@@ -1396,7 +1427,48 @@ class AppState:
 
     # ── BITMAP / WORKFLOW UPDATES ─────────────────────────────────────────────
 
+    def _anchor_bitmap(self):
+        """Force a stitch into every bottom-row cell, and report what was filled.
+
+        The one place that assigns a repaired bitmap. Sets no status message --
+        callers compose their own, because the two that go through
+        restore_snapshot write theirs afterwards and would clobber it.
+        """
+        repaired, columns = anchor_bitmap(self.bitmap)
+        if columns.size:
+            self.bitmap = repaired
+        return columns
+
+    def _reconcile_rows_after_anchor(self, pre_bitmap):
+        """Give the newly-anchored bottom row its loop, leaving the rest alone.
+
+        Repairing the bitmap is not enough on the load path: the saved control
+        rows are installed verbatim afterwards, and they carry the flat,
+        zero-height bottom row the cleared cell produced -- so the pattern would
+        read as anchored while the fabric still showed the bar.
+
+        Nudging from a reference built with the *pre-repair* bitmap confines the
+        change to the cells that actually changed: only row 0 differs between
+        the two parametric builds, so the user's tuned geometry above it is
+        carried through untouched.
+        """
+        saved = self.bitmap
+        self.bitmap = np.asarray(pre_bitmap, dtype=np.float32)
+        try:
+            # _fresh_rebuild_rows -> _sync_loop_heights reads bitmap_size, never
+            # bitmap, and the repair cannot change the shape, so this swap is safe.
+            reference = [row.copy() for row in self._fresh_rebuild_rows()]
+        finally:
+            self.bitmap = saved
+        self.param_ref_ctrl_rows = reference
+        self.nudge_spline_from_params(rebuild_mesh=False)
+
     def on_bitmap_change(self):
+        # Silent backstop. The editor refuses the edit that would break this, so
+        # in practice nothing is left to repair here -- but any future caller
+        # writing straight to state.bitmap still cannot produce a fabric that
+        # hangs from nothing.
+        self._anchor_bitmap()
         self._sync_loop_heights()
         self.rebuild_spline_from_params()
 
@@ -1408,6 +1480,9 @@ class AppState:
         new_bm[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)] = old[:min(old.shape[0], new_rows), :min(old.shape[1], new_cols)]
         self.bitmap = new_bm
         self.bitmap_size = np.array([new_rows, new_cols], dtype=np.int32)
+        # The old bottom row is copied straight into the new one, so a resize can
+        # carry an existing violation through even though it never creates one.
+        self._anchor_bitmap()
         self._sync_row_colors(new_rows)
         self._sync_row_visibility(new_rows)
         self._sync_loop_heights()
@@ -1502,6 +1577,13 @@ class AppState:
             if 'bitmap' in data:
                 self.bitmap = np.array(data['bitmap'], dtype=np.float32)
                 self.bitmap_size = np.array(self.bitmap.shape, dtype=np.int32)
+            # A file can hold a pattern the editor would now refuse to create.
+            # Kept alongside the pre-repair bitmap because the saved control
+            # rows below carry the flat bottom row it produced, and those have
+            # to be reconciled too or the model reports repaired and still
+            # draws the bar.
+            pre_anchor_bitmap = np.asarray(self.bitmap, dtype=np.float32).copy()
+            anchored_columns = self._anchor_bitmap()
 
             loaded_spline_rows = data.get('spline_control_rows')
             loaded_radius_rows = data.get('spline_radius_rows')
@@ -1539,7 +1621,7 @@ class AppState:
             self.mode = 'spline'
             self.camera.fov_deg = self.view_fov
             self.load_path = path
-            self.status_msg = f'Loaded ← {os.path.basename(path)}'
+            self.status_msg = _with_anchor_note(f'Loaded ← {os.path.basename(path)}', anchored_columns)
             # 'period_offset' is the pre-split key; keep reading it so params
             # files written before period_offset_x/_y still load.
             legacy_period = data.get('period_offset')
@@ -1569,7 +1651,12 @@ class AppState:
                 # and only X was being re-measured afterwards -- so a saved
                 # model loaded with a stale Y period every time.
                 self.sync_period_offset_y_to_row_count()
-                self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
+                if anchored_columns.size:
+                    # Gives the repaired bottom row its loop while leaving the
+                    # rows above exactly as they were saved.
+                    self._reconcile_rows_after_anchor(pre_anchor_bitmap)
+                else:
+                    self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
                 self.rebuild_spline_mesh(preserve_model_placement=False)
         except Exception as e:
             self.status_msg = f"Load error: {e}"

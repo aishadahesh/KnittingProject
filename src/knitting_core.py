@@ -42,6 +42,50 @@ def compute_bitmap_scale_factors(bitmap):
     return scale_factors
 
 
+def unanchored_columns(bitmap):
+    """Columns whose bottom cell is cleared, leaving a stitch with no support.
+
+    A cleared cell is normally covered: compute_bitmap_scale_factors gives the
+    nearest active cell below it a span reaching up over the gap, and the
+    topmost active cell stretches to the top of the fabric. Row 0 is the one
+    place that cannot work, because there is no cell below it -- so a cleared
+    bottom cell is never stood in for, and the fabric there hangs from nothing.
+
+    Returns the offending column indices; empty means the pattern is legal.
+    This also covers an entirely cleared column, which necessarily has its
+    bottom cell cleared too.
+    """
+    bitmap_array = np.asarray(bitmap, dtype=np.float32)
+    if bitmap_array.ndim != 2 or bitmap_array.size == 0:
+        return np.empty(0, dtype=np.int64)
+    return np.flatnonzero(bitmap_array[0, :] <= 0.5)
+
+
+def bitmap_is_anchored(bitmap):
+    """True when every column has a stitch in row 0 for the fabric to hang from."""
+    return unanchored_columns(bitmap).size == 0
+
+
+def anchor_bitmap(bitmap):
+    """Return a legal copy of `bitmap`, plus the columns that had to be filled.
+
+    Filling row 0 is the only repair available. Clearing the rest of the column
+    instead would leave it with no stitches at all, which is worse, and the
+    column count is fixed by the pattern size.
+
+    Never mutates the input, and always returns a new array so callers cannot
+    end up aliasing each other's buffers.
+    """
+    bitmap_array = np.asarray(bitmap, dtype=np.float32)
+    if bitmap_array.ndim != 2 or bitmap_array.size == 0:
+        return bitmap_array.astype(np.float32, copy=True), np.empty(0, dtype=np.int64)
+    columns = unanchored_columns(bitmap_array)
+    repaired = bitmap_array.astype(np.float32, copy=True)
+    if columns.size:
+        repaired[0, columns] = 1.0
+    return repaired, columns
+
+
 def _height_grid_from_params(params, bitmap, lh_idx):
     params = np.asarray(params, dtype=np.float32)
     bitmap = np.asarray(bitmap, dtype=np.float32)

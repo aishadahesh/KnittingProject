@@ -489,20 +489,41 @@ def _draw_bitmap_editor(state, id_suffix=""):
     for r in reversed(range(nr)):
         imgui.text_disabled(f"R{r + 1}")
         imgui.same_line()
+        # Row 1 is the cast-on: every other cleared cell is stood in for by the
+        # stitch below it, and row 0 has none, so clearing it leaves the fabric
+        # hanging from nothing. Locked rather than merely repaired afterwards,
+        # so the pattern on screen is always one that can be knitted.
+        locked = r == 0
         for c in range(nc):
             active = float(state.bitmap[r, c]) > 0.5
-            imgui.push_style_color(imgui.Col_.button, (0.18, 0.62, 0.28, 1.0) if active else (0.22, 0.22, 0.22, 1.0))
-            imgui.push_style_color(imgui.Col_.button_hovered, (0.28, 0.72, 0.38, 1.0) if active else (0.35, 0.35, 0.35, 1.0))
-            if imgui.button(f"##bm{id_suffix}_{r}_{c}", imgui.ImVec2(cell_w, cell_h)):
+            if locked:
+                # Its own green, and the same colour for hover and press: a
+                # square that lights up and then does nothing reads as broken.
+                fill = (0.16, 0.44, 0.24, 1.0)
+                imgui.push_style_color(imgui.Col_.button, fill)
+                imgui.push_style_color(imgui.Col_.button_hovered, fill)
+                imgui.push_style_color(imgui.Col_.button_active, fill)
+            else:
+                imgui.push_style_color(imgui.Col_.button, (0.18, 0.62, 0.28, 1.0) if active else (0.22, 0.22, 0.22, 1.0))
+                imgui.push_style_color(imgui.Col_.button_hovered, (0.28, 0.72, 0.38, 1.0) if active else (0.35, 0.35, 0.35, 1.0))
+                imgui.push_style_color(imgui.Col_.button_active, (0.28, 0.72, 0.38, 1.0) if active else (0.35, 0.35, 0.35, 1.0))
+            clicked = imgui.button(f"##bm{id_suffix}_{r}_{c}", imgui.ImVec2(cell_w, cell_h))
+            imgui.pop_style_color(3)
+            if locked and imgui.is_item_hovered():
+                imgui.set_tooltip("Bottom row - always knitted. The fabric hangs from these stitches.")
+            # Turning a bottom cell on is still allowed, so a pattern that
+            # arrived cleared can be fixed by clicking it. Turning one off is
+            # refused before push_undo, so a refused click leaves no undo entry
+            # that would appear to do nothing.
+            if clicked and not (locked and active):
                 if not changed_bitmap:
                     state.push_undo("Pattern")
                 state.bitmap[r, c] = 0.0 if active else 1.0
                 changed_bitmap = True
-            imgui.pop_style_color(2)
             if c < nc - 1:
                 imgui.same_line()
     imgui.pop_style_var()
-    imgui.text_disabled("Row 1 is the bottom row, as knitted.")
+    imgui.text_disabled("Row 1 is the bottom row, as knitted - always on.")
     if changed_bitmap:
         state.on_bitmap_change()
     return changed_bitmap

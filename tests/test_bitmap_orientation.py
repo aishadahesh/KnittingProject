@@ -107,6 +107,10 @@ def _drawn_row_order(state, monkeypatch):
     monkeypatch.setattr(imgui, "slider_int", lambda label, v, *a, **k: (False, v))
     monkeypatch.setattr(imgui, "text_disabled", lambda *a, **k: None)
     monkeypatch.setattr(imgui, "same_line", lambda *a, **k: None)
+    # The locked bottom row draws a tooltip; without these the harness would
+    # call the real imgui with no frame active.
+    monkeypatch.setattr(imgui, "is_item_hovered", lambda *a, **k: False)
+    monkeypatch.setattr(imgui, "set_tooltip", lambda *a, **k: None)
     monkeypatch.setattr(imgui, "push_style_var", lambda *a, **k: None)
     monkeypatch.setattr(imgui, "pop_style_var", lambda *a, **k: None)
     monkeypatch.setattr(imgui, "push_style_color", lambda *a, **k: None)
