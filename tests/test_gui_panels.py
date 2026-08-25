@@ -118,7 +118,8 @@ def state(gl_context, tmp_path):
     from rendering import Camera, MeshRenderer
 
     renderer = MeshRenderer(gl_context.ctx, 320, 240)
-    app_state = AppState(Camera(), renderer)
+    puzzle_renderer = MeshRenderer(gl_context.ctx, 320, 240)
+    app_state = AppState(Camera(), renderer, puzzle_renderer=puzzle_renderer)
     # Redirected before anything draws: draw_sidebar calls state.maybe_autosave(),
     # which would otherwise overwrite the real config/params.json every run.
     app_state.save_path = str(tmp_path / "params.json")
@@ -143,17 +144,18 @@ def _draw_one_frame(gui, app_state, renderer, mode, window=None, ref_tex=None):
     """
     gui._set_app_mode(app_state, mode)
     for _ in range(2):
+        scene_renderer = app_state.active_scene_renderer()
         imgui.new_frame()
         gui.draw_menu_bar(app_state)
-        gui.draw_sidebar(app_state, renderer, window)
+        gui.draw_sidebar(app_state, scene_renderer, window)
         # Arrives with the sidebar split; called when present so the test keeps
         # covering the same surface before and after.
         draw_mode_windows = getattr(gui, "draw_mode_windows", None)
         if draw_mode_windows is not None:
-            draw_mode_windows(app_state, renderer, window)
+            draw_mode_windows(app_state, scene_renderer, window)
         if mode != "database":
             # app.py skips the viewport in Database Mode, which takes the window over.
-            gui.draw_viewport(app_state, renderer, ref_tex, window)
+            gui.draw_viewport(app_state, scene_renderer, ref_tex, window)
         imgui.render()
     return int(imgui.get_draw_data().total_vtx_count)
 

@@ -94,6 +94,9 @@ def main():
     # ── Scene objects ─────────────────────────────────────────────────────────
     camera   = Camera()
     renderer = MeshRenderer(ctx, 960, 720)
+    # Puzzle owns a separate framebuffer and mesh buffers. Scan can rebuild the
+    # main viewport as often as it needs without ever touching Puzzle's scene.
+    puzzle_renderer = MeshRenderer(ctx, 960, 720)
     # Second view with its own camera and framebuffer, so orbiting it never
     # disturbs the main viewport's fixed framing.
     orbit_camera   = Camera()
@@ -103,7 +106,13 @@ def main():
         os.makedirs(os.path.join(resolve_project_path(config["rendering"]["output_dir"]), d), exist_ok=True)
 
     # ── App state ─────────────────────────────────────────────────────────────
-    state = AppState(camera, renderer, orbit_camera=orbit_camera, orbit_renderer=orbit_renderer)
+    state = AppState(
+        camera,
+        renderer,
+        orbit_camera=orbit_camera,
+        orbit_renderer=orbit_renderer,
+        puzzle_renderer=puzzle_renderer,
+    )
     state.reference_image_pixels = np.asarray(ref_pil, dtype=np.float32) / 255.0
 
     # initial_params.json is the frozen reset baseline.
@@ -268,7 +277,7 @@ def main():
         imgui.end()
 
         # ── Sidebar ───────────────────────────────────────────────────────────
-        draw_sidebar(state, renderer, window)
+        draw_sidebar(state, state.active_scene_renderer(), window)
 
         # MuJoCo offscreen rendering can make its own GL context current.
         # Restore the app context before ModernGL allocates/draws viewport buffers.
@@ -277,7 +286,9 @@ def main():
 
         # ── 3D Viewport ───────────────────────────────────────────────────────
         if str(state.get("app_mode", "edit")) != "database":
-            draw_viewport(state, renderer, ref_tex, window)
+            # Re-evaluate after draw_sidebar: its mode buttons can switch into
+            # or out of Puzzle during this same frame.
+            draw_viewport(state, state.active_scene_renderer(), ref_tex, window)
             # Edit Mode only: the other modes drive the shared model/camera
             # themselves, and a second live view of it would fight them.
             if str(state.get('app_mode', 'edit')) == 'edit':

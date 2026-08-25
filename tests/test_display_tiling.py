@@ -228,6 +228,13 @@ def test_scan_template_reproduces_its_saved_fabric(state, tmp_path, monkeypatch)
     # _scanner_template memoises on the file's mtime; drop the cached entry.
     object.__setattr__(state, "_scanner_template_cache", None)
 
+    # The saved rows are only usable at the size they describe, and the scan
+    # pattern size is a setting now -- point it at this template's fabric, the
+    # way the defaults point at the real one.
+    state.scanner_pattern_rows, state.scanner_pattern_cols = (
+        int(state.bitmap.shape[0]), int(state.bitmap.shape[1]),
+    )
+
     state.params = state._scanner_template_params()
     assert state.apply_scanner_template_base() is True
     state.nudge_spline_from_params(rebuild_mesh=False)
@@ -281,3 +288,69 @@ def test_puzzle_tiles_carry_no_depth_shift(state):
 
     expected = {round(k * y_period, 4) for k in (-1, 0, 1)}
     assert offsets == expected
+
+class CaptureRenderer(StubRenderer):
+    """A stub that also hands back a readable colour buffer, like the real one."""
+
+    def __init__(self, vp_w, vp_h, rgba_bytes):
+        self.vp_w = int(vp_w)
+        self.vp_h = int(vp_h)
+        self.color_tex = _ColorTex(rgba_bytes)
+
+
+class _ColorTex:
+    def __init__(self, rgba_bytes):
+        self._rgba_bytes = rgba_bytes
+
+    def read(self):
+        return self._rgba_bytes
+
+
+def _lattice_pixel(px, py, period_w, period_h):
+    """A synthetic fabric: any pixel is fixed by its phase within one repeat."""
+    u = np.asarray(px) % period_w
+    v = np.asarray(py) % period_h
+    return np.stack([
+        (u * 7 + v * 3) % 256,
+        (u * 3 + v * 11) % 256,
+        (u * 13 + v * 5) % 256,
+    ], axis=-1).astype(np.uint8)
+
+
+def test_puzzle_glue_tile_is_exactly_one_repeat_period(state):
+    """The glued tile must be one period tall, not one whole model tall.
+
+    Cropping the model's full projected height instead -- every row of the
+    central copy -- still produces a tile, but it is several periods plus the
+    top and bottom loop overhang. Stamped edge to edge that repeats partial
+    rows, which is the banding the glue exists to rule out.
+    """
+    from scanner_core import _puzzle_build_seamless_tile, _puzzle_period_pixel_vectors
+
+    vp_w, vp_h = 960, 720
+    state.camera.dist = 120.0
+    probe = StubRenderer()
+    probe.vp_w, probe.vp_h = vp_w, vp_h
+    periods = _puzzle_period_pixel_vectors(state, probe)
+    period_w = int(round(abs(float(periods["x_step"][0]))))
+    period_h = int(round(abs(float(periods["y_step"][1]))))
+    assert 4 < period_w < vp_w and 4 < period_h < vp_h
+
+    # A viewport painted with a fabric that repeats on exactly that lattice.
+    ys, xs = np.mgrid[0:vp_h, 0:vp_w]
+    visible = _lattice_pixel(xs, ys, period_w, period_h)
+    rgba = np.dstack([np.flipud(visible), np.full((vp_h, vp_w, 1), 255, np.uint8)])
+    renderer = CaptureRenderer(vp_w, vp_h, rgba.tobytes())
+
+    tile, glued, info = _puzzle_build_seamless_tile(state, renderer, 3, 4)
+
+    assert (info["tile_w"], info["tile_h"]) == (period_w, period_h)
+    assert tile.size == (period_w, period_h)
+
+    # The glue continues the fabric: every pixel of the canvas is the pixel the
+    # underlying lattice would have had, extended past the captured viewport.
+    x0, y0 = info["tile_box"][0], info["tile_box"][1]
+    out = np.asarray(glued, dtype=np.uint8)
+    gys, gxs = np.mgrid[0:out.shape[0], 0:out.shape[1]]
+    expected = _lattice_pixel(gxs + x0, gys + y0, period_w, period_h)
+    assert np.array_equal(out, expected)

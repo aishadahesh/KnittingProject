@@ -221,14 +221,15 @@ def _persist_scanner_state(state, patterns=None, estimates=None):
 
 
 def _scanner_pattern_dimensions(state):
-    template_bitmap = None
-    if hasattr(state, '_scanner_template'):
-        try:
-            template_bitmap = np.asarray(state._scanner_template().get('bitmap', None), dtype=np.float32)
-        except Exception:
-            template_bitmap = None
-    if template_bitmap is not None and template_bitmap.ndim == 2 and template_bitmap.size:
-        return max(2, int(template_bitmap.shape[0])), max(2, int(template_bitmap.shape[1]))
+    """The scan pattern grid, from the one place that decides it.
+
+    Feeds the plan's fabric size and the persisted tile cache's key, so it has
+    to agree with the bitmap the generator actually produces -- this used to
+    read the scan template's shape while claiming to fall back to the settings,
+    which meant the cache key could not see a pattern-size change either.
+    """
+    if hasattr(state, '_scanner_pattern_size'):
+        return state._scanner_pattern_size()
     return (
         max(2, int(state.get('scanner_pattern_rows', max(2, int(state.bitmap_size[0]))))),
         max(2, int(state.get('scanner_pattern_cols', max(2, int(state.bitmap_size[1]))))),
@@ -434,6 +435,7 @@ _SCAN_TILE_SNAPSHOT_FIELDS = (
 
 def _scan_snapshot_state(state):
     snap = {key: copy.deepcopy(state.get(key)) for key in _SCAN_TILE_SNAPSHOT_FIELDS}
+    snap['mode_epoch'] = int(state.get('mode_epoch', 0))
     snap['camera'] = {
         'target': np.array(state.camera.target, dtype=np.float32).copy(),
         'dist': float(state.camera.dist),
@@ -445,6 +447,11 @@ def _scan_snapshot_state(state):
 
 
 def _scan_restore_state(state, snap):
+    if int(snap.get('mode_epoch', -1)) != int(state.get('mode_epoch', 0)):
+        # The user changed modes while this temporary Scan model was alive.
+        # The new mode has already installed its own workspace; restoring the
+        # old Scan snapshot here would overwrite both its bitmap and geometry.
+        return False
     for key in _SCAN_TILE_SNAPSHOT_FIELDS:
         setattr(state, key, snap[key])
     cam = snap['camera']
@@ -453,6 +460,7 @@ def _scan_restore_state(state, snap):
     state.camera.az = cam['az']
     state.camera.el = cam['el']
     state.camera.fov_deg = cam['fov_deg']
+    return True
 
 
 class TiledFabricTexture:
@@ -577,8 +585,14 @@ def _scan_batch(state):
             state.__dict__.pop('_scan_batch_depth', None)
             snapshot = state.__dict__.pop('_scan_batch_snapshot', None)
             if snapshot is not None:
-                _scan_restore_state(state, snapshot)
-                state.rebuild_spline_mesh(preserve_model_placement=True)
+                if _scan_restore_state(state, snapshot):
+                    # A Scan batch always restores the normal viewport.
+                    # Choosing the renderer from app_mode here allowed a late
+                    # cleanup to upload its Scan grid into Puzzle's renderer.
+                    state.rebuild_spline_mesh(
+                        preserve_model_placement=True,
+                        target_renderer=state.renderer,
+                    )
 
 
 def _scan_batch_active(state):
@@ -679,8 +693,6 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
     rows, cols = (int(v) for v in bitmap_shape)
     full_bitmap = np.ones((max(1, rows), max(1, cols)), dtype=np.float32)
     snap = _scan_snapshot_state(state)
-    prev_renderer = state.renderer
-    state.renderer = renderer
     try:
         state.params = state._scanner_template_params()
         state.bitmap = full_bitmap
@@ -699,7 +711,10 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
             state.nudge_spline_from_params(rebuild_mesh=False)
         else:
             state.rebuild_spline_from_params(rebuild_mesh=False)
-        state.rebuild_spline_mesh(preserve_model_placement=False)
+        state.rebuild_spline_mesh(
+            preserve_model_placement=False,
+            target_renderer=renderer,
+        )
         frame = _scan_autoframe(state, renderer, target_w, camera_az_deg, camera_el_deg, zoom)
         if frame is None:
             return None
@@ -714,11 +729,13 @@ def _scan_measure_pattern_frame(state, renderer, bitmap_shape, target_w=480, cam
     except Exception:
         return None
     finally:
-        state.renderer = prev_renderer
         # Inside a _scan_batch the restore is deferred to the end of the batch.
         if not _scan_batch_active(state):
-            _scan_restore_state(state, snap)
-            state.rebuild_spline_mesh(preserve_model_placement=True)
+            if _scan_restore_state(state, snap):
+                state.rebuild_spline_mesh(
+                    preserve_model_placement=True,
+                    target_renderer=state.renderer,
+                )
 
 
 def _scan_capture_one_azimuth(state, renderer, repeat_cols, repeat_rows, target_w,
@@ -787,8 +804,6 @@ def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, col
     Returns {azimuth: TiledFabricTexture or None}.
     """
     snap = _scan_snapshot_state(state)
-    prev_renderer = state.renderer
-    state.renderer = renderer
     results = {}
     try:
         state.params = state._scanner_template_params()
@@ -822,7 +837,10 @@ def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, col
             state.nudge_spline_from_params(rebuild_mesh=False)
         else:
             state.rebuild_spline_from_params(rebuild_mesh=False)
-        state.rebuild_spline_mesh(preserve_model_placement=False)
+        state.rebuild_spline_mesh(
+            preserve_model_placement=False,
+            target_renderer=renderer,
+        )
         # Control-point markers belong to the editing viewport, not to captured
         # fabric. rebuild_spline_mesh uploads them to whichever renderer it is
         # handed, and the period crop samples the middle of the fabric, which is
@@ -836,10 +854,12 @@ def _scan_render_tiled_pattern_images(state, renderer, bitmap, loop_heights, col
             )
         return results
     finally:
-        state.renderer = prev_renderer
         if not _scan_batch_active(state):
-            _scan_restore_state(state, snap)
-            state.rebuild_spline_mesh(preserve_model_placement=True)
+            if _scan_restore_state(state, snap):
+                state.rebuild_spline_mesh(
+                    preserve_model_placement=True,
+                    target_renderer=state.renderer,
+                )
 
 
 def _scan_render_tiled_pattern_image(state, renderer, bitmap, loop_heights, colors, repeat_cols, repeat_rows, copies=1, target_w=480, camera_az_deg=0.0, camera_el_deg=0.0, zoom=1.0, frame=None):

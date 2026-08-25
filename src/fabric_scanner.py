@@ -1159,13 +1159,20 @@ def _materialize_texture(texture, max_dim=None):
     return rasterize(max_dim)
 
 
-def _paste_projected_texture(base: Image.Image, texture, projected_quad) -> bool:
+def _projected_quad_extent(projected_quad) -> int:
+    """The quad's longer on-screen side, in pixels."""
+    xs = [float(point[0]) for point in projected_quad]
+    ys = [float(point[1]) for point in projected_quad]
+    return int(max(max(xs) - min(xs), max(ys) - min(ys)))
+
+
+def _paste_projected_texture(base: Image.Image, texture, projected_quad, source_max_dim=None) -> bool:
     if any(point is None for point in projected_quad):
         return False
     dst = [(float(point[0]), float(point[1])) for point in projected_quad]
-    # Deliberately materialised at full resolution rather than at the quad's
-    # on-screen size. Pre-filtering the source to roughly what the warp can
-    # resolve is cheaper and, judged on its own, cleaner -- Image.transform
+    # `source_max_dim=None` materialises at full resolution rather than at the
+    # quad's on-screen size. Pre-filtering the source to roughly what the warp
+    # can resolve is cheaper and, judged on its own, cleaner -- Image.transform
     # point-samples with a bicubic kernel and does not area-average, so a large
     # source aliases. But it changes the captured pixels (measured: ~13% of them
     # by more than 8/255 at a 2x pre-filter), and these captures are the
@@ -1173,21 +1180,37 @@ def _paste_projected_texture(base: Image.Image, texture, projected_quad) -> bool
     # to what the glued-image pipeline produced. The memory win is unaffected:
     # this is one transient rasterisation per capture instead of a permanently
     # held glued image per cell.
-    texture = _materialize_texture(texture, None)
+    #
+    # Callers stamping one cell of a lazy tiled texture pass a cap instead: a
+    # cell at 64x64 repeats glues to 30720x6720, and twenty of those per frame
+    # is not a transient cost. TiledFabricTexture filters the tile down with
+    # LANCZOS on the way, which is the correct filter for the reduction.
+    texture = _materialize_texture(texture, source_max_dim)
     src = texture.convert("RGB")
     src_w, src_h = src.size
     if src_w <= 1 or src_h <= 1:
         return False
+    # Warp only into the region the quad can actually cover. Rendering the full
+    # frame per quad was fine for the single whole-grid paste; per cell it is
+    # the same picture computed grid_rows x grid_cols times over.
+    bx0 = max(0, int(math.floor(min(point[0] for point in dst))))
+    by0 = max(0, int(math.floor(min(point[1] for point in dst))))
+    bx1 = min(base.size[0], int(math.ceil(max(point[0] for point in dst))) + 1)
+    by1 = min(base.size[1], int(math.ceil(max(point[1] for point in dst))) + 1)
+    if bx1 <= bx0 or by1 <= by0:
+        return False
+    box_size = (bx1 - bx0, by1 - by0)
+    dst = [(x - bx0, y - by0) for x, y in dst]
     src_quad = [(0.0, 0.0), (float(src_w), 0.0), (float(src_w), float(src_h)), (0.0, float(src_h))]
     try:
         coeffs = _perspective_coeffs(dst, src_quad)
     except np.linalg.LinAlgError:
         return False
     resample = getattr(getattr(Image, "Resampling", Image), "BICUBIC", Image.BICUBIC)
-    warped = src.transform(base.size, Image.Transform.PERSPECTIVE, coeffs, resample=resample)
+    warped = src.transform(box_size, Image.Transform.PERSPECTIVE, coeffs, resample=resample)
     mask_src = Image.new("L", (src_w, src_h), 255)
-    mask = mask_src.transform(base.size, Image.Transform.PERSPECTIVE, coeffs, resample=resample)
-    base.paste(warped, (0, 0), mask)
+    mask = mask_src.transform(box_size, Image.Transform.PERSPECTIVE, coeffs, resample=resample)
+    base.paste(warped, (bx0, by0), mask)
     return True
 
 
@@ -1395,6 +1418,21 @@ def _apply_scanner_lighting(texture: Image.Image, view_name: str, focused: bool,
 
     out = np.clip(lit * 255.0, 0, 255).astype(np.uint8)
     return Image.fromarray(out, "RGB")
+
+
+def _natural_cell_textures(plan):
+    """Per-cell fabric textures for a whole-grid capture, or None if unavailable.
+
+    These are the same renders the grid preview composite is built from, before
+    that composite caps the entire layout at 1400 px. Each is a lazy tiled
+    texture, so a camera quad can ask for exactly the resolution it can show.
+    """
+    tiles = getattr(plan, "scan_tiled_pattern_images", None)
+    if not tiles:
+        return None
+    if len(tiles) != int(plan.grid_rows) * int(plan.grid_cols):
+        return None
+    return tiles
 
 
 def _lit_rendered_texture_for_camera(plan: FabricPlan, row: int, col: int, focused: bool, view_name: str, camera_zoom: float = 1.0) -> Image.Image | None:
@@ -1629,6 +1667,29 @@ def _detect_knitting_patch(full_image: Image.Image) -> tuple[tuple[int, int, int
     implausibly tiny detections relative to the frame. A low score flags an
     unreliable detection for review rather than silently trusting a bad crop.
     """
+    # Detection does not need one mask element per output pixel. At 4096x3072,
+    # the old float image plus diff/brightness/saturation/mask intermediates
+    # could briefly consume hundreds of MB and make the application appear
+    # hung. Detect on a bounded proxy, then map the box back to source pixels.
+    source_w, source_h = full_image.size
+    detection_max_dimension = 1536
+    if max(source_w, source_h) > detection_max_dimension:
+        scale = float(detection_max_dimension) / float(max(source_w, source_h))
+        proxy_size = (
+            max(8, int(round(source_w * scale))),
+            max(8, int(round(source_h * scale))),
+        )
+        proxy = full_image.resize(proxy_size, Image.Resampling.BOX)
+        (px0, py0, px1, py1), confidence = _detect_knitting_patch(proxy)
+        scale_x = float(source_w) / float(proxy_size[0])
+        scale_y = float(source_h) / float(proxy_size[1])
+        return (
+            max(0, int(np.floor(px0 * scale_x))),
+            max(0, int(np.floor(py0 * scale_y))),
+            min(source_w, int(np.ceil(px1 * scale_x))),
+            min(source_h, int(np.ceil(py1 * scale_y))),
+        ), confidence
+
     rgb = np.asarray(full_image.convert("RGB"), dtype=np.float32)
     h, w = rgb.shape[:2]
     if h < 8 or w < 8:
@@ -1761,34 +1822,35 @@ def render_camera_image(
     up = up / max(float(np.linalg.norm(up)), 1e-8)
 
     camera_zoom = max(0.20, float(camera_zoom))
-    if focused_capture:
-        x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
-        y_axis = np.array([0.0, 1.0, 0.0], dtype=float)
-        half_view_w = 0.5 * (
-            abs(float(np.dot(x_axis, right))) * cell_w
-            + abs(float(np.dot(y_axis, right))) * cell_l
-        )
-        half_view_h = 0.5 * (
-            abs(float(np.dot(x_axis, up))) * cell_w
-            + abs(float(np.dot(y_axis, up))) * cell_l
-        )
-        aspect = float(width_px) / max(float(height_px), 1.0)
-        # Fill the frame with fabric ("cover" fit: the shorter projected axis
-        # sets the zoom) rather than fitting the whole cell with margin on
-        # whichever axis doesn't match the image's aspect ratio ("contain"
-        # fit). A cell's true aspect rarely matches the capture's fixed 4:3
-        # frame, so "contain" always left a visible background gap on one
-        # axis; a small amount of edge cropping on the other axis is a much
-        # better trade for RGB-analysis accuracy than background pixels are.
-        framing_pad = 1.02
-        fov_y = 2.0 * math.atan(
-            framing_pad
-            * min(half_view_h, half_view_w / max(aspect, 1e-6))
-            / max(camera_standoff, 1e-6)
-        )
-        fov_y = float(np.clip(fov_y, math.radians(4.0), math.radians(58.0)))
-    else:
-        fov_y = math.radians(74.0)
+    # Both capture modes frame the cell the robot is at. The half-extents of
+    # that cell along the camera's own axes; the camera is oblique in natural
+    # mode, so the cell's width and length both project onto each axis.
+    x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+    y_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+    half_view_w = 0.5 * (
+        abs(float(np.dot(x_axis, right))) * cell_w
+        + abs(float(np.dot(y_axis, right))) * cell_l
+    )
+    half_view_h = 0.5 * (
+        abs(float(np.dot(x_axis, up))) * cell_w
+        + abs(float(np.dot(y_axis, up))) * cell_l
+    )
+    aspect = float(width_px) / max(float(height_px), 1.0)
+    # Both modes fill the frame with the cell the robot is at ("cover" fit: the
+    # shorter projected axis sets the zoom) rather than fitting the whole cell
+    # with margin on whichever axis doesn't match the image's aspect ratio
+    # ("contain" fit). A cell's true aspect rarely matches the capture's fixed
+    # 4:3 frame, so "contain" always left a visible gap on one axis -- for a
+    # cell at the edge of the grid that gap is empty background, which is what
+    # made a centred capture look off-centre. A little edge cropping on the
+    # other axis is a much better trade for RGB-analysis accuracy.
+    framing_pad = 1.02
+    half_view = min(half_view_h, half_view_w / max(aspect, 1e-6))
+    # Natural keeps the wider ceiling: it shoots from the robot's own pose, so
+    # its standoff is whatever the tool path gives it rather than a chosen one.
+    fov_limits = (4.0, 58.0) if focused_capture else (4.0, 74.0)
+    fov_y = 2.0 * math.atan(framing_pad * half_view / max(camera_standoff, 1e-6))
+    fov_y = float(np.clip(fov_y, math.radians(fov_limits[0]), math.radians(fov_limits[1])))
     fov_y = float(np.clip(fov_y / camera_zoom, math.radians(12.0), math.radians(86.0)))
     focal = (height_px * 0.5) / math.tan(fov_y * 0.5)
     near = 0.004
@@ -1815,37 +1877,78 @@ def render_camera_image(
 
     draw = ImageDraw.Draw(img)
     fabric_z = plan.fabric_origin[2] - FABRIC_THICKNESS * 0.48
-    rendered_texture = _lit_rendered_texture_for_camera(
-        plan,
-        active_row,
-        active_col,
-        focused_capture,
-        view_name,
-        camera_zoom=camera_zoom,
-    )
+
+    def cell_quad(row, col):
+        x0 = grid_origin_x + col * cell_w
+        y0 = grid_origin_y + row * cell_l
+        x1, y1 = x0 + cell_w, y0 + cell_l
+        return [
+            project_camera(np.array([x0, y0, fabric_z + 0.0003])),
+            project_camera(np.array([x1, y0, fabric_z + 0.0003])),
+            project_camera(np.array([x1, y1, fabric_z + 0.0003])),
+            project_camera(np.array([x0, y1, fabric_z + 0.0003])),
+        ]
+
+    cell_textures = None if focused_capture else _natural_cell_textures(plan)
+    painted_texture = False
+    if cell_textures is not None:
+        # One texture per cell, each stamped for its own camera quad. The
+        # whole-grid alternative below is the grid preview composite, which is
+        # capped at 1400 px for the entire layout: at 64x64 repeats across a
+        # five-cell row that leaves ~4 px per repeat, so the stitches are gone
+        # from the source before the camera ever looks at it, and the capture
+        # is a flat smear of the fabric's average colour.
+        lighting = None
+        if not bool(getattr(plan, "rendered_fabric_image_lit", False)):
+            lighting = _normalize_scanner_lighting(getattr(plan, "scanner_lighting", None))
+        for row in range(plan.grid_rows):
+            for col in range(plan.grid_cols):
+                quad = cell_quad(row, col)
+                if any(point is None for point in quad):
+                    continue
+                # Detail beyond what the quad can show costs rasterisation time
+                # and then aliases, since the warp point-samples.
+                quad_dim = int(np.clip(_projected_quad_extent(quad), 64, 2 * max(width_px, height_px)))
+                texture = cell_textures[row * plan.grid_cols + col]
+                if lighting is not None:
+                    texture = _apply_scanner_lighting(
+                        _materialize_texture(texture, quad_dim), view_name, False, lighting,
+                    )
+                if _paste_projected_texture(img, texture, quad, source_max_dim=quad_dim):
+                    painted_texture = True
+        draw = ImageDraw.Draw(img)
+
+    rendered_texture = None
+    if not painted_texture:
+        rendered_texture = _lit_rendered_texture_for_camera(
+            plan,
+            active_row,
+            active_col,
+            focused_capture,
+            view_name,
+            camera_zoom=camera_zoom,
+        )
     if rendered_texture is not None:
         if focused_capture:
-            tex_x0 = grid_origin_x + active_col * cell_w
-            tex_y0 = grid_origin_y + active_row * cell_l
-            tex_x1 = tex_x0 + cell_w
-            tex_y1 = tex_y0 + cell_l
+            tex_quad = cell_quad(active_row, active_col)
         else:
             tex_x0 = grid_origin_x
             tex_y0 = grid_origin_y
             tex_x1 = grid_origin_x + plan.grid_cols * cell_w
             tex_y1 = grid_origin_y + plan.grid_rows * cell_l
-        tex_quad = [
-            project_camera(np.array([tex_x0, tex_y0, fabric_z + 0.0003])),
-            project_camera(np.array([tex_x1, tex_y0, fabric_z + 0.0003])),
-            project_camera(np.array([tex_x1, tex_y1, fabric_z + 0.0003])),
-            project_camera(np.array([tex_x0, tex_y1, fabric_z + 0.0003])),
-        ]
-        _paste_projected_texture(img, rendered_texture, tex_quad)
+            tex_quad = [
+                project_camera(np.array([tex_x0, tex_y0, fabric_z + 0.0003])),
+                project_camera(np.array([tex_x1, tex_y0, fabric_z + 0.0003])),
+                project_camera(np.array([tex_x1, tex_y1, fabric_z + 0.0003])),
+                project_camera(np.array([tex_x0, tex_y1, fabric_z + 0.0003])),
+            ]
+        if _paste_projected_texture(img, rendered_texture, tex_quad):
+            painted_texture = True
         draw = ImageDraw.Draw(img)
 
     render_rows = [active_row] if focused_capture else range(plan.grid_rows)
     render_cols = [active_col] if focused_capture else range(plan.grid_cols)
-    if rendered_texture is None:
+    if not painted_texture:
         for row in render_rows:
             for col in render_cols:
                 x0 = grid_origin_x + col * cell_w
@@ -1891,10 +1994,21 @@ def render_camera_image(
                                 draw.line(pts2d, fill=shade, width=max(1, yarn_px // max(repeat_rows, repeat_cols)) + 2, joint="curve")
                                 draw.line(pts2d, fill=color, width=max(1, yarn_px // max(repeat_rows, repeat_cols)), joint="curve")
 
+    # Lens vignette. The margins and the falloff are in pixels, so they were
+    # tuned against CAMERA_IMAGE_SIZE and have to be scaled with the capture:
+    # left fixed, a 2000 px capture gets half the relative feathering of a
+    # 1024 px one, which reads as a hard black oval stamped over the frame
+    # rather than as a lens.
+    vignette_scale = max(
+        float(width_px) / float(CAMERA_IMAGE_SIZE[0]),
+        float(height_px) / float(CAMERA_IMAGE_SIZE[1]),
+    )
     overlay = Image.new("L", (width_px, height_px), 0)
     mask_draw = ImageDraw.Draw(overlay)
-    mask_draw.ellipse([-70, -45, width_px + 70, height_px + 45], fill=255)
-    mask = overlay.filter(ImageFilter.GaussianBlur(12))
+    pad_x = 70.0 * vignette_scale
+    pad_y = 45.0 * vignette_scale
+    mask_draw.ellipse([-pad_x, -pad_y, width_px + pad_x, height_px + pad_y], fill=255)
+    mask = overlay.filter(ImageFilter.GaussianBlur(12.0 * vignette_scale))
     dark = Image.new("RGB", (width_px, height_px), (0, 0, 0))
     img = Image.composite(img, dark, mask)
     draw = ImageDraw.Draw(img)

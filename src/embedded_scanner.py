@@ -12,6 +12,7 @@ that it never imports imgui.
 """
 
 import json
+import os
 import queue
 import threading
 import time
@@ -71,6 +72,8 @@ class EmbeddedMujocoScanner:
     # past here" line rather than a hard cap on the pass.
     FRAME_BUDGET = 0.015
     MAX_EXECUTED_TRAIL_POINTS = 300
+    CAMERA_PREVIEW_MAX_WIDTH = 1280
+    ANALYSIS_MAX_DIMENSION = 1600
 
     def __init__(self, state, gl_ctx, window=None, width=512, height=384, preview_image=None, per_cell_images=None, auto_start=True):
         import fabric_scanner as scanner
@@ -358,7 +361,11 @@ class EmbeddedMujocoScanner:
         return clamp_capture_size(width, height)
 
     def _active_camera_image_size(self):
-        return self._single_capture_image_size() if self.single_capture_mode else self._capture_image_size()
+        width, height = self._single_capture_image_size() if self.single_capture_mode else self._capture_image_size()
+        if width <= self.CAMERA_PREVIEW_MAX_WIDTH:
+            return width, height
+        scale = float(self.CAMERA_PREVIEW_MAX_WIDTH) / float(width)
+        return self.CAMERA_PREVIEW_MAX_WIDTH, max(240, int(round(height * scale)))
 
     def set_single_capture_resolution(self, width):
         self.args.single_capture_image_size = clamp_capture_size(width)
@@ -473,13 +480,25 @@ class EmbeddedMujocoScanner:
         )
 
     def _show_robot_camera_image(self, image, *, hold_seconds=0.0):
-        self._upload_camera_preview(image)
-        self.latest_camera_image = image.copy()
+        preview = self._camera_preview_image(image)
+        self._upload_camera_preview(preview)
+        self.latest_camera_image = preview.copy()
         now = time.monotonic()
         self._last_camera_preview_time = now
         self._camera_preview_dirty = False
         if hold_seconds > 0.0:
             self._saved_preview_hold_until = max(self._saved_preview_hold_until, now + float(hold_seconds))
+
+    def _camera_preview_image(self, image):
+        """Returns a display-sized image without changing capture resolution."""
+        preview = image
+        if image.width > self.CAMERA_PREVIEW_MAX_WIDTH:
+            scale = float(self.CAMERA_PREVIEW_MAX_WIDTH) / float(image.width)
+            preview = image.resize(
+                (self.CAMERA_PREVIEW_MAX_WIDTH, max(1, int(round(image.height * scale)))),
+                Image.Resampling.LANCZOS,
+            )
+        return preview
 
     # -- Staged capture ------------------------------------------------------
     #
@@ -492,11 +511,78 @@ class EmbeddedMujocoScanner:
 
     def _begin_capture(self, tcp_pos, target_index, station_id):
         self._capture_job = {
+            "kind": "scan",
             "stage": 0,
             "tcp": np.asarray(tcp_pos, dtype=float).copy(),
             "target_index": int(target_index),
             "station_id": int(station_id),
         }
+
+    def _publish_single_capture(self, job, status, progress, message, path=None):
+        """Publishes a small, thread-free job summary for the Scan Mode UI."""
+        summary = {
+            "id": int(job["id"]),
+            "status": str(status),
+            "progress": float(np.clip(progress, 0.0, 1.0)),
+            "message": str(message),
+            "requested_size": [int(v) for v in job["image_size"]],
+            "path": str(path or job.get("path") or ""),
+        }
+        self.app_state.single_capture_job = summary
+        self.status = str(message)
+
+    def start_single_capture(self, row, col, angle_index, camera_zoom):
+        """Starts one capture without doing expensive work in the UI callback."""
+        if self._capture_in_progress():
+            self.status = "A capture is already in progress"
+            return False
+
+        target_index, station_id = self._single_target_index(row, col, angle_index)
+        self.target_index = target_index
+        self.args.camera_zoom = float(camera_zoom)
+        self.running = False
+        self.paused = True
+        self.single_capture_mode = True
+        self.single_target_active = True
+        self.single_target_station = station_id
+        self._camera_preview_dirty = True
+
+        sequence = int(self.app_state.get("single_capture_job_seq", 0)) + 1
+        self.app_state.single_capture_job_seq = sequence
+        self._capture_job = {
+            "kind": "single",
+            "id": sequence,
+            "stage": "positioning",
+            "target_index": int(target_index),
+            "station_id": int(station_id),
+            "image_size": tuple(int(v) for v in self._single_capture_image_size()),
+            "cancelled": False,
+        }
+        active_row, active_col = self.plan.station_cells[station_id]
+        self._publish_single_capture(
+            self._capture_job,
+            "positioning",
+            0.05,
+            f"Positioning for row {active_row + 1}, col {active_col + 1}",
+        )
+        return True
+
+    def cancel_single_capture(self):
+        job = getattr(self, "_capture_job", None)
+        if job is None or job.get("kind") != "single":
+            return False
+        if job.get("stage") == 4:
+            self._publish_single_capture(job, "saving", 0.90, "Finishing atomic image save")
+            return False
+        job["cancelled"] = True
+        self._publish_single_capture(job, "cancelling", 0.0, "Cancelling single capture")
+        return True
+
+    def _finish_cancelled_single_capture(self, job):
+        job.pop("result", None)
+        self.single_target_active = False
+        self._publish_single_capture(job, "cancelled", 0.0, "Single capture cancelled")
+        self._capture_job = None
 
     def _capture_in_progress(self):
         return getattr(self, "_capture_job", None) is not None
@@ -505,6 +591,11 @@ class EmbeddedMujocoScanner:
         """Runs capture stages until `deadline` passes. True when the capture is done."""
         job = getattr(self, "_capture_job", None)
         while job is not None:
+            if job.get("kind") == "single" and job.get("cancelled"):
+                if job.get("stage") == 2 and not job["done"].is_set():
+                    return False
+                self._finish_cancelled_single_capture(job)
+                return True
             stage = job["stage"]
             if stage == 0:
                 # GL work, frame thread only: make sure this cell's tiles exist.
@@ -512,21 +603,45 @@ class EmbeddedMujocoScanner:
                 # other angles of that cell are already in the per-cell cache.
                 self._capture_stage_tiles(job)
                 job["stage"] = 1
+                if job.get("kind") == "single":
+                    width, height = job["image_size"]
+                    self._publish_single_capture(
+                        job, "rendering", 0.30,
+                        f"Preparing {width} x {height} capture",
+                    )
             elif stage == 1:
                 # Hand the pure-CPU composition to the worker and yield at once,
                 # so the frame thread is free while it runs.
                 if self._capture_dispatch_image(job):
                     job["stage"] = 2
+                    if job.get("kind") == "single":
+                        width, height = job["image_size"]
+                        self._publish_single_capture(
+                            job, "rendering", 0.45,
+                            f"Rendering and analyzing {width} x {height} image",
+                        )
                     return False
                 # Could not hand off safely; do it here instead.
+                if job.get("kind") == "single":
+                    job["error"] = RuntimeError("Could not prepare the selected pattern tile")
+                    job["stage"] = 3
+                    continue
                 self._capture_compose(job)
                 job["stage"] = 3
             elif stage == 2:
                 if not job["done"].is_set():
                     return False        # still composing; give the frame back
                 job["stage"] = 3
-            else:
+            elif stage == 3:
                 self._capture_stage_finish(job)
+                if job.get("kind") == "single" and job.get("stage") == 4:
+                    return False
+                self._capture_job = None
+                return True
+            elif stage == 4:
+                if not job["save_group"]["done"].is_set():
+                    return False
+                self._finish_single_capture_save(job)
                 self._capture_job = None
                 return True
             if time.monotonic() >= deadline:
@@ -585,29 +700,39 @@ class EmbeddedMujocoScanner:
             job["target_index"],
             station_id=job["station_id"],
             target_pose=target_pose,
-            image_size=self._capture_image_size(),
+            image_size=(job["image_size"] if "image_size" in job else self._capture_image_size()),
             detect_patch=True,
         )
+        if job.get("kind") == "single" and not job.get("cancelled"):
+            image, patch_image, _debug_image, _detection = self._unpack_capture_result(job["result"])
+            if image is not None:
+                # LANCZOS downsampling a 4K frame is also CPU work. Prepare the
+                # viewport copy here so the frame thread only uploads it.
+                job["preview_image"] = self._camera_preview_image(image)
+            analysis_image = patch_image if patch_image is not None else image
+            if analysis_image is not None:
+                max_dim = max(analysis_image.size)
+                if max_dim > self.ANALYSIS_MAX_DIMENSION:
+                    scale = float(self.ANALYSIS_MAX_DIMENSION) / float(max_dim)
+                    analysis_image = analysis_image.resize(
+                        tuple(max(1, int(round(v * scale))) for v in analysis_image.size),
+                        Image.Resampling.BOX,
+                    )
+                job["analysis_stats"] = self._fabric_rgb_stats(analysis_image)
 
     def _capture_stage_finish(self, job):
         if job.get("error") is not None:
+            if job.get("kind") == "single":
+                self.single_target_active = False
+                self._publish_single_capture(job, "failed", 1.0, f"Capture error: {job['error']}")
+                return
             self.status = f"Capture error: {job['error']}"
+        if job.get("kind") == "single":
+            self._start_single_capture_save(job)
+            return
         self._write_capture_result(
             job.get("result"), job["target_index"], job["station_id"],
         )
-
-    def _save_gripper_camera_image(self, tcp_pos, target_index, station_id):
-        """Renders and saves one capture synchronously (single-target path)."""
-        target_pose = self.plan.poses[min(target_index, len(self.plan.poses) - 1)]
-        result = self._render_robot_camera_image(
-            tcp_pos,
-            target_index,
-            station_id=station_id,
-            target_pose=target_pose,
-            image_size=self._capture_image_size(),
-            detect_patch=True,
-        )
-        return self._write_capture_result(result, target_index, station_id)
 
     def _write_capture_result(self, result, target_index, station_id):
         output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
@@ -616,7 +741,7 @@ class EmbeddedMujocoScanner:
         image, patch_image, debug_image, detection = self._unpack_capture_result(result)
         if image is None:
             return None
-        self._show_robot_camera_image(image, hold_seconds=0.45)
+        self._show_robot_camera_image(job.get("preview_image", image), hold_seconds=0.45)
         active_row, active_col = self.plan.station_cells[station_id]
         clean_view = self.plan.view_names[target_index].replace(" ", "_")
         clean_mode = "focused_batch" if capture_mode == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
@@ -641,6 +766,68 @@ class EmbeddedMujocoScanner:
             self._queue_image_save(debug_image, debug_path)
         return path
 
+    def _start_single_capture_save(self, job):
+        image, patch_image, debug_image, detection = self._unpack_capture_result(job.get("result"))
+        if image is None:
+            self.single_target_active = False
+            self._publish_single_capture(job, "failed", 1.0, "Single capture produced no image")
+            return
+
+        self._show_robot_camera_image(image, hold_seconds=0.45)
+        output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
+        active_row, active_col = self.plan.station_cells[job["station_id"]]
+        clean_view = self.plan.view_names[job["target_index"]].replace(" ", "_")
+        capture_mode = str(getattr(self.args, "capture_mode", "natural"))
+        clean_mode = "focused_batch" if capture_mode == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        stem = (
+            f"single_capture_{stamp}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_"
+            f"station_{job['station_id'] + 1:03d}_{clean_view}"
+        )
+        path = output_dir / f"{stem}.png"
+        patch_path = output_dir / f"{stem}_patch.png" if patch_image is not None else None
+        debug_path = output_dir / f"{stem}_debug.png" if debug_image is not None else None
+
+        self._record_capture_analysis(
+            image,
+            path,
+            job["target_index"],
+            job["station_id"],
+            detection=detection,
+            patch_image=patch_image,
+            patch_path=patch_path,
+            debug_path=debug_path,
+            stats=job.get("analysis_stats"),
+        )
+        images = [(image, path)]
+        if patch_image is not None:
+            images.append((patch_image, patch_path))
+        if debug_image is not None:
+            images.append((debug_image, debug_path))
+        save_group = {"remaining": len(images), "errors": [], "done": threading.Event()}
+        job["path"] = path
+        job["save_group"] = save_group
+        job["stage"] = 4
+        job.pop("result", None)
+        for capture_image, capture_path in images:
+            self._queue_image_save(capture_image, capture_path, save_group=save_group)
+        self._publish_single_capture(job, "saving", 0.85, f"Saving {path.name}")
+
+    def _finish_single_capture_save(self, job):
+        self.single_target_active = False
+        errors = job["save_group"]["errors"]
+        if errors:
+            self._publish_single_capture(job, "failed", 1.0, f"Could not save capture: {errors[0]}")
+            return
+        self.saved_count += 1
+        self._publish_single_capture(
+            job,
+            "completed",
+            1.0,
+            f"Saved single capture: {Path(job['path']).name}",
+            path=job["path"],
+        )
+
     @staticmethod
     def _unpack_capture_result(result):
         """render_camera_image returns a plain Image normally, or a dict with
@@ -657,19 +844,36 @@ class EmbeddedMujocoScanner:
     def _save_worker(self):
         while not self._save_stop.is_set() or not self._save_queue.empty():
             try:
-                image, path = self._save_queue.get(timeout=0.1)
+                image, path, save_group = self._save_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            temp_path = Path(path).with_name(
+                f".{Path(path).name}.{threading.get_ident()}.tmp"
+            )
             try:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
-                image.save(path)
+                image.save(temp_path, format="PNG")
+                os.replace(temp_path, path)
             except Exception as exc:
-                self.status = f"Could not save scan image: {exc}"
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if save_group is None:
+                    self.status = f"Could not save scan image: {exc}"
+                else:
+                    save_group["errors"].append(str(exc))
             finally:
+                if save_group is not None:
+                    save_group["remaining"] -= 1
+                    if save_group["remaining"] <= 0:
+                        save_group["done"].set()
                 self._save_queue.task_done()
 
-    def _queue_image_save(self, image, path):
-        self._save_queue.put((image.copy(), Path(path)))
+    def _queue_image_save(self, image, path, *, save_group=None):
+        # Queue ownership is transferred to the saver. Avoiding image.copy()
+        # prevents another full 4096x3072 allocation for every output file.
+        self._save_queue.put((image, Path(path), save_group))
 
     # -- Analysis section: fabric-only color measurements ----------------------
 
@@ -679,7 +883,7 @@ class EmbeddedMujocoScanner:
         definition of "average fabric colour" -- see rgb_analysis.fabric_rgb_stats."""
         return fabric_rgb_stats(image, debug_path=debug_path)
 
-    def _record_capture_analysis(self, image, path, target_index, station_id, detection=None, patch_image=None, patch_path=None, debug_path=None):
+    def _record_capture_analysis(self, image, path, target_index, station_id, detection=None, patch_image=None, patch_path=None, debug_path=None, stats=None):
         row, col = self.plan.station_cells[station_id]
         view_name = str(self.plan.view_names[target_index])
         # Prefer averaging the already-detected, already-tightly-cropped patch
@@ -687,7 +891,8 @@ class EmbeddedMujocoScanner:
         # re-guessing the fabric region from scratch on the wide frame -- the
         # patch still gets its own brightness/saturation mask applied so any
         # residual background at the crop's small padding border is excluded.
-        stats = self._fabric_rgb_stats(patch_image if patch_image is not None else image)
+        if stats is None:
+            stats = self._fabric_rgb_stats(patch_image if patch_image is not None else image)
         avg = np.asarray(stats["rgb"], dtype=np.float32)
         record = {
             "row": int(row),
@@ -824,7 +1029,16 @@ class EmbeddedMujocoScanner:
     def _single_target_index(self, row, col, angle_index):
         row = int(np.clip(row, 0, self.plan.grid_rows - 1))
         col = int(np.clip(col, 0, self.plan.grid_cols - 1))
-        station_id = row * self.plan.grid_cols + col
+        # Stations are ordered along the robot's serpentine path, so every odd
+        # row runs right to left and row-major arithmetic lands on the mirrored
+        # cell: asking for row 2, col 1 of a five-wide grid captured row 2,
+        # col 5 -- and labelled the image with the cell it actually went to, so
+        # the capture looked correct while being of the wrong square.
+        station_id = next(
+            (idx for idx, cell in enumerate(self.plan.station_cells)
+             if (int(cell[0]), int(cell[1])) == (row, col)),
+            row * self.plan.grid_cols + col,
+        )
         indices = self._scan_indices_for_station(station_id)
         if not indices:
             indices = [idx for idx, sid in enumerate(self.plan.station_ids) if int(sid) == int(station_id)]
@@ -834,6 +1048,9 @@ class EmbeddedMujocoScanner:
         return indices[angle_index], station_id
 
     def preview_single_target(self, row, col, angle_index, camera_zoom):
+        if self._capture_in_progress():
+            self.status = "Wait for the current capture to finish before changing its target"
+            return
         target_index, station_id = self._single_target_index(row, col, angle_index)
         self.target_index = target_index
         self.args.camera_zoom = float(camera_zoom)
@@ -842,55 +1059,10 @@ class EmbeddedMujocoScanner:
         self.single_capture_mode = True
         self.single_target_active = True
         self.single_target_station = station_id
-        self._render_frame()
+        self._camera_preview_dirty = True
+        self._mark_viewport_dirty()
         active_row, active_col = self.plan.station_cells[station_id]
         self.status = f"Moving to single target: row {active_row + 1}, col {active_col + 1}, {self.plan.view_names[target_index]}"
-
-    def capture_single_target(self, row, col, angle_index, camera_zoom):
-        self.preview_single_target(row, col, angle_index, camera_zoom)
-        target_index, station_id = self._single_target_index(row, col, angle_index)
-        pose = self.plan.poses[target_index]
-        for _ in range(max(32, int(self.scanner.IK_SUBSTEPS) * 8)):
-            self.scanner.step_ik(self.mujoco, self.model, self.data, self.site_id, pose)
-        self.single_target_active = False
-        tcp = self.scanner.get_tcp(self.mujoco, self.model, self.data, self.site_id)
-        target_pose = self.plan.poses[target_index]
-        self.args.camera_zoom = float(camera_zoom)
-        result = self._render_robot_camera_image(
-            tcp,
-            target_index,
-            station_id=station_id,
-            target_pose=target_pose,
-            image_size=self._single_capture_image_size(),
-            detect_patch=True,
-        )
-        image, patch_image, debug_image, detection = self._unpack_capture_result(result)
-        self._show_robot_camera_image(image, hold_seconds=0.0)
-        output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
-        output_dir.mkdir(parents=True, exist_ok=True)
-        active_row, active_col = self.plan.station_cells[station_id]
-        clean_view = self.plan.view_names[target_index].replace(" ", "_")
-        clean_mode = "focused_batch" if str(getattr(self.args, "capture_mode", "natural")) == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        stem = (
-            f"single_capture_{stamp}_{clean_mode}_row_{active_row + 1:02d}_col_{active_col + 1:02d}_"
-            f"station_{station_id + 1:03d}_{clean_view}"
-        )
-        path = output_dir / f"{stem}.png"
-        patch_path = output_dir / f"{stem}_patch.png" if patch_image is not None else None
-        debug_path = output_dir / f"{stem}_debug.png" if debug_image is not None else None
-        image.save(path)
-        if patch_image is not None:
-            patch_image.save(patch_path)
-        if debug_image is not None:
-            debug_image.save(debug_path)
-        self._record_capture_analysis(
-            image, path, target_index, station_id,
-            detection=detection, patch_image=patch_image, patch_path=patch_path, debug_path=debug_path,
-        )
-        self.saved_count += 1
-        self.status = f"Captured single target: {path.name}"
-        return path
 
     # -- Rendering section: simulator and live camera textures -----------------
 
@@ -912,6 +1084,14 @@ class EmbeddedMujocoScanner:
     def close(self):
         self.running = False
         self.paused = False
+        capture_job = getattr(self, "_capture_job", None)
+        if capture_job is not None and capture_job.get("kind") == "single":
+            capture_job["cancelled"] = True
+            self.single_target_active = False
+            self._publish_single_capture(
+                capture_job, "cancelled", 0.0, "Single capture cancelled because Scan Mode closed",
+            )
+            self._capture_job = None
         self._flush_capture_index()
         try:
             if hasattr(self, '_compose_stop'):
@@ -1005,7 +1185,7 @@ class EmbeddedMujocoScanner:
     def _render_camera_preview(self, tcp_pose, target_index, target_pose):
         # Nothing on screen is showing this, so do not spend a full camera
         # render producing it. Saved captures go through
-        # _save_gripper_camera_image and are unaffected.
+        # the staged capture job and are unaffected.
         if not getattr(self, "preview_visible", True):
             return
         if time.monotonic() < self._saved_preview_hold_until and self.latest_camera_image is not None:
@@ -1018,7 +1198,7 @@ class EmbeddedMujocoScanner:
             self._camera_render_lighting_key(),
         )
         now = time.monotonic()
-        force = self._camera_preview_dirty or preview_key != self._last_camera_preview_key or self.single_capture_mode
+        force = self._camera_preview_dirty or preview_key != self._last_camera_preview_key
         if not force and self.latest_camera_image is not None and now - self._last_camera_preview_time < self.CAMERA_PREVIEW_INTERVAL:
             return
         station = self.plan.station_ids[min(target_index, len(self.plan.station_ids) - 1)]
@@ -1042,6 +1222,34 @@ class EmbeddedMujocoScanner:
             return
 
         pose = self.plan.poses[self.target_index]
+        capture_job = getattr(self, "_capture_job", None)
+        if capture_job is not None and capture_job.get("kind") == "single":
+            deadline = time.monotonic() + self.FRAME_BUDGET
+            if capture_job.get("cancelled") and capture_job.get("stage") != 2:
+                self._finish_cancelled_single_capture(capture_job)
+                self._render_frame()
+                return
+            if capture_job.get("stage") == "positioning":
+                tcp = self._step_toward_pose(pose, single_target=True)
+                err_pos, err_rot = self.scanner.pose_errors(tcp, pose)
+                if err_pos < self.scanner.TARGET_TOL and err_rot < self.scanner.TARGET_ROT_TOL:
+                    self.single_target_active = False
+                    capture_job["tcp"] = np.asarray(tcp, dtype=float).copy()
+                    capture_job["stage"] = 0
+                    self._camera_preview_dirty = True
+                    self._publish_single_capture(capture_job, "preparing", 0.20, "Target reached; preparing capture")
+                else:
+                    progress = 0.05 + 0.12 * float(np.clip(1.0 - err_pos / 0.20, 0.0, 1.0))
+                    self._publish_single_capture(
+                        capture_job,
+                        "positioning",
+                        progress,
+                        f"Positioning camera | position error {err_pos:.3f} m",
+                    )
+            if capture_job.get("stage") != "positioning":
+                self._step_capture(deadline)
+            self._render_frame()
+            return
         if self.single_capture_mode and self.paused and self.single_target_active:
             tcp = self._step_toward_pose(pose, single_target=True)
             err_pos, err_rot = self.scanner.pose_errors(tcp, pose)

@@ -359,12 +359,16 @@ def _draw_yarn_simulation_panel(state):
 
 def _set_app_mode(state, mode):
     mode = mode if mode in ('edit', 'scan', 'puzzle', 'database', 'ur5') else 'edit'
-    if str(state.get('app_mode', 'edit')) == mode:
+    current_mode = str(state.get('app_mode', 'edit'))
+    if current_mode == mode:
         return
+    # Invalidates every temporary Scan snapshot made in the mode being left.
+    # A delayed cleanup must not restore that old model over the new workspace.
+    state.mode_epoch = int(state.get('mode_epoch', 0)) + 1
     # Leaving UR5 Robot Mode stops the run, releases the arm and closes the
     # camera. Left connected, a background scan thread would keep moving real
     # hardware while the user is in a mode that shows none of it.
-    if str(state.get('app_mode', 'edit')) == 'ur5':
+    if current_mode == 'ur5':
         controller = state.get('ur5_controller')
         if controller is not None:
             try:
@@ -379,7 +383,6 @@ def _set_app_mode(state, mode):
         # already in flight finishes and sees sim_active False on write-back.
         with state.sim_lock:
             state.sim_active = False
-    state.app_mode = mode
     scanner_idx = next((i for i, item in enumerate(state.workflow_stages) if item[0] == 'Scanner'), 0)
     embedded = state.get('embedded_scanner')
     if embedded is not None:
@@ -388,6 +391,16 @@ def _set_app_mode(state, mode):
         except Exception:
             pass
         state.embedded_scanner = None
+    # Puzzle owns its model, pattern and undo history. Swap workspaces only
+    # after the scanner has closed, so an in-flight temporary scan render has
+    # finished restoring the non-Puzzle model before it is snapshotted.
+    if current_mode == 'puzzle':
+        state.leave_puzzle_workspace()
+    state.app_mode = mode
+    if mode == 'puzzle':
+        # Select Puzzle before restoring its workspace so restore_snapshot
+        # cannot infer the previous Scan renderer from the old mode.
+        state.enter_puzzle_workspace()
     if mode == 'scan':
         state.workflow_step = scanner_idx
         state.scanner_preview_grid_enabled = True
@@ -397,7 +410,11 @@ def _set_app_mode(state, mode):
     elif mode == 'puzzle':
         state.workflow_step = scanner_idx
         state.scanner_preview_grid_enabled = False
-        _puzzle_apply_geometry_copies(state, preserve=False)
+        # enter_puzzle_workspace restored Puzzle's own placement. Its copy grid
+        # is symmetric about the base model, so rebuilding it must preserve that
+        # placement; recentering here made a prior Scan scene appear to transform
+        # into Puzzle rather than returning to Puzzle's saved scene.
+        _puzzle_apply_geometry_copies(state, preserve=True)
     elif mode == 'database':
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
@@ -415,7 +432,10 @@ def _set_app_mode(state, mode):
         state.workflow_step = 0
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
-    state.rebuild_spline_mesh(preserve_model_placement=False)
+    # Puzzle already rebuilt its copies above. A second non-preserving rebuild
+    # discarded the independent transform that was just restored.
+    if mode != 'puzzle':
+        state.rebuild_spline_mesh(preserve_model_placement=False)
 
 
 def _scan_duplicate_runs(state):
@@ -1133,9 +1153,9 @@ def draw_sidebar(state, renderer, window=None):
             "Batch texture resolution##scanner_batch_texture_width",
             batch_texture_width,
             160,
-            2048,
+            4096,
         )
-        new_tex_res = int(np.clip(int(round(float(new_tex_res) / 32.0) * 32), 160, 2048))
+        new_tex_res = int(np.clip(int(round(float(new_tex_res) / 32.0) * 32), 160, 4096))
         changed_sx, new_sx = imgui.slider_float(
             "X repeat spacing##scanner_repeat_spacing_x",
             spacing_x,
@@ -1163,7 +1183,20 @@ def draw_sidebar(state, renderer, window=None):
             "%.2f",
         )
         changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
-        random_changed = changed_rr or changed_rc or changed_tex_res or changed_sx or changed_sy or changed_density or changed_seed
+        # The pattern grid. Its row count is also the scanned fabric's row
+        # count -- the loop-height grid has one entry per stitch -- so these
+        # resize the fabric, not just the pattern drawn onto it.
+        pattern_rows_now, pattern_cols_now = state._scanner_pattern_size()
+        changed_prows, new_prows = imgui.slider_int(
+            "Pattern rows##scanner_pattern_rows", pattern_rows_now,
+            2, max(2, int(state.config['knit_parameters']['bitmap_rows'])),
+        )
+        changed_pcols, new_pcols = imgui.slider_int(
+            "Pattern columns##scanner_pattern_cols", pattern_cols_now,
+            2, int(state.SCANNER_PATTERN_MAX_COLS),
+        )
+        random_changed = (changed_rr or changed_rc or changed_tex_res or changed_sx or changed_sy
+                          or changed_density or changed_seed or changed_prows or changed_pcols)
         if changed_rr:
             state.scanner_pattern_repeat_rows = int(new_rr)
         if changed_rc:
@@ -1178,7 +1211,25 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_pattern_density = float(new_density)
         if changed_seed:
             state.scanner_random_seed = int(new_seed)
-        imgui.text_disabled("Patterns update when repeat, spacing, density, or seed changes.")
+        if changed_prows:
+            state.scanner_pattern_rows = int(new_prows)
+        if changed_pcols:
+            state.scanner_pattern_cols = int(new_pcols)
+        imgui.text_disabled("Patterns update when repeat, spacing, density, seed or pattern size changes.")
+        # Say which fabric a capture will actually be built on, rather than
+        # leaving it to be discovered: the template's tuned rows only fit its
+        # own size, so any other size falls back to building from its parameters.
+        template_bitmap = np.asarray(state._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
+        if template_bitmap.ndim == 2 and template_bitmap.size:
+            tpl_rows, tpl_cols = int(template_bitmap.shape[0]), int(template_bitmap.shape[1])
+            pattern_rows_now, pattern_cols_now = state._scanner_pattern_size()
+            if (pattern_rows_now, pattern_cols_now) != (tpl_rows, tpl_cols):
+                imgui.text_colored(
+                    (0.95, 0.75, 0.20, 1.0),
+                    f"Pattern is {pattern_rows_now}x{pattern_cols_now}; the saved fabric is "
+                    f"{tpl_rows}x{tpl_cols}.",
+                )
+                imgui.text_disabled("Scans will be built from the template's parameters, not its tuned shape.")
         if random_changed:
             embedded = state.get('embedded_scanner')
             if embedded is not None:
@@ -1485,26 +1536,20 @@ def draw_sidebar(state, renderer, window=None):
                         float(state.get('scanner_camera_zoom', 1.0)),
                     )
             current_capture_width, _current_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
-            current_capture_width = int(np.clip(current_capture_width, 320, 2048))
+            current_capture_width = int(np.clip(current_capture_width, 320, 4096))
             changed_capture_res, capture_width = imgui.slider_int(
                 "Capture resolution##single_capture_resolution",
                 current_capture_width,
                 320,
-                2048,
+                4096,
             )
-            capture_width = int(np.clip(int(round(float(capture_width) / 64.0) * 64), 320, 2048))
+            capture_width = int(np.clip(int(round(float(capture_width) / 64.0) * 64), 320, 4096))
             capture_width, capture_height = clamp_capture_size(capture_width)
             if changed_capture_res:
                 state.scanner_single_capture_width = capture_width
                 embedded = state.get('embedded_scanner')
                 if embedded is not None:
                     embedded.set_single_capture_resolution(capture_width)
-                    embedded.preview_single_target(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
             imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
             if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
                 embedded = ensure_embedded_single_capture()
@@ -1517,17 +1562,34 @@ def draw_sidebar(state, renderer, window=None):
                         float(state.get('scanner_camera_zoom', 1.0)),
                     )
                     state.scanner_status = embedded.status
-            if imgui.button("Capture Image##single_capture_save", (-1, 0)):
+            single_job = state.get('single_capture_job') or {}
+            single_job_busy = str(single_job.get('status', '')) in {
+                'positioning', 'preparing', 'rendering', 'saving', 'cancelling',
+            }
+            capture_label = "Capture in progress...##single_capture_save" if single_job_busy else "Capture Image##single_capture_save"
+            if imgui.button(capture_label, (-1, 0)) and not single_job_busy:
                 embedded = ensure_embedded_single_capture()
                 if embedded is not None:
                     embedded.set_single_capture_resolution(capture_width)
-                    path = embedded.capture_single_target(
+                    embedded.start_single_capture(
                         int(state.get('scanner_single_row', 1)) - 1,
                         int(state.get('scanner_single_col', 1)) - 1,
                         int(state.get('scanner_single_angle', 1)) - 1,
                         float(state.get('scanner_camera_zoom', 1.0)),
                     )
-                    state.scanner_status = f"Saved single capture: {Path(path).name}"
+                    state.scanner_status = embedded.status
+            if single_job:
+                progress = float(np.clip(single_job.get('progress', 0.0), 0.0, 1.0))
+                imgui.text_disabled(f"Capture progress: {progress * 100.0:.0f}%")
+                message = str(single_job.get('message', '')).strip()
+                if message:
+                    imgui.text_wrapped(message)
+                if single_job_busy and str(single_job.get('status')) != 'saving':
+                    if imgui.button("Cancel Capture##single_capture_cancel", (-1, 0)):
+                        embedded = state.get('embedded_scanner')
+                        if embedded is not None:
+                            embedded.cancel_single_capture()
+                            state.scanner_status = embedded.status
         if not single_workflow and str(state.scanner_execution_mode) == "robot":
             changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip), 64)
             changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
@@ -2097,7 +2159,16 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.set_next_window_pos((360, 20), cond=imgui.Cond_.first_use_ever)
     imgui.set_next_window_size((840, 820), cond=imgui.Cond_.first_use_ever)
     imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
-    imgui.text("3D Viewport")
+    if str(state.get('app_mode', 'edit')) == 'puzzle':
+        # Validate immediately before drawing.  This is the last ownership
+        # boundary, after sidebar callbacks and any completed Scan work.
+        state.ensure_puzzle_scene()
+        renderer = state.puzzle_renderer
+    imgui.text(
+        "3D Puzzle Viewport"
+        if str(state.get('app_mode', 'edit')) == 'puzzle'
+        else "3D Viewport"
+    )
 
     avail_x, avail_y = imgui.get_content_region_avail()
     disp_w = max(1, int(avail_x))

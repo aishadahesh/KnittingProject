@@ -503,6 +503,10 @@ class MeshRenderer:
         self.fbo = None
         self.meshes = []      # list of (vao, outline_vao, depth_vao, n_indices, color, row_idx)
         self.mesh_pick_data = []
+        # Keep the semantic mesh metadata beside the GPU buffers.  Mode
+        # isolation checks use this to reject a Scan grid before it can be
+        # displayed by Puzzle Mode; row_idx alone cannot distinguish the two.
+        self.mesh_meta = []
         self.pt_vao = None
         self.n_pts  = 0
         # Simulation debug overlays; stay empty unless set_debug_lines /
@@ -570,6 +574,7 @@ class MeshRenderer:
             depth_vao.release()
         self.meshes.clear()
         self.mesh_pick_data.clear()
+        self.mesh_meta = [dict(item) for item in meta] if meta is not None else []
         if prepared is None:
             prepared = self.prepare_meshes(verts_list, faces_list)
         for i, (v, tris, pos_bytes, norm_bytes, tri_bytes) in enumerate(prepared):

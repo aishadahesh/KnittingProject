@@ -64,9 +64,12 @@ class AppState:
             return {k: AppState._clone(x) for k, x in v.items()}
         return v
 
-    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None):
+    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None, puzzle_renderer=None):
         self.camera = camera
         self.renderer = renderer
+        # Dedicated GPU scene for Puzzle Mode. Keeping this renderer distinct is
+        # what makes Scan/Puzzle isolation structural instead of timing-based.
+        self.puzzle_renderer = puzzle_renderer
         # Optional second view. rebuild_spline_mesh uploads to state.renderer
         # only, so the orbit renderer has to be fed explicitly there -- without
         # that it draws an empty scene, which is the same failure mode as a
@@ -178,6 +181,9 @@ class AppState:
             'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
             'display_copies': np.array([0, 0], dtype=np.int32),
             'app_mode': 'edit',
+            # Incremented for every mode transition. Temporary Scan work records
+            # this value and is forbidden from restoring across a transition.
+            'mode_epoch': 0,
             'scanner_layout_pattern': 'grid',
             'scanner_random_seed': 1,
             'scanner_pattern_density': 0.62,
@@ -199,6 +205,11 @@ class AppState:
             'scanner_single_col': 1,
             'scanner_single_angle': 1,
             'scanner_camera_zoom': 1.0,
+            # Transient UI-facing summary of the asynchronous high-resolution
+            # single-capture pipeline. The scanner owns the actual worker job;
+            # AppState only exposes progress without leaking thread objects.
+            'single_capture_job': None,
+            'single_capture_job_seq': 0,
             # ── UR5 Robot Mode ───────────────────────────────────────────────
             # The real arm. Separate from the scanner_robot_* keys, which drive
             # Scan Mode's fire-and-forget URScript send: this mode holds a live
@@ -223,6 +234,15 @@ class AppState:
             'puzzle_capture_height': 680,
             'puzzle_detect_color_count': 6,
             'puzzle_capture_rect': [0.08, 0.08, 0.84, 0.84],
+            # Puzzle Mode owns a complete model workspace. These snapshots are
+            # deliberately transient (and excluded from undo snapshots below):
+            # nesting a snapshot inside itself would recurse forever, and the
+            # normal params autosave continues to describe the Edit workspace.
+            'puzzle_model_snapshot': None,
+            'puzzle_initial_snapshot': None,
+            'puzzle_undo_stack': [],
+            'workspace_model_snapshot': None,
+            'workspace_undo_stack': None,
             'ui_theme': 'dark',
             # Seeded empty: _sync_loop_heights fills it from loop_height_1..n.
             # A hard-coded block here became stale the moment those parameters
@@ -309,7 +329,10 @@ class AppState:
 
     # Live objects rather than state: they must bypass _data so they are never
     # cloned, snapshotted, undone or written to params.json.
-    _DIRECT_ATTRS = ('camera', 'optimizer', 'renderer', 'orbit_camera', 'orbit_renderer', '_data')
+    _DIRECT_ATTRS = (
+        'camera', 'optimizer', 'renderer', 'puzzle_renderer',
+        'orbit_camera', 'orbit_renderer', '_data',
+    )
 
     def __setattr__(self, name, value):
         if name in self._DIRECT_ATTRS or name in self.__dict__:
@@ -436,6 +459,18 @@ class AppState:
         if not rows:
             return False
 
+        # The saved rows describe a fabric of the template's own size. At any
+        # other pattern size they cannot carry it, so say so here rather than
+        # installing them and leaving nudge_spline_from_params' shape guard to
+        # discard them further down -- the caller's parametric fallback is then
+        # a decision instead of an accident.
+        pattern_rows, pattern_cols = self._scanner_pattern_size()
+        template_bitmap = np.asarray(template.get('bitmap', np.empty((0, 0))), dtype=np.float32)
+        if len(rows) != pattern_rows:
+            return False
+        if template_bitmap.ndim == 2 and template_bitmap.size and int(template_bitmap.shape[1]) != pattern_cols:
+            return False
+
         reference = build_parametric_control_rows(
             np.asarray(template['params'], dtype=np.float32),
             np.asarray(template['bitmap'], dtype=np.float32),
@@ -468,13 +503,33 @@ class AppState:
         idx = self._lh_idx[min(int(row_idx), len(self._lh_idx) - 1)]
         return float(params[idx])
 
+    # Beyond this the extra rows would all reuse the last loop_height parameter,
+    # since that is how many the model defines.
+    SCANNER_PATTERN_MAX_COLS = 8
+
+    def _scanner_pattern_size(self):
+        """The scan pattern grid: rows and columns, as the user set them.
+
+        The single source of truth. Both the generator and the plan geometry
+        used to take their size from the scan template's bitmap instead, falling
+        back to these settings only when the template had none -- which never
+        happens, so the size was welded to the template and neither the settings
+        nor the model could move it.
+
+        The defaults already come from the template (AppState.__init__ reads
+        initial_params.json's bitmap shape), so honouring them here changes
+        nothing until the user moves the sliders.
+        """
+        max_rows = max(2, int(self.config['knit_parameters']['bitmap_rows']))
+        rows = int(self.get('scanner_pattern_rows', max(2, int(self.bitmap_size[0]))))
+        cols = int(self.get('scanner_pattern_cols', max(2, int(self.bitmap_size[1]))))
+        return (
+            int(np.clip(rows, 2, max_rows)),
+            int(np.clip(cols, 2, self.SCANNER_PATTERN_MAX_COLS)),
+        )
+
     def _scanner_random_bitmap(self, cell_index):
-        template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.ones((2, 2))), dtype=np.float32)
-        if template_bitmap.ndim == 2 and template_bitmap.size:
-            pattern_rows, pattern_cols = [max(2, int(v)) for v in template_bitmap.shape]
-        else:
-            pattern_rows = max(2, int(self.get('scanner_pattern_rows', max(2, int(self.bitmap_size[0])))))
-            pattern_cols = max(2, int(self.get('scanner_pattern_cols', max(2, int(self.bitmap_size[1])))))
+        pattern_rows, pattern_cols = self._scanner_pattern_size()
         density = float(np.clip(float(self.get('scanner_pattern_density', 0.62)), 0.05, 0.95))
         seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
         rng = np.random.default_rng(seed)
@@ -901,7 +956,40 @@ class AppState:
         else:
             self.sim_L0 = np.array([])
 
-    def rebuild_spline_mesh(self, preserve_model_placement=True):
+    def active_scene_renderer(self):
+        """Renderer owned by the mode currently shown in the 3D viewport."""
+        if str(self.get('app_mode', 'edit')) == 'puzzle' and self.puzzle_renderer is not None:
+            return self.puzzle_renderer
+        return self.renderer
+
+    def ensure_puzzle_scene(self):
+        """Keep Scan meshes out of Puzzle's dedicated GPU scene.
+
+        Scan generation temporarily replaces the shared model with random
+        bitmaps.  All Scan uploads are explicitly routed away from Puzzle, but
+        this boundary also validates the GPU scene before display so a delayed
+        or future Scan path cannot leave random cells visible in Puzzle Mode.
+        """
+        if str(self.get('app_mode', 'edit')) != 'puzzle' or self.puzzle_renderer is None:
+            return
+        mesh_meta = getattr(self.puzzle_renderer, 'mesh_meta', None)
+        contaminated = mesh_meta is not None and any('scanner_cell' in item for item in mesh_meta)
+        empty = not getattr(self.puzzle_renderer, 'mesh_pick_data', None)
+        if contaminated or empty:
+            self.scanner_preview_grid_enabled = False
+            self.rebuild_spline_mesh(
+                preserve_model_placement=True,
+                target_renderer=self.puzzle_renderer,
+            )
+
+    def rebuild_spline_mesh(self, preserve_model_placement=True, target_renderer=None):
+        """Build the current model and upload it to the requested renderer.
+
+        The normal destination is the main viewport renderer. Scan capture code
+        passes its private renderer explicitly; it must never replace
+        ``state.renderer``, because a mode switch during that temporary ownership
+        leaves the visible viewport holding Scan meshes.
+        """
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
         self._ensure_spline_radius_rows()
@@ -917,15 +1005,17 @@ class AppState:
         fl = compute_knitting_faces(self.config['knit_parameters']['segments'], vl)
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         colors = self.active_colors()
+        destination = self.active_scene_renderer() if target_renderer is None else target_renderer
         # Triangulation, normals and buffer packing are identical for both
         # renderers, so they are done once here and the GL uploads share them.
-        prepared = self.renderer.prepare_meshes(display_vl, display_fl)
-        self.renderer.set_meshes(display_vl, display_fl, colors=colors, meta=meta, prepared=prepared)
-        self.renderer.set_ctrl_pts(self.flat_pts)
+        prepared = destination.prepare_meshes(display_vl, display_fl)
+        destination.set_meshes(display_vl, display_fl, colors=colors, meta=meta, prepared=prepared)
+        destination.set_ctrl_pts(self.flat_pts)
         # Same meshes into the orbit view. Note this uploads to a second
         # renderer, so it costs a duplicate GL upload per rebuild; skipped
-        # entirely when no orbit renderer is attached (e.g. headless callers).
-        if self.orbit_renderer is not None and self.orbit_renderer is not self.renderer:
+        # entirely for private Scan renders and when no orbit renderer is
+        # attached (e.g. headless callers).
+        if destination is self.renderer and self.orbit_renderer is not None and self.orbit_renderer is not self.renderer:
             self.orbit_renderer.set_meshes(display_vl, display_fl, colors=colors, meta=meta, prepared=prepared)
         if preserve_model_placement:
             self.mesh_center = old_center
@@ -1252,6 +1342,12 @@ class AppState:
     _SNAPSHOT_EXCLUDE = frozenset({
         'render_tex', 'render_result', 'undo_stack',
         'ur5_controller', 'embedded_scanner', 'scanner_storage', 'scanner_process',
+        # Mode workspaces are containers for snapshots, not model fields. They
+        # must never be copied into the snapshots they contain.
+        'puzzle_model_snapshot', 'puzzle_initial_snapshot', 'puzzle_undo_stack',
+        'workspace_model_snapshot', 'workspace_undo_stack',
+        'single_capture_job', 'single_capture_job_seq',
+        'mode_epoch',
         # Which mode the user is looking at is not part of the model, and
         # restoring it moved them without going through _set_app_mode -- so the
         # mode they left was never torn down and the one they landed in was
@@ -1276,7 +1372,7 @@ class AppState:
         if len(self.undo_stack) > self.max_undo:
             del self.undo_stack[0]
 
-    def restore_snapshot(self, snap):
+    def restore_snapshot(self, snap, target_renderer=None):
         """Restore a snapshot. Returns the bottom-row columns it had to repair.
 
         The return value exists because undo_last and reset_to_initial both set
@@ -1305,7 +1401,7 @@ class AppState:
             # The snapshot's control rows carry the flat bottom row, same as a
             # loaded file does.
             self._reconcile_rows_after_anchor(pre_anchor_bitmap)
-        self.rebuild_spline_mesh()
+        self.rebuild_spline_mesh(target_renderer=target_renderer)
         return anchored_columns
 
     def undo_last(self):
@@ -1316,6 +1412,53 @@ class AppState:
 
     def capture_initial_state(self):
         super().__setattr__('_initial_snapshot', self.snapshot_state())
+        # Puzzle starts from its bitmap and parameters, not from the tuned
+        # control rows stored in initial_params.json. Scan also uses that file
+        # as its fabric template and carries random patterns through per-cell
+        # loop heights; copying the saved geometry made an all-green Puzzle
+        # bitmap display height patterns that looked like Scan samples.
+        #
+        # Build Puzzle's canonical baseline once, then put the normal initial
+        # model back verbatim. Later mode switches preserve Puzzle edits from
+        # this clean baseline instead of rebuilding them away.
+        initial_snapshot = self._initial_snapshot
+        self.loop_heights = np.empty((0, 0), dtype=np.float32)
+        self.loop_height_overrides = np.zeros(tuple(int(v) for v in self.bitmap_size), dtype=bool)
+        self.rebuild_spline_from_params()
+        self.puzzle_model_snapshot = self.snapshot_state()
+        self.puzzle_initial_snapshot = self._clone(self.puzzle_model_snapshot)
+        self.restore_snapshot(initial_snapshot, target_renderer=self.renderer)
+
+    def enter_puzzle_workspace(self):
+        """Swap the independent Puzzle model into the shared render pipeline."""
+        if self.get('workspace_model_snapshot') is not None:
+            return
+
+        self.workspace_model_snapshot = self.snapshot_state()
+        self.workspace_undo_stack = self.undo_stack
+
+        puzzle_snapshot = self.get('puzzle_model_snapshot')
+        if puzzle_snapshot is None:
+            puzzle_snapshot = getattr(self, '_initial_snapshot', None)
+        if puzzle_snapshot is None:
+            puzzle_snapshot = self.snapshot_state()
+
+        self.undo_stack = self.get('puzzle_undo_stack', [])
+        self.restore_snapshot(puzzle_snapshot, target_renderer=self.puzzle_renderer)
+
+    def leave_puzzle_workspace(self):
+        """Store Puzzle edits and restore the non-Puzzle model verbatim."""
+        workspace_snapshot = self.get('workspace_model_snapshot')
+        if workspace_snapshot is None:
+            return
+
+        self.puzzle_model_snapshot = self.snapshot_state()
+        self.puzzle_undo_stack = self.undo_stack
+        workspace_undo_stack = self.get('workspace_undo_stack')
+        self.undo_stack = workspace_undo_stack if workspace_undo_stack is not None else []
+        self.restore_snapshot(workspace_snapshot, target_renderer=self.renderer)
+        self.workspace_model_snapshot = None
+        self.workspace_undo_stack = None
 
     def reset(self, unit_model=False):
         """Unified reset entry point, matching feat/simulation's call style.
@@ -1333,6 +1476,12 @@ class AppState:
             self.reset_to_initial()
 
     def reset_to_initial(self):
+        if str(self.get('app_mode', 'edit')) == 'puzzle' and self.get('puzzle_initial_snapshot') is not None:
+            self.push_undo("Reset Puzzle")
+            anchored = self.restore_snapshot(self.puzzle_initial_snapshot)
+            self.status_msg = _with_anchor_note('Reset Puzzle to its initial pattern', anchored)
+            return
+
         initial_snapshot = getattr(self, '_initial_snapshot', None)
         if initial_snapshot is not None:
             self.push_undo("Reset all")
@@ -1547,6 +1696,11 @@ class AppState:
 
     def maybe_autosave(self):
         if not self.autosave_enabled:
+            return
+        # The normal params file is the Edit/Scan workspace. Puzzle has an
+        # independent in-memory model and must never overwrite that file merely
+        # because its panel is being drawn.
+        if str(self.get('app_mode', 'edit')) == 'puzzle':
             return
         if self.autosave_deferred():
             return
