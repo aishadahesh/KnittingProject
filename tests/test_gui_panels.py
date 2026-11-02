@@ -18,6 +18,7 @@ the static checks in test_gui_structure.py.
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -28,7 +29,7 @@ imgui_bundle = pytest.importorskip("imgui_bundle")
 glfw = pytest.importorskip("glfw")
 from imgui_bundle import imgui  # noqa: E402
 
-MODES = ("edit", "scan", "puzzle", "database", "ur5")
+MODES = ("edit", "scan", "puzzle", "database", "ur5", "model")
 
 
 def _make_hidden_window():
@@ -222,6 +223,27 @@ def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_co
     assert controller.camera is None
 
 
+def test_capture_path_draws_a_checked_plan(imgui_context, state, gl_context, ref_tex):
+    """The viewpoint preview is drawn from a real solved plan, not just an empty panel.
+
+    Everything the preview reads -- positions, the subject, per-viewpoint verdicts -- comes
+    from the solve, so drawing it with no plan present covers none of it.
+    """
+    pytest.importorskip("mujoco")
+    import gui
+    import scan_geometry
+    import ur5_robot
+
+    app_state, renderer = state
+    gl = gl_context
+    _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex)
+    controller = app_state.get("ur5_controller")
+    controller.plan = scan_geometry.build_capture_plan(ur5_robot.DEFAULT_HOME_JOINTS, pattern="spin", count=3)
+
+    assert _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex) > 0
+    assert controller.robot.connected is False
+
+
 def test_vertex_counts_are_recorded_per_mode(imgui_context, state, gl_context, ref_tex):
     """Prints the per-mode vertex counts used as the code-movement oracle.
 
@@ -238,3 +260,142 @@ def test_vertex_counts_are_recorded_per_mode(imgui_context, state, gl_context, r
     for mode, count in counts.items():
         print(f"  {mode:9} {count}")
     assert all(count > 0 for count in counts.values())
+
+
+def test_reset_layout_brings_the_controls_back_in_front(imgui_context, state, gl_context, ref_tex, tmp_path, monkeypatch):
+    """Windows docked into one full-screen panel covered the control window and every mode button
+    with it; Reset Layout must undock them and put the controls back, at their own size, in front."""
+    import gui
+    import paths
+
+    monkeypatch.setattr(paths, "LAYOUT_INI", tmp_path / "imgui_layout.ini")
+    app_state, renderer = state
+    _draw_one_frame(gui, app_state, renderer, "model", gl_context.window, ref_tex)   # the big Model Mode window
+    gui._reset_layout(app_state)
+    _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    window = imgui.internal.find_window_by_name("Knitting Control")
+    assert (window.pos.x, window.pos.y) == (20, 20)
+    assert (window.size.x, window.size.y) == (360, 820)
+    assert not app_state.get("_layout_reset_pending", False)
+
+
+def test_model_mode_hands_its_repeating_loops_to_edit_mode(imgui_context, state, gl_context, ref_tex):
+    """'Open in Edit Mode' makes the fitted repeat Edit Mode's pattern: its tile of stitches and
+    openings, and its loop numbers, in Edit Mode, with one undo step to go back."""
+    import gui
+
+    app_state, renderer = state
+    bitmap = np.ones((7, 3), dtype=np.float32)
+    bitmap[2:4, 1] = 0.0
+    _draw_one_frame(gui, app_state, renderer, "model", gl_context.window, ref_tex)
+    undo_before = len(app_state.undo_stack)
+    app_state.model_to_edit = {"parameters": {"stitch_width": 3.03, "dy": 2.23, "stitch_bulge": 0.65, "stitch_z": 0.1,
+                                              "radius": 0.3, **{f"loop_height_{r + 1}": 3.9 for r in range(7)}},
+                               "bitmap": bitmap}
+    imgui.new_frame()
+    gui.draw_sidebar(app_state, app_state.active_scene_renderer(), gl_context.window)
+    imgui.render()
+    assert app_state.get("app_mode") == "edit"
+    assert app_state.bitmap.shape == (7, 3) and app_state.bitmap[2, 1] == 0.0
+    pidx = app_state._pidx
+    assert abs(app_state.params[pidx["stitch_width"]] - 3.03) < 1e-6 and abs(app_state.params[pidx["dy"]] - 2.23) < 1e-6
+    assert len(app_state.ctrl_rows) == 7
+    assert len(app_state.undo_stack) == undo_before + 1
+    assert app_state.get("model_to_edit") is None
+
+
+def test_edit_mode_builds_a_crochet_fabric_and_takes_one_from_model_mode(imgui_context, state, gl_context, ref_tex):
+    """Edit Mode's crochet fabric is drawn from the stitch equations; Model Mode's crochet model opens
+    in it with its numbers and grid; Undo goes back to the knit fabric."""
+    import gui
+
+    app_state, renderer = state
+    _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    app_state.fabric_type = "crochet"
+    vertices = _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    assert vertices > 0 and app_state.crochet_active()
+    assert len(app_state.renderer.meshes) > 0
+
+    app_state.fabric_type = "knit"
+    _draw_one_frame(gui, app_state, renderer, "model", gl_context.window, ref_tex)
+    stitches = np.array([[1, 0, 0], [1, 1, 1], [1, 1, 1]], dtype=np.float32)
+    app_state.model_to_edit = {"fabric": "crochet", "stitches": stitches,
+                               "parameters": {"stitch_width": 3.03, "row_height": 5.2, "wraps": 1, "yarn_radius": 0.4, "twist": 0.75, "lean": 0.0}}
+    imgui.new_frame()
+    gui.draw_sidebar(app_state, app_state.active_scene_renderer(), gl_context.window)
+    imgui.render()
+    assert app_state.get("app_mode") == "edit" and app_state.fabric_type == "crochet"
+    assert np.array_equal(app_state.crochet_stitches, stitches)
+    assert abs(app_state.crochet_parameters().row_height - 5.2) < 1e-9
+    app_state.undo_last()
+    assert app_state.fabric_type == "knit"
+
+
+def test_edit_mode_fits_its_crochet_equations_to_a_scan(imgui_context, state, gl_context, ref_tex, monkeypatch):
+    """'Fit these equations to the scan' in Edit Mode: the crochet fabric takes the numbers fitted to a
+    scan, keeps its repeat's size, and one Undo puts the old numbers back."""
+    import time
+
+    import gui
+    import gui_model
+    import scan_fit
+    import strand_equations
+    from test_lace_lattice import _lace_splat
+
+    splat = _lace_splat(0.0, points=120_000)
+    prepared = {"model": None, "splat": splat, "extraction": strand_equations.extract(splat, 1.0, (0.0, 0.0, 1.0)), "mm_per_unit": 1.0}
+    fake_model = {"name": "synthetic lace", "ply": Path("synthetic.ply"), "mm_per_unit": 1.0, "psnr": 30.0, "run": None, "dataset": None}
+    prepared["model"] = fake_model
+    monkeypatch.setattr(gui_model, "find_models", lambda: [fake_model])
+    monkeypatch.setattr(scan_fit, "prepare", lambda model, progress=None: prepared)
+    gui._SCAN_FIT.models = None
+    gui._SCAN_FIT.prepared = None
+
+    app_state, renderer = state
+    app_state.fabric_type = "crochet"
+    app_state.crochet_stitches = np.ones((6, 3), dtype=np.float32)
+    before = dict(app_state.crochet_params)
+    _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    gui._start_scan_fit(app_state, "crochet")
+    deadline = time.time() + 120
+    while gui._SCAN_FIT.job is not None and time.time() < deadline:
+        gui._SCAN_FIT.job[0].join(timeout=1.0)
+        _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    assert gui._SCAN_FIT.job is None and gui._SCAN_FIT.result is not None, gui._SCAN_FIT.message
+    fitted = app_state.crochet_parameters()
+    assert abs(fitted.stitch_width - 3.0) < 0.2 and abs(fitted.row_height - 2.0) < 0.2     # the test lace's 3 x 2 mm stitch
+    assert np.asarray(app_state.crochet_stitches).shape == (6, 3)
+    assert gui._SCAN_FIT.texture is not None
+    app_state.undo_last()
+    assert dict(app_state.crochet_params) == before
+
+
+def test_a_finished_photo_fit_gives_edit_mode_the_learned_stitch(imgui_context, state, gl_context, ref_tex, tmp_path):
+    """fit_stitch_model.py's stitch_model.json, read back by scan_fit, becomes Edit Mode's crochet fabric:
+    its numbers, its stitch grid and its learned templates; Undo takes it off again."""
+    import json
+    from types import SimpleNamespace
+
+    import crochet_core
+    import gui
+    import scan_fit
+
+    p = crochet_core.CrochetParams(stitch_width=1.5, row_height=5.0, yarn_radius=0.5)
+    stitches = [[1, 1, 0, 0, 1, 1], [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]]
+    path = tmp_path / "stitch_model.json"
+    path.write_text(json.dumps({"stitch_width": 1.5, "row_height": 5.0, "yarn_radius": 0.5, "wraps": 1, "twist": 0.75, "lean": 0.0,
+                                "stitches": stitches, "templates": crochet_core.hand_templates(p),
+                                "scores": {"model_psnr": 13.1, "splat_psnr": 13.9, "before_model_psnr": 7.7}}), encoding="utf-8")
+    finished = SimpleNamespace(running=False, lines=["done"], result=lambda: (*scan_fit.load_stitch_model(path), "held-out pictures: 13.10 dB"))
+    app_state, renderer = state
+    _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    gui._SCAN_FIT.photo_fit = finished
+    gui._finish_photo_fit(app_state)
+    assert app_state.fabric_type == "crochet" and gui._SCAN_FIT.photo_fit is None
+    learned = app_state.crochet_parameters()
+    assert learned.templates and abs(learned.row_height - 5.0) < 1e-9
+    assert np.array_equal(np.asarray(app_state.crochet_stitches), np.asarray(stitches, dtype=np.float32))
+    vertices = _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
+    assert vertices > 0 and len(app_state.renderer.meshes) > 0
+    app_state.undo_last()
+    assert not app_state.crochet_parameters().templates

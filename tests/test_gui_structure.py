@@ -22,13 +22,14 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 APP = Path(__file__).resolve().parent.parent / "app.py"
 
 # One module per mode. A module here may not import another module here.
-MODE_MODULES = ("gui_edit", "gui_scan", "gui_puzzle", "gui_database", "gui_ur5")
+MODE_MODULES = ("gui_edit", "gui_scan", "gui_puzzle", "gui_database", "gui_ur5", "gui_model")
 
 # Modules that must stay usable without a UI: they are imported by headless
 # callers (tests, scripts, the scan runner) where imgui does not exist.
 IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core", "embedded_scanner",
                       "rgb_analysis", "robot_camera", "ur5_robot", "ur5_scan",
-                      "gaussian_splatting", "paths")
+                      "gaussian_splatting", "free_capture", "paths", "strand_equations",
+                      "lace_lattice", "crochet_core", "crochet_fit", "scan_fit", "crochet_stitches")
 
 
 def _existing(names):

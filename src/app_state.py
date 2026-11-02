@@ -4,6 +4,7 @@ import threading
 import time
 import numpy as np
 
+import crochet_core
 import paths
 
 from knitting_core import (
@@ -120,6 +121,7 @@ class AppState:
         for attr, cast_fn in _SCHEMA_CASTS.items():
             super().__setattr__(attr, cast_fn(app_config[attr]))
         extra_saved_keys = (
+            'fabric_type', 'crochet_params', 'crochet_stitches',
             'app_mode', 'loop_heights', 'loop_height_overrides', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
             'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
             'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols',
@@ -131,9 +133,18 @@ class AppState:
             'puzzle_capture_rect',
             # UR5 Robot Mode settings. ur5_controller is deliberately absent: it
             # holds live threads and GL handles, and is not state to save.
-            'ur5_robot_ip', 'ur5_transport', 'ur5_speed_limit', 'ur5_dwell', 'ur5_save_images',
+            'ur5_robot_ip', 'ur5_transport', 'ur5_speed_limit', 'ur5_dwell', 'ur5_save_images', 'ur5_video',
             'ur5_capture_width', 'ur5_camera_device', 'ur5_lighting_condition', 'ur5_workspace_center',
             'ur5_splat_fov', 'ur5_splat_camera_offset', 'ur5_splat_command',
+            'ur5_camera_autofocus', 'ur5_camera_focus', 'ur5_min_sharpness', 'ur5_fabric_check', 'ur5_min_coverage',
+            'ur5_show_detection', 'ur5_home_joints', 'ur5_camera_image_turn', 'ur5_show_scene', 'ur5_jog_step', 'ur5_expert', 'ur5_splat_object_only',
+            'free_auto', 'free_auto_interval', 'free_require_sides',
+            'teleop_address', 'teleop_pattern', 'teleop_angles', 'teleop_arc', 'teleop_elevation',
+            'teleop_rings', 'teleop_max_rise', 'teleop_view_radius', 'teleop_subject_distance',
+            'teleop_tool_offset', 'teleop_move_seconds', 'teleop_speed_deg_s',
+            'teleop_grid_rows', 'teleop_grid_cols', 'teleop_camera_height', 'teleop_orbit_radius', 'teleop_max_tilt',
+            'teleop_taught_views', 'teleop_taught_set', 'teleop_fabric_corners', 'teleop_fabric_z', 'teleop_grid_overlap', 'teleop_sweep_overlap', 'teleop_grid_views', 'teleop_grid_passes', 'teleop_overview_height', 'teleop_overview_joints',
+            'teleop_splat_views', 'teleop_splat_layers',
         )
         super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
@@ -180,6 +191,11 @@ class AppState:
             'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
             'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
             'display_copies': np.array([0, 0], dtype=np.int32),
+            # Edit Mode's fabric: 'knit' (the loop rows above) or 'crochet' (crochet_core's posts and
+            # chains, from its own parameters and a stitch grid: rows x stitches, 1 a post, 0 open).
+            'fabric_type': 'knit',
+            'crochet_params': crochet_core.CrochetParams().as_dict(),
+            'crochet_stitches': np.array([[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float32),
             'app_mode': 'edit',
             # Incremented for every mode transition. Temporary Scan work records
             # this value and is forbidden from restoring across a transition.
@@ -216,18 +232,96 @@ class AppState:
             # RTDE connection and must not inherit that path's settings.
             # Defaults are deliberately timid -- dry run, quarter speed -- so
             # opening the mode cannot command hardware by itself.
-            'ur5_robot_ip': '132.74.121.230',
-            'ur5_transport': 'dry_run',
+            # This cell's arm. It was the campus address 132.74.121.230, which no longer
+            # answers, so a Direct RTDE connect spent the OS TCP timeout failing.
+            'ur5_robot_ip': '192.168.0.101',
+            'ur5_transport': 'teleop',
             'ur5_speed_limit': 0.25,
             'ur5_dwell': 0.2,
             'ur5_save_images': True,
-            'ur5_capture_width': 1280,
+            'ur5_video': True,
+            'ur5_capture_width': 640,
             'ur5_camera_device': 0,
             'ur5_lighting_condition': '',
             'ur5_workspace_center': [-0.45, -0.08, 0.30],
-            'ur5_splat_fov': 55.0,
+            'ur5_splat_fov': 38.0,
+            # Capture quality. Focus is the camera's own UVC control - most webcam autofocus
+            # hunts at close range. A capture below the sharpness is retaken; one with less
+            # fabric than the coverage (by MobileSAM) is flagged and left out of the analysis.
+            'ur5_camera_autofocus': True,
+            'ur5_camera_focus': 0.0,
+            'ur5_min_sharpness': 150.0,
+            'ur5_fabric_check': True,
+            'ur5_min_coverage': 0.8,
+            'ur5_show_detection': True,
+            # Home, once straightened (lens down, image squared to the cloth); empty until then,
+            # and Home is ur5_robot.DEFAULT_HOME_JOINTS, the pose taught by hand.
+            'ur5_home_joints': [],
+            # How the camera's image is turned on the tool, measured by Calibrate camera turn;
+            # empty until then, which means the image's axes are taken to be the tool's.
+            'ur5_camera_image_turn': [],
+            # Whether UR5 Robot Mode also renders the knit scan preview in the 3D View - off, as it
+            # is the heaviest per-frame work there and TeleopApp already shows the cell.
+            'ur5_show_scene': False,
+            # UR5 Robot Mode shows one simple page unless Expert is ticked.
+            'ur5_expert': False,
+            'ur5_splat_object_only': True,
+            # How far one press of the Position tab's jog pad moves the camera.
+            'ur5_jog_step': 0.01,
             'ur5_splat_camera_offset': 0.12,
             'ur5_splat_command': '',
+            # 5 Free capture: whether pictures are taken by themselves while the camera is held, and how often.
+            'free_auto': False,
+            'free_auto_interval': 1.5,
+            # Whether "enough" asks for tilted views from around the fabric; off, top-down views suffice.
+            'free_require_sides': True,
+            # The capture path this mode flies when it drives the arm through TeleopApp.
+            # The tool offset is the measured camera mount, not a guess: it is what makes a
+            # planned tool point and the arm's actual camera the same place.
+            'teleop_address':           'localhost:50052',
+            'teleop_pattern':           'grid',
+            'teleop_angles':            6,
+            'teleop_arc':               360.0,
+            'teleop_elevation':         75.0,
+            'teleop_rings':             3,
+            'teleop_max_rise':          0.19,
+            'teleop_view_radius':       0.06,
+            'teleop_subject_distance':  0.20,
+            'teleop_tool_offset':       0.0306,
+            'teleop_move_seconds':      6.0,
+            'teleop_speed_deg_s':       12.0,
+            # The low grid: straight-down views this close to the fabric plane, which is
+            # what keeps every frame sharp and at one scale.
+            'teleop_grid_rows':         3,
+            'teleop_grid_cols':         3,
+            # The capture height (Z): how far over the fabric plane the camera looks straight down
+            # from. Grid, centred and Move over fabric all take it, so it is the one zoom control.
+            'teleop_camera_height':     0.05,
+            # The orbit's own radius. Not teleop_subject_distance, which only estimates where
+            # the fabric is when no corner is marked - shrinking that would raise the plane.
+            'teleop_orbit_radius':      0.10,
+            # How far the centred pattern may tilt from straight down at most; each direction is
+            # further limited to what keeps the whole frame on the fabric.
+            'teleop_max_tilt':          20.0,
+            # Teacher mode: the views posed by hand, as [{"name", "joints"}], and the name
+            # of the set they were last saved as or loaded from.
+            'teleop_taught_views':      [],
+            'teleop_taught_set':        'default',
+            # The fabric's corners as camera points [x, y, z], touched in free drive. One gives
+            # its height, three or more its outline; none, and the height is estimated from Home.
+            'teleop_fabric_corners':    [],
+            # The fabric plane's height from a ruler, lens to cloth, when no corner is touched; None is unset.
+            'teleop_fabric_z':          None,
+            # How much neighbouring grid frames share when the grid fills a fabric outline.
+            'teleop_grid_overlap':      0.3,
+            'teleop_sweep_overlap':     0.65,
+            'teleop_grid_views':        1,
+            'teleop_grid_passes':       3,
+            'teleop_overview_height':   None,
+            'teleop_overview_joints':   None,
+            # The splat dome: views in each ring, and how many distances it is flown at.
+            'teleop_splat_views':       12,
+            'teleop_splat_layers':      2,
             'puzzle_copies_x': 5,
             'puzzle_copies_y': 5,
             'puzzle_capture_width': 960,
@@ -992,6 +1086,11 @@ class AppState:
         """
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
+        if self.crochet_active():
+            self._rebuild_crochet_mesh(target_renderer)
+            if preserve_model_placement:
+                self.mesh_center, self.model_t = old_center, old_model_t
+            return
         self._ensure_spline_radius_rows()
         radius_profiles = [np.asarray(row, dtype=np.float32) for row in self.spline_radius_rows]
         vl = build_spline_mesh(
@@ -1022,6 +1121,33 @@ class AppState:
             self.model_t = old_model_t
         else:
             self._recompute_center(display_vl)
+
+    def crochet_active(self):
+        """Edit Mode is showing a crochet fabric (the other modes always work on the knit model)."""
+        return str(self.get('fabric_type', 'knit')) == 'crochet' and str(self.get('app_mode', 'edit')) == 'edit'
+
+    def crochet_parameters(self):
+        return crochet_core.CrochetParams(**{**crochet_core.CrochetParams().as_dict(), **dict(self.get('crochet_params', {}))})
+
+    def _rebuild_crochet_mesh(self, target_renderer=None):
+        """The crochet fabric from its equations (crochet_core), repeated display_copies times each way,
+        as Edit Mode's meshes: one tube per post leg, wrap, V top and chain, coloured by row."""
+        stitches = np.asarray(self.get('crochet_stitches'), dtype=np.float32)
+        if stitches.ndim != 2 or stitches.size == 0:
+            stitches = np.ones((1, 1), dtype=np.float32)
+        segments = int(self.config['knit_parameters']['segments'])
+        meshes, rows = crochet_core.ring_meshes(stitches, self.crochet_parameters(), segments,
+                                                copies=tuple(int(c) for c in self.display_copies))
+        faces = [compute_knitting_faces(segments, [mesh])[0] for mesh in meshes]
+        meta = [{'row': row, 'base_row': row} for row in rows]
+        destination = self.active_scene_renderer() if target_renderer is None else target_renderer
+        prepared = destination.prepare_meshes(meshes, faces)
+        destination.set_meshes(meshes, faces, colors=self.active_colors(), meta=meta, prepared=prepared)
+        # The knit control points are not this fabric's: nothing to pick or drag.
+        destination.set_ctrl_pts(np.empty((0, 3), dtype=np.float32))
+        if destination is self.renderer and self.orbit_renderer is not None and self.orbit_renderer is not self.renderer:
+            self.orbit_renderer.set_meshes(meshes, faces, colors=self.active_colors(), meta=meta, prepared=prepared)
+        self._recompute_center(meshes)
 
     def _recompute_center(self, display_vl):
         if not display_vl:

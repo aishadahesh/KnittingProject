@@ -19,6 +19,24 @@ dependencies = [
     "ur-rtde>=1.6.0",
     "vedo>=2026.6.1",
     "vtk>=9.6.2",
+    # The MuJoCo UR5e every capture path is solved and collision-checked against.
+    "mujoco>=3.2.7",
+    "robot-descriptions>=3.2.0",
+    # UR5 Robot Mode's default transport speaks gRPC to CraftLabXRFleet's TeleopApp, whose
+    # robot.proto stubs are regenerated into that checkout on connect. Generated stubs refuse
+    # an older runtime than produced them, so these move together, at that project's floor.
+    "grpcio>=1.83.0",
+    "grpcio-tools>=1.83.0",
+    "protobuf>=6.33.0",
+    # The per-capture fabric check runs MobileSAM's ONNX graphs on the CPU.
+    "onnxruntime>=1.20.0",
+]
+
+# Installed by every `uv sync`. Without it `uv run pytest` falls through to whatever pytest is
+# on PATH - another Python, with none of this project's packages.
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
 ]
 
 [project.optional-dependencies]
@@ -29,4 +47,6 @@ gpu = [
 # marked synthetic frames; with it, real cameras can be opened.
 camera = [
     "opencv-python>=4.10.0",
+    # Friendly device names (e.g. "2K HD Camera") in the picker, Windows only.
+    "pygrabber>=0.2; sys_platform == 'win32'",
 ]

@@ -10,7 +10,7 @@
       [0.14, 0.45, 0.9],
       [0.35, 0.18, 0.08]
     ],
-    "bitmap_rows": 5,
+    "bitmap_rows": 8,
     "bitmap_loops": 5,
     "loop_res": 32,
     "segments": 32,
@@ -77,6 +77,24 @@
       },
       {
         "name": "loop_height_5",
+        "initial": 3.0,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_6",
+        "initial": 3.0,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_7",
+        "initial": 3.0,
+        "range": [0.1, 6.0],
+        "delta": 0.01
+      },
+      {
+        "name": "loop_height_8",
         "initial": 3.0,
         "range": [0.1, 6.0],
         "delta": 0.01

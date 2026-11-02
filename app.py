@@ -220,10 +220,29 @@ def main():
     # ── Static textures ───────────────────────────────────────────────────────
     ref_tex = pil_to_texture(ctx, ref_pil)
 
+    # ── Frame pacing ──────────────────────────────────────────────────────────
+    # The loop used to redraw flat out whether anything changed or not. Now it
+    # waits for input, up to IDLE_FRAME_SECONDS, unless something on screen
+    # moves by itself every frame - Scan Mode's simulator stepping, or the yarn
+    # solver - and any mouse or key event still wakes it at once.
+    IDLE_FRAME_SECONDS = 1.0 / 15.0
+
+    def animating(state):
+        embedded = state.get('embedded_scanner')
+        scanning = embedded is not None and (
+            bool(getattr(embedded, 'running', False))
+            or bool(getattr(embedded, 'single_target_active', False))
+            or getattr(embedded, '_capture_job', None) is not None
+        )
+        return scanning or sim_may_run(state)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
     undo_shortcut_was_down = False
     while not glfw.window_should_close(window):
-        glfw.poll_events()
+        if animating(state):
+            glfw.poll_events()
+        else:
+            glfw.wait_events_timeout(IDLE_FRAME_SECONDS)
         impl.process_inputs()
         # Upload whatever the solver produced since the last frame. GL work has
         # to happen on this thread, so the solver only flags that it moved.
@@ -285,7 +304,11 @@ def main():
         ctx.screen.use()
 
         # ── 3D Viewport ───────────────────────────────────────────────────────
-        if str(state.get("app_mode", "edit")) != "database":
+        # UR5 Robot Mode only draws the knit preview when asked: the arm and the
+        # cell are TeleopApp's to show, and re-rendering the tiled scan layout
+        # every frame beside it was the heaviest thing the app did there.
+        mode_now = str(state.get("app_mode", "edit"))
+        if mode_now not in ("database", "model") and (mode_now != "ur5" or bool(state.get("ur5_show_scene", False))):
             # Re-evaluate after draw_sidebar: its mode buttons can switch into
             # or out of Puzzle during this same frame.
             draw_viewport(state, state.active_scene_renderer(), ref_tex, window)

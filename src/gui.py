@@ -4,7 +4,8 @@ Module layout (dependencies point one way, no cycles):
 
     gui.py             this file -- imgui panels and per-mode UI
       |- scanner_core      scanner/puzzle logic, no imgui
-      `- gui_ur5           UR5 Robot Mode UI           -> scanner_core
+      |- gui_ur5           UR5 Robot Mode UI           -> scanner_core
+      `- gui_model         Model Mode UI               -> strand_equations
 
 `app.py` imports draw_menu_bar / draw_sidebar / draw_viewport /
 draw_orbit_viewport from here. Names moved into scanner_core kept their original
@@ -54,6 +55,10 @@ from scanner_core import (
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
 # inside the functions that need it, so there is no cycle at load time.
 import gui_ur5
+import gui_model
+import crochet_core
+import crochet_fit
+import scan_fit
 
 # Per-step solver displacements are tiny next to the model, so the force overlay
 # exaggerates them to stay visible. Display only -- never fed back into state.
@@ -261,18 +266,32 @@ def _draw_puzzle_capture_widget(state, image, texture, avail_w, avail_h):
 def draw_menu_bar(state):
     if imgui.begin_menu_bar():
         if imgui.begin_menu("Window"):
-            clicked_reset, _ = imgui.menu_item("Reset Layout")
+            clicked_reset, _ = imgui.menu_item("Reset Layout", "", False)
             if clicked_reset:
-                try:
-                    # Located via paths, not from save_path's folder: the saved
-                    # parameters live in config/ while the layout file sits in
-                    # the project root, so deriving one from the other deletes
-                    # nothing and silently does not reset the layout.
-                    os.remove(paths.LAYOUT_INI)
-                except FileNotFoundError:
-                    pass
+                _reset_layout(state)
             imgui.end_menu()
         imgui.end_menu_bar()
+
+
+def _reset_layout(state):
+    """Every window back where it starts: undocked, the saved layout forgotten, and the control
+    window (all the mode buttons) put back in front at its own size.
+
+    Deleting the layout file alone did nothing while the app ran - imgui writes the layout it holds
+    back to the file on exit - and windows docked into one full-screen panel kept covering the
+    controls."""
+    try:
+        # Located via paths, not from save_path's folder: the saved
+        # parameters live in config/ while the layout file sits in
+        # the project root, so deriving one from the other deletes
+        # nothing and silently does not reset the layout.
+        os.remove(paths.LAYOUT_INI)
+    except FileNotFoundError:
+        pass
+    context = imgui.get_current_context()
+    imgui.internal.dock_context_clear_nodes(context, 0, True)
+    imgui.internal.clear_ini_settings()
+    state._layout_reset_pending = True
 
 
 def _mark_sim_geometry_dirty(state):
@@ -357,8 +376,53 @@ def _draw_yarn_simulation_panel(state):
         state.sim_show_forces = bool(val_forces)
 
 
+def _open_model_in_edit(state, request):
+    """Model Mode's repeating loops, fitted to a scan, made Edit Mode's pattern: its loop parameters
+    (mm) and its tile of worked stitches and openings, shown repeated so the joins can be seen.
+    One undo step, taken in Edit Mode, brings back what was there before."""
+    _set_app_mode(state, 'edit')
+    state.push_undo("Pattern from scanned model")
+    if request.get('fabric') == 'crochet':
+        # Crochet: Edit Mode's crochet fabric takes the fitted stitch numbers and grid as they are.
+        state.fabric_type = 'crochet'
+        state.crochet_params = dict(request['parameters'])
+        state.crochet_stitches = np.asarray(request['stitches'], dtype=np.float32).copy()
+        state.display_copies = np.array([1, 1], dtype=np.int32)
+        state.rebuild_spline_mesh(preserve_model_placement=False)
+        state.center_model_on_view()
+        rows, stitches = state.crochet_stitches.shape
+        state.status_msg = f"Crochet from the scan: {rows} rows x {stitches} stitches"
+        return
+    state.fabric_type = 'knit'
+    _apply_knit_pattern(state, request['parameters'], request['bitmap'])
+    state.display_copies = np.array([1, 1], dtype=np.int32)
+    state.rebuild_spline_mesh(preserve_model_placement=False)
+    state.center_model_on_view()
+    state.status_msg = f"Pattern from the scan: {state.bitmap.shape[0]} rows x {state.bitmap.shape[1]} stitches"
+
+
+def _apply_knit_pattern(state, parameters, bitmap):
+    """Knit loop parameters (mm, by name, clipped to their ranges) and a stitch bitmap, made Edit Mode's."""
+    ranges = {p['name']: p['range'] for p in state.config['knit_parameters']['parameters']}
+    params = list(state.params)
+    for name, value in parameters.items():
+        if name in state._pidx:
+            low, high = ranges[name]
+            params[state._pidx[name]] = float(np.clip(value, low, high))
+    state.params = params
+    bitmap = np.asarray(bitmap, dtype=np.float32)
+    max_rows = int(state.config['knit_parameters']['bitmap_rows'])
+    bitmap = bitmap[:max_rows, :32]
+    state.bitmap = bitmap.copy()
+    state.bitmap_size = np.array(bitmap.shape, dtype=np.int32)
+    state._sync_row_colors(bitmap.shape[0])
+    state._sync_row_visibility(bitmap.shape[0])
+    state.clear_loop_height_overrides()
+    state.on_bitmap_change()
+
+
 def _set_app_mode(state, mode):
-    mode = mode if mode in ('edit', 'scan', 'puzzle', 'database', 'ur5') else 'edit'
+    mode = mode if mode in ('edit', 'scan', 'puzzle', 'database', 'ur5', 'model') else 'edit'
     current_mode = str(state.get('app_mode', 'edit'))
     if current_mode == mode:
         return
@@ -419,6 +483,10 @@ def _set_app_mode(state, mode):
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
         state.database_view_mode = "results"
+    elif mode == 'model':
+        # Model Mode draws its own pictures of a trained splat; the knit preview is not shown.
+        state.scanner_preview_grid_enabled = False
+        state.display_copies = np.array([0, 0], dtype=np.int32)
     elif mode == 'ur5':
         # Shows the same fabric grid preview Scan Mode does, since the real
         # robot scans that same layout -- the 3D View is the plan being sent to
@@ -480,6 +548,391 @@ def _apply_ui_theme(state):
     else:
         imgui.style_colors_dark()
     state._applied_ui_theme = theme
+
+
+def _draw_fabric_type(state):
+    """Edit Mode's fabric: knitted loop rows, or crochet posts and chains. Returns the one shown."""
+    fabric = str(state.get('fabric_type', 'knit'))
+    imgui.text("Fabric:")
+    for value, label in (('knit', "Knit (loop rows)"), ('crochet', "Crochet (posts and chains)")):
+        imgui.same_line()
+        if imgui.radio_button(f"{label}##fabric_{value}", fabric == value) and fabric != value:
+            state.push_undo("Fabric type")
+            if value == 'crochet' and bool(state.get('sim_active', False)):
+                # The yarn simulation moves knit control rows; a crochet fabric has none.
+                with state.sim_lock:
+                    state.sim_active = False
+            state.fabric_type = value
+            fabric = value
+            state.rebuild_spline_mesh(preserve_model_placement=False)
+            state.center_model_on_view()
+    imgui.separator()
+    return fabric
+
+
+# What each crochet number may be set to, and its step: (key, label, low, high, format, tooltip).
+CROCHET_SLIDERS = (
+    ('stitch_width', "Stitch width (mm)", 0.3, 5.0, "%.2f", "How far apart neighbouring stitches stand along the row."),
+    ('row_height', "Row height (mm)", 0.8, 8.0, "%.2f", "How tall one row of posts is."),
+    ('yarn_radius', "Yarn radius (mm)", 0.05, 1.0, "%.2f", "Half the yarn's thickness."),
+    ('twist', "Post twist (turns)", 0.0, 2.0, "%.2f", "How many times a post's two legs turn round each other."),
+    ('lean', "Post lean (mm)", -2.0, 2.0, "%.2f", "How far a post's top sits sideways of its foot."),
+)
+
+
+def _draw_crochet_editor(state):
+    """Crochet in Edit Mode: the stitch grid (a post or a chain across, per stitch), the numbers in the
+    stitch's equations, and the equations themselves (crochet_core)."""
+    params = state.crochet_parameters().as_dict()
+    stitches = np.asarray(state.get('crochet_stitches'), dtype=np.float32)
+    changed = False
+    if imgui.collapsing_header("Stitch grid##crochet_grid", imgui.TreeNodeFlags_.default_open):
+        rows, cols = stitches.shape
+        imgui.set_next_item_width(110)
+        rows_changed, new_rows = imgui.input_int("rows##crochet_rows", rows)
+        imgui.same_line()
+        imgui.set_next_item_width(110)
+        cols_changed, new_cols = imgui.input_int("stitches##crochet_cols", cols)
+        if rows_changed or cols_changed:
+            new_rows, new_cols = int(np.clip(new_rows, 1, 16)), int(np.clip(new_cols, 1, 32))
+            if (new_rows, new_cols) != (rows, cols):
+                state.push_undo("Crochet grid size")
+                grown = np.ones((new_rows, new_cols), dtype=np.float32)
+                grown[:min(rows, new_rows), :min(cols, new_cols)] = stitches[:min(rows, new_rows), :min(cols, new_cols)]
+                stitches, changed = grown, True
+        imgui.text_disabled("Click a stitch: filled = a post, empty = a chain across (an opening). Top row first.")
+        size = 18.0
+        imgui.push_style_var(imgui.StyleVar_.item_spacing, (2, 2))
+        for r in range(stitches.shape[0] - 1, -1, -1):
+            for c in range(stitches.shape[1]):
+                post = stitches[r, c] > 0.5
+                imgui.push_style_color(imgui.Col_.button, (0.86, 0.84, 0.78, 1.0) if post else (0.16, 0.16, 0.20, 1.0))
+                if imgui.button(f"##crochet_cell_{r}_{c}", (size, size)):
+                    state.push_undo("Crochet stitch")
+                    stitches = stitches.copy()
+                    stitches[r, c] = 0.0 if post else 1.0
+                    changed = True
+                imgui.pop_style_color()
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(f"row {r + 1}, stitch {c + 1}: {'post' if post else 'chain (open)'}")
+                if c < stitches.shape[1] - 1:
+                    imgui.same_line()
+        imgui.pop_style_var()
+    if imgui.collapsing_header("Stitch shape##crochet_shape", imgui.TreeNodeFlags_.default_open):
+        for key, label, low, high, fmt, tip in CROCHET_SLIDERS:
+            moved, value = imgui.slider_float(f"{label}##crochet_{key}", float(params[key]), low, high, fmt)
+            if imgui.is_item_activated():
+                state.push_undo(label)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(tip)
+            if moved:
+                params[key], changed = float(value), True
+        moved, wraps = imgui.slider_int("Yarn-overs per post##crochet_wraps", int(params['wraps']), 0, 4)
+        if imgui.is_item_activated():
+            state.push_undo("Yarn-overs")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("0 half double / single, 1 double crochet, 2 treble, 3 double treble")
+        if moved:
+            params['wraps'], changed = int(wraps), True
+        copies = [int(c) for c in state.display_copies]
+        imgui.set_next_item_width(160)
+        moved, copies = imgui.input_int2("Repeat left/right, up/down##crochet_copies", copies)
+        if moved:
+            state.display_copies = np.array([int(np.clip(c, 0, 6)) for c in copies], dtype=np.int32)
+            changed = True
+    if imgui.collapsing_header("Equations##crochet_equations", imgui.TreeNodeFlags_.default_open):
+        name = {0: "single / half double crochet", 1: "double crochet", 2: "treble crochet", 3: "double treble"}.get(int(params['wraps']), "")
+        imgui.text_colored((0.65, 0.65, 0.65, 1.0), f"{name}; s from 0 to 1 up a post, t round a loop, u along a wrap; mm")
+        for line in crochet_core.equations(crochet_core.CrochetParams(**params)):
+            imgui.text_wrapped(line)
+    if changed:
+        state.crochet_params = params
+        state.crochet_stitches = stitches
+        state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+# Edit Mode's "Fit to a scan": one job at a time, its scanned model prepared once and reused by refits.
+_SCAN_FIT = SimpleNamespace(models=None, index=-1, prepared=None, job=None, progress="", result=None, fabric=None,
+                            read_openings=True, along_openings=True, picture=None, texture=None, message="",
+                            photo_fit=None, try_more=True, grid=None)
+
+
+def _start_scan_fit(state, fabric):
+    view = _SCAN_FIT
+    model = view.models[view.index]
+    prepared = view.prepared if view.prepared is not None and view.prepared["model"] is model else None
+    holder = {}
+    if fabric == 'crochet':
+        grid = np.asarray(state.get('crochet_stitches'), dtype=np.float32).copy()
+        wraps = int(state.crochet_parameters().wraps)
+    else:
+        grid, wraps = np.asarray(state.bitmap, dtype=np.float32).copy(), 0
+    read_openings, along = bool(view.read_openings), bool(view.along_openings)
+
+    def run():
+        try:
+            ready = prepared or scan_fit.prepare(model, progress=lambda m: setattr(view, "progress", m))
+            say = lambda m: setattr(view, "progress", m)
+            if fabric == 'crochet':
+                result = scan_fit.fit_crochet(ready, grid, wraps, read_openings, along, progress=say)
+            else:
+                result = scan_fit.fit_knit(ready, grid, progress=say)
+            say("Drawing the scan from above")
+            holder.update(prepared=ready, result=result, picture=scan_fit.scan_picture(ready, result.angle_deg))
+        except Exception as exc:          # shown in the panel; the fabric is left as it was
+            holder["error"] = str(exc)
+
+    view.progress, view.fabric = "Starting", fabric
+    view.job = (threading.Thread(target=run, daemon=True, name="edit-scan-fit"), holder)
+    view.job[0].start()
+
+
+def _finish_scan_fit(state, renderer):
+    """A finished fit made the fabric's: its numbers (and grid, when read from the scan), one undo step."""
+    view = _SCAN_FIT
+    if view.job is None or view.job[0].is_alive():
+        return
+    holder, view.job = view.job[1], None
+    if "error" in holder:
+        view.message = f"Could not fit: {holder['error']}"
+        return
+    view.prepared, view.result, view.picture = holder["prepared"], holder["result"], holder["picture"]
+    view.texture = upload_rgb_texture(renderer.ctx, view.texture, np.asarray(view.picture))
+    result = view.result
+    state.push_undo("Fit to scan")
+    if view.fabric == 'crochet':
+        state.crochet_params = result.params.as_dict()
+        if view.read_openings:
+            state.crochet_stitches = np.asarray(result.cells, dtype=np.float32).copy()
+        p = result.params
+        view.message = (f"{result.stitch_name}: stitch {p.stitch_width:.2f} mm, row {p.row_height:.2f} mm, yarn r {p.yarn_radius:.2f} mm, "
+                        f"twist {p.twist:.2f}, lean {p.lean:+.2f} mm")
+    else:
+        _apply_knit_pattern(state, result.edit_parameters(), result.bitmap)
+        view.message = (f"stitch {result.stitch_width:.2f} mm, rows {result.row_pitch:.2f} mm apart, loop {result.loop_height:.2f} mm, "
+                        f"bulge {result.stitch_bulge:.2f}")
+    state.rebuild_spline_mesh(preserve_model_placement=False)
+    state.center_model_on_view()
+    state.status_msg = "Fitted to the scan"
+
+
+def _finish_photo_fit(state):
+    """A finished photo fit made the crochet fabric's: the learned stitch, its numbers and grid, one undo step."""
+    view = _SCAN_FIT
+    job = view.photo_fit
+    if job is None or job.running:
+        return
+    view.photo_fit = None
+    result = job.result()
+    if result is None:
+        view.message = "The photo fit did not finish: " + (job.lines[-1] if job.lines else "no output")
+        return
+    _apply_photo_fit(state, result)
+
+
+def _apply_photo_fit(state, result):
+    """A photo fit's learned stitch, numbers and grid made the crochet fabric's, as one undo step."""
+    view = _SCAN_FIT
+    params, stitches, summary = result
+    state.push_undo("Fit to the photos")
+    state.fabric_type = 'crochet'
+    state.crochet_params = params
+    state.crochet_stitches = stitches
+    state.rebuild_spline_mesh(preserve_model_placement=False)
+    state.center_model_on_view()
+    view.message = (f"Learned stitch: a stitch every {params['stitch_width']:.2f} mm, rows {params['row_height']:.2f} mm, "
+                    f"yarn r {params['yarn_radius']:.2f} mm; {summary}")
+    state.status_msg = "Fitted to the photos"
+
+
+# How far the grid's sliders reach: degrees either way of where it started, and its sizes (mm).
+GRID_TURN_DEG = 30.0
+GRID_SIZES = {"stitch_width": (0.4, 5.0), "row_height": (0.8, 9.0)}
+
+
+def _start_grid(state, renderer):
+    """Read the chosen scan's photos and cameras, and start the stitch grid where the scan suggests
+    (or where it was last lined up), on a background thread."""
+    view = _SCAN_FIT
+    model = view.models[view.index]
+    grid_size = np.asarray(state.get('crochet_stitches')).shape
+    wraps = int(state.crochet_parameters().wraps)
+    holder = {}
+
+    def run():
+        try:
+            prepared = view.prepared if view.prepared is not None and view.prepared["model"] is model else scan_fit.prepare(model)
+            cameras, lens, train, _ = scan_fit.load_cameras(model["run"], model["dataset"])
+            lattice = scan_fit.load_grid(model["output"])
+            if lattice is None:
+                start = crochet_fit.fit(prepared["extraction"], stitches=int(grid_size[1]), rows=int(grid_size[0]), wraps=wraps,
+                                        rows_along_holes=True, refine=False)
+                lattice = scan_fit.lattice_from_fit(start)
+            photos = scan_fit.read_photos(cameras)
+            holder.update(prepared=prepared, cameras=cameras, lens=lens, train=train, photos=photos, lattice=lattice,
+                          start_angle=float(lattice["angle_deg"]), index=scan_fit.square_on_camera(prepared, cameras),
+                          table=scan_fit.table_colour(photos, prepared, cameras, lens, train))
+        except Exception as exc:
+            holder["error"] = str(exc)
+
+    view.grid = SimpleNamespace(job=threading.Thread(target=run, daemon=True, name="stitch-grid"), holder=holder, lattice=None,
+                                texture=None, picture_key=None, openings=[], message="Reading the scan's photos...")
+    view.grid.job.start()
+
+
+def _draw_grid(state, renderer):
+    """The stitch grid over a photo of the scan, to line it up by eye: posts green, rows' tops yellow,
+    openings read from the photos as red rings."""
+    view = _SCAN_FIT
+    grid = view.grid
+    if grid is None:
+        if imgui.button("Line up the stitch grid on a photo##grid_start", (-1, 0)):
+            _start_grid(state, renderer)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Shows the scan's most square-on photo with the stitch grid drawn on it: turn, slide and\n"
+                              "stretch the grid until the posts and openings sit on the real ones, then fit to the photos.")
+        return
+    if grid.job is not None:
+        if grid.job.is_alive():
+            imgui.text_colored((0.65, 0.65, 0.65, 1.0), grid.message)
+            return
+        holder, grid.job = grid.holder, None
+        if "error" in holder:
+            view.grid = None
+            view.message = f"Could not show the grid: {holder['error']}"
+            return
+        for key, value in holder.items():
+            setattr(grid, key, value)
+        grid.message = ""
+    lattice = grid.lattice
+    changed = False
+    _, angle = imgui.slider_float("Rows' direction (deg)##grid_angle", float(lattice["angle_deg"]),
+                                  grid.start_angle - GRID_TURN_DEG, grid.start_angle + GRID_TURN_DEG, "%.1f")
+    if angle != lattice["angle_deg"]:
+        lattice["angle_deg"], changed = float(angle), True
+    for key, label in (("stitch_width", "Stitch width (mm)"), ("row_height", "Row height (mm)")):
+        low, high = GRID_SIZES[key]
+        _, value = imgui.slider_float(f"{label}##grid_{key}", float(lattice[key]), low, high, "%.3f")
+        if value != lattice[key]:
+            lattice[key], changed = float(value), True
+    w, h = lattice["stitch_width"], lattice["row_height"]
+    _, along = imgui.slider_float("Slide along the rows (mm)##grid_su", float(lattice["shift"][0] % w), 0.0, w, "%.2f")
+    _, across = imgui.slider_float("Slide across the rows (mm)##grid_sv", float(lattice["shift"][1] % h), 0.0, h, "%.2f")
+    if (along, across) != (lattice["shift"][0] % w, lattice["shift"][1] % h):
+        lattice["shift"], changed = [float(along), float(across)], True
+    if changed:
+        grid.openings = []                 # read again for the new grid
+    if imgui.small_button("< Previous photo##grid_prev"):
+        grid.index = (grid.index - 1) % len(grid.cameras)
+    imgui.same_line()
+    if imgui.small_button("Next photo >##grid_next"):
+        grid.index = (grid.index + 1) % len(grid.cameras)
+    imgui.same_line()
+    if imgui.small_button("Read the openings##grid_open"):
+        places = scan_fit.stitch_places(grid.prepared, lattice)
+        share = scan_fit.photo_openings(grid.prepared, lattice, places, grid.cameras, grid.lens, grid.photos, grid.train, grid.table)
+        grid.openings = [place for place, s in zip(places, share) if s >= 0.35]
+        grid.message = f"{len(grid.openings)} of {len(places)} stitches read as openings (red)"
+    imgui.same_line()
+    if imgui.small_button("Save grid##grid_save"):
+        path = scan_fit.save_grid(view.models[view.index]["output"], lattice)
+        grid.message = f"Saved to {path.name}; the photo fit keeps it"
+    key = (grid.index, json.dumps(lattice, sort_keys=True), len(grid.openings))
+    if grid.picture_key != key:
+        camera = grid.cameras[grid.index]
+        picture = scan_fit.grid_picture(grid.prepared, lattice, camera, grid.lens, grid.photos[grid.index], grid.openings)
+        grid.texture = upload_rgb_texture(renderer.ctx, grid.texture, np.asarray(picture))
+        grid.picture_key, grid.size = key, picture.size
+    imgui.text_colored((0.65, 0.65, 0.65, 1.0), f"Photo {grid.index + 1} of {len(grid.cameras)}: posts green, rows' tops yellow, openings red")
+    width = max(160.0, imgui.get_content_region_avail().x)
+    draw_fitted_texture(grid.texture.glo, grid.size[0], grid.size[1], width, width * grid.size[1] / grid.size[0], flip_y=True)
+    if grid.message:
+        imgui.text_wrapped(grid.message)
+
+
+def _draw_photo_fit(state):
+    """The slow, best fit: the stitch's own curves fitted to the photos (scan_fit.PhotoFit)."""
+    view = _SCAN_FIT
+    _finish_photo_fit(state)
+    if view.photo_fit is not None:
+        imgui.text_colored((0.65, 0.65, 0.65, 1.0), view.photo_fit.progress)
+        if imgui.small_button("Stop the photo fit##photo_fit_stop"):
+            view.photo_fit.stop()
+        return
+    _, view.try_more = imgui.checkbox("Also try 2x and 3x the stitches (more posts per repeat)##photo_fit_try", bool(view.try_more))
+    if imgui.button("Fit to the photos (slow, best)##photo_fit_go", (-1, 0)):
+        grid = np.asarray(state.get('crochet_stitches'))
+        rows, stitches = int(grid.shape[0]), int(grid.shape[1])
+        output = view.models[view.index]["output"]
+        lined_up = view.grid is not None and view.grid.lattice is not None
+        candidates = ",".join(f"{stitches * k}x{rows}" for k in (1, 2, 3)) if view.try_more and not lined_up else ""
+        lattice_path = scan_fit.save_grid(output, view.grid.lattice) if lined_up else None
+        view.photo_fit = scan_fit.PhotoFit(output, stitches, rows, int(state.crochet_parameters().wraps), candidates, lattice_path)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Draws the stitch equations into every photo of the scan and changes them until the drawings look\n"
+                          "like the photos: the lattice, the cloth's bow, and the stitch's own curves (learned, as Fourier\n"
+                          "series). A few minutes on the graphics card; close the splat viewer first.")
+    output = view.models[view.index].get("output")
+    last = Path(output) / "stitch_fit" if output is not None else None
+    if last is not None and (last / "stitch_model.json").is_file():
+        if imgui.small_button("Open the last photo fit##photo_fit_open"):
+            result = scan_fit.read_photo_fit(last)
+            if result is not None:
+                _apply_photo_fit(state, result)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("The stitch this scan's last photo fit learned, without fitting again")
+    if state.crochet_parameters().templates:
+        if imgui.small_button("Back to the hand-made stitch##photo_fit_forget"):
+            state.push_undo("Hand-made stitch")
+            state.crochet_params = {**state.crochet_parameters().as_dict(), "templates": None}
+            state.rebuild_spline_mesh(preserve_model_placement=True)
+
+
+def _draw_scan_fit(state, fabric, renderer):
+    """Fit this fabric's equations to a scanned model, keeping the repeat's size (the grid's rows and
+    stitches) and, if asked, the grid drawn here; the scan from above beside the result."""
+    view = _SCAN_FIT
+    _finish_scan_fit(state, renderer)
+    if view.models is None:
+        view.models = gui_model.find_models()
+        measured = [i for i, m in enumerate(view.models) if m["mm_per_unit"] is not None]
+        view.index = max(measured, key=lambda i: view.models[i]["psnr"] or 0.0) if measured else (0 if view.models else -1)
+    if not view.models:
+        imgui.text_colored((0.95, 0.75, 0.20, 1.0), "No trained scans under robot_scans.")
+        return
+    imgui.set_next_item_width(-1)
+    changed, index = imgui.combo("##scan_fit_model", view.index, [m["name"] for m in view.models])
+    if changed:
+        view.index, view.prepared, view.result, view.picture = index, None, None, None
+    grid = np.asarray(state.get('crochet_stitches') if fabric == 'crochet' else state.bitmap)
+    imgui.text_wrapped(f"The repeat is this grid: {grid.shape[0]} rows x {grid.shape[1]} stitches - from one opening to the next. "
+                       "Set its size above to what you count on the lace; the stitch sizes, yarn and loop shape are measured.")
+    if fabric == 'crochet':
+        _, view.read_openings = imgui.checkbox("Read the openings from the scan (else keep my grid)##scan_fit_read", bool(view.read_openings))
+        _, view.along_openings = imgui.checkbox("Rows run along the rows of openings##scan_fit_along", bool(view.along_openings))
+    busy = view.job is not None
+    if busy:
+        imgui.begin_disabled()
+    if imgui.button("Fit these equations to the scan##scan_fit_go", (-1, 0)):
+        _start_scan_fit(state, fabric)
+    if busy:
+        imgui.end_disabled()
+        imgui.text_colored((0.65, 0.65, 0.65, 1.0), view.progress + "...")
+    if fabric == 'crochet':
+        _draw_grid(state, renderer)
+        _draw_photo_fit(state)
+    if view.message:
+        imgui.text_wrapped(view.message)
+    result = view.result
+    if result is not None and view.fabric == fabric and result.comparison:
+        c = result.comparison
+        imgui.text(f"Model yarn to scan: {c['rebuilt_to_scan_mean_mm']:.2f} mm mean; "
+                   f"scan covered within 0.2 mm: {c['scan_within_0.2mm'] * 100:.0f}%")
+    if view.texture is not None and view.picture is not None:
+        imgui.text_colored((0.65, 0.65, 0.65, 1.0), "The scan from above, its rows turned to run left to right:")
+        width = max(160.0, imgui.get_content_region_avail().x)
+        w, h = view.picture.size
+        draw_fitted_texture(view.texture.glo, w, h, width, width * h / w, flip_y=True)
 
 
 def _draw_bitmap_editor(state, id_suffix=""):
@@ -551,13 +1004,19 @@ def _draw_bitmap_editor(state, id_suffix=""):
 
 def draw_sidebar(state, renderer, window=None):
     _apply_ui_theme(state)
-    database_active_layout = str(state.get('app_mode', 'edit')) == 'database'
+    database_active_layout = str(state.get('app_mode', 'edit')) in ('database', 'model')
     if database_active_layout:
         imgui.set_next_window_pos((20, 20), cond=imgui.Cond_.always)
         imgui.set_next_window_size((1280, 840), cond=imgui.Cond_.always)
     else:
-        imgui.set_next_window_pos((20, 20), cond=imgui.Cond_.first_use_ever)
-        imgui.set_next_window_size((360, 820), cond=imgui.Cond_.first_use_ever)
+        # After Reset Layout, once: placed and sized as on a first start, and brought to the front.
+        reset = bool(state.get('_layout_reset_pending', False))
+        cond = imgui.Cond_.always if reset else imgui.Cond_.first_use_ever
+        imgui.set_next_window_pos((20, 20), cond=cond)
+        imgui.set_next_window_size((360, 820), cond=cond)
+        if reset:
+            imgui.set_next_window_focus()
+            state._layout_reset_pending = False
     imgui.begin("Knitting Control")
 
     def rebuild_current_mesh(preserve=True):
@@ -738,6 +1197,7 @@ def draw_sidebar(state, renderer, window=None):
     puzzle_active = current_mode == 'puzzle'
     database_active = current_mode == 'database'
     ur5_active = current_mode == 'ur5'
+    model_active = current_mode == 'model'
     button_w = max(72, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x * 3.0) / 4.0)
     imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if edit_active else (0.20, 0.20, 0.20, 1.0))
     if imgui.button("Edit Mode##mode_edit", (button_w, 0)):
@@ -757,6 +1217,10 @@ def draw_sidebar(state, renderer, window=None):
     imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if database_active else (0.20, 0.20, 0.20, 1.0))
     if imgui.button("Database##mode_database", (button_w, 0)):
         _set_app_mode(state, 'database')
+    imgui.pop_style_color()
+    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if model_active else (0.20, 0.20, 0.20, 1.0))
+    if imgui.button("Model Mode: 3D scan and loop equations##mode_model", (-1, 0)):
+        _set_app_mode(state, 'model')
     imgui.pop_style_color()
     # On its own row, and in its own colour: the four above are simulation, this
     # one drives the physical arm. Crowding it into the same row as the others
@@ -802,11 +1266,25 @@ def draw_sidebar(state, renderer, window=None):
 
     if database_active:
         _draw_database_summary_page(state, renderer)
+        state.maybe_autosave()
+        imgui.end()
+        return
+
+    if model_active:
+        gui_model.draw_model_panel(state, renderer)
+        request = state.get('model_to_edit')
+        if request is not None:
+            state.model_to_edit = None
+            imgui.end()
+            _open_model_in_edit(state, request)
+            return
+        state.maybe_autosave()
         imgui.end()
         return
 
     if ur5_active:
         gui_ur5.draw_ur5_panel(state, renderer, window)
+        state.maybe_autosave()
         imgui.end()
         return
 
@@ -816,8 +1294,19 @@ def draw_sidebar(state, renderer, window=None):
             state.display_copies = np.array([0, 0], dtype=np.int32)
             state.rebuild_spline_mesh(preserve_model_placement=False)
 
+        if _draw_fabric_type(state) == 'crochet':
+            _draw_crochet_editor(state)
+            if imgui.collapsing_header("Fit to a scan##crochet_scan_fit", imgui.TreeNodeFlags_.default_open):
+                _draw_scan_fit(state, 'crochet', renderer)
+            state.maybe_autosave()
+            imgui.end()
+            return
+
         if imgui.collapsing_header("Pattern", imgui.TreeNodeFlags_.default_open):
             _draw_bitmap_editor(state)
+
+        if imgui.collapsing_header("Fit to a scan##knit_scan_fit"):
+            _draw_scan_fit(state, 'knit', renderer)
 
         if imgui.collapsing_header("Loop Heights", imgui.TreeNodeFlags_.default_open):
             state._sync_loop_heights()
@@ -1591,7 +2080,7 @@ def draw_sidebar(state, renderer, window=None):
                             embedded.cancel_single_capture()
                             state.scanner_status = embedded.status
         if not single_workflow and str(state.scanner_execution_mode) == "robot":
-            changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip), 64)
+            changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip))
             changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
             if changed_ip:
                 state.scanner_robot_ip = ip

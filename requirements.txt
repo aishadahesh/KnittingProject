@@ -29,6 +29,9 @@ ur-rtde>=1.6.0
 # camera can be opened.
 opencv-python>=4.10.0
 
+# Friendly camera names (e.g. "2K HD Camera") in the picker, Windows only.
+pygrabber>=0.2; sys_platform == "win32"
+
 # Test runner
 pytest>=8.0.0
 
