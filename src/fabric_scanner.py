@@ -258,6 +258,20 @@ class FabricPlan:
     scanner_lighting: dict[str, float] | None = None
     display_batch_colors: list[tuple[float, float, float, float]] | None = None
 
+    def assess(self) -> tuple[bool, list[str]]:
+        """Whether the arm can traverse this plan, judged on the densified Cartesian path.
+
+        The straight line between waypoints is what the controller traverses, so the
+        densified path is what gets checked -- a reach violation halfway along a long move
+        is still a collision.
+        """
+        dense = densify_plan_for_robot(self)
+        return assess_plan_safety(dense.mapped_points, max_step=ROBOT_MAX_CARTESIAN_STEP)
+
+    def capture_metadata(self, index: int, image_width: int | None = None) -> dict:
+        """No geometry beyond the row, col and view name the runner already stores."""
+        return {}
+
 
 def _serpentine_indices(rows: int, cols: int):
     for row in range(rows):

@@ -1,0 +1,79 @@
+{
+  "from_sessions": [
+    "ur5_20261019_180051"
+  ],
+  "rotvec": [
+    0.22026413902560313,
+    0.20452174692014302,
+    -0.7929675738355911
+  ],
+  "translation": [
+    -0.05225401867994361,
+    -0.0045701606268687715,
+    -0.04452414651608295
+  ],
+  "target": [
+    -0.2131481269766405,
+    0.6643958269427267,
+    0.05572281764563722
+  ],
+  "fov_degrees": 30.0,
+  "lens": "fitted field of view, no distortion",
+  "roll": "fitted",
+  "rms_px": 10.856865428770567,
+  "max_px": 39.98265951841719,
+  "pictures_used": 50,
+  "skipped": [
+    "ur5_0009_row_01_col_01_station_001_d1_az+30_tilt7.png: the object runs off the edge of the frame",
+    "ur5_0017_row_01_col_01_station_001_d1_az+70_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0018_row_01_col_01_station_001_d1_az+40_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0019_row_01_col_01_station_001_d1_az+10_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0020_row_01_col_01_station_001_d1_az-20_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0021_row_01_col_01_station_001_d1_az-50_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0028_row_01_col_01_station_001_d1_az-100_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0029_row_01_col_01_station_001_d1_az-70_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0030_row_01_col_01_station_001_d1_az-40_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0031_row_01_col_01_station_001_d1_az-10_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0032_row_01_col_01_station_001_d1_az+20_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0033_row_01_col_01_station_001_d1_az+50_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0034_row_01_col_01_station_001_d1_az+80_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0035_row_01_col_01_station_001_d1_az+110_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0036_row_01_col_01_station_001_d1_az+140_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0044_row_01_col_01_station_001_d2_az+20_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0045_row_01_col_01_station_001_d2_az+50_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0046_row_01_col_01_station_001_d2_az+80_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0047_row_01_col_01_station_001_d2_az+110_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0048_row_01_col_01_station_001_d2_az+140_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0049_row_01_col_01_station_001_d2_az+170_tilt20.png: the object runs off the edge of the frame",
+    "ur5_0050_row_01_col_01_station_001_d2_az+160_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0051_row_01_col_01_station_001_d2_az+130_tilt13.png: the object runs off the edge of the frame",
+    "ur5_0052_row_01_col_01_station_001_d2_az+100_tilt13.png: the object runs off the edge of the frame"
+  ],
+  "image_size": [
+    640,
+    480
+  ],
+  "fitted_at": "2026-10-25 13:00:56",
+  "worst": [
+    {
+      "name": "ur5_0016_row_01_col_01_station_001_d1_az+100_tilt13.png",
+      "error_px": 39.98265951841719
+    },
+    {
+      "name": "ur5_0037_row_01_col_01_station_001_d1_az+170_tilt20.png",
+      "error_px": 35.41381715565505
+    },
+    {
+      "name": "ur5_0053_row_01_col_01_station_001_d2_az+70_tilt13.png",
+      "error_px": 30.512889123635755
+    },
+    {
+      "name": "ur5_0038_row_01_col_01_station_001_d2_az-160_tilt20.png",
+      "error_px": 24.825723160187827
+    },
+    {
+      "name": "ur5_0054_row_01_col_01_station_001_d2_az+40_tilt13.png",
+      "error_px": 24.686650263858247
+    }
+  ]
+}

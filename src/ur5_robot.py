@@ -59,18 +59,47 @@ SAFETY_MODES = {
 BLOCKING_SAFETY_MODES = {3, 4, 5, 6, 7, 8, 9}
 # The controller must be in "running" mode (7) for RTDE motion to execute.
 READY_ROBOT_MODE = 7
+# RTDE runtime state while any program runs on the controller: TeleopApp's
+# control script, a pendant program, or a script another client left behind.
+RUNTIME_STATE_PLAYING = 2
 
 DEFAULT_RTDE_PORT = 30004
+# How often the controller streams state to this app. ur_rtde's default on an e-Series is
+# 500 Hz, and the controller drops an RTDE client that falls behind reading it - which a laptop
+# busy with anything else (the fabric check's model, say) does. Nothing here needs more than
+# this: moves are joint moves the controller interpolates, not a servo stream. TeleopApp reads
+# the same arm at the same rate.
+RTDE_FREQUENCY_HZ = 125.0
+# The controller's dashboard server: plain text, one command and one reply per line. It is
+# how a program left running is named, and stopped, without opening a control session.
+DASHBOARD_PORT = 29999
+DASHBOARD_TIMEOUT = 3.0
+# How long a stopped program is given to actually leave PLAYING before connecting again.
+STOP_SETTLE_TIMEOUT = 5.0
+# The primary interface, where a URScript program sent replaces the one running.
+SCRIPT_PORT = 30001
+# What replaces a stray script: bring the arm to rest, then end, leaving nothing running.
+STOP_SCRIPT = "def knitting_stop():\n  stopj(2.0)\nend\n"
 # Conservative defaults for scanning near fabric. Deliberately far below the
 # arm's capability: this moves a camera between close-set targets.
 DEFAULT_SPEED = 0.06
 DEFAULT_ACCELERATION = 0.30
 MAX_SPEED = 0.25
 MAX_ACCELERATION = 0.80
-# Joint angles for a safe, retracted pose over the table.
-DEFAULT_HOME_JOINTS = [0.0, -math.pi / 2.0, 0.0, -math.pi / 2.0, 0.0, 0.0]
+# The `Home` taught on this cell's arm in TeleopApp (config/ur5_saved_poses.json), in UR
+# joint order - TeleopApp stores the joints alphabetically, so shoulder_pan and elbow
+# trade places. The camera looks straight down at the fabric from here, 20 cm above it,
+# which is why the capture check reads the fabric's height off this pose. It replaced the
+# upright [0, -90, 0, -90, 0, 0] candle, which looks sideways at nothing.
+DEFAULT_HOME_JOINTS = [-1.597935978566305, -1.6107450924315394, 1.5623295942889612,
+                       -1.615626951257223, -1.4477899710284632, -0.1366961638080042]
 POSE_REACHED_TOL = 0.003
 POSE_REACHED_ROT_TOL = 0.05
+# Largest joint error, in radians, at which a joint move counts as arrived.
+JOINTS_REACHED_TOL = 0.01
+# Default peak joint speed for a Direct RTDE joint move, until the panel's own
+# setting is pushed onto the transport.
+DEFAULT_JOINT_SPEED_DEG = 12.0
 
 
 @dataclass
@@ -107,6 +136,90 @@ class RobotState:
 # Transports
 # ============================================================================
 
+class ProgramAlreadyRunning(RuntimeError):
+    """The controller is running a program, so a control session would replace it.
+
+    Carries what the dashboard says is loaded, so the panel can name it and offer to stop
+    it - the one way past this that does not mean walking to the pendant.
+    """
+
+    def __init__(self, ip, program, state):
+        self.ip, self.program, self.state = str(ip), str(program), str(state)
+        super().__init__(
+            f"{self.describe()}. Connecting would replace it. Stop it here, or on the pendant - "
+            "or, if TeleopApp is still running, use Via TeleopApp")
+
+    @property
+    def sent_over_network(self) -> bool:
+        """RTDE says a program runs while the dashboard says none plays: a script sent to the
+        controller's socket, which the dashboard never lists - most often ur_rtde's control
+        script, left by a client that closed without stopping it."""
+        return not self.state.upper().startswith("PLAYING")
+
+    def describe(self) -> str:
+        if self.sent_over_network:
+            return ("a script sent over the network is running on the arm - no pendant program is playing; "
+                    "most likely the control script TeleopApp or an earlier session left behind")
+        return f"the pendant program {self.program or '(unnamed)'} is playing on the arm"
+
+
+def dashboard(ip: str, command: str) -> str:
+    """One dashboard command, and the controller's one-line reply."""
+    import socket
+
+    with socket.create_connection((str(ip), DASHBOARD_PORT), timeout=DASHBOARD_TIMEOUT) as link:
+        reader = link.makefile("r", encoding="utf-8", newline="\n")
+        reader.readline()
+        link.sendall((command + "\n").encode("utf-8"))
+        return reader.readline().strip()
+
+
+def runtime_state(ip: str) -> int:
+    """The controller's RTDE runtime state - the one signal that sees scripts as well as programs."""
+    import rtde_receive
+
+    receive = rtde_receive.RTDEReceiveInterface(str(ip), RTDE_FREQUENCY_HZ)
+    try:
+        return int(receive.getRuntimeState())
+    finally:
+        receive.disconnect()
+
+
+def send_script(ip: str, script: str) -> None:
+    """Send a URScript program to the controller's primary interface, which replaces whatever runs."""
+    import socket
+
+    with socket.create_connection((str(ip), SCRIPT_PORT), timeout=DASHBOARD_TIMEOUT) as link:
+        link.sendall(script.encode("utf-8"))
+
+
+def _settles(ip: str, runtime) -> bool:
+    deadline = time.monotonic() + STOP_SETTLE_TIMEOUT
+    while time.monotonic() < deadline:
+        if runtime(ip) != RUNTIME_STATE_PLAYING:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def stop_program(ip: str, runtime=runtime_state) -> str:
+    """Stop whatever the controller is running - pendant program or stray script - and prove it.
+
+    First the dashboard's `stop`, which ends a pendant program. A script sent over the network
+    may outlive it, so if RTDE still says PLAYING it is replaced by one that only brings the arm
+    to rest and ends. Judged by RTDE's runtime state throughout: the dashboard does not see
+    scripts, which is how a stop that did nothing once read as done.
+    """
+    reply = dashboard(ip, "stop")
+    if _settles(ip, runtime):
+        return reply
+    send_script(ip, STOP_SCRIPT)
+    if _settles(ip, runtime):
+        return "the stray script was replaced by a stop and has ended"
+    raise RuntimeError(f"it is still running after the dashboard stop ({reply}) and after being replaced - "
+                       "stop it on the pendant, or power-cycle the controller")
+
+
 class UR5Transport:
     """What the robot layer needs from whatever is on the other end."""
 
@@ -128,6 +241,49 @@ class UR5Transport:
 
     def move_to_joints(self, joints, speed: float, acceleration: float) -> None:
         raise NotImplementedError
+
+    def ramp_for(self, joints) -> float:
+        """Seconds a move to `joints` will take, for a caller that has to wait it out."""
+        return 0.0
+
+    def linked(self) -> bool:
+        """Whether this app has a live session to read the arm through - whether or not the arm
+        behind it is up. A path can be planned from a live link; only a live arm can run it."""
+        return False
+
+    def rehearsable(self) -> bool:
+        """Whether a move can be sent without the arm moving, which is what a rehearsal is.
+
+        True only where something else executes the motion: a dry run, or a transport whose
+        far side holds a virtual robot that is not currently driving the arm. On a transport
+        wired straight to a controller a "rehearsal" is an ordinary move, so it is not one.
+        """
+        return not self.is_real
+
+    def blockers(self) -> list[str]:
+        """What stops this transport's commands from reaching the arm, beyond RobotState.
+
+        RobotState carries what every arm has - connected, powered, stopped. A transport
+        with a condition of its own says so here, and readiness() folds it in, so that the
+        guard refuses a move that would be accepted and then quietly do nothing.
+        """
+        return []
+
+    def move_home(self, joints, speed: float, acceleration: float) -> None:
+        """Where "start from home" sends the arm. Joints, unless a transport knows better."""
+        self.move_to_joints(joints, speed, acceleration)
+
+    def free_drive(self) -> None:
+        """Make the arm hand-guidable: gravity-compensated, holding wherever it is left."""
+        raise NotImplementedError(f"the {self.name} transport has no free drive")
+
+    def hold(self) -> None:
+        """End free drive: motors take the arm back and hold it where the hand left it."""
+        raise NotImplementedError(f"the {self.name} transport has no free drive")
+
+    def joints_now(self) -> list[float]:
+        """The measured joints as of this call, not as of the last poll - what a taught view records."""
+        return list(self.read_state().joints)
 
     def stop(self, deceleration: float = 2.0) -> None:
         raise NotImplementedError
@@ -156,6 +312,7 @@ class RTDETransport(UR5Transport):
         self.receive = None
         self.io = None
         self.ip = ""
+        self.max_joint_speed_deg = DEFAULT_JOINT_SPEED_DEG
 
     def connect(self, ip: str) -> None:
         import rtde_control
@@ -165,8 +322,22 @@ class RTDETransport(UR5Transport):
         # Receive first: it is read-only, so a wrong address or an unreachable
         # controller fails here without ever having opened a control channel
         # that could command motion.
-        self.receive = rtde_receive.RTDEReceiveInterface(self.ip)
-        self.control = rtde_control.RTDEControlInterface(self.ip)
+        self.receive = rtde_receive.RTDEReceiveInterface(self.ip, RTDE_FREQUENCY_HZ)
+        try:
+            # Uploading the control script replaces whatever program is running,
+            # and a control interface whose constructor fails because another
+            # client holds the arm takes the whole process down inside ur_rtde,
+            # past any except. So a busy controller is refused before either.
+            if self.receive.getRuntimeState() == RUNTIME_STATE_PLAYING:
+                try:
+                    program, state = dashboard(self.ip, "get loaded program"), dashboard(self.ip, "programState")
+                except Exception:
+                    program, state = "", ""
+                raise ProgramAlreadyRunning(self.ip, program.split(":", 1)[-1].strip(), state)
+            self.control = rtde_control.RTDEControlInterface(self.ip, RTDE_FREQUENCY_HZ)
+        except Exception:
+            self.disconnect()
+            raise
         try:
             import rtde_io
 
@@ -177,6 +348,13 @@ class RTDETransport(UR5Transport):
             self.io = None
 
     def disconnect(self) -> None:
+        # ur_rtde's disconnect leaves its control script running, which reads as
+        # a busy arm to the next client, this app included.
+        if self.control is not None:
+            try:
+                self.control.stopScript()
+            except Exception:
+                pass
         for handle in (self.control, self.receive, self.io):
             if handle is None:
                 continue
@@ -191,6 +369,15 @@ class RTDETransport(UR5Transport):
     def read_state(self) -> RobotState:
         if self.receive is None:
             return RobotState(connected=False)
+        # The receive stream only reads, so a dropped one is simply reopened. The control
+        # session is not: re-establishing it re-uploads the control script, which is a decision
+        # for the user after a stop, not something to do under a running scan.
+        try:
+            if not self.receive.isConnected():
+                self.receive.reconnect()
+        except Exception as exc:
+            return RobotState(connected=False, error=f"the RTDE state stream dropped and would not reopen: {exc}",
+                              updated_at=time.monotonic())
         try:
             state = RobotState(
                 connected=bool(self.receive.isConnected()),
@@ -222,9 +409,51 @@ class RTDETransport(UR5Transport):
         self.control.moveL([float(v) for v in pose], float(speed), float(acceleration), True)
 
     def move_to_joints(self, joints, speed: float, acceleration: float) -> None:
+        """A joint move at the panel's joint speed.
+
+        `speed` and `acceleration` are ignored, as in TeleopAppTransport: they are the
+        Cartesian m/s every caller passes, and moveJ reads its arguments as rad/s, so
+        passing them through crawls a scan at under a degree a second. The controller's
+        speed slider, which apply_speed_limit sets, still scales the move.
+        """
         if self.control is None:
             raise RuntimeError("Not connected to the robot")
-        self.control.moveJ([float(v) for v in joints], float(speed), float(acceleration), True)
+        joint_speed = math.radians(self.max_joint_speed_deg)
+        self.control.moveJ([float(v) for v in joints], joint_speed, joint_speed, True)
+
+    def linked(self) -> bool:
+        try:
+            return self.receive is not None and bool(self.receive.isConnected())
+        except Exception:
+            return False
+
+    def blockers(self) -> list[str]:
+        """The state stream can be up while the control session is gone, and then every move fails."""
+        try:
+            alive = self.control is not None and bool(self.control.isConnected())
+        except Exception:
+            alive = False
+        return [] if alive else ["the RTDE control session dropped - Disconnect, then Connect again"]
+
+    def free_drive(self) -> None:
+        if self.control is None:
+            raise RuntimeError("Not connected to the robot")
+        if not self.control.teachMode():
+            raise RuntimeError("the controller refused teach mode - check the pendant for a popup")
+
+    def hold(self) -> None:
+        if self.control is None:
+            raise RuntimeError("Not connected to the robot")
+        if not self.control.endTeachMode():
+            raise RuntimeError("teach mode would not end, so the arm is still loose - the control script has "
+                               "probably stopped; press Reset, then Hold again")
+
+    def ramp_for(self, joints) -> float:
+        """moveJ's trapezoid: cruise the furthest joint's travel, plus one second to ramp."""
+        if self.receive is None:
+            return 0.0
+        largest = float(np.max(np.abs(np.asarray(joints, dtype=float) - np.asarray(self.receive.getActualQ(), dtype=float))))
+        return largest / math.radians(self.max_joint_speed_deg) + 1.0
 
     def stop(self, deceleration: float = 2.0) -> None:
         if self.control is None:
@@ -275,12 +504,13 @@ class RTDETransport(UR5Transport):
 
 
 class DryRunTransport(UR5Transport):
-    """A stand-in arm that reports arriving where it was told to go.
+    """A stand-in arm that reports arriving where it was told to go - the tests' arm.
 
     Lets the whole UR5 workflow -- connect, plan, move, capture, store, analyse
-    -- be exercised with no hardware, and gives the tests something to drive.
-    It reports ``is_real=False``, which travels into the database alongside the
-    captures so a dry run is never mistaken for a real scan.
+    -- be exercised with no hardware. The panel no longer offers it: it shows no
+    motion, so simulating is done on TeleopApp's 3D arm instead. It reports
+    ``is_real=False``, which travels into the database alongside the captures so
+    a test run is never mistaken for a real scan.
     """
 
     name = "dry-run"
@@ -341,6 +571,17 @@ class DryRunTransport(UR5Transport):
             raise RuntimeError("Not connected to the robot")
         self._joints = np.asarray(joints, dtype=float).copy()
 
+    def linked(self) -> bool:
+        return self._connected
+
+    def free_drive(self) -> None:
+        if not self._connected:
+            raise RuntimeError("Not connected to the robot")
+
+    def hold(self) -> None:
+        if not self._connected:
+            raise RuntimeError("Not connected to the robot")
+
     def stop(self, deceleration: float = 2.0) -> None:
         self._advance()
         self._target = self._pose.copy()
@@ -357,10 +598,11 @@ class DryRunTransport(UR5Transport):
         self._speed_scale = float(np.clip(float(fraction), 0.01, 1.0))
 
 
-def make_transport(kind: str) -> UR5Transport:
-    if str(kind) == "rtde":
-        return RTDETransport()
-    return DryRunTransport()
+TRANSPORT_LABELS = {
+    "rtde":    "UR5 over RTDE",
+    "teleop":  "UR5 via TeleopApp",
+    "dry-run": "Dry run (no hardware)",
+}
 
 
 def rtde_available() -> bool:
@@ -387,10 +629,16 @@ class UR5Robot:
         self.state = RobotState()
         self.status = "Not connected"
         self.last_error = ""
+        # Why the last connect failed, kept as the exception so a caller can tell a busy
+        # controller - which it can offer to stop - from one that did not answer.
+        self.last_exception: Exception | None = None
         # Set by the stop button. Latched: it stays set until reset() clears it,
         # so nothing can quietly resume after a stop.
         self.stop_requested = False
         self.paused = False
+        # Set while the arm is hand-guidable. Nothing may be commanded then: a move sent to
+        # an arm someone is holding is a move into their hands.
+        self.free_driving = False
         self.speed_limit = 1.0
         self.speed = DEFAULT_SPEED
         self.acceleration = DEFAULT_ACCELERATION
@@ -415,9 +663,11 @@ class UR5Robot:
         if not self.ip:
             self.status = "Enter the robot IP address first"
             return False
+        self.last_exception = None
         try:
             self.transport.connect(self.ip)
         except Exception as exc:
+            self.last_exception = exc
             self.last_error = str(exc)
             self.status = f"Could not connect to {self.ip}: {exc}"
             self.state = RobotState(connected=False, error=str(exc))
@@ -428,12 +678,17 @@ class UR5Robot:
         self._poll_stop.clear()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True, name="ur5-poll")
         self._poll_thread.start()
-        kind = "robot" if self.is_real else "dry-run robot"
+        kind = "robot" if self.is_real else "simulated robot"
         self.status = f"Connected to {kind} at {self.ip}"
         self.apply_speed_limit(self.speed_limit)
         return True
 
     def disconnect(self) -> None:
+        if self.free_driving:
+            try:
+                self.hold()
+            except Exception as exc:
+                self.last_error = f"left in free drive: {exc}"
         self._poll_stop.set()
         thread = self._poll_thread
         self._poll_thread = None
@@ -482,7 +737,7 @@ class UR5Robot:
         issues: list[str] = []
         state = self.state
         if not state.connected:
-            issues.append("not connected to the robot")
+            issues.append("not connected to the robot" + (f" - {state.error}" if state.error else ""))
             return False, issues
         if state.emergency_stopped:
             issues.append("robot is in emergency stop; release it at the pendant")
@@ -497,6 +752,9 @@ class UR5Robot:
             )
         if self.stop_requested:
             issues.append("a stop is latched in the app; press Reset to clear it")
+        if self.free_driving:
+            issues.append("the arm is in free drive; press Hold to take it back")
+        issues.extend(self.transport.blockers())
         return len(issues) == 0, issues
 
     def ready(self) -> bool:
@@ -512,6 +770,29 @@ class UR5Robot:
         ok, issues = self.readiness()
         if not ok:
             raise RuntimeError(f"{action} refused: " + "; ".join(issues))
+
+    # -- free drive ----------------------------------------------------------
+
+    def free_drive(self) -> None:
+        """Let the arm be posed by hand. Refused while a run or a stop could be in play."""
+        if not self.connected:
+            raise RuntimeError("Free drive refused: not connected to the robot")
+        if self.stop_requested:
+            raise RuntimeError("Free drive refused: a stop is latched; press Reset first")
+        self.transport.free_drive()
+        self.free_driving = True
+        self.status = "Free drive - pose the camera by hand, then Record view"
+
+    def hold(self) -> None:
+        """Take the arm back from the hand. The flag clears only once the transport says it held."""
+        self.transport.hold()
+        self.free_driving = False
+        self.status = "Holding - the arm holds where it was left"
+
+    def joints_now(self) -> list[float]:
+        if not self.connected:
+            raise RuntimeError("Not connected to the robot")
+        return [float(value) for value in self.transport.joints_now()]
 
     # -- safety controls ---------------------------------------------------
 
@@ -584,7 +865,7 @@ class UR5Robot:
         """Sends the arm to the retracted safe pose."""
         try:
             self._guard("Move to home")
-            self.transport.move_to_joints(
+            self.transport.move_home(
                 self.home_joints,
                 self.limited_speed(0.35),
                 self.limited_acceleration(0.8),
@@ -620,7 +901,25 @@ class UR5Robot:
         position, rotation = self.pose_error(pose)
         return position <= float(tol) and rotation <= float(rot_tol)
 
+    def move_to_joints(self, joints) -> bool:
+        self._guard("Move")
+        self.transport.move_to_joints([float(v) for v in np.asarray(joints, dtype=float).reshape(-1)[:6]],
+                                      self.limited_speed(), self.limited_acceleration())
+        return True
+
+    def joint_error(self, joints) -> float:
+        """Largest single-joint distance, in radians, from the measured configuration."""
+        target = np.asarray(joints, dtype=float).reshape(-1)[:6]
+        current = np.asarray(self.state.joints, dtype=float).reshape(-1)[:6]
+        if current.size < 6:
+            return float("inf")
+        return float(np.max(np.abs(target - current)))
+
+    def at_joints(self, joints, tol: float = JOINTS_REACHED_TOL) -> bool:
+        return self.joint_error(joints) <= float(tol)
+
     def describe(self) -> str:
-        transport = "UR5 over RTDE" if self.is_real else "Dry run (no hardware)"
+        # Keyed on the transport rather than on is_real, which cannot tell two real ones apart.
+        transport = TRANSPORT_LABELS.get(str(self.transport.name), str(self.transport.name))
         return f"{transport} @ {self.ip}" if self.ip else transport
 

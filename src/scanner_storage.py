@@ -727,6 +727,11 @@ class ScannerStorage:
                 "splat_output_path": str(row[18] or ""),
                 "camera_backend": record.get("camera_backend", ""),
                 "camera_is_real": bool(record.get("camera_is_real", False)),
+                # Which capture path put the camera here. Absent on a fabric scan, whose
+                # geometry is the grid the row and column columns already carry.
+                "capture_pattern": str(record.get("capture_pattern", "")),
+                "capture_azimuth_deg": record.get("capture_azimuth_deg"),
+                "capture_elevation_deg": record.get("capture_elevation_deg"),
             }
             captures.append(capture)
 

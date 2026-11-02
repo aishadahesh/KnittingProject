@@ -14,3 +14,15 @@ scanner_data/
 scanner_images/
 scanner_images_old/
 scan_*.png
+
+# Downloaded model weights (scripts/fetch_mobilesam.py)
+models/
+
+# Session logs (scripts/run_sim_session.ps1)
+logs/
+
+# Robot scans, splats and fits: data, not code (gigabytes)
+robot_scans/
+
+# Generated print mesh (40 MB); rebuild it from its .scad
+hardware/endoscope_holder/endoscope_flange_mount_v2.stl

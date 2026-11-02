@@ -34,6 +34,16 @@ STATE_SCHEMA_JSON = CONFIG_DIR / "state_schema.json"
 INITIAL_PARAMS_JSON = CONFIG_DIR / "initial_params.json"
 PARAMS_JSON = CONFIG_DIR / "params.json"
 
+# UR5 Robot Mode's taught capture views, one JSON per named set. Kept with the
+# configuration rather than the runtime output: a set is taught once for a cell
+# and reused on every fabric mounted there.
+TAUGHT_VIEWS_DIR = CONFIG_DIR / "taught_views"
+
+# Downloaded model weights - fetched by scripts, never committed. MobileSAM is the fabric
+# check's segmentation model (scripts/fetch_mobilesam.py).
+MODELS_DIR = PROJECT_ROOT / "models"
+MOBILESAM_DIR = MODELS_DIR / "mobilesam"
+
 # Dear ImGui's window layout. Written by the UI at runtime rather than being
 # configuration anyone edits, so it stays out of config/.
 LAYOUT_INI = PROJECT_ROOT / "imgui_layout.ini"
@@ -41,6 +51,9 @@ LAYOUT_INI = PROJECT_ROOT / "imgui_layout.ini"
 # Runtime output directories.
 SCANNER_IMAGES_DIR = PROJECT_ROOT / "scanner_images"
 SCANNER_DATA_DIR = PROJECT_ROOT / "scanner_data"
+# What TeleopApp's simulated cell is built from - the fabric mesh and texture it loads as a prop -
+# and the frames its gripper camera writes. TeleopApp reads these paths, so they must be absolute.
+SIM_CELL_DIR = SCANNER_DATA_DIR / "sim_cell"
 ROBOT_SCANS_DIR = PROJECT_ROOT / "robot_scans"
 
 

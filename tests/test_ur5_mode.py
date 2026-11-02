@@ -7,6 +7,7 @@ saving a frame from the wrong pose, losing a capture's provenance -- are the
 ones pinned down here.
 """
 
+import math
 import os
 import sys
 import time
@@ -23,6 +24,7 @@ import robot_camera
 import ur5_robot
 import ur5_scan
 from scanner_storage import ScannerStorage
+from scan_geometry import TELEOP_JOINTS
 
 
 # ============================================================================
@@ -234,6 +236,28 @@ def test_preflight_refuses_without_a_camera(robot, plan):
     assert runner.start() is False
 
 
+def test_a_run_that_saves_nothing_needs_no_camera(robot, plan):
+    """Motion only: every move and every wait, no shutter - so no camera to refuse for.
+
+    The arm is often ready before the camera is, and a path worth walking is worth walking
+    then; refusing to start for want of a device the run never touches refuses the one
+    thing it can still do.
+    """
+    runner = ur5_scan.RealScanRunner(robot, None, plan, save_images=False)
+    assert runner.preflight() == (True, [])
+    assert runner.start() is True
+    runner.wait(timeout=120)
+
+    progress = runner.progress
+    assert progress.error == ""
+    assert progress.captured == 0
+    assert progress.target_index + 1 == progress.target_count
+
+    saving = ur5_scan.RealScanRunner(robot, None, plan, save_images=True)
+    ok, issues = saving.preflight()
+    assert not ok and any("camera is not running" in issue for issue in issues)
+
+
 def test_preflight_refuses_when_robot_not_ready(camera, plan):
     bot = ur5_robot.UR5Robot(ur5_robot.DryRunTransport())
     runner = ur5_scan.RealScanRunner(bot, camera, plan)
@@ -383,7 +407,9 @@ def test_undo_does_not_orphan_a_live_robot_connection():
     state = AppState(Camera(), StubRenderer())
     state.project_root = "."
     controller = gui_ur5.UR5ModeController(state, None, None)
-    controller.connect("127.0.0.1", "dry_run")
+    # The panel no longer offers the dry run; the tests' stand-in arm is connected directly.
+    controller.robot = ur5_robot.UR5Robot(ur5_robot.DryRunTransport())
+    controller.robot.connect("127.0.0.1")
     state.ur5_controller = controller
     try:
         snapshot = state.snapshot_state()
@@ -410,12 +436,16 @@ def test_ur5_settings_persist_but_the_controller_does_not():
 
 
 def test_ur5_defaults_cannot_command_hardware_on_their_own():
-    """Opening the mode must not be able to drive a real arm by itself."""
+    """Opening the mode must not be able to drive a real arm by itself.
+
+    The default is TeleopApp, which moves the arm only while it is following it; Direct
+    RTDE, where every command is the arm's, has to be chosen.
+    """
     from rendering import Camera
     from app_state import AppState
 
     state = AppState(Camera(), None)
-    assert state.get("ur5_transport") == "dry_run"
+    assert state.get("ur5_transport") == "teleop"
     assert state.get("ur5_speed_limit") <= 0.25
 
 
@@ -478,3 +508,283 @@ def test_trainer_refuses_incomplete_configuration(tmp_path):
 
     dataset.image_count = 4
     assert gaussian_splatting.SplatTrainer("", dataset, tmp_path).start() is False
+
+
+# ============================================================================
+# TeleopApp transport
+# ============================================================================
+
+HOME_JOINTS = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+
+
+class FakeTeleop:
+    """TeleopApp's DynamicRpcServer, reduced to the JSON it answers with.
+
+    Records every call in order, which is how the seed-before-arm sequence is checked:
+    arming across a standing gap is what trips the app's deviation guard, and the order is
+    the whole fix.
+    """
+
+    def __init__(self, **status):
+        self.calls = []
+        self.status = {
+            "connected": True, "motorsOn": True, "commandSending": True, "realHardware": False,
+            "trackingMode": "tracking", "engaging": False, "trackingGapDeg": 0.0,
+            "trajectoryExecuting": False, "poses": ["Home"],
+            "q": dict(zip(TELEOP_JOINTS, HOME_JOINTS)),
+            "plannedQ": dict(zip(TELEOP_JOINTS, HOME_JOINTS)),
+            "currentPose": {"px": 0.0, "py": 0.0, "pz": 0.0},
+        }
+        self.status.update(status)
+
+    def call(self, method, *args):
+        self.calls.append((method, *args))
+        if method == "describe":
+            return {"targets": {"ur5": {"joints": TELEOP_JOINTS}}}
+        if method == "getStatus":
+            return dict(self.status)
+        return None
+
+    def methods(self):
+        return [call[0] for call in self.calls]
+
+
+@pytest.fixture
+def teleop():
+    pytest.importorskip("mujoco")
+    import teleop_transport
+
+    fake = FakeTeleop()
+    transport = teleop_transport.TeleopAppTransport(client_factory=lambda address, path: fake)
+    transport.connect("localhost:50052")
+    return transport, fake
+
+
+def test_following_is_read_from_command_sending_not_the_tracking_mode(teleop):
+    """The guard trips, the mode still says tracking, and the arm stands still.
+
+    This is the flag that made a panel claim it was armed while nothing moved.
+    """
+    transport, fake = teleop
+    assert transport.following
+
+    fake.status.update(commandSending=False, trackingMode="tracking")
+    transport._refresh(force=True)
+    assert transport.following is False
+    assert transport.blockers() == ["TeleopApp is not commanding the arm; arm it with Reset"]
+
+
+def test_an_unevaluable_tracking_gap_is_not_a_gap_of_minus_one(teleop):
+    transport, fake = teleop
+    fake.status.update(trackingGapDeg=-1.0)
+    transport._refresh(force=True)
+    assert transport.gap_deg is None
+
+    fake.status.update(trackingGapDeg=12.5)
+    transport._refresh(force=True)
+    assert transport.gap_deg == pytest.approx(12.5)
+
+
+def test_arming_seeds_the_virtual_robot_before_energizing(teleop):
+    """Order matters: seed, then motors, then tracking."""
+    transport, fake = teleop
+    fake.status.update(trackingGapDeg=20.0)
+    transport._refresh(force=True)
+    transport.reset_stop()
+
+    ordered = [method for method in fake.methods() if method in ("gotoJointAngles", "setMotors", "setTrackingMode")]
+    assert ordered == ["gotoJointAngles", "setMotors", "setTrackingMode"]
+
+
+def test_arming_refuses_loudly_when_commanding_never_starts(teleop):
+    transport, fake = teleop
+    fake.status.update(commandSending=False)
+    transport._refresh(force=True)
+    with pytest.raises(RuntimeError, match="not commanding the arm"):
+        transport.reset_stop()
+
+
+def test_a_move_is_paced_by_how_far_the_furthest_joint_travels(teleop):
+    """Seconds per move, derived from joint travel -- not from the interface's metres per second.
+
+    The configured speed is the PEAK, because the arm eases in and out of every move: asking
+    for 12 deg/s and getting a 12 deg/s average would put 22.5 deg/s through the middle of it.
+    """
+    import scan_geometry
+
+    transport, _ = teleop
+    transport.max_joint_speed_deg = 12.0
+    transport.floor_seconds = 2.0
+
+    nudge = list(HOME_JOINTS)
+    nudge[0] += math.radians(6.0)
+    swing = list(HOME_JOINTS)
+    swing[0] += math.radians(120.0)
+
+    assert transport.ramp_for(nudge) == pytest.approx(2.0)
+
+    seconds = transport.ramp_for(swing)
+    assert 120.0 / seconds * scan_geometry.PEAK_OVER_MEAN == pytest.approx(12.0, abs=0.1)
+    assert seconds == pytest.approx(18.75, abs=0.2)
+
+
+def test_a_commanded_pose_is_the_tool_point_not_the_flange(teleop):
+    """The planner names where the camera goes, so the flange target is one offset back.
+
+    Solving the tool point as a flange target parks the camera a tool-length past the pose
+    that was asked for, and the runner's arrival check then never converges.
+    """
+    transport, fake = teleop
+    asked = transport.tool_pose()
+
+    transport.move_to_pose(asked, 0.0, 0.0)
+    sent = [call for call in fake.calls if call[0] == "gotoJointAngles"][-1]
+    fake.status["q"] = dict(sent[2])
+    transport._refresh(force=True)
+
+    assert float(np.linalg.norm(np.asarray(transport.tool_pose())[:3] - np.asarray(asked)[:3])) < 0.002
+
+
+def test_home_uses_the_taught_pose_when_the_arm_has_one(teleop):
+    """Home is where the simulated and the real arm are defined to agree."""
+    transport, fake = teleop
+    transport.move_home(HOME_JOINTS, 0.0, 0.0)
+    assert ("gotoPose", "ur5", "Home") in fake.calls
+
+    fake.status["poses"] = []
+    transport._refresh(force=True)
+    transport.move_home(HOME_JOINTS, 0.0, 0.0)
+    assert fake.methods()[-1] == "gotoJointAngles"
+
+
+def test_a_rehearsal_is_only_offered_where_it_would_not_move_the_arm(teleop):
+    """A "rehearsal" on a transport wired straight to a controller is an ordinary move."""
+    transport, fake = teleop
+
+    assert ur5_robot.DryRunTransport().rehearsable() is True
+    assert ur5_robot.RTDETransport().rehearsable() is False
+
+    assert transport.following and not transport.on_hardware and transport.rehearsable() is True
+    fake.status.update(realHardware=True)
+    transport._refresh(force=True)
+    assert transport.following and transport.on_hardware and transport.rehearsable() is False
+    fake.status.update(commandSending=False)
+    transport._refresh(force=True)
+    assert transport.rehearsable() is True
+
+
+def test_teleop_captures_are_real_only_on_the_arm_itself(teleop):
+    """On TeleopApp's emulator nothing physical moved, so a capture must not be stored as real."""
+    transport, fake = teleop
+
+    assert transport.is_real is False
+    fake.status.update(realHardware=True)
+    transport._refresh(force=True)
+    assert transport.is_real is True
+
+
+def test_not_following_blocks_a_move_through_the_guard(teleop):
+    """A move sent while TeleopApp is not commanding is accepted and does nothing.
+
+    Reporting it as a readiness blocker is what turns that silence into a refusal.
+    """
+    transport, fake = teleop
+    bot = ur5_robot.UR5Robot(transport)
+    bot.connect("localhost:50052")
+    time.sleep(0.15)
+    try:
+        assert bot.ready()
+
+        fake.status.update(commandSending=False)
+        transport._refresh(force=True)
+        bot.refresh()
+        assert not bot.ready()
+        with pytest.raises(RuntimeError, match="not commanding"):
+            bot.move_to_pose(transport.tool_pose())
+    finally:
+        bot.disconnect()
+
+
+# ============================================================================
+# The capture path
+# ============================================================================
+
+def test_a_capture_plan_only_offers_reachable_collision_free_poses():
+    pytest.importorskip("mujoco")
+    import scan_geometry
+
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3)
+
+    assert len(plan.viewpoints) == 3
+    assert plan.clear and not plan.refused
+    assert all(point.err_pos < scan_geometry.UNREACHED_POS for point in plan.viewpoints)
+    assert plan.assess() == (True, [])
+
+
+def test_every_capture_viewpoint_is_photographed():
+    """A view named approach/retreat/travel is skipped by the runner, so none may be."""
+    pytest.importorskip("mujoco")
+    import scan_geometry
+
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3)
+    runner = ur5_scan.RealScanRunner(ur5_robot.UR5Robot(ur5_robot.DryRunTransport()), None, plan)
+    assert runner.scan_targets == list(range(len(plan.view_names)))
+
+
+def test_a_capture_records_the_geometry_it_was_taken_from():
+    pytest.importorskip("mujoco")
+    import scan_geometry
+
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1)
+    recorded = plan.capture_metadata(1)
+
+    assert recorded["capture_pattern"] == "orbit"
+    assert recorded["capture_azimuth_deg"] == pytest.approx(plan.viewpoints[1].azimuth_deg)
+    assert len(recorded["capture_subject"]) == 3
+
+
+def test_a_capture_run_stores_one_image_per_viewpoint(tmp_path, robot, camera):
+    """The whole point of the reuse: the wait at each viewpoint becomes a real capture.
+
+    Same runner, same storage, same records as a fabric scan - only the plan differs, so a
+    capture session is queryable next to every other session in the database.
+    """
+    pytest.importorskip("mujoco")
+    import scan_geometry
+
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3)
+    storage = ScannerStorage(tmp_path)
+    runner = ur5_scan.RealScanRunner(
+        robot, camera, plan, storage,
+        output_root=tmp_path / "robot_scans",
+        settings_snapshot={"teleop_pattern": "spin"},
+        dwell=0.0,
+    )
+    assert runner.preflight()[0] is True
+    assert runner.start() is True
+    runner.wait(timeout=120)
+
+    progress = runner.progress
+    assert progress.error == ""
+    assert progress.captured == len(plan.viewpoints)
+
+    summary = storage.database_summary()
+    assert summary["capture_count"] == len(plan.viewpoints)
+    stored = summary["captures"][0]
+    assert stored["capture_pattern"] == "spin"
+    assert stored["camera_angle"] in plan.view_names
+    assert stored["capture_azimuth_deg"] is not None
+    assert os.path.exists(stored["image_path"])
+
+    session = storage.robot_sessions()[0]
+    assert session["status"] == "finished"
+    assert session["capture_count"] == len(plan.viewpoints)
+
+
+def test_a_path_with_nothing_reachable_is_refused_before_the_arm_moves():
+    """The refusal has to come before the arm moves, not 363 mm short of the target."""
+    pytest.importorskip("mujoco")
+    import scan_geometry
+
+    with pytest.raises(RuntimeError, match="No viewpoint"):
+        scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=1, grid_cols=2, fabric_z=1.5)
