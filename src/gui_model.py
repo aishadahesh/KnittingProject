@@ -10,8 +10,14 @@ all from one shared orbit camera (drag to turn, right-drag to move, wheel to zoo
 The equation yarn is either the traced strands (only what the pictures showed clearly), or the
 complete repeating loops: the cloth's repeat found in the scan and filled in as Edit Mode's knit
 (lace_lattice.py), which "Open in Edit Mode" hands over to be edited there.
-The geometry is strand_equations.py and lace_lattice.py; the splat loading and CPU renderer are
-gaussian_splatting.py.
+The pictures are drawn on the GPU (splat_gl.py) every frame, so they follow the mouse. "Spin" turns
+them by themselves, "Wiggle" rocks them a little either way (near yarn slides over far yarn),
+"Draw" shows the soft splat or its single Gaussians (ellipses, centres, outlines in the soft splat,
+or each one's longest axis as a 3D line, alone or on the soft splat), "Edge-on" looks along the cloth, and "Colour by height"
+paints each Gaussian by how far it stands above the cloth's bow - the ways to see that the model is
+really 3D. Where the GPU
+renderer cannot start, the CPU one (gaussian_splatting.py) draws them, sharpening while the view rests.
+The geometry is strand_equations.py and lace_lattice.py; the splat loading is gaussian_splatting.py.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ import crochet_fit
 import gaussian_splatting
 import lace_lattice
 import paths
+import splat_gl
 import strand_equations
 from rendering import draw_fitted_texture, upload_rgb_texture
 
@@ -38,6 +45,10 @@ COLOR_OK = (0.25, 0.80, 0.40, 1.0)
 COLOR_WARN = (0.95, 0.75, 0.20, 1.0)
 COLOR_MUTED = (0.65, 0.65, 0.65, 1.0)
 RENDER_SIZE = (560, 420)
+SPIN_DEG_PER_S = 25.0
+# "Wiggle" rocks the view this many degrees either way, this many times a second: the parallax of
+# near yarn sliding over far yarn is the plainest sign the model is 3D.
+WIGGLE_DEG, WIGGLE_HZ = 8.0, 0.8
 BACKGROUND = (18, 18, 24)
 SHOWS = ("Scan", "Equations", "Side by side", "Overlay")
 COLOURINGS = ("Yarn white", "Distance to scan (heat map)")
@@ -84,6 +95,7 @@ def _view(state) -> SimpleNamespace:
             selected=-1, show=2, colouring=1, heat_mm=0.5, overlay=0.6, tube_splat=None, tube_key=None,
             periodic=None, periodic_job=None, source=0, counts=(3, 6),
             crochet=None, crochet_job=None, crochet_counts=[3, 3], crochet_wraps=1, crochet_along_holes=True, crochet_auto=False,
+            gl=None, gl_failed=False, gl_used=set(), spin=False, wiggle=False, wiggle_offset=0.0, by_height=False, plane=None, style=splat_gl.SOFT,
         )
         state.model_view = view
     return view
@@ -95,7 +107,7 @@ def _select_model(view, index: int) -> None:
     model = view.models[index]
     view.index, view.splat, view.frame, view.extraction, view.selected = index, None, None, None, -1
     view.periodic, view.crochet, view.source = None, None, 0
-    view.tube_splat, view.tube_key, view.pictures = None, None, {}
+    view.tube_splat, view.tube_key, view.pictures, view.plane = None, None, {}, None
     view.mm_per_unit = model["mm_per_unit"] or 1.0
     holder = {}
 
@@ -130,6 +142,7 @@ def _poll_loader(view) -> None:
     if "guess" in holder:
         view.mm_per_unit = holder["guess"]
     view.frame = gaussian_splatting.orbit_frame(view.splat["positions"][view.splat["opacity"] >= 0.1])
+    view.plane = splat_gl.cloth_plane(view.splat["positions"][view.splat["opacity"] >= 0.1])
 
 
 def _start_extraction(view) -> None:
@@ -394,8 +407,54 @@ def _model_caption(view) -> str:
     return "Rebuilt from the traced equations"
 
 
+def _gpu(view, ctx):
+    """The GPU splat renderer, made on first use; None where this GL cannot run it (the CPU draws)."""
+    if view.gl is None and not view.gl_failed:
+        try:
+            view.gl = splat_gl.SplatRenderer(ctx)
+        except Exception as exc:
+            view.gl_failed = True
+            view.status = f"Drawing the pictures on the CPU: the GPU renderer could not start ({exc})"
+    return view.gl
+
+
+def _gpu_picture(view, gl, which: str, size):
+    """One picture drawn on the GPU, again only when the camera, the yarn or the size has changed."""
+    def colouring(splat):
+        return (lambda: splat_gl.height_colours(splat["positions"], view.plane)) if view.by_height else None
+
+    layers = []
+    if which in ("scan", "overlay"):
+        layers.append((("scan", view.index, view.by_height), view.splat, colouring(view.splat), 1.0))
+    if which in ("equations", "overlay"):
+        tubes = _tube_splat(view)
+        if tubes is not None:
+            layers.append((("tubes", view.tube_key, view.by_height), tubes, colouring(tubes),
+                           1.0 if which == "equations" else float(view.overlay)))
+    slot = view.pictures.setdefault(which, SimpleNamespace(texture=None, shown=None))
+    wanted = (view.camera, size, view.style, tuple((key, strength) for key, _, _, strength in layers))
+    if slot.shown != wanted or getattr(slot, "gpu", None) is None:
+        slot.gpu = gl.render(layers, view.camera, view.frame, size, BACKGROUND, target=which, style=view.style)
+        slot.shown = wanted
+    view.gl_used.update(key for key, *_ in layers)
+    return slot.gpu
+
+
 def _draw_picture(view, ctx, which: str, width: float, caption: str):
     imgui.begin_group()
+    gl = _gpu(view, ctx)
+    if gl is not None:
+        size = (int(width), int(min(width * 0.75, 620.0)))
+        try:
+            texture = _gpu_picture(view, gl, which, size)
+        except Exception as exc:          # the CPU pictures from here on
+            view.gl, view.gl_failed, view.pictures = None, True, {}
+            view.status = f"Drawing the pictures on the CPU: the GPU renderer failed ({exc})"
+        else:
+            imgui.text_colored(COLOR_MUTED, caption)
+            rect = draw_fitted_texture(texture.glo, size[0], size[1], width, size[1], flip_y=True)
+            imgui.end_group()
+            return rect
     slot = _picture(view, ctx, which)
     imgui.text_colored(COLOR_MUTED, caption)
     if slot.stage < FULL_STAGE:
@@ -665,6 +724,40 @@ def _draw_view_options(view) -> None:
     imgui.same_line()
     if imgui.small_button("Top##model_top"):
         view.camera = (view.camera[0], 89.0, view.camera[2], view.camera[3])
+    imgui.same_line()
+    if imgui.small_button("Edge-on##model_edge"):
+        view.camera = (view.camera[0], 3.0, view.camera[2], view.camera[3])
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Looks along the cloth: a flat picture would vanish to a line, the model shows its thickness.")
+    imgui.same_line()
+    _, view.spin = imgui.checkbox("Spin##model_spin", bool(view.spin))
+    imgui.same_line()
+    _, view.wiggle = imgui.checkbox("Wiggle##model_wiggle", bool(view.wiggle))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Rocks the view a few degrees either way: in a 3D model the near yarn slides\n"
+                          "over the far yarn and the table; a flat picture would only skew as one piece.")
+    imgui.same_line()
+    _, view.by_height = imgui.checkbox("Colour by height##model_height", bool(view.by_height))
+    if view.gl is not None:
+        imgui.same_line()
+        imgui.set_next_item_width(150)
+        _, view.style = imgui.combo("Draw##model_style", int(view.style), list(splat_gl.STYLES))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Soft splat: the picture as trained.\n"
+                              "Gaussian ellipses: every Gaussian solid out to one standard deviation, rimmed -\n"
+                              "its size, stretch and turn. Gaussian centres: only their middles, as dots.\n"
+                              "Soft splat + Gaussian outlines: the picture with each Gaussian's outline in it;\n"
+                              "turn it and the outlines change shape as flattened 3D ellipsoids do.\n"
+                              "Gaussian axes: each Gaussian's longest axis as a 3D line - red along the cloth's x,\n"
+                              "green along its y, blue standing up out of it.\n"
+                              "Soft splat + Gaussian axes: those axes on the model; the ones behind the cloth stay hidden.")
+    if view.plane is not None:
+        relief_mm = (view.plane[4] - view.plane[3]) * float(view.mm_per_unit)
+        imgui.text_colored(COLOR_MUTED, f"Relief above the cloth's bow: {relief_mm:.2f} mm (2nd to 98th percentile of "
+                                        f"{len(view.splat['positions']):,} Gaussians); a flat picture would be 0.")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Each Gaussian coloured by how far it stands above the cloth's smooth bow:\n"
+                          "blue low, red high. The yarn's crossings and the openings' rims show as relief.")
 
 
 def draw_model_panel(state, renderer) -> None:
@@ -692,6 +785,15 @@ def draw_model_panel(state, renderer) -> None:
     imgui.same_line()
     if imgui.begin_child("model_pictures", (0, 0)):
         _draw_view_options(view)
+        if view.spin and not view.dragging:
+            azimuth, elevation, zoom, pan = view.camera
+            azimuth = ((azimuth + SPIN_DEG_PER_S * float(imgui.get_io().delta_time) + 180.0) % 360.0) - 180.0
+            view.camera = (azimuth, elevation, zoom, pan)
+        if view.wiggle and not view.dragging:
+            offset = WIGGLE_DEG * float(np.sin(2.0 * np.pi * WIGGLE_HZ * time.monotonic()))
+            azimuth, elevation, zoom, pan = view.camera
+            view.camera = (azimuth + offset - view.wiggle_offset, elevation, zoom, pan)
+            view.wiggle_offset = offset
         if view.splat is None or view.frame is None:
             imgui.text_colored(COLOR_MUTED, "Loading the model..." if view.loader is not None else "No model loaded.")
         else:
@@ -711,3 +813,6 @@ def draw_model_panel(state, renderer) -> None:
                 rects = [_draw_picture(view, ctx, "scan", avail, "Scan")]
             _handle_mouse(view, rects)
     imgui.end_child()
+    if view.gl is not None:               # splats no picture drew this frame are let go
+        view.gl.forget(keep=view.gl_used)
+        view.gl_used = set()

@@ -223,8 +223,9 @@ def main():
     # ── Frame pacing ──────────────────────────────────────────────────────────
     # The loop used to redraw flat out whether anything changed or not. Now it
     # waits for input, up to IDLE_FRAME_SECONDS, unless something on screen
-    # moves by itself every frame - Scan Mode's simulator stepping, or the yarn
-    # solver - and any mouse or key event still wakes it at once.
+    # moves by itself every frame - Scan Mode's simulator stepping, the yarn
+    # solver, or Model Mode's spinning model - and any mouse or key event still
+    # wakes it at once.
     IDLE_FRAME_SECONDS = 1.0 / 15.0
 
     def animating(state):
@@ -234,7 +235,10 @@ def main():
             or bool(getattr(embedded, 'single_target_active', False))
             or getattr(embedded, '_capture_job', None) is not None
         )
-        return scanning or sim_may_run(state)
+        model_view = state.get('model_view')
+        spinning = model_view is not None and (bool(getattr(model_view, 'spin', False))
+                                               or bool(getattr(model_view, 'wiggle', False)))
+        return scanning or spinning or sim_may_run(state)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     undo_shortcut_was_down = False

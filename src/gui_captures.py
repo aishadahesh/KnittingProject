@@ -21,6 +21,7 @@ from PIL import Image
 
 import gaussian_splatting
 import scan_geometry
+import splat_gl
 from rendering import draw_fitted_texture, upload_rgb_texture
 
 COLOR_OK = (0.25, 0.80, 0.40, 1.0)
@@ -443,6 +444,17 @@ def _trained_object_only(artifact: Path) -> bool:
     return False
 
 
+def _splat_gl(view, controller):
+    """The viewer's GPU splat renderer, made on first use; None where this GL cannot run it."""
+    if getattr(view, "splat_gl", None) is None and not getattr(view, "splat_gl_failed", False):
+        try:
+            view.splat_gl = splat_gl.SplatRenderer(controller.gl_ctx)
+        except Exception as exc:
+            view.splat_gl, view.splat_gl_failed = None, True
+            controller.status = f"Drawing the splat on the CPU: the GPU renderer could not start ({exc})"
+    return getattr(view, "splat_gl", None)
+
+
 def draw_splat_viewer(controller, artifacts) -> None:
     """A trained splat, turned with sliders - the reconstruction, seen without the trainer's GPU viewer."""
     view = gallery(controller)
@@ -477,6 +489,7 @@ def draw_splat_viewer(controller, artifacts) -> None:
         view.splat_view, view.splat_texture, view.splat_pan = (0.0, 60.0, 1.0), None, (0.0, 0.0)
         view.splat_shown, view.splat_fine, view.splat_worker, view.splat_result = None, None, None, None
         view.splat_object_only = _trained_object_only(plys[0])
+        view.splat_frame, view.splat_gpu_shown = None, None
     imgui.text_colored(COLOR_OK, f"Splat: {plys[0].name}, {view.splat['count']:,} Gaussians"
                                  + (f" (drawing {len(view.splat['positions']):,})" if view.splat["count"] > len(view.splat["positions"]) else ""))
     object_only = bool(getattr(view, "splat_object_only", False))
@@ -506,14 +519,35 @@ def draw_splat_viewer(controller, artifacts) -> None:
     imgui.same_line()
     if imgui.small_button("Reset view##splat_reset"):
         azimuth, elevation, zoom, pan = 0.0, 60.0, 1.0, (0.0, 0.0)
+    if getattr(view, "splat_gl", None) is not None:
+        imgui.same_line()
+        imgui.set_next_item_width(150)
+        _, view.splat_style = imgui.combo("Draw##splat_style", int(getattr(view, "splat_style", splat_gl.SOFT)), list(splat_gl.STYLES))
 
-    # Every input is answered at once with a dots-only picture (a few milliseconds); the proper
-    # render (a second or two) runs on a thread once the view has rested for a moment, and is
-    # swapped in when it is done - the panel never waits for it.
+    # Drawn on the GPU (splat_gl.py), the proper picture every frame. Where that cannot run, every
+    # input is answered at once with a dots-only picture (a few milliseconds); the proper CPU render
+    # (a second or two) runs on a thread once the view has rested for a moment, and is swapped in
+    # when it is done - the panel never waits for it.
     background = (0, 0, 0) if object_only else (18, 18, 24)
     now = time.monotonic()
     wanted = (azimuth, elevation, zoom, pan)
-    if view.splat_texture is None or getattr(view, "splat_shown", None) != wanted:
+    gl = _splat_gl(view, controller)
+    if gl is not None:
+        try:
+            style = int(getattr(view, "splat_style", splat_gl.SOFT))
+            if getattr(view, "splat_gpu_shown", None) != (wanted, view.splat_path, style):
+                if view.splat_frame is None:
+                    view.splat_frame = gaussian_splatting.orbit_frame(view.splat["positions"][view.splat["opacity"] >= 0.1])
+                gl.forget(keep={view.splat_path})
+                view.splat_gpu = gl.render([(view.splat_path, view.splat, None, 1.0)], (azimuth, elevation, zoom, pan),
+                                           view.splat_frame, (720, 540), background, style=style)
+                view.splat_gpu_shown = (wanted, view.splat_path, style)
+        except Exception as exc:
+            view.splat_gl, view.splat_gl_failed = None, True
+            controller.status = f"Drawing the splat on the CPU: the GPU renderer failed ({exc})"
+    if getattr(view, "splat_gl", None) is not None:
+        view.splat_texture_id, view.splat_size = view.splat_gpu.glo, (720, 540)
+    elif view.splat_texture is None or getattr(view, "splat_shown", None) != wanted:
         image = gaussian_splatting.render_splat_quick(view.splat, azimuth, elevation, zoom, size=(480, 360), background=background, pan=pan)
         view.splat_texture = upload_rgb_texture(controller.gl_ctx, view.splat_texture, np.asarray(image))
         view.splat_size = image.size
@@ -526,7 +560,7 @@ def draw_splat_viewer(controller, artifacts) -> None:
             view.splat_texture = upload_rgb_texture(controller.gl_ctx, view.splat_texture, np.asarray(result[1]))
             view.splat_size = result[1].size
             view.splat_fine = result[0]
-    if (worker is None and view.splat_fine != wanted and now - getattr(view, "splat_rested_at", now) > 0.25):
+    if (gl is None and worker is None and view.splat_fine != wanted and now - getattr(view, "splat_rested_at", now) > 0.25):
         splat = view.splat
 
         def render(wanted=wanted):
@@ -537,7 +571,8 @@ def draw_splat_viewer(controller, artifacts) -> None:
         view.splat_worker.start()
     width, height = view.splat_size
     avail = max(160.0, imgui.get_content_region_avail().x)
-    rect = draw_fitted_texture(view.splat_texture.glo, width, height, avail, min(avail * height / width, 480.0), flip_y=True)
+    texture_id = view.splat_texture_id if getattr(view, "splat_gl", None) is not None else view.splat_texture.glo
+    rect = draw_fitted_texture(texture_id, width, height, avail, min(avail * height / width, 480.0), flip_y=True)
 
     io = imgui.get_io()
     over = False

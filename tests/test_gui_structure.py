@@ -29,7 +29,8 @@ MODE_MODULES = ("gui_edit", "gui_scan", "gui_puzzle", "gui_database", "gui_ur5",
 IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core", "embedded_scanner",
                       "rgb_analysis", "robot_camera", "ur5_robot", "ur5_scan",
                       "gaussian_splatting", "free_capture", "paths", "strand_equations",
-                      "lace_lattice", "crochet_core", "crochet_fit", "scan_fit", "crochet_stitches")
+                      "lace_lattice", "crochet_core", "crochet_fit", "scan_fit", "crochet_stitches",
+                      "splat_gl")
 
 
 def _existing(names):
