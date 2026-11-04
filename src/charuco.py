@@ -177,6 +177,64 @@ class Detector:
         return None
 
 
+# The board's printed sheet, for masking it out of a scan: its white border round the squares (m),
+# the most a pixel may be coloured and still be the paper (HSV saturation, 0-255; the yarn is blue),
+# and the fewest markers that pin the sheet down (one alone extrapolates badly across the frame).
+SHEET_BORDER_M = 0.004
+PAPER_MAX_SATURATION = 25
+DARK_PAPER_VALUE, DARK_PAPER_MAX_SATURATION = 110, 80
+MASK_MIN_MARKERS = 2
+
+
+def board_paper_mask(image: np.ndarray, spec: dict) -> tuple[np.ndarray, int]:
+    """Where a picture shows the board's paper: (bool mask, markers read). Empty when too few markers.
+
+    The sheet is found from its markers (a homography from the board's plane), and inside it only the
+    neutral paper counts - cloth lying over the sheet's edge stays in. For a scan whose board moved
+    under the cloth while the pictures were taken: masked, the board neither places the cameras nor
+    is trained into the splat."""
+    import cv2
+
+    board = make_board(spec)
+    corners_on_board = {int(i): np.asarray(p, dtype=np.float64)[:, :2] for i, p in zip(np.asarray(board.getIds()).ravel(), board.getObjPoints())}
+    parameters = cv2.aruco.DetectorParameters()
+    parameters.adaptiveThreshWinSizeMax = 63
+    parameters.adaptiveThreshWinSizeStep = 6
+    parameters.perspectiveRemovePixelPerCell = 8
+    parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Enlarged and sharpened, as Detector reads small markers.
+    up = cv2.resize(grey, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    up = cv2.addWeighted(up, 1.8, cv2.GaussianBlur(up, (0, 0), 3), -0.8, 0)
+    found, ids, _ = cv2.aruco.ArucoDetector(board.getDictionary(), parameters).detectMarkers(up)
+    empty = np.zeros(grey.shape, dtype=bool)
+    if ids is None:
+        return empty, 0
+    on_board, in_picture = [], []
+    for marker, marker_id in zip(found, np.asarray(ids).ravel()):
+        if int(marker_id) in corners_on_board:
+            on_board.append(corners_on_board[int(marker_id)])
+            in_picture.append((np.asarray(marker, dtype=np.float64).reshape(4, 2) - 0.5) / 2.0)
+    if len(on_board) < MASK_MIN_MARKERS:
+        return empty, len(on_board)
+    homography, _ = cv2.findHomography(np.concatenate(on_board), np.concatenate(in_picture), cv2.RANSAC, HOMOGRAPHY_TOLERANCE_PX)
+    if homography is None:
+        return empty, len(on_board)
+    # Every pixel carried back onto the board's plane: inside the sheet or not.
+    ys, xs = np.mgrid[0:grey.shape[0], 0:grey.shape[1]]
+    pixels = np.stack([xs.ravel(), ys.ravel()], axis=1).astype(np.float64).reshape(-1, 1, 2)
+    plane = cv2.perspectiveTransform(pixels, np.linalg.inv(homography)).reshape(-1, 2)
+    width = float(spec["squares_x"]) * float(spec["square_mm"]) / 1000.0
+    height = float(spec["squares_y"]) * float(spec["square_mm"]) / 1000.0
+    sheet = ((plane[:, 0] > -SHEET_BORDER_M) & (plane[:, 0] < width + SHEET_BORDER_M)
+             & (plane[:, 1] > -SHEET_BORDER_M) & (plane[:, 1] < height + SHEET_BORDER_M)).reshape(grey.shape)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # In the black squares the camera's noise reads as colour: dark paper may be more saturated.
+    paper = (hsv[..., 1] < PAPER_MAX_SATURATION) | ((hsv[..., 2] < DARK_PAPER_VALUE) & (hsv[..., 1] < DARK_PAPER_MAX_SATURATION))
+    mask = cv2.morphologyEx((sheet & paper).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    return cv2.dilate(mask, np.ones((5, 5), np.uint8)).astype(bool) & sheet, len(on_board)
+
+
 def camera_matrix(intrinsics: dict) -> tuple[np.ndarray, np.ndarray]:
     """OpenCV's K and distortion (k1, k2, p1, p2, k3) from transforms.json-style intrinsics."""
     matrix = np.array([[float(intrinsics["fl_x"]), 0.0, float(intrinsics["cx"])],

@@ -102,6 +102,9 @@ def main() -> None:
                              "the cameras' distance (+ toward the cameras) - e.g. -0.5,-0.12 for a cloth lying below the board")
     parser.add_argument("--drop-board", action="store_true",
                         help="also drop the ChArUco board beside the cloth (found by its black squares against the lace's blue holes)")
+    parser.add_argument("--one-piece", action="store_true",
+                        help="keep only the cloth's own connected piece (as --drop-board does last) without dropping the "
+                             "board's squares - for a board masked out in training, beside a dark band the square finder would take")
     parser.add_argument("--drop-blue", action="store_true",
                         help="also drop the deep-blue surface the cloth lies on, leaving the cloth alone")
     parser.add_argument("--checkpoint", action="store_true",
@@ -289,7 +292,7 @@ def crop_mask(points, opacity_logit, log_scales, c2ws, lens, args, label, colour
     specks = kept[neighbours < SPECK_MIN_NEIGHBOURS]
     print(f"  isolated speck: {len(specks)} dropped")
     keep[specks] = False
-    if args.drop_board and colour_dc is not None:
+    if (args.drop_board and colour_dc is not None) or args.one_piece:
         # Last, once the specks no longer bridge the gap between them: only the cloth's own piece stays.
         drop = keep & ~largest_piece(points, centre, normal, reach, keep)
         print(f"  apart from the cloth (the board's white squares, the paper strip): {int(drop.sum())} dropped")

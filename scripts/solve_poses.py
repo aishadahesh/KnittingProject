@@ -74,6 +74,32 @@ def equalise_exposure(images: Path, percentile: float = 95.0, limits=(0.5, 2.0))
 STRAY_CAMERA_FACTOR = 10.0
 
 
+def mask_board(images: Path, output: Path) -> dict[str, float]:
+    """A mask per picture with the board's paper black (charuco.board_paper_mask), written twice: as
+    COLMAP reads masks (colmap_masks/<picture>.png) and as nerfstudio does (masks/<picture>).
+    Returns each masked picture's masked share."""
+    import cv2
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    import charuco
+
+    spec = charuco.load_board_spec()
+    if spec is None:
+        raise SystemExit("--mask-board: no board spec (config/charuco_board.json)")
+    for folder in ("masks", "colmap_masks"):
+        (output / folder).mkdir(parents=True, exist_ok=True)
+    shares = {}
+    for picture in sorted(images.iterdir()):
+        board, _ = charuco.board_paper_mask(cv2.imread(str(picture)), spec)
+        keep = np.where(board, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(output / "masks" / picture.name), keep)
+        cv2.imwrite(str(output / "colmap_masks" / (picture.name + ".png")), keep)
+        if board.any():
+            shares[picture.name] = round(float(board.mean()), 3)
+    print(f"0/4 Board masked in {len(shares)} of {sum(1 for _ in images.iterdir())} pictures", flush=True)
+    return shares
+
+
 def drop_stray_cameras(transforms_path: Path) -> list[str]:
     """Removes cameras far from the rest from transforms.json, in place. Returns their picture names."""
     transforms = json.loads(transforms_path.read_text(encoding="utf-8"))
@@ -151,6 +177,9 @@ def main() -> None:
     parser.add_argument("--fov", type=float, default=55.0, help="the lens's horizontal field of view, degrees (the app passes its own)")
     parser.add_argument("--refine-focal", action="store_true",
                         help="solve the focal length too - for a dome of views at several distances (a flat sweep cannot)")
+    parser.add_argument("--mask-board", action="store_true",
+                        help="leave the ChArUco board's paper out of the pose solve and the training - for a scan whose "
+                             "board slid under the cloth while it was taken")
     args = parser.parse_args()
     session, output = Path(args.session), Path(args.output)
 
@@ -181,7 +210,8 @@ def main() -> None:
         raise SystemExit(f"only {len(names)} pictures in {session}; the pose solve needs many more")
     # Only what an earlier solve wrote is cleared: the app's log of this very run (train.log) is open
     # in the same folder.
-    for stale in ("images", "sparse", "colmap", "database.db", "transforms.json", "sparse_pc.ply", "pose_report.json"):
+    for stale in ("images", "sparse", "colmap", "database.db", "transforms.json", "sparse_pc.ply", "pose_report.json",
+                  "masks", "colmap_masks"):
         path = output / stale
         if path.is_dir():
             shutil.rmtree(path)
@@ -193,6 +223,7 @@ def main() -> None:
         shutil.copy2(sources[name], images / name)
     if settings.get("equalise_exposure", True):
         equalise_exposure(images)
+    masked = mask_board(images, output) if args.mask_board else {}
 
     import pycolmap
     from PIL import Image
@@ -202,9 +233,10 @@ def main() -> None:
     focal = width / (2.0 * math.tan(math.radians(args.fov) / 2.0))
     database = output / "database.db"
     print(f"1/4 Finding features in {len(names)} pictures (lens {args.fov:.0f} deg, focal {focal:.0f} px)", flush=True)
-    pycolmap.extract_features(str(database), str(images), camera_mode=pycolmap.CameraMode.SINGLE,
-                              reader_options=pycolmap.ImageReaderOptions(camera_model="SIMPLE_RADIAL",
-                                                                         camera_params=f"{focal},{width / 2.0},{height / 2.0},0"))
+    reader = pycolmap.ImageReaderOptions(camera_model="SIMPLE_RADIAL", camera_params=f"{focal},{width / 2.0},{height / 2.0},0")
+    if masked:
+        reader.mask_path = str(output / "colmap_masks")
+    pycolmap.extract_features(str(database), str(images), camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader)
     print(f"2/4 Matching every pair ({len(names) * (len(names) - 1) // 2} pairs)", flush=True)
     pycolmap.match_exhaustive(str(database))
     print("3/4 Placing the cameras (incremental mapping)", flush=True)
@@ -230,8 +262,16 @@ def main() -> None:
 
     colmap_to_json(recon_dir=recon_dir, output_dir=output)
     strays = drop_stray_cameras(output / "transforms.json")
+    if masked:
+        # nerfstudio leaves a frame's masked pixels out of the training loss.
+        transforms = json.loads((output / "transforms.json").read_text())
+        for frame in transforms["frames"]:
+            frame["mask_path"] = f"masks/{Path(frame['file_path']).name}"
+        (output / "transforms.json").write_text(json.dumps(transforms, indent=2))
     report = measure(recon_dir, names, len(models))
     report["stray_cameras"] = strays
+    if masked:
+        report["board_masked_share"] = masked
     report["registered"] -= len(strays)
     report["unregistered"] += strays
     (output / "pose_report.json").write_text(json.dumps(report, indent=2))

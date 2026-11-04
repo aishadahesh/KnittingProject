@@ -156,3 +156,27 @@ def test_a_scan_without_the_board_is_refused(tmp_path):
     cv2.imwrite(str(path), blank)
     with pytest.raises(ValueError, match="board is in none"):
         charuco.export_dataset([{"path": str(path), "session_id": "s"}], tmp_path / "ds", spec=SPEC, measured_lens=LENS)
+
+
+def test_the_board_paper_is_masked_but_cloth_lying_on_it_is_kept():
+    # A close picture of part of the board (6 mm squares, about 16 px each), with light-blue cloth
+    # lying over its left third and dark blue table beyond the sheet's right edge.
+    spec = {"squares_x": 47, "squares_y": 33, "square_mm": 6.0, "marker_mm": 4.5, "dictionary": "DICT_5X5_1000"}
+    page = charuco.board_image(spec, px_per_mm=2.7, page_mm=(47 * 6 + 20, 33 * 6 + 20))
+    picture = cv2.cvtColor(page[100:580, 330:970], cv2.COLOR_GRAY2BGR).copy()
+    sheet_right = (page.shape[1] - int(round(47 * 6 * 2.7))) // 2 + int(round(47 * 6 * 2.7)) - 330    # in the picture
+    sheet_bottom = (page.shape[0] - int(round(33 * 6 * 2.7))) // 2 + int(round(33 * 6 * 2.7)) - 100
+    picture[:, sheet_right + 12:] = (90, 20, 10)                       # the table (BGR)
+    picture[:, :200] = (235, 200, 160)                                  # the cloth over the sheet
+    board, markers = charuco.board_paper_mask(picture, spec)
+    assert markers >= charuco.MASK_MIN_MARKERS
+    assert board[:sheet_bottom - 10, 260:sheet_right - 10].mean() > 0.95  # the open paper: masked
+    assert board[:, :190].mean() < 0.02                                 # the cloth on it: kept
+    assert board[:, sheet_right + 20:].mean() < 0.02                    # the table beyond the sheet: kept
+
+
+def test_a_picture_without_the_board_masks_nothing():
+    picture = np.full((480, 640, 3), (235, 200, 160), dtype=np.uint8)
+    board, markers = charuco.board_paper_mask(picture, {"squares_x": 47, "squares_y": 33, "square_mm": 6.0,
+                                                        "marker_mm": 4.5, "dictionary": "DICT_5X5_1000"})
+    assert markers == 0 and not board.any()
