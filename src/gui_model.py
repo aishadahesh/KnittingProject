@@ -1030,17 +1030,14 @@ def _draw_model_choice(view) -> None:
 
 
 def _save_to_drive(view, model) -> None:
-    """Pack the model's scan folders and copy the zip to Drive, on a thread; view.drive_job says how far."""
-    job = {"stage": "Packing", "share": 0.0, "done": False, "error": None}
+    """Copy the model's folders to Drive on a thread; view.drive_job says how far."""
+    job = {"stage": "Starting", "share": 0.0, "done": False, "error": None}
 
     def work():
         staging = Path(tempfile.mkdtemp(prefix="drive_"))
         try:
-            def packed(share):
-                job["share"] = share
-            target, info = drive_store.pack(model["output"], staging, packed)
-            job.update(stage=f"Uploading {target.name} ({info['bytes'] / 1e6:.0f} MB)", share=0.0)
-            process = drive_store.upload(target)
+            process, count, size = drive_store.upload(model["output"], staging / "files.txt")
+            job["stage"] = f"Uploading {count} files ({size / 1e6:.0f} MB)"
             last = ""
             for line in process.stderr:
                 share = drive_store.progress_of(line)
@@ -1049,8 +1046,9 @@ def _save_to_drive(view, model) -> None:
                 last = line.strip() or last
             if process.wait() != 0:
                 raise RuntimeError(last or "rclone failed")
-            job["stage"] = f"Saved {target.name} to Drive ({info['files']} files, {info['bytes'] / 1e6:.0f} MB)"
-        except Exception as exc:              # shown in the panel; nothing half-saved is kept locally
+            names = ", ".join(f.name for f in drive_store.scan_folders(model["output"]))
+            job["stage"] = f"Saved to Drive's {drive_store.FOLDER}: {names} ({count} files, {size / 1e6:.0f} MB)"
+        except Exception as exc:              # shown in the panel
             job["error"] = str(exc)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -1058,6 +1056,16 @@ def _save_to_drive(view, model) -> None:
 
     threading.Thread(target=work, daemon=True, name="drive-save").start()
     view.drive_job = job
+
+
+def _copy_share_link(view, name: str) -> None:
+    """A view link to a Drive folder, copied to the clipboard."""
+    try:
+        link = drive_store.share_link(name)
+        imgui.set_clipboard_text(link)
+        view.status = f"Link copied (anyone with it can view {name or drive_store.FOLDER}): {link}"
+    except Exception as exc:
+        view.status = f"No link: {exc}"
 
 
 def _draw_drive(view, model) -> None:
@@ -1107,9 +1115,16 @@ def _draw_drive(view, model) -> None:
     entries = view.drive_saved["entries"]
     if entries is None:
         imgui.text_colored(COLOR_MUTED, "Reading what is on Drive...")
-    elif imgui.tree_node(f"On Drive ({len(entries)})##drive_list"):
+    elif imgui.tree_node(f"On Drive ({len(entries)} scan folders)##drive_list"):
+        if imgui.small_button("Copy a link to the whole folder##drive_link_all"):
+            _copy_share_link(view, "")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Anyone with the link can view (not change) the folder.")
         for entry in entries:
-            imgui.text(f"{entry['name']}  {entry['bytes'] / 1e6:.0f} MB  {entry['modified']}")
+            if imgui.small_button(f"link##drive_link_{entry['name']}"):
+                _copy_share_link(view, entry["name"])
+            imgui.same_line()
+            imgui.text(f"{entry['name']}  {entry['modified']}")
         imgui.tree_pop()
 
 

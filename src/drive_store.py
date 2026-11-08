@@ -1,20 +1,21 @@
 """Save a scanned model to Google Drive, through rclone (https://rclone.org), from the app.
 
-A model is saved as one zip of what cannot be made again: its scan folder - and, for a model built from
-several captures (combined.json), each capture's folder - with the raw photos and the arm's poses, the
-cameras' poses, the masks, the scale, every splat (the Gaussians, .ply) and the colours, yarns and
-stitch fits read from it. What can be made again is left out: training checkpoints, COLMAP databases,
-the photo copies inside splat_dataset*, renders and a fit's region.ply. Paths in the zip start at the
-scan folder's name, so it unzips straight back into robot_scans.
+A model is saved as folders, as they are in robot_scans (so the Drive folder can be opened and shared
+as it is): its scan folder - and, for a model built from several captures (combined.json), each
+capture's folder - with what cannot be made again: the raw photos and the arm's poses, the cameras'
+poses, the masks, the scale, every splat (the Gaussians, .ply) and the colours, yarns and stitch fits
+read from it. What can be made again is left out: training checkpoints, COLMAP databases, the photo
+copies inside splat_dataset*, renders and a fit's region.ply. Saving again copies only what changed.
 
   rclone_path    the rclone program (on PATH, or where winget installed it), or None
   connected      whether the Drive remote is set up
   connect        set it up: a browser opens for the person to sign in to their Google account (rclone
                  is given access only to the files it makes)
   scan_folders   the folders a model's data lives in
-  pack           zip them (returns the zip and what went in)
-  upload         start copying a zip to Drive (a process; its stderr carries rclone's progress)
-  saved          what is on Drive already
+  files_to_save  the files of those folders worth saving
+  upload         start copying them to Drive (a process; its stderr carries rclone's progress)
+  share_link     a link to a folder on Drive, for anyone who has it to view
+  saved          the scan folders on Drive already
   progress_of    the share done, read from one of rclone's progress lines
 
 No imgui here.
@@ -22,18 +23,15 @@ No imgui here.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
-import zipfile
 from pathlib import Path
 
 REMOTE = "gdrive"
 FOLDER = "KnittingProject_data"
-STORED = {".png", ".jpg", ".ply", ".mp4", ".npy"}          # already compressed: stored as they are
 REBUILDABLE = {".ckpt", ".db"}
 HIDE_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -68,12 +66,12 @@ def connect() -> subprocess.Popen:
 
 def scan_folders(output: Path) -> list[Path]:
     """The scan folder a model (its splat_output folder) belongs to, after the captures it was built from."""
-    scan = Path(output).parent
+    scan = Path(output).resolve().parent
     folders = []
     combined = scan / "combined.json"
     if combined.is_file():
         for session in json.loads(combined.read_text(encoding="utf-8")).get("sessions", []):
-            path = Path(session)
+            path = Path(session).resolve()
             path = path if path.is_dir() else scan.parent / path.name
             if path.is_dir() and path != scan:
                 folders.append(path)
@@ -91,43 +89,42 @@ def keep(relative: Path) -> bool:
     return True
 
 
-def pack(output: Path, out_dir: Path, report=lambda share: None) -> tuple[Path, dict]:
-    """Zip a model's scan folders into out_dir/<scan folder>.zip: (the zip, what went in)."""
+def files_to_save(output: Path) -> tuple[Path, list[Path]]:
+    """robot_scans, and every file of the model's scan folders worth saving, as paths from it."""
     folders = scan_folders(output)
     root = folders[-1].parent
-    files = [f for folder in folders for f in sorted(folder.rglob("*")) if f.is_file() and keep(f.relative_to(root))]
-    total = max(sum(f.stat().st_size for f in files), 1)
-    target = Path(out_dir) / f"{folders[-1].name}.zip"
-    done = 0
-    with zipfile.ZipFile(target, "w") as archive:
-        for f in files:
-            method = zipfile.ZIP_STORED if f.suffix.lower() in STORED else zipfile.ZIP_DEFLATED
-            archive.write(f, f.relative_to(root).as_posix(), compress_type=method)
-            done += f.stat().st_size
-            report(done / total)
-    digest = hashlib.sha256()
-    with target.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return target, {"folders": [f.name for f in folders], "files": len(files), "bytes": target.stat().st_size,
-                    "sha256": digest.hexdigest(), "unzip_into": "robot_scans"}
+    return root, [f.relative_to(root) for folder in folders for f in sorted(folder.rglob("*"))
+                  if f.is_file() and keep(f.relative_to(root))]
 
 
-def upload(path: Path) -> subprocess.Popen:
-    """Copy a file into the Drive folder; rclone's progress comes on stderr, a line a second."""
-    return subprocess.Popen([rclone_path(), "copyto", str(path), f"{REMOTE}:{FOLDER}/{Path(path).name}",
-                             "--stats", "1s", "--stats-one-line", "-v", "--retries", "10", "--low-level-retries", "20",
-                             "--drive-chunk-size", "64M"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, creationflags=HIDE_WINDOW)
+def upload(output: Path, list_file: Path) -> tuple[subprocess.Popen, int, int]:
+    """Copy a model's files into the Drive folder as they are, folder by folder (files already there
+    and unchanged are skipped). Returns the process - rclone's progress comes on its stderr, a line a
+    second - and how many files and bytes go."""
+    root, files = files_to_save(output)
+    Path(list_file).write_text("\n".join(f.as_posix() for f in files), encoding="utf-8")
+    process = subprocess.Popen([rclone_path(), "copy", str(root), f"{REMOTE}:{FOLDER}", "--files-from", str(list_file),
+                                "--stats", "1s", "--stats-one-line", "-v", "--transfers", "8", "--checkers", "8",
+                                "--retries", "10", "--low-level-retries", "20"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, creationflags=HIDE_WINDOW)
+    return process, len(files), sum((root / f).stat().st_size for f in files)
+
+
+def share_link(name: str = "") -> str:
+    """A link to a folder on Drive (the whole data folder by default). Anyone with the link can view it."""
+    result = _run("link", f"{REMOTE}:{FOLDER}/{name}".rstrip("/"))
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "rclone link failed")
+    return result.stdout.strip()
 
 
 def saved() -> list[dict]:
-    """What is in the Drive folder: [{"name", "bytes", "modified"}], newest first."""
-    result = _run("lsjson", f"{REMOTE}:{FOLDER}", "--files-only")
+    """The scan folders in the Drive folder: [{"name", "modified"}], by name."""
+    result = _run("lsjson", f"{REMOTE}:{FOLDER}", "--dirs-only")
     if result.returncode != 0:
         return []
-    entries = [{"name": e["Name"], "bytes": e["Size"], "modified": e["ModTime"][:16].replace("T", " ")} for e in json.loads(result.stdout or "[]")]
-    return sorted(entries, key=lambda e: e["modified"], reverse=True)
+    return sorted(({"name": e["Name"], "modified": e["ModTime"][:16].replace("T", " ")} for e in json.loads(result.stdout or "[]")),
+                  key=lambda e: e["name"])
 
 
 def progress_of(line: str) -> float | None:

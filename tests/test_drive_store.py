@@ -1,8 +1,7 @@
-"""drive_store: what goes into a model's zip for Drive, and reading rclone's progress."""
+"""drive_store: which of a model's files go to Drive, and reading rclone's progress."""
 
 import json
 import sys
-import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -34,9 +33,9 @@ def test_pack_keeps_what_cannot_be_made_again(tmp_path):
     _write(model / "splat_dataset_colmap" / "transforms.json")
 
     assert drive_store.scan_folders(output) == [capture, model]
-    target, info = drive_store.pack(output, tmp_path)
-    names = set(zipfile.ZipFile(target).namelist())
-    assert target.name == "ur5_a_rescan.zip" and info["files"] == len(names)
+    root, files = drive_store.files_to_save(output)
+    names = {f.as_posix() for f in files}
+    assert root == scans
     assert {"ur5_a/ur5_0001.png", "ur5_a/ur5_0001.json", "ur5_a_rescan/combined.json",
             "ur5_a_rescan/splat_dataset_colmap/colmap_masks/ur5_0001.png",
             "ur5_a_rescan/splat_dataset_colmap/transforms.json"} <= names
