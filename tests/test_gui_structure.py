@@ -30,7 +30,7 @@ IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core", "embedded_scanner",
                       "rgb_analysis", "robot_camera", "ur5_robot", "ur5_scan",
                       "gaussian_splatting", "free_capture", "paths", "strand_equations",
                       "lace_lattice", "crochet_core", "crochet_fit", "scan_fit", "crochet_stitches",
-                      "splat_gl")
+                      "splat_gl", "fabric_palette", "yarn_tracks", "fit_yarns")
 
 
 def _existing(names):

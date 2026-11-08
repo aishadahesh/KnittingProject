@@ -37,6 +37,7 @@ STYLES = ("Soft splat", "Gaussian ellipses", "Gaussian centres", "Soft splat + G
           "Soft splat + Gaussian axes")
 SOFT, ELLIPSES, CENTRES, OUTLINED, AXES, SPLAT_AXES = range(len(STYLES))
 DEPTH_ONLY = 9                            # the shader's style for the cores' depth pass (not a STYLES entry)
+IDS = 10                                  # each pixel the number of the Gaussian in front there (gaussian_ids)
 AXIS_LIFT = 0.015
 AXIS_SIGMAS = 1.5
 AXIS_MIN_OPACITY = 0.1
@@ -115,6 +116,11 @@ void main() {
     float r2 = dot(v_local, v_local);
     if (style == 2) {                                     // a centre: a round opaque dot
         if (r2 > 9.0 || v_opacity < 0.1) discard;
+        frag = vec4(v_colour, 1.0);
+        return;
+    }
+    if (style == 10) {                                    // the Gaussian's number, exactly: its core, depth-tested
+        if (r2 > 1.0 || v_opacity < 0.1) discard;
         frag = vec4(v_colour, 1.0);
         return;
     }
@@ -346,12 +352,11 @@ class SplatRenderer:
         fbo.color_attachments[0].filter = (moderngl.LINEAR, moderngl.LINEAR)
         return fbo
 
-    def _draw(self, key, splat, colours, eye, forward, right, up, size, style, depth_range, extent):
+    def _draw(self, key, splat, colours, eye, forward, right, up, size, style, depth_range, extent, focal):
         data, vao, lines = self._upload(key, splat, colours)
         if not len(data.positions):
             return
         world_to_cam = np.stack([right, -up, forward]).astype(np.float32)
-        focal = 0.5 * size[0] / math.tan(math.radians(HALF_FOV_DEG))
         for program in (self.program, self.line_program):
             program["world_to_cam"].write(np.ascontiguousarray(world_to_cam.T).tobytes())
             program["eye"].value = tuple(float(v) for v in eye)
@@ -374,6 +379,16 @@ class SplatRenderer:
         if style == AXES and lines is not None:
             axes(0.0)
             return
+        if style == IDS:                  # opaque cores, the nearest wins: no sort, no blend
+            data.texture.use(0)
+            self.program["data"].value = 0
+            data.order.write(np.arange(len(data.positions), dtype=np.uint32).tobytes())
+            self.ctx.disable(moderngl.BLEND)
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            quads(IDS)
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.enable(moderngl.BLEND)
+            return
         if style == AXES:                 # round Gaussians: no axis to draw, their centres instead
             style = CENTRES
         order = np.argsort(-((data.positions - eye) @ forward)).astype(np.uint32)       # far first
@@ -389,17 +404,23 @@ class SplatRenderer:
             self.ctx.disable(moderngl.DEPTH_TEST)
             axes(AXIS_LIFT * extent)
 
-    def render(self, layers, camera, frame, size, background=(18, 18, 24), target="picture", style=SOFT):
+    def render(self, layers, camera, frame, size, background=(18, 18, 24), target="picture", style=SOFT, view=None):
         """Draws `layers` - [(key, splat, colours, strength)] - from the orbit `camera`
         (azimuth, elevation, zoom, pan) round `frame` (centre, extent) into a size (w, h) picture;
         each later layer is laid over the ones before at its strength (1 = as drawn). Returns the
         picture's texture. `key` names a splat's upload: a new key uploads, an old one reuses it;
         `colours` (None: the splat's own, or a function giving them) is only read on an upload.
         Each `target` name keeps its own picture, so several can be shown at once. `style` is one of
-        STYLES' indices (module docstring)."""
+        STYLES' indices (module docstring). `view` - (eye, forward, right, up, focal px) - draws from that
+        camera instead of the orbit one (a training camera, to lay the splat over its photo)."""
         size = (max(1, int(size[0])), max(1, int(size[1])))
-        azimuth, elevation, zoom, pan = camera
-        eye, forward, right, up = gaussian_splatting.orbit_camera(None, azimuth, elevation, zoom, pan, frame)
+        if view is not None:
+            eye, forward, right, up = (np.asarray(v, dtype=np.float64) for v in view[:4])
+            focal = float(view[4])
+        else:
+            azimuth, elevation, zoom, pan = camera
+            eye, forward, right, up = gaussian_splatting.orbit_camera(None, azimuth, elevation, zoom, pan, frame)
+            focal = 0.5 * size[0] / math.tan(math.radians(HALF_FOV_DEG))
         distance, extent = float(np.linalg.norm(np.asarray(frame[0]) - eye)), float(frame[1])
         depth_range = (max(distance - 4.0 * extent, 0.01 * distance), distance + 4.0 * extent)
         fbo = self.targets[target] = self._framebuffer(self.targets.get(target), size)
@@ -413,13 +434,13 @@ class SplatRenderer:
             ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
             if index == 0 or strength >= 1.0:
                 fbo.use()
-                self._draw(key, splat, colours, eye, forward, right, up, size, style, depth_range, extent)
+                self._draw(key, splat, colours, eye, forward, right, up, size, style, depth_range, extent, focal)
                 continue
             # A see-through layer: drawn on its own, then laid over the picture at its strength.
             self.layer = self._framebuffer(self.layer, size)
             self.layer.use()
             self.layer.clear(0.0, 0.0, 0.0, 0.0)
-            self._draw(key, splat, colours, eye, forward, right, up, size, style, depth_range, extent)
+            self._draw(key, splat, colours, eye, forward, right, up, size, style, depth_range, extent, focal)
             fbo.use()
             self.layer.color_attachments[0].use(0)
             self.composite["layer"].value = 0
@@ -430,6 +451,21 @@ class SplatRenderer:
         if target is not None:            # a standalone context has no screen
             target.use()
         return fbo.color_attachments[0]
+
+    def gaussian_ids(self, key, splat, view, size, frame, min_opacity: float = 0.02) -> np.ndarray:
+        """Which Gaussian of `splat` is in front at each pixel seen from `view` (render's): an (h, w) int
+        array of indices into splat's own order, -1 where none is. Each Gaussian is drawn as its solid
+        core (one standard deviation), depth-tested, its number written as its colour."""
+        keep = np.flatnonzero(np.asarray(splat["opacity"]) >= min_opacity)
+        code = keep + 1                                   # 0 is "no Gaussian"
+        colours = np.stack([code & 255, (code >> 8) & 255, (code >> 16) & 255], axis=1).astype(np.float32) / 255.0
+        full = np.zeros((len(splat["opacity"]), 3), dtype=np.float32)
+        full[keep] = colours
+        self.render([(key, splat, full, 1.0)], None, frame, size, background=(0, 0, 0), style=IDS, view=view)
+        fbo = self.targets["picture"]
+        w, h = fbo.size
+        raw = np.frombuffer(fbo.read(components=3), dtype=np.uint8).reshape(h, w, 3)[::-1].astype(np.int64)
+        return raw[..., 0] + (raw[..., 1] << 8) + (raw[..., 2] << 16) - 1
 
     def read(self, target="picture") -> np.ndarray:
         """A picture as an (h, w, 3) uint8 array, top row first."""

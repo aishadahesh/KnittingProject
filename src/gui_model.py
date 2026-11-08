@@ -10,6 +10,10 @@ all from one shared orbit camera (drag to turn, right-drag to move, wheel to zoo
 The equation yarn is either the traced strands (only what the pictures showed clearly), or the
 complete repeating loops: the cloth's repeat found in the scan and filled in as Edit Mode's knit
 (lace_lattice.py), which "Open in Edit Mode" hands over to be edited there.
+"Fabric colour" shows the fabric's colour, measured on the splat (its yarn's lit side; which Gaussians
+are yarn comes from scripts/fabric_colours.py), and puts one colour on the whole fabric - picked, taken
+from another model, or saved earlier - keeping its light and shade (fabric_palette.py); the equation
+yarn is drawn in it too.
 The pictures are drawn on the GPU (splat_gl.py) every frame, so they follow the mouse. "Spin" turns
 them by themselves, "Wiggle" rocks them a little either way (near yarn slides over far yarn),
 "Draw" shows the soft splat or its single Gaussians (ellipses, centres, outlines in the soft splat,
@@ -23,6 +27,8 @@ The geometry is strand_equations.py and lace_lattice.py; the splat loading is ga
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -34,7 +40,9 @@ from PIL import Image
 
 import crochet_core
 import crochet_fit
+import fabric_palette
 import gaussian_splatting
+import yarn_tracks
 import lace_lattice
 import paths
 import splat_gl
@@ -46,12 +54,13 @@ COLOR_WARN = (0.95, 0.75, 0.20, 1.0)
 COLOR_MUTED = (0.65, 0.65, 0.65, 1.0)
 RENDER_SIZE = (560, 420)
 SPIN_DEG_PER_S = 25.0
+YARNS_FILE, YARNS_JSON = "fabric_yarns.npy", "fabric_yarns.json"      # scripts/fabric_yarns.py's
 # "Wiggle" rocks the view this many degrees either way, this many times a second: the parallax of
 # near yarn sliding over far yarn is the plainest sign the model is 3D.
 WIGGLE_DEG, WIGGLE_HZ = 8.0, 0.8
 BACKGROUND = (18, 18, 24)
 SHOWS = ("Scan", "Equations", "Side by side", "Overlay")
-COLOURINGS = ("Yarn white", "Distance to scan (heat map)")
+COLOURINGS = ("Fabric colour", "Distance to scan (heat map)")
 SOURCES = ("Traced strands", "Knit repeating loops", "Crochet model")
 SELECTED_COLOUR = (1.0, 0.55, 0.10)
 CONTROLS_WIDTH = 410.0
@@ -95,6 +104,11 @@ def _view(state) -> SimpleNamespace:
             selected=-1, show=2, colouring=1, heat_mm=0.5, overlay=0.6, tube_splat=None, tube_key=None,
             periodic=None, periodic_job=None, source=0, counts=(3, 6),
             crochet=None, crochet_job=None, crochet_counts=[3, 3], crochet_wraps=1, crochet_along_holes=True, crochet_auto=False,
+            fabric=None, fabric_measured=None, fabric_target=None, fabric_base=None, fabric_version=0, fabric_job=None,
+            recolour_scan=True, fabric_source=0, palettes=None, palette_pick=0, palette_name="", yarn_map=False, colours_to_find=0,
+            multi=None, yarns=None, yarns_info=None, yarns_job=None, yarn_colours={}, show_yarns=False, yarn_tool=0,
+            yarn_pen=None, yarn_order="1,2", yarn_flip=False, brush_yarn=0, brush_seeds=[], yarn_dirs=None, yarn_dirs_job=None,
+            yarns_edited=False,
             gl=None, gl_failed=False, gl_used=set(), spin=False, wiggle=False, wiggle_offset=0.0, by_height=False, plane=None, style=splat_gl.SOFT,
         )
         state.model_view = view
@@ -108,6 +122,9 @@ def _select_model(view, index: int) -> None:
     view.index, view.splat, view.frame, view.extraction, view.selected = index, None, None, None, -1
     view.periodic, view.crochet, view.source = None, None, 0
     view.tube_splat, view.tube_key, view.pictures, view.plane = None, None, {}, None
+    view.fabric, view.fabric_measured, view.fabric_target, view.fabric_base, view.multi = None, None, None, None, None
+    view.yarns, view.yarns_info, view.yarn_colours, view.yarn_dirs, view.yarns_edited = None, None, {}, None, False
+    view.palette_name = model["name"].split(" / ")[0]
     view.mm_per_unit = model["mm_per_unit"] or 1.0
     holder = {}
 
@@ -143,6 +160,425 @@ def _poll_loader(view) -> None:
         view.mm_per_unit = holder["guess"]
     view.frame = gaussian_splatting.orbit_frame(view.splat["positions"][view.splat["opacity"] >= 0.1])
     view.plane = splat_gl.cloth_plane(view.splat["positions"][view.splat["opacity"] >= 0.1])
+    view.fabric_base = np.asarray(view.splat["colours"], dtype=np.float32).copy()
+    _load_fabric(view)
+
+
+# ----------------------------------------------------------------------------------------- fabric colours
+
+def _load_fabric(view) -> None:
+    """The selected model's fabric (fabric_palette) and its one colour, measured on the splat itself."""
+    view.fabric = fabric_palette.load(view.models[view.index]["output"], len(view.fabric_base)) if view.fabric_base is not None else None
+    view.fabric_measured = fabric_palette.fabric_colour(view.fabric, view.fabric_base) if view.fabric else None
+    view.fabric_target, view.multi = None, None
+    _load_yarns(view)
+    _apply_fabric(view)
+
+
+def _load_yarns(view) -> None:
+    """The model's yarns (scripts/fabric_yarns.py: each Gaussian's yarn) when they were found for this splat."""
+    output = view.models[view.index]["output"]
+    path, info = output / YARNS_FILE, output / YARNS_JSON
+    view.yarns, view.yarns_info = None, None
+    if path.is_file() and view.fabric_base is not None:
+        yarns = np.load(path)
+        if len(yarns) == len(view.fabric_base):
+            view.yarns = yarns.astype(np.int64)
+            view.yarns_info = json.loads(info.read_text(encoding="utf-8")) if info.is_file() else {}
+    view.yarn_colours, view.yarn_dirs, view.yarns_edited = {}, None, False
+
+
+def _yarn_numbers(view) -> list[int]:
+    numbers = sorted(int(k) for k in np.unique(view.yarns) if k >= 0) if view.yarns is not None else []
+    return numbers[::-1] if view.yarn_flip else numbers
+
+
+def _main_yarn_colour(view):
+    """The colour the equation yarn is drawn in: the fabric's colour as chosen or measured, else plain white."""
+    if view.yarn_colours:
+        return tuple(float(v) for v in next(iter(view.yarn_colours.values())))
+    colour = (view.multi["colours"][0] if view.multi else
+              view.fabric_target if view.fabric_target is not None else view.fabric_measured)
+    return (0.92, 0.92, 0.88) if colour is None else tuple(float(v) for v in colour)
+
+
+def _apply_fabric(view) -> None:
+    """The scan's colours with the whole fabric in the chosen colour (or as trained, unticked or unchosen)."""
+    if view.splat is None or view.fabric_base is None:
+        return
+    colours = view.fabric_base
+    if view.show_yarns and view.yarns is not None:
+        colours = _yarns_painted(view)
+    elif (view.recolour_scan and view.yarn_colours and view.yarns is not None and view.fabric is not None
+            and view.fabric["labels"] is not None):
+        # Each coloured yarn's Gaussians take its colour, light and shade kept; the rest stay as scanned.
+        targets = np.asarray(view.fabric_base, dtype=np.float64).copy()
+        coloured = np.zeros(len(targets), dtype=bool)
+        for number, colour in view.yarn_colours.items():
+            mine = view.yarns == number
+            targets[mine] = colour
+            coloured |= mine
+        recoloured = fabric_palette.recolour_all(view.fabric_base, view.fabric["labels"], view.fabric["groups"], targets)
+        colours = np.where(coloured[:, None], recoloured, view.fabric_base).astype(np.float32)
+    elif view.yarn_map and view.fabric is not None and view.fabric["labels"] is not None:
+        colours = fabric_palette.yarn_map(view.fabric, len(view.fabric_base))
+    elif view.recolour_scan and view.multi and view.fabric is not None and view.fabric["labels"] is not None:
+        m = view.multi
+        targets = fabric_palette.spread(view.fabric, view.splat["positions"], m["colours"],
+                                        fabric_palette.parse_sequence(m["sequence"], len(m["colours"])), m["how"],
+                                        m["stripe_mm"], m["angle"], view.mm_per_unit)
+        colours = fabric_palette.recolour_all(view.fabric_base, view.fabric["labels"], view.fabric["groups"], targets)
+    elif (view.recolour_scan and view.fabric_target is not None and view.fabric is not None
+            and view.fabric["labels"] is not None):
+        colours = fabric_palette.recolour_all(view.fabric_base, view.fabric["labels"], view.fabric["groups"], view.fabric_target)
+    view.splat["colours"] = colours
+    view.fabric_version += 1
+    view.pictures = {}          # the CPU pictures are drawn again; the GPU ones are keyed by the version
+
+
+def _poll_fabric_job(view) -> None:
+    if view.fabric_job is None or view.fabric_job.poll() is None:
+        return
+    job, view.fabric_job = view.fabric_job, None
+    output = job.stdout.read() if job.stdout else ""
+    if job.returncode == 0:
+        _load_fabric(view)
+        view.status = "Fabric colours extracted."
+    else:
+        view.status = "Could not extract the fabric colours: " + (output.strip().splitlines() or ["(no message)"])[-1]
+
+
+def _colours_of_model(model) -> list:
+    """Another model's yarn colours, the most of its cloth first, measured on its own splat as this
+    one's are; empty when it has none."""
+    try:
+        splat = gaussian_splatting.load_splat_ply(model["ply"])
+    except Exception:
+        return []
+    fabric = fabric_palette.load(model["output"], len(splat["colours"]))
+    return fabric_palette.yarn_colours(fabric, splat["colours"]) if fabric else []
+
+
+def _take_colours(view, colours, source: str) -> None:
+    """Put `colours` on this model: one is the fabric's colour; several are spread - by yarn when this
+    fabric has as many yarns, else in stripes across it."""
+    colours = [np.asarray(c, dtype=np.float64) for c in colours]
+    if len(colours) == 1:
+        view.fabric_target, view.multi = colours[0], None
+        view.status = f"Fabric coloured {fabric_palette.hex_of(colours[0])}, from {source}."
+    else:
+        enough_yarns = len(fabric_palette.yarns(view.fabric)) >= len(colours)
+        view.multi = {"colours": colours, "sequence": ",".join(str(k + 1) for k in range(len(colours))),
+                      "how": fabric_palette.BY_YARN if enough_yarns else fabric_palette.STRIPES, "stripe_mm": 5.0,
+                      "angle": fabric_palette.long_axis_deg(view.splat["positions"], view.fabric["labels"], view.fabric["groups"])}
+        view.status = (f"{len(colours)} colours from {source}, spread " + ("by yarn." if enough_yarns else
+                       "in stripes (this fabric has fewer yarns than colours)."))
+    _apply_fabric(view)
+
+
+def _draw_multi(view) -> None:
+    """Several colours: each with its picker, how they are spread (by yarn, or in stripes of a width and
+    a direction) and in what order."""
+    m = view.multi
+    imgui.separator()
+    imgui.text(f"{len(m['colours'])} colours")
+    changed_any = False
+    remove = None
+    for k, colour in enumerate(m["colours"]):
+        changed, picked = imgui.color_edit3(f"Colour {k + 1}##multi_{k}", tuple(float(v) for v in colour), imgui.ColorEditFlags_.no_inputs)
+        if changed:
+            m["colours"][k] = np.asarray(picked[:3], dtype=np.float64)
+            changed_any = True
+        imgui.same_line()
+        imgui.text(fabric_palette.hex_of(m["colours"][k]))
+        if len(m["colours"]) > 1:
+            imgui.same_line()
+            if imgui.small_button(f"x##multi_remove_{k}"):
+                remove = k
+    if remove is not None:
+        del m["colours"][remove]
+        changed_any = True
+    if imgui.small_button("Add colour##multi_add"):
+        m["colours"].append(m["colours"][-1].copy())
+        changed_any = True
+    imgui.same_line()
+    if imgui.small_button("Back to one colour##multi_clear"):
+        view.fabric_target, view.multi = m["colours"][0], None
+        _apply_fabric(view)
+        return
+    for i, name in enumerate(fabric_palette.SPREADS):
+        if i:
+            imgui.same_line()
+        if imgui.radio_button(f"{name}##multi_how{i}", m["how"] == i):
+            m["how"] = i
+            changed_any = True
+    if m["how"] == fabric_palette.BY_YARN:
+        found = len(fabric_palette.yarns(view.fabric))
+        imgui.text_colored(COLOR_MUTED if found > 1 else COLOR_WARN,
+                           f"Yarn 1 takes the order's first colour, yarn 2 the second... ({found} yarn{'s' if found != 1 else ''} found here"
+                           + ("; use stripes to show more than one colour)" if found < 2 else ")"))
+    else:
+        imgui.set_next_item_width(160)
+        changed, m["stripe_mm"] = imgui.slider_float("stripe width (mm)##multi_width", float(m["stripe_mm"]), 0.5, 30.0, "%.1f")
+        changed_any |= changed
+        imgui.set_next_item_width(160)
+        changed, m["angle"] = imgui.slider_float("direction (deg)##multi_angle", float(m["angle"]), 0.0, 180.0, "%.0f")
+        changed_any |= changed
+        imgui.same_line()
+        if imgui.small_button("Turn 90##multi_turn"):
+            m["angle"] = (float(m["angle"]) + 90.0) % 180.0
+            changed_any = True
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Stripes across the fabric, or along it.")
+    imgui.set_next_item_width(160)
+    changed, m["sequence"] = imgui.input_text("order##multi_order", m["sequence"])
+    changed_any |= changed
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("The colour numbers in the order they follow one another, repeated: 1,2 alternates;\n"
+                          "1,1,2 is two of colour 1, then one of colour 2.")
+    if changed_any:
+        _apply_fabric(view)
+
+
+def _draw_fabric_colours(view) -> None:
+    """The fabric's one colour: as the scan shows it, a picker for another, another model's, saved ones."""
+    model = view.models[view.index] if view.models and view.index >= 0 else None
+    if model is None or view.splat is None:
+        imgui.text_colored(COLOR_MUTED, "Load a model first.")
+        return
+    if view.fabric_job is not None:
+        imgui.text_colored(COLOR_MUTED, "Reading the yarns from the photos (about a minute)...")
+        return
+    if view.fabric is None or view.fabric_measured is None:
+        imgui.text_wrapped("Not extracted for this model yet: which Gaussians are the fabric's yarn (not the table "
+                           "under it), and the fabric's colour.")
+        if model["dataset"] is None or not model["ply"].name.endswith("_clean.ply"):
+            imgui.text_colored(COLOR_WARN, "Needs the cropped splat (splat_clean.ply) and its training pictures.")
+        elif imgui.button("Extract the fabric colour##fabric_extract", (-1, 0)):
+            view.fabric_job = fabric_palette.extract(model["output"], model["dataset"], view.colours_to_find)
+        return
+    _draw_extracted(view, model)
+    measured = view.fabric_measured
+    imgui.color_button("##fabric_measured", (*[float(v) for v in measured], 1.0), 0, (40, 22))
+    imgui.same_line()
+    imgui.text(f"Measured {fabric_palette.hex_of(measured)}  (the yarn's lit side, as the scan shows it)")
+    shown = view.fabric_target if view.fabric_target is not None else measured
+    if not view.multi:
+        changed, picked = imgui.color_edit3("New colour##fabric_target", tuple(float(v) for v in shown))
+        if changed:
+            view.fabric_target = np.asarray(picked[:3], dtype=np.float64)
+            _apply_fabric(view)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("The whole fabric takes this colour; its light and shade are kept (the table under it is not changed).")
+    if imgui.small_button("Reset to measured##fabric_reset"):
+        view.fabric_target, view.multi = None, None
+        _apply_fabric(view)
+    imgui.same_line()
+    changed, view.recolour_scan = imgui.checkbox("Recolour the scan##fabric_recolour", bool(view.recolour_scan))
+    if changed:
+        _apply_fabric(view)
+    if view.fabric["labels"] is None:
+        imgui.text_colored(COLOR_WARN, "The colours were read from another splat file: extract again to recolour this one.")
+        if imgui.small_button("Extract again##fabric_again") and model["dataset"] is not None:
+            view.fabric_job = fabric_palette.extract(model["output"], model["dataset"], view.colours_to_find)
+    # Another model's colour.
+    others = [m for m in view.models if m is not model and (m["output"] / fabric_palette.COLOURS_FILE).is_file()]
+    if others:
+        view.fabric_source = min(int(view.fabric_source), len(others) - 1)
+        imgui.set_next_item_width(-150)
+        _, view.fabric_source = imgui.combo("##fabric_source", view.fabric_source, [m["name"] for m in others])
+        imgui.same_line()
+        if imgui.button("Take its colours##fabric_take", (-1, 0)):
+            found = _colours_of_model(others[view.fabric_source])
+            if not found:
+                view.status = "That model's colours could not be read (extract them again there)."
+            else:
+                _take_colours(view, found, others[view.fabric_source]["name"])
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("All the other model's yarn colours, measured the same way: put on this one, they look the same.\n"
+                              "Several are spread by yarn or in stripes - choose below.")
+    if view.multi:
+        _draw_multi(view)
+    _draw_saved_colours(view, shown)
+    imgui.text_colored(COLOR_MUTED, "The equation yarn is drawn in this colour too.")
+    _draw_yarns(view, model)
+
+
+def _yarns_painted(view) -> np.ndarray:
+    """Each yarn in its own flat colour (the one it is given, else a distinct hue), the rest dark."""
+    import colorsys
+
+    numbers = _yarn_numbers(view)
+    paint = np.full((len(view.yarns), 3), 0.12, dtype=np.float32)
+    for k, number in enumerate(sorted(numbers)):
+        hue = (k * 0.61803) % 1.0
+        paint[view.yarns == number] = view.yarn_colours.get(number, colorsys.hsv_to_rgb(hue, 0.8, 0.95))
+    return paint
+
+
+def _poll_yarns_job(view) -> None:
+    if view.yarns_job is not None and view.yarns_job.poll() is not None:
+        job, view.yarns_job = view.yarns_job, None
+        message = (job.stdout.read() if job.stdout else "").strip().splitlines()
+        if job.returncode == 0:
+            _load_yarns(view)
+            _apply_fabric(view)
+            view.status = "Yarns found: " + (message[-2] if len(message) >= 2 else "")
+        else:
+            view.status = "Could not find the yarns: " + (message[-1] if message else "(no message)")
+    if view.yarn_dirs_job is not None and not view.yarn_dirs_job[0].is_alive():
+        view.yarn_dirs = view.yarn_dirs_job[1].get("dirs")
+        view.yarn_dirs_job = None
+
+
+def _draw_yarns(view, model) -> None:
+    """The fabric's yarns: found from the fitted model (or the Gaussians' directions), shown each in a
+    colour, coloured in order or one by one with a click, and corrected with a brush."""
+    imgui.separator()
+    imgui.text("Yarns")
+    fit_path = model["output"] / "stitch_fit" / "stitch_model.json"
+    if view.yarns_job is not None:
+        imgui.text_colored(COLOR_MUTED, "Finding the yarns...")
+        return
+    label = "from the fitted stitches" if fit_path.is_file() else "from the Gaussians' directions"
+    if imgui.small_button(("Find the yarns again" if view.yarns is not None else "Find the yarns") + f" ({label})##yarns_find"):
+        view.yarns_job = subprocess.Popen([sys.executable, str(paths.PROJECT_ROOT / "scripts" / "fabric_yarns.py"), str(model["output"])],
+                                          cwd=str(paths.PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("From the fitted stitches: each yarn Gaussian takes its nearest fitted curve; a row's curves are one yarn.\n"
+                          "Without a photo fit, from the Gaussians alone (less reliable: yarns come out in patches).")
+    if view.yarns is None:
+        imgui.text_colored(COLOR_MUTED, "Not found yet for this model.")
+        return
+    info = view.yarns_info or {}
+    numbers = _yarn_numbers(view)
+    how = (f"from the fit, median {info['median_distance_mm']:.2f} mm from the fitted curves" if info.get("source") == "fit"
+           else "from the Gaussians' directions")
+    imgui.text(f"{len(numbers)} yarns ({how})")
+    changed, view.show_yarns = imgui.checkbox("Show the yarns##yarns_show", bool(view.show_yarns))
+    if changed:
+        _apply_fabric(view)
+    # Colouring in order: the colours shown above (several taken, or the one), round and round.
+    palette = view.multi["colours"] if view.multi else [view.fabric_target if view.fabric_target is not None else view.fabric_measured]
+    imgui.set_next_item_width(90)
+    _, view.yarn_order = imgui.input_text("order##yarn_order", view.yarn_order)
+    imgui.same_line()
+    _, view.yarn_flip = imgui.checkbox("Flip##yarn_flip", bool(view.yarn_flip))
+    imgui.same_line()
+    if imgui.small_button("Colour the yarns in order##yarn_in_order"):
+        order = fabric_palette.parse_sequence(view.yarn_order, len(palette))
+        view.yarn_colours = {number: np.asarray(palette[order[k % len(order)]], dtype=np.float64) for k, number in enumerate(_yarn_numbers(view))}
+        _apply_fabric(view)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Yarn 1 takes the order's first colour, yarn 2 the second... with the colours above\n"
+                          "(the several taken from a model, or the one). Flip starts from the other side.")
+    imgui.same_line()
+    if imgui.small_button("Clear##yarn_clear"):
+        view.yarn_colours = {}
+        _apply_fabric(view)
+    # Tools on the picture.
+    for i, name in enumerate(("Turn the view", "Click a yarn to colour it", "Brush a yarn")):
+        if i:
+            imgui.same_line()
+        if imgui.radio_button(f"{name}##yarn_tool{i}", view.yarn_tool == i):
+            view.yarn_tool = i
+    if view.yarn_tool:
+        if view.yarn_pen is None:
+            view.yarn_pen = np.asarray(palette[0], dtype=np.float64)
+        changed, picked = imgui.color_edit3("colour to give##yarn_pen", tuple(float(v) for v in view.yarn_pen), imgui.ColorEditFlags_.no_inputs)
+        if changed:
+            view.yarn_pen = np.asarray(picked[:3], dtype=np.float64)
+        imgui.same_line()
+        imgui.text_colored(COLOR_MUTED, "on the Scan picture; right-drag still moves the view")
+    if view.yarn_tool == 2:
+        imgui.set_next_item_width(90)
+        _, view.brush_yarn = imgui.input_int("yarn to brush into##brush_yarn", int(view.brush_yarn))
+        if view.yarn_dirs is None and view.yarn_dirs_job is None:
+            holder = {}
+            positions = np.asarray(view.splat["positions"], dtype=np.float64)
+            splat, mm = view.splat, float(view.mm_per_unit)
+
+            def work():
+                axes = yarn_tracks.long_axes(splat["scales"], splat["quaternion"])
+                sc = np.sort(np.asarray(splat["scales"], dtype=np.float64), axis=1)
+                weight = np.asarray(splat["opacity"], dtype=np.float64) * sc[:, 1] * sc[:, 2]
+                radius = float((view.yarns_info or {}).get("radius_mm", yarn_tracks.YARN_RADIUS_MM)) / mm
+                holder["dirs"] = (*yarn_tracks.directions(positions, axes, weight, yarn_tracks.NEIGHBOURHOOD_RADII * radius), radius)
+
+            thread = threading.Thread(target=work, daemon=True, name="yarn-directions")
+            thread.start()
+            view.yarn_dirs_job = (thread, holder)
+        if view.yarn_dirs is None:
+            imgui.text_colored(COLOR_MUTED, "Reading the yarn directions for the brush...")
+    if view.yarns_edited:
+        if imgui.small_button("Save the yarn edits##yarns_save"):
+            np.save(model["output"] / YARNS_FILE, view.yarns.astype(np.int32))
+            view.yarns_edited = False
+            view.status = "Yarn edits saved."
+
+
+def _draw_extracted(view, model) -> None:
+    """The colours found: each yarn's swatch, colour and share; the rims and the table summed up; how many
+    to find, and extracting again; the yarn map, to see the division on the scan."""
+    groups = view.fabric["groups"]
+    yarn_total = sum(g["share"] for g in groups if g["role"] == "yarn") or 1.0
+    for g in fabric_palette.yarns(view.fabric):
+        imgui.color_button(f"##found_{g['index']}", (*[float(v) for v in g["measured"]], 1.0), 0, (22, 22))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(f"{g['name']}: {fabric_palette.hex_of(g['measured'])} (board-corrected), "
+                              f"{fabric_palette.hex_of(g['camera'])} as the camera saw it; in shade {fabric_palette.hex_of(g['shade'])}")
+        imgui.same_line()
+        imgui.text(f"{fabric_palette.hex_of(g['measured'])}  {g['share'] / yarn_total * 100:.0f}% of the yarn  {g['name']}")
+    others = [g for g in groups if g["role"] != "yarn"]
+    if others:
+        edge = sum(g["share"] for g in others if g["role"] == "edge")
+        table = sum(g["share"] for g in others if g["role"] == "table")
+        imgui.text_colored(COLOR_MUTED, f"Also: the openings' rims {edge * 100:.0f}%, the table under them {table * 100:.0f}% (not yarn)")
+    imgui.set_next_item_width(120)
+    _, view.colours_to_find = imgui.slider_int("##colours_to_find", int(view.colours_to_find), 0, 6,
+                                               "Auto" if int(view.colours_to_find) == 0 else "%d colours")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("How many colours to look for. Auto: as many as really differ (more than about 12 delta E).")
+    imgui.same_line()
+    if imgui.small_button("Extract again##fabric_reextract") and model["dataset"] is not None:
+        view.fabric_job = fabric_palette.extract(model["output"], model["dataset"], view.colours_to_find)
+    imgui.same_line()
+    changed, view.yarn_map = imgui.checkbox("Show the yarn map##fabric_map", bool(view.yarn_map))
+    if changed:
+        _apply_fabric(view)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Each Gaussian painted flat in its group's colour: each yarn its own, the openings' rims orange,\n"
+                          "the table blue - to check how the fabric was divided.")
+    imgui.separator()
+
+
+def _draw_saved_colours(view, shown) -> None:
+    """Save the colour shown under a name, or put a saved one on this model (fabric_palette)."""
+    imgui.separator()
+    imgui.set_next_item_width(-150)
+    _, view.palette_name = imgui.input_text("##palette_name", view.palette_name)
+    imgui.same_line()
+    if imgui.button("Save colours##palette_save", (-1, 0)):
+        to_save = view.multi["colours"] if view.multi else [shown]
+        path = fabric_palette.save_colour(view.palette_name, to_save, view.models[view.index]["name"])
+        view.palettes = None
+        view.status = f"Colour saved: {path}"
+    if view.palettes is None:
+        view.palettes = fabric_palette.list_palettes()
+    if not view.palettes:
+        imgui.text_colored(COLOR_MUTED, "No colours saved yet.")
+        return
+    view.palette_pick = min(int(view.palette_pick), len(view.palettes) - 1)
+    saved = view.palettes[view.palette_pick]
+    imgui.color_button("##palette_swatch", (*saved["colours"][0]["rgb"], 1.0), 0, (22, 22))
+    imgui.same_line()
+    imgui.set_next_item_width(-150)
+    _, view.palette_pick = imgui.combo("##palette_pick", view.palette_pick,
+                                       [f"{p['name']}  " + " ".join(c["hex"] for c in p["colours"]) for p in view.palettes])
+    imgui.same_line()
+    if imgui.button("Use these##palette_apply", (-1, 0)):
+        saved = view.palettes[view.palette_pick]
+        _take_colours(view, [c["rgb"] for c in saved["colours"]], f"saved \"{saved['name']}\"")
 
 
 def _start_extraction(view) -> None:
@@ -311,7 +747,7 @@ def _tube_splat(view):
     if result is None or not len(result.tube.get("vertices", ())):
         return None
     selected = view.selected if result is view.extraction else -1
-    key = (id(result), view.colouring, round(view.heat_mm, 3), selected)
+    key = (id(result), view.colouring, round(view.heat_mm, 3), selected, _main_yarn_colour(view))
     if view.tube_key != key:
         count = len(result.tube["vertices"])
         if view.colouring == 1 and "error_mm" in result.tube:
@@ -319,7 +755,7 @@ def _tube_splat(view):
             # The underside was never photographed: grey, not held against the scan.
             colours[~result.tube["seen"]] = (0.35, 0.35, 0.38)
         else:
-            colours = np.tile((0.92, 0.92, 0.88), (count, 1))
+            colours = np.tile(_main_yarn_colour(view), (count, 1))
         if 0 <= selected < len(result.strands):
             colours[result.tube["strand"] == selected] = SELECTED_COLOUR
         view.tube_splat, view.tube_key = strand_equations.tube_as_splat(result, colours), key
@@ -425,7 +861,7 @@ def _gpu_picture(view, gl, which: str, size):
 
     layers = []
     if which in ("scan", "overlay"):
-        layers.append((("scan", view.index, view.by_height), view.splat, colouring(view.splat), 1.0))
+        layers.append((("scan", view.index, view.by_height, view.fabric_version), view.splat, colouring(view.splat), 1.0))
     if which in ("equations", "overlay"):
         tubes = _tube_splat(view)
         if tubes is not None:
@@ -466,8 +902,64 @@ def _draw_picture(view, ctx, which: str, width: float, caption: str):
     return rect
 
 
+def _pick(view, rect, points) -> np.ndarray:
+    """The Gaussians in front at screen `points` (x, y) on the Scan picture `rect`, as drawn from the
+    current camera (splat_gl's id render). Returns their indices (repeats removed)."""
+    x0, y0, w, h = rect
+    size = (int(round(w)), int(round(h)))
+    azimuth, elevation, zoom, pan = view.camera
+    eye, forward, right, up = gaussian_splatting.orbit_camera(None, azimuth, elevation, zoom, pan, view.frame)
+    focal = 0.5 * size[0] / np.tan(np.radians(splat_gl.HALF_FOV_DEG))
+    ids = view.gl.gaussian_ids(("ids", view.index), view.splat, (eye, forward, right, up, focal), size, view.frame)
+    view.gl_used.add(("ids", view.index))
+    found = []
+    for x, y in points:
+        px, py = int(x - x0), int(y - y0)
+        window = ids[max(py - 3, 0):py + 4, max(px - 3, 0):px + 4]
+        found.extend(window[window >= 0].ravel().tolist())
+    return np.unique(np.asarray(found, dtype=int))
+
+
+def _yarn_tool(view, rect, io) -> bool:
+    """Clicking a yarn or brushing along one, on the Scan picture; True when the mouse was used for it."""
+    if not view.yarn_tool or view.yarns is None or view.gl is None or rect is None:
+        return False
+    mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
+    inside = rect[0] <= mx <= rect[0] + rect[2] and rect[1] <= my <= rect[1] + rect[3] and imgui.is_window_hovered()
+    if view.yarn_tool == 1:
+        if inside and imgui.is_mouse_clicked(imgui.MouseButton_.left):
+            hit = _pick(view, rect, [(mx, my)])
+            numbers = view.yarns[hit][view.yarns[hit] >= 0]
+            if len(numbers):
+                number = int(np.bincount(numbers).argmax())
+                view.yarn_colours[number] = np.asarray(view.yarn_pen, dtype=np.float64)
+                _apply_fabric(view)
+                view.status = f"Yarn {number} coloured {fabric_palette.hex_of(view.yarn_pen)}."
+        return inside and imgui.is_mouse_down(imgui.MouseButton_.left)
+    # The brush: the stroke's points while the button is down, the yarn grown from them on release.
+    if inside and imgui.is_mouse_down(imgui.MouseButton_.left):
+        view.brush_seeds.extend(_pick(view, rect, [(mx, my)]).tolist())
+        return True
+    if view.brush_seeds and not imgui.is_mouse_down(imgui.MouseButton_.left):
+        if view.yarn_dirs is not None:
+            dirs, strength, radius = view.yarn_dirs
+            chosen = yarn_tracks.brush(view.splat["positions"], dirs, strength, view.brush_seeds, radius)
+            chosen &= view.yarns >= 0                      # yarn only: the table stays out
+            view.yarns = view.yarns.copy()
+            view.yarns[chosen] = int(view.brush_yarn)
+            view.yarns_edited = True
+            if view.yarn_pen is not None:
+                view.yarn_colours[int(view.brush_yarn)] = np.asarray(view.yarn_pen, dtype=np.float64)
+            _apply_fabric(view)
+            view.status = f"{int(chosen.sum())} Gaussians brushed into yarn {int(view.brush_yarn)}."
+        view.brush_seeds = []
+    return False
+
+
 def _handle_mouse(view, rects) -> None:
     io = imgui.get_io()
+    if view.show in (0, 2) and rects and _yarn_tool(view, rects[0], io):
+        return
     mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
     over = next((r for r in rects if r is not None and r[0] <= mx <= r[0] + r[2] and r[1] <= my <= r[1] + r[3]), None)
     over = over if imgui.is_window_hovered() else None
@@ -767,9 +1259,13 @@ def draw_model_panel(state, renderer) -> None:
     _poll_extractor(view)
     _poll_periodic(view)
     _poll_crochet(view)
+    _poll_fabric_job(view)
+    _poll_yarns_job(view)
     if imgui.begin_child("model_controls", (CONTROLS_WIDTH, 0)):
         if imgui.collapsing_header("Model##model_section", imgui.TreeNodeFlags_.default_open):
             _draw_model_choice(view)
+        if imgui.collapsing_header("Fabric colour##model_fabric_section", imgui.TreeNodeFlags_.default_open):
+            _draw_fabric_colours(view)
         if imgui.collapsing_header("Loop equations##model_eq_section", imgui.TreeNodeFlags_.default_open):
             _draw_extraction(view)
             _draw_comparison(view.extraction)

@@ -747,6 +747,12 @@ def save(model, scene, start, scores, out: Path, pairs):
             "bow_grid_mm": {"box": model.field_box, "values": model.field[0, 0].detach().cpu().tolist()},
             "stretch_grid_mm": {"box": model.field_box, "values": model.warp[0].detach().cpu().tolist()},
             "depth_shading_per_mm": float(model.depth_k), "backing_colour": torch.sigmoid(model.backing).detach().cpu().tolist(),
+            # Each stitch's own slip off the lattice (mm, along and across the rows, capped as in centrelines),
+            # by its curves' key and its place (column, row): with them the curves are rebuilt exactly.
+            "slips_mm": [{"key": [k if isinstance(k, str) else int(k) for k in key],
+                          "origins": model.instances[key].detach().cpu().round().int().tolist(),
+                          "slip": (MAX_SLIP_MM * torch.tanh(model.slips[model.slip_index[key]] / MAX_SLIP_MM)).detach().cpu().tolist()}
+                         for key in model.instances],
             "scores": scores}
     (out / "stitch_model.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
     (out / "renders").mkdir(exist_ok=True)

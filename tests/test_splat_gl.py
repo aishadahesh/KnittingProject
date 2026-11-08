@@ -153,3 +153,24 @@ def test_axes_on_the_soft_splat_hide_behind_the_cloth():
 
     assert blue(splat_gl.AXES) > 200                  # the axes alone: the needles show through
     assert blue(splat_gl.SPLAT_AXES) < 10             # on the soft splat: hidden by the sheet
+
+
+def test_the_gaussian_in_front_is_named_at_each_pixel():
+    ctx = _context()
+    # Two sheets of Gaussians seen from above, the near one (z = 0.2, indices 400+) covering the far one's
+    # middle; the drawing order puts the far sheet last, so only depth decides.
+    u, v = np.meshgrid(np.linspace(-1, 1, 20), np.linspace(-1, 1, 20))
+    far = np.stack([u.ravel(), v.ravel(), np.zeros(400)], axis=1)
+    near = np.stack([0.4 * u.ravel(), 0.4 * v.ravel(), np.full(400, 0.2)], axis=1)
+    positions = np.concatenate([near, far]).astype(np.float32)
+    count = len(positions)
+    splat = {"positions": positions, "colours": np.full((count, 3), 0.5, dtype=np.float32), "opacity": np.ones(count, dtype=np.float32),
+             "radius": np.full(count, 0.06, dtype=np.float32), "sigma": np.full(count, 0.06, dtype=np.float32), "count": count}
+    renderer = splat_gl.SplatRenderer(ctx)
+    frame = (np.zeros(3), 1.0)
+    eye, forward, right, up = gaussian_splatting.orbit_camera(None, 0.0, 89.9, 1.0, (0.0, 0.0), frame)
+    ids = renderer.gaussian_ids("sheets", splat, (eye, forward, right, up, 300.0), (240, 180), frame)
+    middle, edge = ids[80:100, 110:130], ids[5:15, 5:15]
+    assert (middle >= 0).all() and (middle < 400).all()             # the near sheet, wherever it is
+    assert (edge[edge >= 0] >= 400).all() and (edge >= 400).any()    # the far one round it
+    assert (ids == -1).any()                                          # and nothing past the far sheet's edge
