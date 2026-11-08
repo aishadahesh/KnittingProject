@@ -6,10 +6,12 @@ own slip. In crochet one yarn is worked through a whole row of stitches, so the 
 one yarn. Each of the fabric's yarn Gaussians takes the curve nearest it, and so that curve's yarn.
 
   fitted_curves   the fitted curves in cloth-frame mm: [(points (n, 3), row, column, kind)]
+  fit_frame       the cloth frame the fit used, as saved with it (None for fits saved before it was)
+  region_members  which Gaussians make up one part of a cloth worked in two structures (fitted alone)
   yarn_of         each Gaussian's yarn (its curve's row) and curve, and how far it lies from it (mm)
 
-The cloth frame is the one the fit itself used (scan_fit.prepare), so the curves are carried into the
-splat's own coordinates the same way (scan_fit.to_splat_frame). No imgui here.
+The curves are carried into the splat's own coordinates through the cloth frame the fit itself used:
+saved with the fit, or for older fits the whole cloth's (scan_fit.prepare). No imgui here.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -78,6 +81,29 @@ def fitted_curves(fit_path: Path) -> list:
                 z = local[:, 2] + bow(x, y)[0]
                 curves.append((np.stack([x, y, z], axis=1), row, column, kind))
     return curves
+
+
+def fit_frame(fit_path: Path) -> dict | None:
+    """The cloth frame saved with a fit, in scan_fit.prepare's form (enough for to_splat_frame)."""
+    frame = json.loads(Path(fit_path).read_text(encoding="utf-8")).get("frame")
+    if frame is None:
+        return None
+    extraction = SimpleNamespace(centre=np.asarray(frame["extraction_centre"]), axes=np.asarray(frame["extraction_axes"]))
+    return {"extraction": extraction, "mm_per_unit": float(frame["mm_per_unit"]),
+            "flat_centre": np.asarray(frame["flat_centre"]), "flat_axes": np.asarray(frame["flat_axes"])}
+
+
+def region_members(positions: np.ndarray, labels: np.ndarray, roles: list, group: int) -> np.ndarray:
+    """One yarn colour group's Gaussians and the openings' rims lying nearest them (`roles` each group's
+    role, by index): the part of the cloth fitted on its own with --region."""
+    roles = np.asarray(roles)
+    yarn = np.isin(labels, np.flatnonzero(roles == "yarn"))
+    rims = np.flatnonzero(np.isin(labels, np.flatnonzero(roles == "edge")))
+    keep = labels == group
+    if len(rims) and yarn.any():
+        _, nearest = cKDTree(np.asarray(positions)[yarn]).query(np.asarray(positions)[rims])
+        keep[rims[labels[yarn][nearest] == group]] = True
+    return keep
 
 
 def yarn_of(positions_splat: np.ndarray, curves: list, prepared: dict, candidates=None):

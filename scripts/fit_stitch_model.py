@@ -12,6 +12,11 @@ rendered into every calibrated picture and changed until the renders look like t
     ... --stitch mesh      instead of filet posts and chains, a stitch family round each opening
                            (crochet_stitches: mesh, trellis, vstitch, shell), tiled on the openings'
                            diamond lattice; written to stitch_fit_<family>
+    ... --region 1         only one part of a cloth worked in two structures (a lace strip beside a
+                           band of another yarn): the Gaussians of that fabric colour group
+                           (scripts/fabric_colours.py, its rims with it) fitted on their own, with
+                           that yarn's colour; the rest of the cloth left out of the loss. Written
+                           to stitch_fit_region_<group>; fit each part so, and fabric_yarns joins them
 
 The model (all of it differentiable, torch):
   * a lattice - the rows' angle, where the repeat starts, the stitch width w and row height h;
@@ -201,11 +206,54 @@ def table_colour(photos, openings) -> torch.Tensor:
 
 # ----------------------------------------------------------------------------------- the start
 
+def region_ply(output: Path, group: int, out: Path):
+    """One fabric colour group's Gaussians of splat_clean.ply (and the openings' rims nearest them) as a
+    PLY of their own in `out`: (its path, the group's photo colour, the group as fabric_colours wrote it)."""
+    import fit_yarns
+
+    ply = output / "export" / "splat_clean.ply"
+    colours = json.loads((output / "fabric_colours.json").read_text(encoding="utf-8"))["colours"]
+    labels = np.load(output / "fabric_colours_labels.npy")
+    header, table = _read_ply(ply)
+    if len(labels) != len(table) or not 0 <= group < len(colours) or colours[group]["role"] != "yarn":
+        raise SystemExit(f"--region {group}: not one of the fabric's yarn colours (extract the fabric colours again?)")
+    positions = np.stack([table["x"], table["y"], table["z"]], 1)
+    keep = fit_yarns.region_members(positions, labels, [c["role"] for c in colours], group)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "region.ply"
+    with path.open("wb") as handle:
+        for line in header:
+            handle.write(((f"element vertex {int(keep.sum())}" if line.startswith("element vertex") else line) + "\n").encode("ascii"))
+        table[keep].tofile(handle)
+    log(f"Region {group} ({colours[group]['name']}): {int(keep.sum())} of {len(table)} Gaussians")
+    return path, np.asarray(colours[group]["rgb"], dtype=float), {"group": group, "name": colours[group]["name"],
+                                                                 "rgb": colours[group]["rgb"], "gaussians": int(keep.sum())}
+
+
+def region_cloth(region: Path, scene: dict) -> np.ndarray:
+    """Where a region's Gaussians lie, on the whole cloth's yarn map's grid (its openings filled in)."""
+    positions = gaussian_splatting.load_splat_ply(region)["positions"].astype(np.float64)
+    ex = scene["extraction"]
+    flat = (positions - scene["flat_centre"]) @ np.asarray(scene["flat_axes"]).T
+    cloth_mm = (flat * scene["mm"] - ex.centre) @ np.asarray(ex.axes).T
+    shape, low = scene["cloth"].shape, scene["low"]
+    cols, rows = ((cloth_mm[:, 0] - low[0]) / 0.1).astype(int), ((cloth_mm[:, 1] - low[1]) / 0.1).astype(int)
+    inside = (rows >= 0) & (rows < shape[0]) & (cols >= 0) & (cols < shape[1])
+    piece = np.zeros(shape, dtype=bool)
+    piece[rows[inside], cols[inside]] = True
+    filled = ndimage.binary_fill_holes(ndimage.binary_closing(ndimage.binary_dilation(piece, iterations=3), iterations=8))
+    # Its own outline, not clipped to the whole cloth's: that one is the main lace piece alone, and
+    # leaves a band of another yarn out.
+    return ndimage.binary_erosion(filled, iterations=3)
+
+
 def prepare(output: Path, run: Path, dataset: Path, stitches: int, rows: int, wraps: int, lattice: dict | None = None,
-            family: str | None = None):
+            family: str | None = None, region: Path | None = None):
     """The scan read as in Model Mode (laid flat, yarn mapped, crochet_fit with these counts - or the
     `lattice` lined up by eye), and the frames to carry the model's millimetres into the splat's (and
-    the cameras') frame."""
+    the cameras') frame. With a `region` (a part's own PLY, region_ply) the repeat is still read from
+    the whole cloth - the lace's openings along its edge are closed by the other part's yarn - but the
+    stitches are laid, and the photos judged, only where the region is."""
     ply = output / "export" / ("splat_clean.ply" if (output / "export" / "splat_clean.ply").is_file() else "splat.ply")
     splat = gaussian_splatting.load_splat_ply(ply)
     mm_per_unit = strand_equations.load_scale(output)
@@ -228,10 +276,15 @@ def prepare(output: Path, run: Path, dataset: Path, stitches: int, rows: int, wr
         log(f"Reading the crochet: {rows} rows x {stitches} stitches per repeat, {wraps} yarn-over(s)")
         start = crochet_fit.fit(extraction, stitches=stitches, rows=rows, wraps=wraps, rows_along_holes=True, refine=True)
     maps = extraction.maps
-    return {"ply": ply, "mm": float(mm_per_unit), "start": start, "extraction": extraction, "family": family,
-            "flat_centre": flat_centre, "flat_axes": flat_axes,
-            "cloth": lace_lattice.cloth_region(maps["support"]), "bow": lace_lattice.bow_map(maps["support"], maps["height"]),
-            "low": extraction.map_origin}
+    scene = {"ply": ply, "mm": float(mm_per_unit), "start": start, "extraction": extraction, "family": family,
+             "flat_centre": flat_centre, "flat_axes": flat_axes,
+             "cloth": lace_lattice.cloth_region(maps["support"]), "bow": lace_lattice.bow_map(maps["support"], maps["height"]),
+             "low": extraction.map_origin}
+    if region is not None:
+        scene["cloth"] = region_cloth(region, scene)
+        scene["ply"] = region
+        log(f"The region covers {scene['cloth'].sum() * 0.01:.0f} mm^2 of the cloth's map")
+    return scene
 
 
 def family_start(extraction, family: str):
@@ -557,7 +610,7 @@ OPEN_SHARE = 0.4
 PHOTO_OPEN_SHARE = 0.35
 
 
-def photo_openings(scene, start, instances, cameras, lens, photos, table, views):
+def photo_openings(scene, start, instances, cameras, lens, photos, table, views, yarn=(0.85, 0.85, 0.82)):
     """Each stitch's place looked at in every picture that sees it: an opening where the table's colour
     shows more than the yarn's (module docstring). Returns new instances and, per stitch, its share."""
     p, a, low, bow = start.params, math.radians(start.angle_deg), scene["low"], scene["bow"]
@@ -577,7 +630,7 @@ def photo_openings(scene, start, instances, cameras, lens, photos, table, views)
     points = np.concatenate(points)                                             # cloth-frame mm
     splat = ((points @ ex.axes + ex.centre) / mm) @ flat_axes + flat_centre     # the splat's (cameras') frame
     K = intrinsics(lens)
-    yarn = np.array([0.85, 0.85, 0.82])
+    yarn = np.asarray(yarn, dtype=float)
     table = np.asarray(table, dtype=float)
     votes, looks = np.zeros(len(points)), np.zeros(len(points))
     pictures = photos.cpu().numpy()
@@ -753,6 +806,12 @@ def save(model, scene, start, scores, out: Path, pairs):
                           "origins": model.instances[key].detach().cpu().round().int().tolist(),
                           "slip": (MAX_SLIP_MM * torch.tanh(model.slips[model.slip_index[key]] / MAX_SLIP_MM)).detach().cpu().tolist()}
                          for key in model.instances],
+            # The cloth frame the fit used (cloth mm -> splat): a region laid flat on its own is not the
+            # whole cloth's frame, so its curves are carried back with this one.
+            "frame": {"mm_per_unit": scene["mm"], "extraction_centre": np.asarray(scene["extraction"].centre).tolist(),
+                      "extraction_axes": np.asarray(scene["extraction"].axes).tolist(),
+                      "flat_centre": np.asarray(scene["flat_centre"]).tolist(), "flat_axes": np.asarray(scene["flat_axes"]).tolist()},
+            **({"region": scene["region"]} if scene.get("region") else {}),
             "scores": scores}
     (out / "stitch_model.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
     (out / "renders").mkdir(exist_ok=True)
@@ -760,6 +819,12 @@ def save(model, scene, start, scores, out: Path, pairs):
         side = np.hstack([image, target]) * 255
         cv2.imwrite(str(out / "renders" / f"heldout_{i:03d}.png"), cv2.cvtColor(side.astype(np.uint8), cv2.COLOR_RGB2BGR))
     log(f"written to {out}")
+
+
+def start_colour(model, yarn_rgb) -> None:
+    """Start the yarn's colour from the region's photo colour (its lit side) rather than white."""
+    with torch.no_grad():
+        model.albedo.copy_(torch.tensor(np.clip(np.asarray(yarn_rgb) * 1.05, 0.02, 1.0), dtype=torch.float32).expand_as(model.albedo))
 
 
 def try_counts(args, run, dataset, cameras, lens, train, heldout):
@@ -771,7 +836,7 @@ def try_counts(args, run, dataset, cameras, lens, train, heldout):
         stitches, rows = (int(v) for v in text.lower().split("x"))
         log(f"Trying {stitches} stitches x {rows} rows per repeat")
         try:
-            scene = prepare(args.output, run, dataset, stitches, rows, args.wraps)
+            scene = prepare(args.output, run, dataset, stitches, rows, args.wraps, region=args.ply)
         except Exception as exc:
             log(f"  {text}: could not read the scan this way ({exc})")
             continue
@@ -780,9 +845,10 @@ def try_counts(args, run, dataset, cameras, lens, train, heldout):
             photos = load_photos(cameras, lens)
             table = table_colour(photos, openings)
         instances, _ = photo_openings(scene, scene["start"], stitch_instances(scene, scene["start"]), cameras, lens, photos,
-                                      table.cpu().numpy(), train)
+                                      table.cpu().numpy(), train, args.yarn_rgb)
         model = StitchModel(scene, instances, lens["w"], lens["h"])
         model.background.copy_(table)
+        start_colour(model, args.yarn_rgb)
         fit(model, photos, masks, coverage, cameras, lens, train, [{**s, "steps": max(int(s["steps"] * 0.25), 10)} for s in STAGES], report_every=10 ** 9)
         scores, _ = evaluate(model, photos, masks, cameras, lens, heldout)
         log(f"  {text}: held-out {scores['model_psnr']:.2f} dB, SSIM {scores['model_ssim']:.3f}, "
@@ -813,15 +879,23 @@ def main() -> None:
     parser.add_argument("--lattice", type=Path, default=None, help="the stitch grid lined up by eye (JSON: angle_deg, shift, stitch_width, row_height)")
     parser.add_argument("--try", dest="candidates", default="",
                         help="stitches x rows counts to compare first, e.g. 3x3,6x3,9x3 (each a short fit, judged on held-out pictures)")
+    parser.add_argument("--region", type=int, default=None,
+                        help="fit only this fabric colour group's part of the cloth (its index in fabric_colours.json)")
     args = parser.parse_args()
 
+    out = args.out or (args.output / ("stitch_fit_synthetic" if args.synthetic else f"stitch_fit_{args.stitch}" if args.stitch
+                                      else f"stitch_fit_region_{args.region}" if args.region is not None else "stitch_fit"))
+    args.ply, args.yarn_rgb, region = None, (0.85, 0.85, 0.82), None
+    if args.region is not None:
+        args.ply, args.yarn_rgb, region = region_ply(args.output, args.region, out)
     run, dataset = find_run_and_dataset(args.output)
     cameras, lens, train, heldout = load_cameras(run, dataset)
     log(f"{len(cameras)} pictures ({len(train)} to fit, {len(heldout)} held out), {DEVICE}")
     if args.candidates and not args.synthetic:
         args.stitches, args.rows = try_counts(args, run, dataset, cameras, lens, train, heldout)
     lattice = json.loads(args.lattice.read_text(encoding="utf-8")) if args.lattice else None
-    scene = prepare(args.output, run, dataset, args.stitches, args.rows, args.wraps, lattice, args.stitch)
+    scene = prepare(args.output, run, dataset, args.stitches, args.rows, args.wraps, lattice, args.stitch, args.ply)
+    scene["region"] = region
     start = scene["start"]
     instances = family_instances(scene, start) if args.stitch else stitch_instances(scene, start)
     log(f"Start: rows at {start.angle_deg:.1f} deg, stitch {start.params.stitch_width:.2f} mm, row {start.params.row_height:.2f} mm, "
@@ -833,7 +907,7 @@ def main() -> None:
         photos = load_photos(cameras, lens)
         table = table_colour(photos, openings)
     if not args.synthetic and not args.stitch:
-        instances, share = photo_openings(scene, start, instances, cameras, lens, photos, table.cpu().numpy(), train)
+        instances, share = photo_openings(scene, start, instances, cameras, lens, photos, table.cpu().numpy(), train, args.yarn_rgb)
         log(f"Openings read from the photos: {int((share >= PHOTO_OPEN_SHARE).sum())} of {len(share)} stitches "
             f"(table seen in {np.percentile(share, 50) * 100:.0f}% of looks at a typical stitch, {np.percentile(share, 90) * 100:.0f}% at the 90th)")
     if args.per_stitch:
@@ -880,6 +954,7 @@ def main() -> None:
         log(f"Synthetic truth: w {float(truth.w):.3f} h {float(truth.h):.3f}; start template off by {template_rms(model, truth):.3f} mm")
     else:
         model.background.copy_(table)
+        start_colour(model, args.yarn_rgb)
         log(f"The table through the openings: RGB {[round(float(c), 3) for c in model.background]}")
 
     before, _ = evaluate(model, photos, masks, cameras, lens, heldout, None if args.synthetic else splat)
@@ -893,7 +968,6 @@ def main() -> None:
     if args.synthetic:
         scores.update({"w_error": float(model.w / truth.w - 1), "h_error": float(model.h / truth.h - 1), "template_rms_mm": template_rms(model, truth)})
         log(f"Recovered: w off by {scores['w_error'] * 100:+.1f}%, h off by {scores['h_error'] * 100:+.1f}%, template off by {scores['template_rms_mm']:.3f} mm")
-    out = args.out or (args.output / ("stitch_fit_synthetic" if args.synthetic else f"stitch_fit_{args.stitch}" if args.stitch else "stitch_fit"))
     save(model, scene, start, scores, out, pairs)
 
 

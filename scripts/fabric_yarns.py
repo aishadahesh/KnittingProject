@@ -5,7 +5,9 @@
 Two ways to find them:
   fit         from the fitted crochet model (src/fit_yarns.py: each yarn Gaussian takes its nearest
               fitted curve, a row's curves being one yarn) - the default when the model has a photo fit
-              (stitch_fit/stitch_model.json);
+              (stitch_fit/stitch_model.json), or one per part of a cloth worked in two structures
+              (stitch_fit_region_<group>/, fit_stitch_model.py --region): each part's Gaussians take
+              their own fit's curves, and the parts' yarns are numbered one after the other;
   directions  from the Gaussians alone (src/yarn_tracks.py: linked where close and pointing alike).
 
 Needs the fabric colours first (scripts/fabric_colours.py): its groups say which Gaussians are yarn
@@ -42,7 +44,11 @@ def main() -> None:
                         help="how to find the yarns (default: fit when the model has stitch_fit/stitch_model.json)")
     args = parser.parse_args()
     fit_path = args.run / "stitch_fit" / "stitch_model.json"
-    source = args.source or ("fit" if fit_path.is_file() else "directions")
+    regions = sorted(args.run.glob("stitch_fit_region_*/stitch_model.json"), key=lambda p: int(p.parent.name.rsplit("_", 1)[1]))
+    fits = regions or ([fit_path] if fit_path.is_file() else [])
+    source = args.source or ("fit" if fits else "directions")
+    if source == "fit" and not fits:
+        raise SystemExit("no photo fit (stitch_fit/ or stitch_fit_region_*/) for --from fit")
 
     splat = gaussian_splatting.load_splat_ply(args.run / "export" / "splat_clean.ply")
     fabric = fabric_palette.load(args.run, len(splat["positions"]))
@@ -54,16 +60,35 @@ def main() -> None:
     yarn_groups = [g["index"] for g in fabric["groups"] if g["role"] in ("yarn", "edge")]
     candidates = np.isin(fabric["labels"], yarn_groups) & (np.asarray(splat["opacity"]) >= 0.3)
     if source == "fit":
-        import gui_model
-        import scan_fit
+        yarn = np.full(len(candidates), -1)
+        curve = np.full(len(candidates), -1)
+        distance_mm = np.full(len(candidates), np.inf)
+        roles = [g["role"] for g in sorted(fabric["groups"], key=lambda g: g["index"])]
+        count, radii, parts = 0, [], []
+        for path in fits:
+            fit = json.loads(path.read_text(encoding="utf-8"))
+            prepared = fit_yarns.fit_frame(path)
+            if prepared is None:                       # saved before fits kept their frame: the whole cloth's
+                import gui_model
+                import scan_fit
 
-        model = next(m for m in gui_model.find_models() if m["output"].resolve() == args.run.resolve())
-        model["mm_per_unit"] = mm
-        prepared = scan_fit.prepare(model)
-        curves = fit_yarns.fitted_curves(fit_path)
-        yarn, curve, distance_mm = fit_yarns.yarn_of(splat["positions"], curves, prepared, candidates)
-        radius_mm = float(json.loads(fit_path.read_text(encoding="utf-8"))["yarn_radius"])
-        extra = {"source": "fit", "curves": len(curves),
+                model = next(m for m in gui_model.find_models() if m["output"].resolve() == args.run.resolve())
+                model["mm_per_unit"] = mm
+                prepared = scan_fit.prepare(model)
+            mine = candidates.copy()
+            if "region" in fit:
+                mine &= fit_yarns.region_members(splat["positions"], fabric["labels"], roles, fit["region"]["group"])
+            curves = fit_yarns.fitted_curves(path)
+            y, c, d = fit_yarns.yarn_of(splat["positions"], curves, prepared, mine)
+            yarn[mine], curve[mine], distance_mm[mine] = y[mine] + count, c[mine] + sum(parts), d[mine]
+            count = int(yarn.max()) + 1
+            parts.append(len(curves))
+            radii.append(float(fit["yarn_radius"]))
+            log_part = fit.get("region", {}).get("name", "the whole cloth")
+            print(f"{log_part}: {int(mine.sum())} yarn Gaussians onto {len(curves)} curves, median {np.median(d[mine]):.2f} mm")
+        candidates = yarn >= 0
+        radius_mm = float(np.mean(radii))
+        extra = {"source": "fit", "fits": [p.parent.name for p in fits], "curves": int(sum(parts)),
                  "median_distance_mm": round(float(np.median(distance_mm[candidates])), 3),
                  "within_1mm": round(float((distance_mm[candidates] <= 1.0).mean()), 3),
                  "within_2mm": round(float((distance_mm[candidates] <= 2.0).mean()), 3)}
