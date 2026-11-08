@@ -27,8 +27,10 @@ The geometry is strand_equations.py and lace_lattice.py; the splat loading is ga
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -40,6 +42,7 @@ from PIL import Image
 
 import crochet_core
 import crochet_fit
+import drive_store
 import fabric_palette
 import gaussian_splatting
 import yarn_tracks
@@ -108,7 +111,7 @@ def _view(state) -> SimpleNamespace:
             recolour_scan=True, fabric_source=0, palettes=None, palette_pick=0, palette_name="", yarn_map=False, colours_to_find=0,
             multi=None, yarns=None, yarns_info=None, yarns_job=None, yarn_colours={}, show_yarns=False, yarn_tool=0,
             yarn_pen=None, yarn_order="1,2", yarn_flip=False, brush_yarn=0, brush_seeds=[], yarn_dirs=None, yarn_dirs_job=None,
-            yarns_edited=False,
+            yarns_edited=False, drive_ok=None, drive_connect=None, drive_job=None, drive_saved=None,
             gl=None, gl_failed=False, gl_used=set(), spin=False, wiggle=False, wiggle_offset=0.0, by_height=False, plane=None, style=splat_gl.SOFT,
         )
         state.model_view = view
@@ -1026,6 +1029,90 @@ def _draw_model_choice(view) -> None:
             model["mm_per_unit"] = view.mm_per_unit
 
 
+def _save_to_drive(view, model) -> None:
+    """Pack the model's scan folders and copy the zip to Drive, on a thread; view.drive_job says how far."""
+    job = {"stage": "Packing", "share": 0.0, "done": False, "error": None}
+
+    def work():
+        staging = Path(tempfile.mkdtemp(prefix="drive_"))
+        try:
+            def packed(share):
+                job["share"] = share
+            target, info = drive_store.pack(model["output"], staging, packed)
+            job.update(stage=f"Uploading {target.name} ({info['bytes'] / 1e6:.0f} MB)", share=0.0)
+            process = drive_store.upload(target)
+            last = ""
+            for line in process.stderr:
+                share = drive_store.progress_of(line)
+                if share is not None:
+                    job["share"] = share
+                last = line.strip() or last
+            if process.wait() != 0:
+                raise RuntimeError(last or "rclone failed")
+            job["stage"] = f"Saved {target.name} to Drive ({info['files']} files, {info['bytes'] / 1e6:.0f} MB)"
+        except Exception as exc:              # shown in the panel; nothing half-saved is kept locally
+            job["error"] = str(exc)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            job["done"] = True
+
+    threading.Thread(target=work, daemon=True, name="drive-save").start()
+    view.drive_job = job
+
+
+def _draw_drive(view, model) -> None:
+    """Saving the model (its photos, poses, Gaussians and results) to Google Drive, and what is there."""
+    imgui.separator()
+    imgui.text("Google Drive")
+    if view.drive_ok is None:
+        view.drive_ok = drive_store.connected()
+    if drive_store.rclone_path() is None:
+        imgui.text_colored(COLOR_WARN, "rclone is not installed (winget install Rclone.Rclone).")
+        return
+    if view.drive_connect is not None:
+        if view.drive_connect.poll() is None:
+            imgui.text_colored(COLOR_MUTED, "Sign in to Google in the browser that opened, then allow access...")
+            return
+        view.drive_connect, view.drive_ok, view.drive_saved = None, drive_store.connected(), None
+    if not view.drive_ok:
+        if imgui.small_button("Connect Google Drive##drive_connect"):
+            view.drive_connect = drive_store.connect()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Opens the browser to sign in to your Google account. rclone gets access only to the files it saves.")
+        return
+    job = view.drive_job
+    if job is not None and not job["done"]:
+        imgui.progress_bar(float(job["share"]), (-1, 0), f"{job['stage']}  {job['share'] * 100:.0f}%")
+    else:
+        if job is not None:
+            if job["error"]:
+                imgui.text_colored(COLOR_WARN, "Not saved: " + job["error"][-200:])
+            else:
+                imgui.text_colored(COLOR_OK, job["stage"])
+                view.drive_saved = None
+        if imgui.small_button("Save this model to Drive##drive_save"):
+            _save_to_drive(view, model)
+        if imgui.is_item_hovered():
+            names = ", ".join(f.name for f in drive_store.scan_folders(model["output"]))
+            imgui.set_tooltip(f"Zips {names} into one file in Drive's {drive_store.FOLDER} folder: the photos and poses,\n"
+                              "masks, scale, every splat (the Gaussians) and the colours, yarns and fits.\n"
+                              "Checkpoints, COLMAP databases, photo copies and renders are left out (they can be made again).")
+    imgui.same_line()
+    if imgui.small_button("Refresh##drive_refresh"):
+        view.drive_saved = None
+    if view.drive_saved is None:              # read on a thread: rclone asks Google, a second or two
+        view.drive_saved = {"entries": None}
+        threading.Thread(target=lambda holder=view.drive_saved: holder.update(entries=drive_store.saved()),
+                         daemon=True, name="drive-list").start()
+    entries = view.drive_saved["entries"]
+    if entries is None:
+        imgui.text_colored(COLOR_MUTED, "Reading what is on Drive...")
+    elif imgui.tree_node(f"On Drive ({len(entries)})##drive_list"):
+        for entry in entries:
+            imgui.text(f"{entry['name']}  {entry['bytes'] / 1e6:.0f} MB  {entry['modified']}")
+        imgui.tree_pop()
+
+
 def _draw_extraction(view) -> None:
     imgui.set_next_item_width(160)
     _, view.tolerance = imgui.slider_float("Fit tolerance (mm)##model_tol", float(view.tolerance), 0.01, 0.2, "%.3f")
@@ -1264,6 +1351,8 @@ def draw_model_panel(state, renderer) -> None:
     if imgui.begin_child("model_controls", (CONTROLS_WIDTH, 0)):
         if imgui.collapsing_header("Model##model_section", imgui.TreeNodeFlags_.default_open):
             _draw_model_choice(view)
+            if view.models and view.index >= 0:
+                _draw_drive(view, view.models[view.index])
         if imgui.collapsing_header("Fabric colour##model_fabric_section", imgui.TreeNodeFlags_.default_open):
             _draw_fabric_colours(view)
         if imgui.collapsing_header("Loop equations##model_eq_section", imgui.TreeNodeFlags_.default_open):
