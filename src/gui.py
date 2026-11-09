@@ -257,27 +257,63 @@ def _draw_puzzle_capture_widget(state, image, texture, avail_w, avail_h):
 
 
 def draw_menu_bar(state):
+    current_mode = str(state.get('app_mode', 'edit'))
     if imgui.begin_menu_bar():
+        if imgui.begin_menu("File"):
+            clicked_save, _ = imgui.menu_item("Save Parameters...", "", False)
+            if clicked_save:
+                path = _pick_file('save', state.save_path)
+                if path:
+                    state.save_params(path)
+            clicked_load, _ = imgui.menu_item("Load Parameters...", "", False)
+            if clicked_load:
+                path = _pick_file('load', state.load_path)
+                if path:
+                    state.load_params(path)
+            clicked_auto, _ = imgui.menu_item("Autosave", "", bool(state.autosave_enabled))
+            if clicked_auto:
+                state.autosave_enabled = not bool(state.autosave_enabled)
+            imgui.separator()
+            clicked_init, _ = imgui.menu_item("Reset to Initial", "", False, current_mode == 'edit')
+            if clicked_init:
+                state.reset_to_initial()
+            imgui.end_menu()
+        if imgui.begin_menu("Edit"):
+            has_undo = bool(state.undo_stack)
+            undo_label = f"Undo {state.undo_stack[-1][0]}" if has_undo else "Undo"
+            clicked_undo, _ = imgui.menu_item(undo_label, "Ctrl+Z", False, has_undo)
+            if clicked_undo:
+                state.undo_last()
+            imgui.end_menu()
+        if imgui.begin_menu("Mode"):
+            for mode_id, mode_label in (
+                ('edit', "Edit"),
+                ('scan', "Scan"),
+                ('puzzle', "Puzzle"),
+                ('database', "Database"),
+                ('model', "Model"),
+                ('ur5', "UR5 Robot"),
+            ):
+                clicked_mode, _ = imgui.menu_item(mode_label, "", current_mode == mode_id)
+                if clicked_mode:
+                    _set_app_mode(state, mode_id)
+            imgui.end_menu()
         if imgui.begin_menu("Window"):
             clicked_reset, _ = imgui.menu_item("Reset Layout", "", False)
             if clicked_reset:
                 _reset_layout(state)
+            light_theme = str(state.get('ui_theme', 'dark')) == 'light'
+            clicked_theme, _ = imgui.menu_item("Light Theme", "", light_theme)
+            if clicked_theme:
+                state.ui_theme = 'dark' if light_theme else 'light'
+                state._applied_ui_theme = ''
             imgui.end_menu()
         imgui.end_menu_bar()
 
 
 def _reset_layout(state):
-    """Every window back where it starts: undocked, the saved layout forgotten, and the control
-    window (all the mode buttons) put back in front at its own size.
-
-    Deleting the layout file alone did nothing while the app ran - imgui writes the layout it holds
-    back to the file on exit - and windows docked into one full-screen panel kept covering the
-    controls."""
+    """Restore all windows to their default positions and sizes."""
     try:
-        # Located via paths, not from save_path's folder: the saved
-        # parameters live in config/ while the layout file sits in
-        # the project root, so deriving one from the other deletes
-        # nothing and silently does not reset the layout.
         os.remove(paths.LAYOUT_INI)
     except FileNotFoundError:
         pass
@@ -285,6 +321,7 @@ def _reset_layout(state):
     imgui.internal.dock_context_clear_nodes(context, 0, True)
     imgui.internal.clear_ini_settings()
     state._layout_reset_pending = True
+    state._layout_reset_viewport = True
 
 
 def _mark_sim_geometry_dirty(state):
@@ -520,6 +557,15 @@ def _apply_ui_theme(state):
         imgui.style_colors_light()
     else:
         imgui.style_colors_dark()
+    style = imgui.get_style()
+    style.window_rounding = 6.0
+    style.child_rounding = 4.0
+    style.frame_rounding = 4.0
+    style.grab_rounding = 3.0
+    style.tab_rounding = 4.0
+    style.frame_padding = imgui.ImVec2(6.0, 4.0)
+    style.item_spacing = imgui.ImVec2(8.0, 6.0)
+    style.window_padding = imgui.ImVec2(10.0, 10.0)
     state._applied_ui_theme = theme
 
 
@@ -527,12 +573,11 @@ def _draw_fabric_type(state):
     """Edit Mode's fabric: knitted loop rows, or crochet posts and chains. Returns the one shown."""
     fabric = str(state.get('fabric_type', 'knit'))
     imgui.text("Fabric:")
-    for value, label in (('knit', "Knit (loop rows)"), ('crochet', "Crochet (posts and chains)")):
+    for value, label in (('knit', "Knit (loops)"), ('crochet', "Crochet (posts & chains)")):
         imgui.same_line()
         if imgui.radio_button(f"{label}##fabric_{value}", fabric == value) and fabric != value:
             state.push_undo("Fabric type")
             if value == 'crochet' and bool(state.get('sim_active', False)):
-                # The yarn simulation moves knit control rows; a crochet fabric has none.
                 with state.sim_lock:
                     state.sim_active = False
             state.fabric_type = value
@@ -562,10 +607,10 @@ def _draw_crochet_editor(state):
     if imgui.collapsing_header("Stitch grid##crochet_grid", imgui.TreeNodeFlags_.default_open):
         rows, cols = stitches.shape
         imgui.set_next_item_width(110)
-        rows_changed, new_rows = imgui.input_int("rows##crochet_rows", rows)
+        rows_changed, new_rows = imgui.input_int("Rows##crochet_rows", rows)
         imgui.same_line()
         imgui.set_next_item_width(110)
-        cols_changed, new_cols = imgui.input_int("stitches##crochet_cols", cols)
+        cols_changed, new_cols = imgui.input_int("Stitches##crochet_cols", cols)
         if rows_changed or cols_changed:
             new_rows, new_cols = int(np.clip(new_rows, 1, 16)), int(np.clip(new_cols, 1, 32))
             if (new_rows, new_cols) != (rows, cols):
@@ -573,21 +618,25 @@ def _draw_crochet_editor(state):
                 grown = np.ones((new_rows, new_cols), dtype=np.float32)
                 grown[:min(rows, new_rows), :min(cols, new_cols)] = stitches[:min(rows, new_rows), :min(cols, new_cols)]
                 stitches, changed = grown, True
-        imgui.text_disabled("Click a stitch: filled = a post, empty = a chain across (an opening). Top row first.")
-        size = 18.0
+        imgui.text_disabled("Click cell: green = post, dark = chain opening.")
+        cell_w, cell_h = 22.0, 16.0
         imgui.push_style_var(imgui.StyleVar_.item_spacing, (2, 2))
         for r in range(stitches.shape[0] - 1, -1, -1):
+            imgui.text_disabled(f"R{r + 1}")
+            imgui.same_line()
             for c in range(stitches.shape[1]):
                 post = stitches[r, c] > 0.5
-                imgui.push_style_color(imgui.Col_.button, (0.86, 0.84, 0.78, 1.0) if post else (0.16, 0.16, 0.20, 1.0))
-                if imgui.button(f"##crochet_cell_{r}_{c}", (size, size)):
+                imgui.push_style_color(imgui.Col_.button, (0.18, 0.62, 0.28, 1.0) if post else (0.22, 0.22, 0.24, 1.0))
+                imgui.push_style_color(imgui.Col_.button_hovered, (0.28, 0.72, 0.38, 1.0) if post else (0.35, 0.35, 0.38, 1.0))
+                imgui.push_style_color(imgui.Col_.button_active, (0.28, 0.72, 0.38, 1.0) if post else (0.35, 0.35, 0.38, 1.0))
+                if imgui.button(f"##crochet_cell_{r}_{c}", (cell_w, cell_h)):
                     state.push_undo("Crochet stitch")
                     stitches = stitches.copy()
                     stitches[r, c] = 0.0 if post else 1.0
                     changed = True
-                imgui.pop_style_color()
+                imgui.pop_style_color(3)
                 if imgui.is_item_hovered():
-                    imgui.set_tooltip(f"row {r + 1}, stitch {c + 1}: {'post' if post else 'chain (open)'}")
+                    imgui.set_tooltip(f"Row {r + 1}, Stitch {c + 1}: {'post' if post else 'chain (open)'}")
                 if c < stitches.shape[1] - 1:
                     imgui.same_line()
         imgui.pop_style_var()
@@ -609,13 +658,13 @@ def _draw_crochet_editor(state):
             params['wraps'], changed = int(wraps), True
         copies = [int(c) for c in state.display_copies]
         imgui.set_next_item_width(160)
-        moved, copies = imgui.input_int2("Repeat left/right, up/down##crochet_copies", copies)
+        moved, copies = imgui.input_int2("Repeat X, Y##crochet_copies", copies)
         if moved:
             state.display_copies = np.array([int(np.clip(c, 0, 6)) for c in copies], dtype=np.int32)
             changed = True
-    if imgui.collapsing_header("Equations##crochet_equations", imgui.TreeNodeFlags_.default_open):
+    if imgui.collapsing_header("Equations##crochet_equations"):
         name = {0: "single / half double crochet", 1: "double crochet", 2: "treble crochet", 3: "double treble"}.get(int(params['wraps']), "")
-        imgui.text_colored((0.65, 0.65, 0.65, 1.0), f"{name}; s from 0 to 1 up a post, t round a loop, u along a wrap; mm")
+        imgui.text_disabled(f"{name}; s in [0, 1] up a post, t round a loop, u along a wrap (mm)")
         for line in crochet_core.equations(crochet_core.CrochetParams(**params)):
             imgui.text_wrapped(line)
     if changed:
@@ -632,6 +681,10 @@ _SCAN_FIT = SimpleNamespace(models=None, index=-1, prepared=None, job=None, prog
 
 def _start_scan_fit(state, fabric):
     view = _SCAN_FIT
+    if view.models is None:
+        view.models = scan_fit.find_models()
+        measured = [i for i, m in enumerate(view.models) if m["mm_per_unit"] is not None]
+        view.index = max(measured, key=lambda i: view.models[i]["psnr"] or 0.0) if measured else (0 if view.models else -1)
     model = view.models[view.index]
     prepared = view.prepared if view.prepared is not None and view.prepared["model"] is model else None
     holder = {}
@@ -975,21 +1028,192 @@ def _draw_bitmap_editor(state, id_suffix=""):
     return changed_bitmap
 
 
+MODE_SPECS = (
+    ('edit', "Edit", "Edit knitted and crocheted geometry, material, and simulation"),
+    ('scan', "Scan", "Simulate multi-angle UR5e fabric scanning in MuJoCo"),
+    ('puzzle', "Puzzle", "Test seamless tile repeat and landmark extraction"),
+    ('database', "Database", "Browse captured images, metadata, and RGB analyses"),
+    ('model', "Model", "Inspect 3D Gaussian splats and fit yarn/stitch equations"),
+    ('ur5', "UR5 Robot", "Connect to physical UR5e or TeleopApp, capture, and reconstruct"),
+)
+
+GEOMETRY_PARAM_LABELS = {
+    'stitch_bulge': "Stitch bulge",
+    'stitch_z': "Loop depth (Z)",
+    'dy': "Row spacing (dy)",
+    'radius': "Yarn radius",
+    'ellipse_ratio': "Ellipse ratio",
+}
+
+
+def _draw_appearance_controls(state, rebuild_current_mesh, is_knit=True):
+    if imgui.collapsing_header("Material", imgui.TreeNodeFlags_.default_open):
+        changed_mode, use_row_colors = imgui.checkbox("Colors per row##rowcolors", bool(state.use_row_colors))
+        if changed_mode:
+            state.push_undo("Color mode")
+            state.use_row_colors = use_row_colors
+            rebuild_current_mesh()
+        if not state.use_row_colors:
+            changed_c, new_col = imgui.color_edit3("Model color##single_color", tuple(float(x) for x in state.single_model_color[:3]))
+            if changed_c:
+                state.single_model_color = np.array(new_col, dtype=np.float32)
+                rebuild_current_mesh()
+        else:
+            colors_changed = False
+            for row_idx in range(int(state.bitmap_size[0])):
+                col = state.row_colors[row_idx]
+                changed_c, new_col = imgui.color_edit3(f"Row {row_idx + 1}##row_color_{row_idx}", (float(col[0]), float(col[1]), float(col[2])))
+                if changed_c:
+                    state.row_colors[row_idx] = list(new_col)
+                    colors_changed = True
+            if colors_changed:
+                rebuild_current_mesh()
+
+    if imgui.collapsing_header("Display & Lighting", imgui.TreeNodeFlags_.default_open):
+        changed_x, new_x = imgui.slider_int("Copy via X##display_copies_x", int(state.display_copies[0]), 0, 20)
+        released_x = imgui.is_item_deactivated_after_edit()
+        changed_y, new_y = imgui.slider_int("Copy via Y##display_copies_y", int(state.display_copies[1]), 0, 20)
+        released_y = imgui.is_item_deactivated_after_edit()
+        if changed_x or changed_y:
+            if not bool(state.__dict__.get('_display_copies_dragging', False)):
+                state.push_undo("Display copies")
+                object.__setattr__(state, '_display_copies_dragging', True)
+            state.scanner_preview_grid_enabled = False
+            state.display_copies = np.array([int(new_x), int(new_y)], dtype=np.int32)
+        if released_x or released_y:
+            object.__setattr__(state, '_display_copies_dragging', False)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
+        if imgui.small_button("Single model##display_single"):
+            state.push_undo("Display copies")
+            state.display_copies = np.array([0, 0], dtype=np.int32)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
+        imgui.same_line()
+        if imgui.small_button("Center model##display_center"):
+            state.push_undo("Center model")
+            state.center_model_on_view()
+        changed_alpha, new_alpha = imgui.slider_float("Model opacity##mdl", float(state.model_alpha), 0.0, 1.0, "%.2f")
+        if changed_alpha:
+            state.model_alpha = float(new_alpha)
+        changed_view_fov, new_view_fov = imgui.slider_float("View FoV##view", float(state.view_fov), 10.0, 120.0, "%.1f")
+        if changed_view_fov:
+            state.view_fov = float(new_view_fov)
+            state.camera.fov_deg = float(new_view_fov)
+        _, state.show_ref_bg = imgui.checkbox("Show reference overlay##display_ref", bool(state.show_ref_bg))
+        if state.show_ref_bg:
+            _, state.ref_bg_alpha = imgui.slider_float("Reference opacity##bg", float(state.ref_bg_alpha), 0.0, 1.0, "%.2f")
+        imgui.separator()
+        changed_light, new_light = imgui.color_edit3(
+            "Light color##render_light",
+            (float(state.render_light_color[0]), float(state.render_light_color[1]), float(state.render_light_color[2])),
+        )
+        if changed_light:
+            state.render_light_color = np.array(new_light, dtype=np.float32)
+        changed_intensity, new_intensity = imgui.slider_float("Light intensity##render_light", float(state.render_light_intensity), 0.05, 3.0, "%.2f")
+        if changed_intensity:
+            state.render_light_intensity = float(new_intensity)
+        changed_ao_s, new_ao_s = imgui.slider_float("AO strength##render_ao", float(state.render_ao_strength), 0.0, 2.0, "%.2f")
+        changed_ao_r, new_ao_r = imgui.slider_float("AO radius##render_ao", float(state.render_ao_radius), 0.01, 1.0, "%.2f")
+        if changed_ao_s:
+            state.render_ao_strength = float(new_ao_s)
+        if changed_ao_r:
+            state.render_ao_radius = float(new_ao_r)
+        if imgui.small_button("Reset lighting##render_light"):
+            state.push_undo("Lighting")
+            state.render_light_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            state.render_light_intensity = 0.9
+            state.render_ao_strength = 0.5
+            state.render_ao_radius = 0.15
+
+    if not is_knit:
+        return
+
+    if imgui.collapsing_header("Surface Fibers", imgui.TreeNodeFlags_.default_open):
+        changed_enabled, enabled = imgui.checkbox("Use multi-fiber rows##fiber_geometry_enabled", bool(state.fiber_geometry_enabled))
+        fibers_changed = False
+        if changed_enabled:
+            state.push_undo("Surface fibers")
+            state.fiber_geometry_enabled = enabled
+            fibers_changed = True
+        if state.fiber_geometry_enabled:
+            changed, value = imgui.slider_int("Fibers per row##fiber_geometry_count", int(state.fiber_geometry_count), 1, 64)
+            if changed:
+                state.fiber_geometry_count = int(value)
+                fibers_changed = True
+            for key, label, lo, hi in (
+                ('fiber_geometry_radius_scale', 'Fiber radius scale', 0.04, 0.45),
+                ('fiber_geometry_lift', 'Lift above surface', 0.0, 1.0),
+                ('fiber_geometry_surface_arc', 'Surface spread', 0.05, 1.0),
+                ('fiber_geometry_randomness', 'Randomness', 0.0, 1.0),
+                ('fiber_geometry_twist', 'Fiber twist', -3.0, 3.0),
+            ):
+                changed, value = imgui.slider_float(f"{label}##{key}", float(state[key]), float(lo), float(hi), "%.2f")
+                if changed:
+                    state[key] = float(value)
+                    fibers_changed = True
+        else:
+            imgui.text_disabled("Enable multi-fiber rows to separate each yarn into smaller fibers.")
+        if fibers_changed:
+            rebuild_current_mesh()
+
+    if imgui.collapsing_header("Texture"):
+        changed_tex, new_tex = imgui.color_edit3(
+            "Texture tint##render_texture",
+            (float(state.render_texture_color[0]), float(state.render_texture_color[1]), float(state.render_texture_color[2])),
+        )
+        if imgui.is_item_activated():
+            state.push_undo("Render texture")
+        if changed_tex:
+            state.render_texture_color = np.array(new_tex, dtype=np.float32)
+        if imgui.small_button("Neutral tint##texture"):
+            state.push_undo("Render texture")
+            state.render_texture_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        imgui.same_line()
+        if imgui.small_button("Copy material color##texture"):
+            state.push_undo("Render texture")
+            src = state.row_colors[0] if state.use_row_colors and state.row_colors else state.single_model_color
+            state.render_texture_color = np.array(src[:3], dtype=np.float32)
+        for group in state.texture_control_groups:
+            if imgui.tree_node(group['title']):
+                for control in group['controls']:
+                    key = control['key']
+                    changed, new_val = imgui.slider_float(
+                        f"{control['label']}##{key}",
+                        float(state[key]),
+                        float(control['min']),
+                        float(control['max']),
+                        control['format'],
+                    )
+                    if imgui.is_item_activated():
+                        state.push_undo(control['label'])
+                    if changed:
+                        state[key] = float(new_val)
+                imgui.tree_pop()
+        imgui.separator()
+        for preset in state.texture_preset_buttons:
+            if preset.get('same_line'):
+                imgui.same_line()
+            if imgui.small_button(f"{preset['label']}##texture_preset_{preset['preset']}"):
+                state.push_undo("Texture preset")
+                state.apply_texture_preset(preset['preset'])
+
+
 def draw_sidebar(state, renderer, window=None):
     _apply_ui_theme(state)
-    database_active_layout = str(state.get('app_mode', 'edit')) in ('database', 'model')
-    if database_active_layout:
+    current_mode = str(state.get('app_mode', 'edit'))
+    wide_layout = current_mode in ('database', 'model') or (current_mode == 'ur5' and not bool(state.get('ur5_show_scene', False)))
+    if wide_layout:
         imgui.set_next_window_pos((20, 20), cond=imgui.Cond_.always)
         imgui.set_next_window_size((1280, 840), cond=imgui.Cond_.always)
+        state._was_wide_layout = True
     else:
-        # After Reset Layout, once: placed and sized as on a first start, and brought to the front.
-        reset = bool(state.get('_layout_reset_pending', False))
+        reset = bool(state.get('_layout_reset_pending', False)) or bool(state.get('_was_wide_layout', False))
         cond = imgui.Cond_.always if reset else imgui.Cond_.first_use_ever
         imgui.set_next_window_pos((20, 20), cond=cond)
         imgui.set_next_window_size((360, 820), cond=cond)
         if reset:
             imgui.set_next_window_focus()
             state._layout_reset_pending = False
+            state._was_wide_layout = False
     imgui.begin("Knitting Control")
 
     def rebuild_current_mesh(preserve=True):
@@ -1109,78 +1333,70 @@ def draw_sidebar(state, renderer, window=None):
             return
         state.scanner_status = "Scanner idle"
 
-    current_mode = str(state.get('app_mode', 'edit'))
     edit_active = current_mode == 'edit'
     scan_active = current_mode == 'scan'
     puzzle_active = current_mode == 'puzzle'
     database_active = current_mode == 'database'
     ur5_active = current_mode == 'ur5'
     model_active = current_mode == 'model'
-    button_w = max(72, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x * 3.0) / 4.0)
-    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if edit_active else (0.20, 0.20, 0.20, 1.0))
-    if imgui.button("Edit Mode##mode_edit", (button_w, 0)):
-        _set_app_mode(state, 'edit')
-    imgui.pop_style_color()
-    imgui.same_line()
-    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if scan_active else (0.20, 0.20, 0.20, 1.0))
-    if imgui.button("Scan Mode##mode_scan", (button_w, 0)):
-        _set_app_mode(state, 'scan')
-    imgui.pop_style_color()
-    imgui.same_line()
-    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if puzzle_active else (0.20, 0.20, 0.20, 1.0))
-    if imgui.button("Puzzle Mode##mode_puzzle", (button_w, 0)):
-        _set_app_mode(state, 'puzzle')
-    imgui.pop_style_color()
-    imgui.same_line()
-    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if database_active else (0.20, 0.20, 0.20, 1.0))
-    if imgui.button("Database##mode_database", (button_w, 0)):
-        _set_app_mode(state, 'database')
-    imgui.pop_style_color()
-    imgui.push_style_color(imgui.Col_.button, (0.22, 0.48, 0.78, 1.0) if model_active else (0.20, 0.20, 0.20, 1.0))
-    if imgui.button("Model Mode: 3D scan and loop equations##mode_model", (-1, 0)):
-        _set_app_mode(state, 'model')
-    imgui.pop_style_color()
-    # On its own row, and in its own colour: the four above are simulation, this
-    # one drives the physical arm. Crowding it into the same row as the others
-    # would present the two as interchangeable, which they are not.
-    imgui.push_style_color(imgui.Col_.button, (0.72, 0.42, 0.16, 1.0) if ur5_active else (0.24, 0.18, 0.14, 1.0))
-    imgui.push_style_color(imgui.Col_.button_hovered, (0.86, 0.52, 0.20, 1.0))
-    if imgui.button("UR5 Robot Mode (real hardware)##mode_ur5", (-1, 0)):
-        _set_app_mode(state, 'ur5')
-    imgui.pop_style_color(2)
-    imgui.separator()
-    action_w = max(120, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
 
-    light_theme = str(state.get('ui_theme', 'dark')) == 'light'
-    changed_theme, light_theme = imgui.checkbox("Light mode##ui_theme", light_theme)
-    if changed_theme:
-        state.ui_theme = 'light' if light_theme else 'dark'
-        state._applied_ui_theme = ''
-    imgui.same_line()
-    imgui.text_disabled("Scanner and model controls update live")
+    cols_per_row = 6 if wide_layout else 3
+    spacing_x = imgui.get_style().item_spacing.x
+    avail_w = imgui.get_content_region_avail().x
+    mode_btn_w = max(72.0, (avail_w - spacing_x * (cols_per_row - 1)) / cols_per_row)
+    is_light = str(state.get('ui_theme', 'dark')) == 'light'
+    inactive_bg = (0.82, 0.84, 0.88, 1.0) if is_light else (0.22, 0.24, 0.28, 1.0)
+    inactive_ur5 = (0.92, 0.82, 0.72, 1.0) if is_light else (0.30, 0.22, 0.16, 1.0)
+    for idx, (mode_id, mode_label, mode_tip) in enumerate(MODE_SPECS):
+        if idx % cols_per_row != 0:
+            imgui.same_line()
+        active = current_mode == mode_id
+        if mode_id == 'ur5':
+            bg = (0.78, 0.44, 0.14, 1.0) if active else inactive_ur5
+            hov = (0.88, 0.52, 0.20, 1.0)
+        else:
+            bg = (0.22, 0.48, 0.78, 1.0) if active else inactive_bg
+            hov = (0.30, 0.56, 0.86, 1.0) if active else ((0.74, 0.78, 0.84, 1.0) if is_light else (0.30, 0.33, 0.38, 1.0))
+        imgui.push_style_color(imgui.Col_.button, bg)
+        imgui.push_style_color(imgui.Col_.button_hovered, hov)
+        if active and is_light:
+            imgui.push_style_color(imgui.Col_.text, (1.0, 1.0, 1.0, 1.0))
+        if imgui.button(f"{mode_label}##mode_{mode_id}", (mode_btn_w, 0)):
+            _set_app_mode(state, mode_id)
+        if active and is_light:
+            imgui.pop_style_color()
+        imgui.pop_style_color(2)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(mode_tip)
     imgui.separator()
 
-    undo_disabled = not state.undo_stack
-    if undo_disabled:
-        imgui.begin_disabled()
-    if imgui.button("Undo##main", (action_w, 0)):
-        state.undo_last()
-    if undo_disabled:
-        imgui.end_disabled()
-    imgui.same_line()
-    # Edit Mode only: it replaces the whole model with the saved initial one,
-    # which the other modes are mid-way through building on -- Scan and Puzzle
-    # have swapped in their own geometry, and resetting underneath them leaves
-    # what is on screen describing a model that is no longer there.
-    if not edit_active:
-        imgui.begin_disabled()
-    if imgui.button("Reset initial##reset_saved_initial_global", (action_w, 0)):
-        state.reset_to_initial()
-    if not edit_active:
-        imgui.end_disabled()
-        if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
-            imgui.set_tooltip("Available in Edit Mode only.")
-    imgui.separator()
+    if edit_active or puzzle_active:
+        quarter_w = max(64.0, (imgui.get_content_region_avail().x - spacing_x * 3.0) / 4.0)
+        undo_disabled = not state.undo_stack
+        if undo_disabled:
+            imgui.begin_disabled()
+        if imgui.button("Undo##main", (quarter_w, 0)):
+            state.undo_last()
+        if undo_disabled:
+            imgui.end_disabled()
+        imgui.same_line()
+        if not edit_active:
+            imgui.begin_disabled()
+        if imgui.button("Reset##reset_saved_initial_global", (quarter_w, 0)):
+            state.reset_to_initial()
+        if not edit_active:
+            imgui.end_disabled()
+        imgui.same_line()
+        if imgui.button("Save...##save_params", (quarter_w, 0)):
+            path = _pick_file('save', state.save_path)
+            if path:
+                state.save_params(path)
+        imgui.same_line()
+        if imgui.button("Load...##load_params", (quarter_w, 0)):
+            path = _pick_file('load', state.load_path)
+            if path:
+                state.load_params(path)
+        imgui.separator()
 
     if database_active:
         _draw_database_summary_page(state, renderer)
@@ -1207,803 +1423,186 @@ def draw_sidebar(state, renderer, window=None):
         return
 
     if edit_active:
-        if _draw_fabric_type(state) == 'crochet':
-            _draw_crochet_editor(state)
-            if imgui.collapsing_header("Fit to a scan##crochet_scan_fit", imgui.TreeNodeFlags_.default_open):
-                _draw_scan_fit(state, 'crochet', renderer)
+        _finish_scan_fit(state, renderer)
+        _finish_photo_fit(state)
+        fabric = _draw_fabric_type(state)
+        if imgui.begin_tab_bar("##edit_tabs"):
+            tab_shape, _ = imgui.begin_tab_item("Pattern & Shape")
+            if tab_shape:
+                if fabric == 'crochet':
+                    _draw_crochet_editor(state)
+                else:
+                    if imgui.collapsing_header("Pattern", imgui.TreeNodeFlags_.default_open):
+                        _draw_bitmap_editor(state)
+
+                    if imgui.collapsing_header("Geometry", imgui.TreeNodeFlags_.default_open):
+                        quality_changed = False
+                        changed_loop_res, new_loop_res = imgui.slider_int("Path smoothness##mesh_loop_res", int(state.config['knit_parameters']['loop_res']), 8, 96)
+                        changed_segments, new_segments = imgui.slider_int("Fiber roundness##mesh_segments", int(state.config['knit_parameters']['segments']), 8, 64)
+                        if changed_loop_res:
+                            state.config['knit_parameters']['loop_res'] = int(new_loop_res)
+                            quality_changed = True
+                        if changed_segments:
+                            state.config['knit_parameters']['segments'] = int(new_segments)
+                            quality_changed = True
+                        params_changed = False
+                        for i, pd in enumerate(state.config['knit_parameters']['parameters']):
+                            if pd['name'] not in GEOMETRY_PARAM_LABELS:
+                                continue
+                            lo, hi = pd['range']
+                            label = GEOMETRY_PARAM_LABELS[pd['name']]
+                            changed, new_val = imgui.slider_float(f"{label}##p{i}", float(state.params[i]), float(lo), float(hi), "%.3f")
+                            if imgui.is_item_activated():
+                                state.push_undo(label)
+                            if changed:
+                                state.params[i] = float(new_val)
+                                params_changed = True
+                        if quality_changed:
+                            rebuild_current_mesh()
+                        if params_changed:
+                            state.nudge_spline_from_params()
+
+                    if imgui.collapsing_header("Loop Heights", imgui.TreeNodeFlags_.default_open):
+                        params = state.config['knit_parameters']['parameters']
+                        default_idx = state._lh_idx[0] if state._lh_idx else None
+                        lo, hi = (0.0, 6.0)
+                        if default_idx is not None:
+                            lo, hi = params[default_idx]['range']
+                        changed_any = False
+                        active_mask = state.bitmap > 0.5
+                        mean_h = float(np.mean(state.loop_heights[active_mask])) if np.any(active_mask) else float(lo)
+                        ch_all, val_all = imgui.slider_float("Uniform height##loop_h_all", mean_h, float(lo), float(hi), "%.2f")
+                        if imgui.is_item_activated():
+                            state.push_undo("Uniform loop height")
+                        if ch_all:
+                            for r in range(int(state.bitmap_size[0])):
+                                for c in range(int(state.bitmap_size[1])):
+                                    if float(state.bitmap[r, c]) > 0.5:
+                                        state.set_loop_height_cell(r, c, float(val_all))
+                            changed_any = True
+                        imgui.text_disabled("Drag cell values (bottom row R1 first):")
+                        nr, nc = int(state.bitmap_size[0]), int(state.bitmap_size[1])
+                        cell_w = max(38.0, min(58.0, (imgui.get_content_region_avail().x - 28.0 - max(0, nc - 1) * 4.0) / max(nc, 1)))
+                        imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(4, 3))
+                        for r in reversed(range(nr)):
+                            imgui.text_disabled(f"R{r + 1}")
+                            imgui.same_line()
+                            for c in range(nc):
+                                active = float(state.bitmap[r, c]) > 0.5
+                                if not active:
+                                    imgui.begin_disabled()
+                                imgui.set_next_item_width(cell_w)
+                                changed, val = imgui.drag_float(
+                                    f"##loop_h_{r}_{c}",
+                                    float(state.loop_heights[r, c]) if active else 0.0,
+                                    0.02,
+                                    float(lo),
+                                    float(hi),
+                                    "%.2f",
+                                )
+                                if not active:
+                                    imgui.end_disabled()
+                                if imgui.is_item_activated():
+                                    state.push_undo("Loop height")
+                                if active and changed:
+                                    state.set_loop_height_cell(r, c, float(np.clip(val, lo, hi)))
+                                    changed_any = True
+                                if c < nc - 1:
+                                    imgui.same_line()
+                        imgui.pop_style_var()
+                        if changed_any:
+                            state.rebuild_spline_from_params()
+
+                    if imgui.collapsing_header("Spline & Tiling Period"):
+                        if imgui.small_button("Rebuild spline from params##spline_rebuild"):
+                            state.push_undo("Rebuild from params")
+                            state.rebuild_spline_from_params()
+                        ch_spl, new_spl = imgui.slider_int("Samples/loop##spl", int(state.samples_per_loop), 2, 20)
+                        if ch_spl:
+                            state.push_undo("Spline resolution")
+                            state.samples_per_loop = int(new_spl)
+                            state.rebuild_spline_from_params()
+                        changed_step, new_step = imgui.slider_float("Keyboard step##spline_keyboard_step", float(state.spline_keyboard_step), 0.001, 0.2, "%.3f")
+                        if changed_step:
+                            state.spline_keyboard_step = float(new_step)
+                        imgui.text(f"Control points: {len(state.flat_pts)}")
+                        if int(state.selected_idx) >= 0:
+                            imgui.same_line()
+                            imgui.text(f"| Selected: #{int(state.selected_idx)}")
+                        imgui.separator()
+                        imgui.text_disabled("Tiling period vectors (X: spline period, Y: simulation):")
+                        changed_px = False
+                        px = np.asarray(state.period_offset_x, dtype=np.float32).copy()
+                        for axis, label in enumerate(("Period X.x", "Period X.y", "Period X.z")):
+                            ch, val = imgui.slider_float(f"{label}##period_x_{axis}", float(px[axis]), -10.0, 10.0, "%.2f")
+                            if ch:
+                                px[axis] = float(val)
+                                changed_px = True
+                        if changed_px:
+                            state.push_undo("Period X")
+                            state.period_offset_x = px
+                            _mark_sim_geometry_dirty(state)
+                            state.rebuild_spline_mesh(preserve_model_placement=True)
+                        changed_py = False
+                        py = np.asarray(state.period_offset_y, dtype=np.float32).copy()
+                        for axis, label in enumerate(("Period Y.x", "Period Y.y", "Period Y.z")):
+                            ch, val = imgui.slider_float(f"{label}##period_y_{axis}", float(py[axis]), -10.0, 10.0, "%.2f")
+                            if ch:
+                                py[axis] = float(val)
+                                changed_py = True
+                        if changed_py:
+                            state.push_undo("Period Y")
+                            state.period_offset_y = py
+                            _mark_sim_geometry_dirty(state)
+                        if imgui.small_button("Re-derive period from model##period_resync"):
+                            state.push_undo("Period resync")
+                            state.sync_period_offset_to_model_width()
+                            state.sync_period_offset_y_to_row_count()
+                            _mark_sim_geometry_dirty(state)
+                            state.rebuild_spline_mesh(preserve_model_placement=True)
+                imgui.end_tab_item()
+
+            tab_look, _ = imgui.begin_tab_item("Appearance")
+            if tab_look:
+                _draw_appearance_controls(state, rebuild_current_mesh, is_knit=(fabric == 'knit'))
+                imgui.end_tab_item()
+
+            tab_fit, _ = imgui.begin_tab_item("Sim & Scan Fit" if fabric == 'knit' else "Scan Fit")
+            if tab_fit:
+                if imgui.collapsing_header("Fit to a scan##edit_scan_fit", imgui.TreeNodeFlags_.default_open):
+                    _draw_scan_fit(state, fabric, renderer)
+                if fabric == 'knit' and imgui.collapsing_header("Yarn Simulation", imgui.TreeNodeFlags_.default_open):
+                    _draw_yarn_simulation_panel(state)
+                imgui.end_tab_item()
+
+            imgui.end_tab_bar()
+        if fabric == 'crochet':
             state.maybe_autosave()
             imgui.end()
             return
 
-        if imgui.collapsing_header("Pattern", imgui.TreeNodeFlags_.default_open):
-            _draw_bitmap_editor(state)
-
-        if imgui.collapsing_header("Fit to a scan##knit_scan_fit"):
-            _draw_scan_fit(state, 'knit', renderer)
-
-        if imgui.collapsing_header("Loop Heights", imgui.TreeNodeFlags_.default_open):
-            params = state.config['knit_parameters']['parameters']
-            default_idx = state._lh_idx[0] if state._lh_idx else None
-            lo, hi = (0.0, 6.0)
-            if default_idx is not None:
-                lo, hi = params[default_idx]['range']
-            changed_any = False
-            for r in range(int(state.bitmap_size[0])):
-                imgui.text(f"Row {r + 1}")
-                for c in range(int(state.bitmap_size[1])):
-                    active = float(state.bitmap[r, c]) > 0.5
-                    label = f"R{r + 1} C{c + 1}##loop_h_{r}_{c}"
-                    if not active:
-                        imgui.begin_disabled()
-                    changed, val = imgui.slider_float(label, float(state.loop_heights[r, c]) if active else 0.0, float(lo), float(hi), "%.2f")
-                    if not active:
-                        imgui.end_disabled()
-                    if imgui.is_item_activated():
-                        state.push_undo("Loop height")
-                    if active and changed:
-                        state.set_loop_height_cell(r, c, val)
-                        changed_any = True
-                imgui.separator()
-            if changed_any:
-                state.rebuild_spline_from_params()
-
-        if imgui.collapsing_header("Geometry", imgui.TreeNodeFlags_.default_open):
-            quality_changed = False
-            changed_loop_res, new_loop_res = imgui.slider_int("Path smoothness##mesh_loop_res", int(state.config['knit_parameters']['loop_res']), 8, 96)
-            changed_segments, new_segments = imgui.slider_int("Fiber roundness##mesh_segments", int(state.config['knit_parameters']['segments']), 8, 64)
-            if changed_loop_res:
-                state.config['knit_parameters']['loop_res'] = int(new_loop_res); quality_changed = True
-            if changed_segments:
-                state.config['knit_parameters']['segments'] = int(new_segments); quality_changed = True
-            useful_params = {'stitch_bulge', 'stitch_z', 'dy', 'radius', 'ellipse_ratio'}
-            params_changed = False
-            for i, pd in enumerate(state.config['knit_parameters']['parameters']):
-                if pd['name'] not in useful_params:
-                    continue
-                lo, hi = pd['range']
-                changed, new_val = imgui.slider_float(f"{pd['name']}##p{i}", float(state.params[i]), float(lo), float(hi), "%.3f")
-                if imgui.is_item_activated():
-                    state.push_undo(pd['name'])
-                if changed:
-                    state.params[i] = float(new_val)
-                    params_changed = True
-            if quality_changed:
-                rebuild_current_mesh()
-            if params_changed:
-                state.nudge_spline_from_params()
-
-        if imgui.collapsing_header("Material", imgui.TreeNodeFlags_.default_open):
-            changed_mode, use_row_colors = imgui.checkbox("Colors per row##rowcolors", bool(state.use_row_colors))
-            if changed_mode:
-                state.push_undo("Color mode")
-                state.use_row_colors = use_row_colors
-                rebuild_current_mesh()
-            if not state.use_row_colors:
-                changed_c, new_col = imgui.color_edit3("Model color##single_color", tuple(float(x) for x in state.single_model_color[:3]))
-                if changed_c:
-                    state.single_model_color = np.array(new_col, dtype=np.float32)
-                    rebuild_current_mesh()
-            else:
-                colors_changed = False
-                for row_idx in range(int(state.bitmap_size[0])):
-                    col = state.row_colors[row_idx]
-                    changed_c, new_col = imgui.color_edit3(f"Row {row_idx + 1}##row_color_{row_idx}", (float(col[0]), float(col[1]), float(col[2])))
-                    if changed_c:
-                        state.row_colors[row_idx] = list(new_col)
-                        colors_changed = True
-                if colors_changed:
-                    rebuild_current_mesh()
-
-        if imgui.collapsing_header("Surface Fibers", imgui.TreeNodeFlags_.default_open):
-            changed_enabled, enabled = imgui.checkbox("Use multi-fiber rows##fiber_geometry_enabled", bool(state.fiber_geometry_enabled))
-            fibers_changed = False
-            if changed_enabled:
-                state.push_undo("Surface fibers")
-                state.fiber_geometry_enabled = enabled
-                fibers_changed = True
-            if state.fiber_geometry_enabled:
-                changed, value = imgui.slider_int("Fibers per row##fiber_geometry_count", int(state.fiber_geometry_count), 1, 64)
-                if changed:
-                    state.fiber_geometry_count = int(value); fibers_changed = True
-                for key, label, lo, hi in (
-                    ('fiber_geometry_radius_scale', 'Fiber radius scale', 0.04, 0.45),
-                    ('fiber_geometry_lift', 'Lift above surface', 0.0, 1.0),
-                    ('fiber_geometry_surface_arc', 'Surface spread', 0.05, 1.0),
-                    ('fiber_geometry_randomness', 'Randomness', 0.0, 1.0),
-                    ('fiber_geometry_twist', 'Fiber twist', -3.0, 3.0),
-                ):
-                    changed, value = imgui.slider_float(f"{label}##{key}", float(state[key]), float(lo), float(hi), "%.2f")
-                    if changed:
-                        state[key] = float(value); fibers_changed = True
-            else:
-                imgui.text_disabled("Enable multi-fiber rows to separate each yarn into smaller fibers.")
-            if fibers_changed:
-                rebuild_current_mesh()
-
-        if imgui.collapsing_header("Texture", imgui.TreeNodeFlags_.default_open):
-            changed_tex, new_tex = imgui.color_edit3(
-                "Texture tint##render_texture",
-                (float(state.render_texture_color[0]), float(state.render_texture_color[1]), float(state.render_texture_color[2])),
-            )
-            if imgui.is_item_activated():
-                state.push_undo("Render texture")
-            if changed_tex:
-                state.render_texture_color = np.array(new_tex, dtype=np.float32)
-            if imgui.small_button("Neutral tint##texture"):
-                state.push_undo("Render texture")
-                state.render_texture_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-            imgui.same_line()
-            if imgui.small_button("Copy material color##texture"):
-                state.push_undo("Render texture")
-                src = state.row_colors[0] if state.use_row_colors and state.row_colors else state.single_model_color
-                state.render_texture_color = np.array(src[:3], dtype=np.float32)
-            for group in state.texture_control_groups:
-                if imgui.tree_node(group['title']):
-                    for control in group['controls']:
-                        key = control['key']
-                        changed, new_val = imgui.slider_float(
-                            f"{control['label']}##{key}",
-                            float(state[key]),
-                            float(control['min']),
-                            float(control['max']),
-                            control['format'],
-                        )
-                        if imgui.is_item_activated():
-                            state.push_undo(control['label'])
-                        if changed:
-                            state[key] = float(new_val)
-                    imgui.tree_pop()
-            imgui.separator()
-            for preset in state.texture_preset_buttons:
-                if preset.get('same_line'):
-                    imgui.same_line()
-                if imgui.small_button(f"{preset['label']}##texture_preset_{preset['preset']}"):
-                    state.push_undo("Texture preset")
-                    state.apply_texture_preset(preset['preset'])
-
-        if imgui.collapsing_header("Display", imgui.TreeNodeFlags_.default_open):
-            # Rebuilt on release, not on every intermediate value. The mesh is
-            # (2n+1)^2 copies of the model, so a rebuild runs from 0.08 s at 1x1
-            # to 7.4 s at 9x9 (16.3 M verts) -- dragging across the range used to
-            # pay every step, ~13 s of rebuilds with the frame loop blocked
-            # throughout, which is what made the window stop responding.
-            changed_x, new_x = imgui.slider_int("Copy via X##display_copies_x", int(state.display_copies[0]), 0, 20)
-            released_x = imgui.is_item_deactivated_after_edit()
-            changed_y, new_y = imgui.slider_int("Copy via Y##display_copies_y", int(state.display_copies[1]), 0, 20)
-            released_y = imgui.is_item_deactivated_after_edit()
-            if changed_x or changed_y:
-                # One undo entry per drag, captured before the first change.
-                if not bool(state.__dict__.get('_display_copies_dragging', False)):
-                    state.push_undo("Display copies")
-                    object.__setattr__(state, '_display_copies_dragging', True)
-                state.scanner_preview_grid_enabled = False
-                state.display_copies = np.array([int(new_x), int(new_y)], dtype=np.int32)
-            if released_x or released_y:
-                object.__setattr__(state, '_display_copies_dragging', False)
-                state.rebuild_spline_mesh(preserve_model_placement=True)
-            if imgui.small_button("Single model##display_single"):
-                state.push_undo("Display copies")
-                state.display_copies = np.array([0, 0], dtype=np.int32)
-                state.rebuild_spline_mesh(preserve_model_placement=True)
-            changed_alpha, new_alpha = imgui.slider_float("Model opacity##mdl", float(state.model_alpha), 0.0, 1.0, "%.2f")
-            if changed_alpha:
-                state.model_alpha = float(new_alpha)
-            changed_view_fov, new_view_fov = imgui.slider_float("View FoV##view", float(state.view_fov), 10.0, 120.0, "%.1f")
-            if changed_view_fov:
-                state.view_fov = float(new_view_fov)
-                state.camera.fov_deg = float(new_view_fov)
-            _, state.show_ref_bg = imgui.checkbox("Show reference overlay##display_ref", bool(state.show_ref_bg))
-            if state.show_ref_bg:
-                _, state.ref_bg_alpha = imgui.slider_float("Reference opacity##bg", float(state.ref_bg_alpha), 0.0, 1.0, "%.2f")
-            if imgui.small_button("Center model##display_center"):
-                state.push_undo("Center model")
-                state.center_model_on_view()
-
-        if imgui.collapsing_header("Tiling Period"):
-            imgui.text_disabled("Vectors a tiled copy is offset by. X drives the")
-            imgui.text_disabled("spline period; Y is used by the yarn simulation.")
-            changed_px = False
-            px = np.asarray(state.period_offset_x, dtype=np.float32).copy()
-            for axis, label in enumerate(("Period X.x", "Period X.y", "Period X.z")):
-                ch, val = imgui.slider_float(f"{label}##period_x_{axis}", float(px[axis]), -10.0, 10.0, "%.2f")
-                if ch:
-                    px[axis] = float(val)
-                    changed_px = True
-            if changed_px:
-                state.push_undo("Period X")
-                state.period_offset_x = px
-                _mark_sim_geometry_dirty(state)
-                state.rebuild_spline_mesh(preserve_model_placement=True)
-
-            changed_py = False
-            py = np.asarray(state.period_offset_y, dtype=np.float32).copy()
-            for axis, label in enumerate(("Period Y.x", "Period Y.y", "Period Y.z")):
-                ch, val = imgui.slider_float(f"{label}##period_y_{axis}", float(py[axis]), -10.0, 10.0, "%.2f")
-                if ch:
-                    py[axis] = float(val)
-                    changed_py = True
-            if changed_py:
-                state.push_undo("Period Y")
-                state.period_offset_y = py
-                # Y only feeds the simulation's periodic collision topology, so
-                # this needs no mesh rebuild -- just a fresh Jacobian.
-                _mark_sim_geometry_dirty(state)
-            if imgui.small_button("Re-derive from model##period_resync"):
-                state.push_undo("Period resync")
-                state.sync_period_offset_to_model_width()
-                state.sync_period_offset_y_to_row_count()
-                _mark_sim_geometry_dirty(state)
-                state.rebuild_spline_mesh(preserve_model_placement=True)
-
-        if imgui.collapsing_header("Yarn Simulation"):
-            _draw_yarn_simulation_panel(state)
-
-        if imgui.collapsing_header("Lighting", imgui.TreeNodeFlags_.default_open):
-            changed_light, new_light = imgui.color_edit3(
-                "Light color##render_light",
-                (float(state.render_light_color[0]), float(state.render_light_color[1]), float(state.render_light_color[2])),
-            )
-            if changed_light:
-                state.render_light_color = np.array(new_light, dtype=np.float32)
-            changed_intensity, new_intensity = imgui.slider_float("Light intensity##render_light", float(state.render_light_intensity), 0.05, 3.0, "%.2f")
-            if changed_intensity:
-                state.render_light_intensity = float(new_intensity)
-            changed_ao_s, new_ao_s = imgui.slider_float("AO strength##render_ao", float(state.render_ao_strength), 0.0, 2.0, "%.2f")
-            changed_ao_r, new_ao_r = imgui.slider_float("AO radius##render_ao", float(state.render_ao_radius), 0.01, 1.0, "%.2f")
-            if changed_ao_s:
-                state.render_ao_strength = float(new_ao_s)
-            if changed_ao_r:
-                state.render_ao_radius = float(new_ao_r)
-            if imgui.small_button("Reset lighting##render_light"):
-                state.push_undo("Lighting")
-                state.render_light_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-                state.render_light_intensity = 0.9
-                state.render_ao_strength = 0.5
-                state.render_ao_radius = 0.15
-
-        if imgui.collapsing_header("Spline", imgui.TreeNodeFlags_.default_open):
-            if imgui.small_button("Rebuild spline from params##spline_rebuild"):
-                state.push_undo("Rebuild from params")
-                state.rebuild_spline_from_params()
-            ch_spl, new_spl = imgui.slider_int("Samples/loop##spl", int(state.samples_per_loop), 2, 20)
-            if ch_spl:
-                state.push_undo("Spline resolution")
-                state.samples_per_loop = int(new_spl)
-                state.rebuild_spline_from_params()
-            changed_step, new_step = imgui.slider_float("Keyboard step##spline_keyboard_step", float(state.spline_keyboard_step), 0.001, 0.2, "%.3f")
-            if changed_step:
-                state.spline_keyboard_step = float(new_step)
-            imgui.text(f"Points: {len(state.flat_pts)}")
-            if int(state.selected_idx) >= 0:
-                imgui.text(f"Selected point: {int(state.selected_idx)}")
-            imgui.text_disabled("Select a white point in the viewport, then drag or use keyboard controls.")
-
-        if imgui.collapsing_header("Review", imgui.TreeNodeFlags_.default_open):
-            imgui.text("Save / Load")
-            if imgui.button("Save params...##save_params", (button_w, 0)):
-                path = _pick_file('save', state.save_path)
-                if path:
-                    state.save_params(path)
-            imgui.same_line()
-            if imgui.button("Load params...##load_params", (button_w, 0)):
-                path = _pick_file('load', state.load_path)
-                if path:
-                    state.load_params(path)
-            changed_auto, new_auto = imgui.checkbox("Autosave", bool(state.autosave_enabled))
-            if changed_auto:
-                state.autosave_enabled = bool(new_auto)
-
     elif scan_active:
-        imgui.text("Scanner")
-        # -- Scanning section: scan layout, random patterns, and capture setup --
-        rows = max(1, int(state.scanner_rows))
-        cols = max(1, int(state.scanner_cols))
-        changed_r, new_r = imgui.slider_int("Layout rows##scanner_rows", rows, 1, 12)
-        changed_c, new_c = imgui.slider_int("Layout columns##scanner_cols", cols, 1, 16)
-        changed_a, new_a = imgui.slider_int("Angles per square##scanner_angles", int(state.scanner_angles), 1, 16)
-        changed_layout = changed_r or changed_c or changed_a
-        if changed_r:
-            state.scanner_rows = int(new_r)
-        if changed_c:
-            state.scanner_cols = int(new_c)
-        if changed_a:
-            state.scanner_angles = int(new_a)
-        if changed_layout:
-            state.scanner_preview_rows = max(1, int(state.scanner_rows))
-            state.scanner_preview_cols = max(1, int(state.scanner_cols))
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                try:
-                    embedded.close()
-                except Exception as exc:
-                    logging.warning("gui.draw_sidebar: %s", exc)
-                state.embedded_scanner = None
-                state.scanner_status = "Scanner layout changed; press Start Scanner to generate new random patterns"
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-        imgui.text("Layout pattern")
-        grid_active = str(state.get('scanner_layout_pattern', 'grid')) == 'grid'
-        if imgui.radio_button("Grid##scan_layout_grid", grid_active):
-            state.scanner_layout_pattern = 'grid'
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-        imgui.same_line()
-        if imgui.radio_button("Staggered##scan_layout_staggered", not grid_active):
-            state.scanner_layout_pattern = 'staggered'
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-        imgui.separator()
-        imgui.text("Random pattern generation")
-        imgui.text_wrapped("Each mini-grid is one fabric sample. A random bitmap pattern is generated once, then repeated many times inside that sample. All samples use the same colors; only the bitmap changes.")
-        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-        spacing_x, spacing_y = _scanner_repeat_spacing(state)
-        batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
-        imgui.text(f"Template bitmap: {pattern_rows} rows x {pattern_cols} cols")
-        imgui.text_disabled("Loaded from initial_params.json; Scan Mode randomizes only 0/1 bitmap values.")
-        changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
-        changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
-        changed_tex_res, new_tex_res = imgui.slider_int(
-            "Batch texture resolution##scanner_batch_texture_width",
-            batch_texture_width,
-            160,
-            4096,
-        )
-        new_tex_res = int(np.clip(int(round(float(new_tex_res) / 32.0) * 32), 160, 4096))
-        changed_sx, new_sx = imgui.slider_float(
-            "X repeat spacing##scanner_repeat_spacing_x",
-            spacing_x,
-            0.55,
-            1.45,
-            "%.2f",
-        )
-        changed_sy, new_sy = imgui.slider_float(
-            "Y repeat spacing##scanner_repeat_spacing_y",
-            spacing_y,
-            0.55,
-            1.45,
-            "%.2f",
-        )
-        imgui.text_disabled(
-            f"Batch source image: {batch_texture_width} x {batch_texture_height}. "
-            "Higher is sharper but heavier."
-        )
-        imgui.text_disabled("1.00 = edge-to-edge, below 1.00 overlaps copies, above 1.00 adds space.")
-        changed_density, new_density = imgui.slider_float(
-            "Active stitch probability##scanner_density",
-            float(state.get('scanner_pattern_density', 0.62)),
-            0.05,
-            0.95,
-            "%.2f",
-        )
-        changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
-        # The pattern grid. Its row count is also the scanned fabric's row
-        # count -- the loop-height grid has one entry per stitch -- so these
-        # resize the fabric, not just the pattern drawn onto it.
-        pattern_rows_now, pattern_cols_now = state._scanner_pattern_size()
-        changed_prows, new_prows = imgui.slider_int(
-            "Pattern rows##scanner_pattern_rows", pattern_rows_now,
-            2, max(2, int(state.config['knit_parameters']['bitmap_rows'])),
-        )
-        changed_pcols, new_pcols = imgui.slider_int(
-            "Pattern columns##scanner_pattern_cols", pattern_cols_now,
-            2, int(state.SCANNER_PATTERN_MAX_COLS),
-        )
-        random_changed = (changed_rr or changed_rc or changed_tex_res or changed_sx or changed_sy
-                          or changed_density or changed_seed or changed_prows or changed_pcols)
-        if changed_rr:
-            state.scanner_pattern_repeat_rows = int(new_rr)
-        if changed_rc:
-            state.scanner_pattern_repeat_cols = int(new_rc)
-        if changed_tex_res:
-            state.scanner_batch_texture_width = int(new_tex_res)
-        if changed_sx:
-            state.scanner_repeat_spacing_x = float(new_sx)
-        if changed_sy:
-            state.scanner_repeat_spacing_y = float(new_sy)
-        if changed_density:
-            state.scanner_pattern_density = float(new_density)
-        if changed_seed:
-            state.scanner_random_seed = int(new_seed)
-        if changed_prows:
-            state.scanner_pattern_rows = int(new_prows)
-        if changed_pcols:
-            state.scanner_pattern_cols = int(new_pcols)
-        imgui.text_disabled("Patterns update when repeat, spacing, density, seed or pattern size changes.")
-        # Say which fabric a capture will actually be built on, rather than
-        # leaving it to be discovered: the template's tuned rows only fit its
-        # own size, so any other size falls back to building from its parameters.
-        template_bitmap = np.asarray(state._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
-        if template_bitmap.ndim == 2 and template_bitmap.size:
-            tpl_rows, tpl_cols = int(template_bitmap.shape[0]), int(template_bitmap.shape[1])
-            pattern_rows_now, pattern_cols_now = state._scanner_pattern_size()
-            if (pattern_rows_now, pattern_cols_now) != (tpl_rows, tpl_cols):
-                imgui.text_colored(
-                    (0.95, 0.75, 0.20, 1.0),
-                    f"Pattern is {pattern_rows_now}x{pattern_cols_now}; the saved fabric is "
-                    f"{tpl_rows}x{tpl_cols}.",
-                )
-                imgui.text_disabled("Scans will be built from the template's parameters, not its tuned shape.")
-        if random_changed:
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                try:
-                    embedded.close()
-                except Exception as exc:
-                    logging.warning("gui.draw_sidebar: %s", exc)
-                state.embedded_scanner = None
-            state.scanner_status = "Random pattern settings changed; press Start Scanner to rebuild"
-        imgui.text("Preview mode")
-        if not state.get('scanner_color_mode'):
-            state.scanner_color_mode = 'realistic'
-        estimate_mode = str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
-        realistic_mode = not estimate_mode
-        if imgui.radio_button("Random fabric preview##scanner_preview_realistic", realistic_mode):
-            if estimate_mode:
-                state.scanner_color_mode = 'realistic'
-                state.scanner_status = "Showing actual generated fabric preview"
-        imgui.same_line()
-        if imgui.radio_button("Estimated color picker##scanner_preview_picker", estimate_mode):
-            if realistic_mode:
-                state.scanner_color_mode = 'estimated'
-                state.scanner_status = "Click a batch and edit its estimated display color"
-
-        imgui.separator()
-        imgui.text("Shared fabric colors")
-        palette = _ensure_scanner_shared_colors(state)
-        changed_color_count, color_count = imgui.slider_int(
-            "Number of colors##scanner_shared_color_count",
-            len(palette),
-            1,
-            12,
-        )
-        palette_changed = False
-        if changed_color_count:
-            palette = _ensure_scanner_shared_colors(state, int(color_count))
-            palette_changed = True
-        imgui.text_disabled("These colors are reused for every random fabric sample; only bitmap patterns change.")
-        for color_idx, color in enumerate(palette):
-            changed_shared, new_shared = imgui.color_edit3(
-                f"Color {color_idx + 1}##scanner_shared_color_{color_idx}",
-                (float(color[0]), float(color[1]), float(color[2])),
-            )
-            if changed_shared:
-                palette[color_idx] = [
-                    float(new_shared[0]),
-                    float(new_shared[1]),
-                    float(new_shared[2]),
-                    1.0,
-                ]
-                state.scanner_color_variants = [list(c) for c in palette]
-                palette_changed = True
-        if palette_changed:
-            state.scanner_estimated_color_overrides = []
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                try:
-                    embedded.close()
-                except Exception as exc:
-                    logging.warning("gui.draw_sidebar: %s", exc)
-                state.embedded_scanner = None
-            state.scanner_status = "Shared scanner colors changed; press Start Scanner to rebuild"
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-        if estimate_mode:
-            _draw_scanner_batch_color_grid(state)
-            rows = max(1, int(state.scanner_rows))
-            cols = max(1, int(state.scanner_cols))
-            selected = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
-            selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
-            selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
-            selected_index = selected_r * cols + selected_c
-            estimates = _scanner_estimated_cell_colors(state)
-            selected_rgb = [float(v) / 255.0 for v in estimates[selected_index].get("rgb", [128.0, 128.0, 128.0])[:3]]
-            imgui.text(f"Selected estimated batch: R{selected_r + 1} C{selected_c + 1}")
-            imgui.text_disabled("This edits only the estimated-color swatch, not the knitted model colors.")
-            changed_batch_color, batch_color = imgui.color_edit3(
-                "Estimated batch color##scanner_selected_estimated_color",
-                (float(selected_rgb[0]), float(selected_rgb[1]), float(selected_rgb[2])),
-            )
-            if changed_batch_color:
-                _set_scanner_estimated_batch_color(state, selected_r, selected_c, batch_color)
-                state.scanner_status = f"Updated estimated color for R{selected_r + 1} C{selected_c + 1}"
-                state.rebuild_spline_mesh(preserve_model_placement=False)
-            if imgui.small_button("Reset selected estimate##scanner_reset_selected_estimate"):
-                overrides = state.get('scanner_estimated_color_overrides', [])
-                if isinstance(overrides, list) and selected_index < len(overrides):
-                    overrides[selected_index] = None
-                    state.scanner_estimated_color_overrides = overrides
-                    _refresh_embedded_scanner_display_colors(state)
-                    state.rebuild_spline_mesh(preserve_model_placement=False)
-            imgui.same_line()
-            if imgui.small_button("Reset all estimates##scanner_reset_all_estimates"):
-                state.scanner_estimated_color_overrides = []
-                _refresh_embedded_scanner_display_colors(state)
-                state.rebuild_spline_mesh(preserve_model_placement=False)
-        imgui.separator()
-        # -- Lighting section: scanner lighting controls ----------------------
-        imgui.text("Scanner lighting")
-        imgui.text_disabled("Applied directly to the Scan Mode 3D view, robot camera, and saved images.")
-        lighting_changed = False
-        lighting_enabled = bool(state.get('scanner_lighting_enabled', True))
-        changed_no_lighting, no_lighting = imgui.checkbox(
-            "No Lighting Effect##scanner_no_lighting",
-            not lighting_enabled,
-        )
-        if changed_no_lighting:
-            state.scanner_lighting_enabled = not bool(no_lighting)
-            lighting_enabled = bool(state.scanner_lighting_enabled)
-            lighting_changed = True
-        if not lighting_enabled:
-            imgui.text_disabled("Flat colors: shadows, highlights, sheen, and directional shading are disabled.")
-            imgui.begin_disabled()
-        changed_az, new_az = imgui.slider_float(
-            "Sun direction##scanner_light_azimuth",
-            float(state.get('scanner_light_azimuth', -35.0)),
-            -180.0,
-            180.0,
-            "%.0f deg",
-        )
-        changed_el, new_el = imgui.slider_float(
-            "Sun height##scanner_light_elevation",
-            float(state.get('scanner_light_elevation', 48.0)),
-            10.0,
-            80.0,
-            "%.0f deg",
-        )
-        changed_si, new_si = imgui.slider_float(
-            "Light strength##scanner_light_sun",
-            float(state.get('scanner_light_sun_intensity', 0.68)),
-            0.20,
-            1.20,
-            "%.2f",
-        )
-        changed_sh, new_sh = imgui.slider_float(
-            "Soft shadow##scanner_light_shadow",
-            float(state.get('scanner_light_shadow', 0.20)),
-            0.0,
-            0.45,
-            "%.2f",
-        )
-        changed_sheen, new_sheen = imgui.slider_float(
-            "Yarn sheen##scanner_light_sheen",
-            float(state.get('scanner_light_sheen', 0.025)),
-            0.0,
-            0.10,
-            "%.3f",
-        )
-        if changed_az:
-            state.scanner_light_azimuth = float(new_az)
-            lighting_changed = True
-        if changed_el:
-            state.scanner_light_elevation = float(new_el)
-            lighting_changed = True
-        if changed_si:
-            state.scanner_light_sun_intensity = float(new_si)
-            lighting_changed = True
-        if changed_sh:
-            state.scanner_light_shadow = float(new_sh)
-            lighting_changed = True
-        if changed_sheen:
-            state.scanner_light_sheen = float(new_sheen)
-            lighting_changed = True
-        if imgui.small_button("Reset scanner lighting##scanner_light_reset"):
-            state.scanner_lighting_enabled = True
-            state.scanner_light_azimuth = -35.0
-            state.scanner_light_elevation = 48.0
-            state.scanner_light_sun_intensity = 0.68
-            state.scanner_light_shadow = 0.20
-            state.scanner_light_sheen = 0.025
-            lighting_changed = True
-        if not lighting_enabled:
-            imgui.end_disabled()
-        if lighting_changed:
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                try:
-                    embedded.close()
-                except Exception as exc:
-                    logging.warning("gui.draw_sidebar: %s", exc)
-            state.embedded_scanner = None
-            state.scanner_status = "Scanner lighting changed; press Start Scanner to rebuild"
-
-        # -- Scanning section: robot camera modes and execution controls -------
-        capture_mode = str(state.get('scanner_capture_mode', 'natural'))
-        focused = capture_mode == "focused"
-        single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
-        mode_is_robot = str(state.scanner_execution_mode) == "robot"
-        if not single_workflow:
-            changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
-            if changed_mode:
-                state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
-        changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 8.0, "%.2f")
-        if changed_speed:
-            state.scanner_speed = float(new_speed)
-        if not single_workflow:
-            changed_dwell, new_dwell = imgui.slider_float("Dwell per view (s)##scanner_dwell", float(state.scanner_dwell), 0.0, 2.0, "%.2f")
-            if changed_dwell:
-                state.scanner_dwell = float(new_dwell)
-        _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
-        imgui.text("Camera image mode")
-        if imgui.radio_button("Single-batch focused##scanner_capture_focused", focused and not single_workflow):
-            state.scanner_camera_workflow = 'path'
-            state.scanner_capture_mode = "focused"
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                embedded.args.capture_mode = "focused"
-        if imgui.radio_button("Natural robot camera##scanner_capture_natural", not focused and not single_workflow):
-            state.scanner_camera_workflow = 'path'
-            state.scanner_capture_mode = "natural"
-            embedded = state.get('embedded_scanner')
-            if embedded is not None:
-                embedded.args.capture_mode = "natural"
-        if imgui.radio_button("Single image capture##scanner_capture_single", single_workflow):
-            state.scanner_camera_workflow = 'single'
-            state.scanner_status = "Single image capture: click a mini-fabric in the 3D view"
-        if not single_workflow:
-            _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
-            if bool(state.scanner_save_images):
-                every_view = str(state.scanner_image_every) == "view"
-                changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
-                if changed_every:
-                    state.scanner_image_every = "view" if every_view else "station"
-                capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
-                changed_scan_res, scan_capture_width = imgui.slider_int(
-                    "Full scan capture resolution##scanner_capture_resolution",
-                    capture_width,
-                    320,
-                    4096,
-                )
-                scan_capture_width = int(np.clip(int(round(float(scan_capture_width) / 64.0) * 64), 320, 4096))
-                scan_capture_width, scan_capture_height = clamp_capture_size(scan_capture_width)
-                if changed_scan_res:
-                    state.scanner_capture_width = scan_capture_width
-                    embedded = state.get('embedded_scanner')
-                    if embedded is not None:
-                        embedded.set_capture_resolution(scan_capture_width)
-                imgui.text_disabled(f"Full scanner output: {scan_capture_width} x {scan_capture_height}")
-        imgui.separator()
-        single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
-        if single_workflow:
-            imgui.text_disabled("Click the fabric, adjust angle/zoom, then capture one image.")
-            max_row = max(1, int(state.scanner_rows))
-            max_col = max(1, int(state.scanner_cols))
-            max_angle = max(1, int(state.scanner_angles))
-            state.scanner_single_row = int(np.clip(int(state.get('scanner_single_row', 1)), 1, max_row))
-            state.scanner_single_col = int(np.clip(int(state.get('scanner_single_col', 1)), 1, max_col))
-            imgui.text_colored(
-                (0.95, 0.80, 0.20, 1.0),
-                f"Target: row {int(state.scanner_single_row)}, col {int(state.scanner_single_col)}",
-            )
-            changed_single_angle, single_angle = imgui.slider_int(
-                "Camera angle##single_capture_angle",
-                int(np.clip(int(state.get('scanner_single_angle', 1)), 1, max_angle)),
-                1,
-                max_angle,
-            )
-            if changed_single_angle:
-                state.scanner_single_angle = int(single_angle)
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.preview_single_target(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
-            changed_camera_zoom, camera_zoom = imgui.slider_float(
-                "Robot camera zoom##single_capture_zoom",
-                float(np.clip(float(state.get('scanner_camera_zoom', 1.0)), 0.25, 5.0)),
-                0.25,
-                5.0,
-                "%.2fx",
-            )
-            if changed_camera_zoom:
-                state.scanner_camera_zoom = float(camera_zoom)
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.args.camera_zoom = float(camera_zoom)
-                    embedded.preview_single_target(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
-            if imgui.small_button("Zoom in##single_capture_zoom_in"):
-                state.scanner_camera_zoom = float(min(5.0, float(state.get('scanner_camera_zoom', 1.0)) * 1.15))
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.preview_single_target(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
-            imgui.same_line()
-            if imgui.small_button("Zoom out##single_capture_zoom_out"):
-                state.scanner_camera_zoom = float(max(0.25, float(state.get('scanner_camera_zoom', 1.0)) / 1.15))
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.preview_single_target(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
-            current_capture_width, _current_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
-            current_capture_width = int(np.clip(current_capture_width, 320, 4096))
-            changed_capture_res, capture_width = imgui.slider_int(
-                "Capture resolution##single_capture_resolution",
-                current_capture_width,
-                320,
-                4096,
-            )
-            capture_width = int(np.clip(int(round(float(capture_width) / 64.0) * 64), 320, 4096))
-            capture_width, capture_height = clamp_capture_size(capture_width)
-            if changed_capture_res:
-                state.scanner_single_capture_width = capture_width
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.set_single_capture_resolution(capture_width)
-            imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
-            if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
-                embedded = ensure_embedded_robot_viewer(single_capture=True)
-                if embedded is not None:
-                    embedded.set_single_capture_resolution(capture_width)
-                    embedded.preview_single_target(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
-                    state.scanner_status = embedded.status
-            single_job = state.get('single_capture_job') or {}
-            single_job_busy = str(single_job.get('status', '')) in {
-                'positioning', 'preparing', 'rendering', 'saving', 'cancelling',
-            }
-            capture_label = "Capture in progress...##single_capture_save" if single_job_busy else "Capture Image##single_capture_save"
-            if imgui.button(capture_label, (-1, 0)) and not single_job_busy:
-                embedded = ensure_embedded_robot_viewer(single_capture=True)
-                if embedded is not None:
-                    embedded.set_single_capture_resolution(capture_width)
-                    embedded.start_single_capture(
-                        int(state.get('scanner_single_row', 1)) - 1,
-                        int(state.get('scanner_single_col', 1)) - 1,
-                        int(state.get('scanner_single_angle', 1)) - 1,
-                        float(state.get('scanner_camera_zoom', 1.0)),
-                    )
-                    state.scanner_status = embedded.status
-            if single_job:
-                progress = float(np.clip(single_job.get('progress', 0.0), 0.0, 1.0))
-                imgui.text_disabled(f"Capture progress: {progress * 100.0:.0f}%")
-                message = str(single_job.get('message', '')).strip()
-                if message:
-                    imgui.text_wrapped(message)
-                if single_job_busy and str(single_job.get('status')) != 'saving':
-                    if imgui.button("Cancel Capture##single_capture_cancel", (-1, 0)):
-                        embedded = state.get('embedded_scanner')
-                        if embedded is not None:
-                            embedded.cancel_single_capture()
-                            state.scanner_status = embedded.status
-        if not single_workflow and str(state.scanner_execution_mode) == "robot":
-            changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip))
-            changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
-            if changed_ip:
-                state.scanner_robot_ip = ip
-            if changed_port:
-                state.scanner_robot_port = int(port)
         embedded = state.get('embedded_scanner')
         embedded_running = embedded is not None and getattr(embedded, 'running', False) and not getattr(embedded, 'paused', False)
         embedded_paused = embedded is not None and getattr(embedded, 'paused', False)
         running = embedded_running
-        path_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'path'
+        single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
+        path_workflow = not single_workflow
+
+        if running:
+            imgui.text_colored((0.15, 0.85, 0.35, 1.0), "Scanner is running")
+        elif embedded_paused:
+            imgui.text_colored((0.95, 0.75, 0.20, 1.0), "Scanner is paused")
+        if state.scanner_status:
+            imgui.text_wrapped(str(state.scanner_status))
+
+        half_btn = max(90.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
         duplicate_prompt = state.get('_scan_duplicate_prompt')
         if duplicate_prompt:
-            # Takes the Start button's place rather than sitting beside it, so
-            # the choice has to be made rather than skipped past.
             imgui.separator()
             imgui.text_colored((0.95, 0.75, 0.20, 1.0), "This scan already exists in the database.")
-            imgui.text_wrapped("Do you want to rescan it or cancel?")
             total = sum(int(run.get('capture_count', 0)) for run in duplicate_prompt)
-            imgui.text_disabled(
-                f"{len(duplicate_prompt)} previous run(s), {total} captures, same configuration:"
-            )
+            imgui.text_disabled(f"{len(duplicate_prompt)} previous run(s), {total} captures:")
             for run in duplicate_prompt[:4]:
                 imgui.text_disabled(
                     f"   {run.get('scan_run', '?')} - {int(run.get('capture_count', 0))} captures"
@@ -2011,395 +1610,820 @@ def draw_sidebar(state, renderer, window=None):
                 )
             if len(duplicate_prompt) > 4:
                 imgui.text_disabled(f"   ... and {len(duplicate_prompt) - 4} more")
-            half = max(90.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
             imgui.push_style_color(imgui.Col_.button, (0.72, 0.42, 0.16, 1.0))
-            if imgui.button("Rescan##scanner_duplicate_rescan", (half, 0)):
+            if imgui.button("Rescan##scanner_duplicate_rescan", (half_btn, 0)):
                 state._scan_duplicate_prompt = None
                 start_scanner_process(force=True)
             imgui.pop_style_color()
             imgui.same_line()
-            if imgui.button("Cancel##scanner_duplicate_cancel", (half, 0)):
+            if imgui.button("Cancel##scanner_duplicate_cancel", (half_btn, 0)):
                 state._scan_duplicate_prompt = None
                 state.scanner_status = "Scan cancelled; the existing database result was kept"
             imgui.separator()
         else:
             if not path_workflow:
                 imgui.begin_disabled()
-            if imgui.button("Start Scanner Now##scanner_start", (-1, 0)):
+            if imgui.button("Start Scanner Now##scanner_start", (half_btn, 0)):
                 start_scanner_process()
             if not path_workflow:
                 imgui.end_disabled()
-                imgui.text_disabled("Switch to Full scanner path to run the full path.")
-        if embedded_paused and path_workflow:
-            if imgui.button("Continue Scanner##scanner_continue", (-1, 0)):
-                embedded.resume()
-                state.scanner_status = "Embedded MuJoCo scanner continued"
-        if running:
-            imgui.text_colored((0.15, 0.85, 0.35, 1.0), "Scanner is running")
-        elif embedded_paused:
-            imgui.text_colored((0.95, 0.75, 0.20, 1.0), "Scanner is paused")
-        if not (running or embedded_paused):
-            imgui.begin_disabled()
-        if imgui.button("Stop Scanner##scanner_stop", (-1, 0)):
-            stop_scanner_process()
-        if not (running or embedded_paused):
-            imgui.end_disabled()
-        if imgui.button("Reset Scan Layout##scanner_reset", (-1, 0)):
-            state.scanner_rows = 3
-            state.scanner_cols = 4
-            state.scanner_angles = 6
-            state.scanner_preview_rows = 3
-            state.scanner_preview_cols = 4
-            state.scanner_preview_grid_enabled = True
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-            state.scanner_status = "Scan layout reset"
-        imgui.separator()
-        # -- Analysis section: captured fabric color dashboard -----------------
-        imgui.text("Per-sample RGB analysis")
-        analysis_ready = embedded is not None and bool(getattr(embedded, "capture_records", []))
-        if not analysis_ready:
-            imgui.text_disabled("Capture scanner images first.")
-        if not analysis_ready:
-            imgui.begin_disabled()
-        if imgui.button("Analyze captured RGB##scanner_analyze_rgb", (-1, 0)):
-            result = embedded.analyze_captures(save_outputs=True)
-            _refresh_embedded_scanner_display_colors(state)
-            if result.get("cells"):
-                state.scanner_status = f"RGB analysis saved for {len(result['cells'])} mini-squares"
-            else:
-                state.scanner_status = result.get("summary", "No RGB analysis results")
-        if not analysis_ready:
-            imgui.end_disabled()
-        result = getattr(embedded, "analysis_results", None) if embedded is not None else None
-        has_analysis = bool(result and result.get("cells"))
-
-        rows = max(1, int(state.scanner_rows))
-        cols = max(1, int(state.scanner_cols))
-        cells_by_pos = {
-            (int(cell["row"]), int(cell["col"])): cell
-            for cell in result["cells"]
-        } if has_analysis else {}
-
-        selected = np.asarray(state.get('scanner_analysis_selected_cell', state.get('scanner_selected_cell', [0, 0])), dtype=np.int32).reshape(-1)
-        selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
-        selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
-        if cells_by_pos and (selected_r, selected_c) not in cells_by_pos:
-            selected_r, selected_c = next(iter(cells_by_pos.keys()))
-        state.scanner_analysis_selected_cell = [selected_r, selected_c]
-
-        # The estimated grid always reflects the current bitmap/color settings
-        # (visible before any scan happens); once cells have been analyzed,
-        # fold in the exact estimated value that was actually compared against
-        # each analyzed cell, so both grids describe the same measurement.
-        estimate_by_pos = {
-            (int(item.get("row", 0)), int(item.get("col", 0))): item
-            for item in _scanner_estimated_cell_colors(state)
-        }
-        for pos, cell in cells_by_pos.items():
-            estimate_by_pos[pos] = {
-                **estimate_by_pos.get(pos, {}),
-                "row": int(pos[0]),
-                "col": int(pos[1]),
-                "rgb": [float(v) for v in cell.get("estimated_rgb", [26.0, 26.0, 26.0])[:3]],
-                "active_ratio": float(cell.get("estimated_active_ratio", estimate_by_pos.get(pos, {}).get("active_ratio", 0.0))),
-            }
-
-        grid_gap = imgui.get_style().item_spacing.x
-        available_w = max(180.0, float(imgui.get_content_region_avail().x))
-        panel_w = max(86.0, (available_w - grid_gap) * 0.5) if has_analysis else available_w
-        cell_size = max(12.0, min(36.0, (panel_w - max(0, cols - 1) * 3.0) / max(cols, 1)))
-
-        def color_rgba(rgb):
-            return (
-                float(np.clip(float(rgb[0]) / 255.0, 0.0, 1.0)),
-                float(np.clip(float(rgb[1]) / 255.0, 0.0, 1.0)),
-                float(np.clip(float(rgb[2]) / 255.0, 0.0, 1.0)),
-                1.0,
-            )
-
-        def draw_analysis_grid(title, source_by_pos, rgb_key, id_prefix):
-            nonlocal selected_r, selected_c
-            imgui.begin_group()
-            imgui.text(title)
-            imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(3, 3))
-            for r in range(rows):
-                for c in range(cols):
-                    cell = source_by_pos.get((r, c))
-                    rgb = cell.get(rgb_key, [26.0, 26.0, 26.0]) if cell is not None else [26.0, 26.0, 26.0]
-                    rgba = color_rgba(rgb)
-                    imgui.push_style_color(imgui.Col_.button, rgba)
-                    imgui.push_style_color(imgui.Col_.button_hovered, (
-                        min(float(rgba[0]) + 0.12, 1.0),
-                        min(float(rgba[1]) + 0.12, 1.0),
-                        min(float(rgba[2]) + 0.12, 1.0),
-                        1.0,
-                    ))
-                    border_selected = r == selected_r and c == selected_c
-                    if border_selected:
-                        imgui.push_style_color(imgui.Col_.border, (1.0, 0.78, 0.15, 1.0))
-                        imgui.push_style_var(imgui.StyleVar_.frame_border_size, 2.0)
-                    clicked = imgui.button(f"##{id_prefix}_{r}_{c}", imgui.ImVec2(cell_size, cell_size))
-                    if border_selected:
-                        imgui.pop_style_var()
-                        imgui.pop_style_color()
-                    imgui.pop_style_color(2)
-                    if clicked and cell is not None:
-                        selected_r, selected_c = r, c
-                        state.scanner_analysis_selected_cell = [r, c]
-                    if c < cols - 1:
-                        imgui.same_line()
-                if r < rows - 1:
-                    imgui.spacing()
-            imgui.pop_style_var()
-            imgui.end_group()
-
-        # Estimated grid is always visible, before and after scanning; the
-        # average-RGB grid only exists once an analysis has actually run.
-        draw_analysis_grid("Estimated Color Grid", estimate_by_pos, "rgb", "estimated_rgb_result")
-        if has_analysis:
             imgui.same_line()
-            draw_analysis_grid("Average RGB Color Grid", cells_by_pos, "overall_rgb", "actual_rgb_result")
-        else:
-            imgui.text_disabled("Average RGB grid appears here after you scan and click 'Analyze captured RGB'.")
-        state.scanner_analysis_selected_cell = [selected_r, selected_c]
+            if not (running or embedded_paused):
+                imgui.begin_disabled()
+            if imgui.button("Stop Scanner##scanner_stop", (half_btn, 0)):
+                stop_scanner_process()
+            if not (running or embedded_paused):
+                imgui.end_disabled()
+            if embedded_paused and path_workflow:
+                if imgui.button("Continue Scanner##scanner_continue", (-1, 0)):
+                    embedded.resume()
+                    state.scanner_status = "Embedded MuJoCo scanner continued"
 
-        if has_analysis:
-            imgui.text(f"Images analyzed: {int(result.get('image_count', 0))}")
-            if bool(result.get("background_ignored", False)):
-                imgui.text_wrapped("Background ignored: RGB is calculated only from detected fabric pixels.")
-            json_path = result.get("json_path")
-            if json_path:
-                imgui.text_disabled(f"Saved: {Path(json_path).name}")
-            used_dir = result.get("used_pixels_dir")
-            if used_dir:
-                imgui.text_disabled(f"Used-pixel crops: {Path(used_dir).name}/")
+        imgui.separator()
+        if imgui.collapsing_header("Scan Layout & Capture##scan_layout_section", imgui.TreeNodeFlags_.default_open):
+            rows = max(1, int(state.scanner_rows))
+            cols = max(1, int(state.scanner_cols))
+            changed_r, new_r = imgui.slider_int("Layout rows##scanner_rows", rows, 1, 12)
+            changed_c, new_c = imgui.slider_int("Layout columns##scanner_cols", cols, 1, 16)
+            changed_a, new_a = imgui.slider_int("Angles per square##scanner_angles", int(state.scanner_angles), 1, 16)
+            changed_layout = changed_r or changed_c or changed_a
+            if changed_r:
+                state.scanner_rows = int(new_r)
+            if changed_c:
+                state.scanner_cols = int(new_c)
+            if changed_a:
+                state.scanner_angles = int(new_a)
+            if changed_layout:
+                state.scanner_preview_rows = max(1, int(state.scanner_rows))
+                state.scanner_preview_cols = max(1, int(state.scanner_cols))
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    try:
+                        embedded.close()
+                    except Exception as exc:
+                        logging.warning("gui.draw_sidebar: %s", exc)
+                    state.embedded_scanner = None
+                    state.scanner_status = "Scanner layout changed; press Start Scanner to generate new random patterns"
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+            grid_active = str(state.get('scanner_layout_pattern', 'grid')) == 'grid'
+            if imgui.radio_button("Grid##scan_layout_grid", grid_active):
+                state.scanner_layout_pattern = 'grid'
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+            imgui.same_line()
+            if imgui.radio_button("Staggered##scan_layout_staggered", not grid_active):
+                state.scanner_layout_pattern = 'staggered'
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+            imgui.same_line()
+            if imgui.small_button("Reset Layout##scanner_reset"):
+                state.scanner_rows = 3
+                state.scanner_cols = 4
+                state.scanner_angles = 6
+                state.scanner_preview_rows = 3
+                state.scanner_preview_cols = 4
+                state.scanner_preview_grid_enabled = True
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+                state.scanner_status = "Scan layout reset"
 
-            selected_cell = cells_by_pos.get((selected_r, selected_c))
-            if selected_cell is not None:
-                rgb = [float(v) for v in selected_cell["overall_rgb"]]
-                estimated_rgb = [float(v) for v in selected_cell.get("estimated_rgb", [0.0, 0.0, 0.0])]
-                estimate_delta = float(selected_cell.get("estimate_actual_delta_rgb", 0.0))
-                imgui.separator()
-                imgui.text(f"Selected mini-square: R{selected_r + 1} C{selected_c + 1}")
-                imgui.color_button(
-                    "##selected_overall_rgb",
-                    (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
-                    imgui.ColorEditFlags_.no_tooltip,
-                    imgui.ImVec2(46, 28),
+            capture_mode = str(state.get('scanner_capture_mode', 'natural'))
+            focused = capture_mode == "focused"
+            mode_is_robot = str(state.scanner_execution_mode) == "robot"
+            if not single_workflow:
+                changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
+                if changed_mode:
+                    state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
+            changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 8.0, "%.2f")
+            if changed_speed:
+                state.scanner_speed = float(new_speed)
+            if not single_workflow:
+                changed_dwell, new_dwell = imgui.slider_float("Dwell per view (s)##scanner_dwell", float(state.scanner_dwell), 0.0, 2.0, "%.2f")
+                if changed_dwell:
+                    state.scanner_dwell = float(new_dwell)
+            _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
+            imgui.text("Camera image mode")
+            if imgui.radio_button("Single-batch focused##scanner_capture_focused", focused and not single_workflow):
+                state.scanner_camera_workflow = 'path'
+                state.scanner_capture_mode = "focused"
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    embedded.args.capture_mode = "focused"
+            if imgui.radio_button("Natural robot camera##scanner_capture_natural", not focused and not single_workflow):
+                state.scanner_camera_workflow = 'path'
+                state.scanner_capture_mode = "natural"
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    embedded.args.capture_mode = "natural"
+            if imgui.radio_button("Single image capture##scanner_capture_single", single_workflow):
+                state.scanner_camera_workflow = 'single'
+                state.scanner_status = "Single image capture: click a mini-fabric in the 3D view"
+            single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
+            if not single_workflow:
+                _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
+                if bool(state.scanner_save_images):
+                    every_view = str(state.scanner_image_every) == "view"
+                    changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
+                    if changed_every:
+                        state.scanner_image_every = "view" if every_view else "station"
+                    capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
+                    changed_scan_res, scan_capture_width = imgui.slider_int(
+                        "Full scan capture resolution##scanner_capture_resolution",
+                        capture_width,
+                        320,
+                        4096,
+                    )
+                    scan_capture_width = int(np.clip(int(round(float(scan_capture_width) / 64.0) * 64), 320, 4096))
+                    scan_capture_width, scan_capture_height = clamp_capture_size(scan_capture_width)
+                    if changed_scan_res:
+                        state.scanner_capture_width = scan_capture_width
+                        embedded = state.get('embedded_scanner')
+                        if embedded is not None:
+                            embedded.set_capture_resolution(scan_capture_width)
+                    imgui.text_disabled(f"Full scanner output: {scan_capture_width} x {scan_capture_height}")
+            if single_workflow:
+                imgui.text_disabled("Click the fabric, adjust angle/zoom, then capture one image.")
+                max_row = max(1, int(state.scanner_rows))
+                max_col = max(1, int(state.scanner_cols))
+                max_angle = max(1, int(state.scanner_angles))
+                state.scanner_single_row = int(np.clip(int(state.get('scanner_single_row', 1)), 1, max_row))
+                state.scanner_single_col = int(np.clip(int(state.get('scanner_single_col', 1)), 1, max_col))
+                imgui.text_colored(
+                    (0.95, 0.80, 0.20, 1.0),
+                    f"Target: row {int(state.scanner_single_row)}, col {int(state.scanner_single_col)}",
                 )
+                changed_single_angle, single_angle = imgui.slider_int(
+                    "Camera angle##single_capture_angle",
+                    int(np.clip(int(state.get('scanner_single_angle', 1)), 1, max_angle)),
+                    1,
+                    max_angle,
+                )
+                if changed_single_angle:
+                    state.scanner_single_angle = int(single_angle)
+                    embedded = state.get('embedded_scanner')
+                    if embedded is not None:
+                        embedded.preview_single_target(
+                            int(state.get('scanner_single_row', 1)) - 1,
+                            int(state.get('scanner_single_col', 1)) - 1,
+                            int(state.get('scanner_single_angle', 1)) - 1,
+                            float(state.get('scanner_camera_zoom', 1.0)),
+                        )
+                changed_camera_zoom, camera_zoom = imgui.slider_float(
+                    "Robot camera zoom##single_capture_zoom",
+                    float(np.clip(float(state.get('scanner_camera_zoom', 1.0)), 0.25, 5.0)),
+                    0.25,
+                    5.0,
+                    "%.2fx",
+                )
+                if changed_camera_zoom:
+                    state.scanner_camera_zoom = float(camera_zoom)
+                    embedded = state.get('embedded_scanner')
+                    if embedded is not None:
+                        embedded.args.camera_zoom = float(camera_zoom)
+                        embedded.preview_single_target(
+                            int(state.get('scanner_single_row', 1)) - 1,
+                            int(state.get('scanner_single_col', 1)) - 1,
+                            int(state.get('scanner_single_angle', 1)) - 1,
+                            float(state.get('scanner_camera_zoom', 1.0)),
+                        )
+                if imgui.small_button("Zoom in##single_capture_zoom_in"):
+                    state.scanner_camera_zoom = float(min(5.0, float(state.get('scanner_camera_zoom', 1.0)) * 1.15))
+                    embedded = state.get('embedded_scanner')
+                    if embedded is not None:
+                        embedded.preview_single_target(
+                            int(state.get('scanner_single_row', 1)) - 1,
+                            int(state.get('scanner_single_col', 1)) - 1,
+                            int(state.get('scanner_single_angle', 1)) - 1,
+                            float(state.get('scanner_camera_zoom', 1.0)),
+                        )
                 imgui.same_line()
-                imgui.text(f"All views average RGB: {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f}")
-                imgui.color_button(
-                    "##selected_estimated_rgb",
-                    (
-                        estimated_rgb[0] / 255.0,
-                        estimated_rgb[1] / 255.0,
-                        estimated_rgb[2] / 255.0,
+                if imgui.small_button("Zoom out##single_capture_zoom_out"):
+                    state.scanner_camera_zoom = float(max(0.25, float(state.get('scanner_camera_zoom', 1.0)) / 1.15))
+                    embedded = state.get('embedded_scanner')
+                    if embedded is not None:
+                        embedded.preview_single_target(
+                            int(state.get('scanner_single_row', 1)) - 1,
+                            int(state.get('scanner_single_col', 1)) - 1,
+                            int(state.get('scanner_single_angle', 1)) - 1,
+                            float(state.get('scanner_camera_zoom', 1.0)),
+                        )
+                current_capture_width, _current_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
+                current_capture_width = int(np.clip(current_capture_width, 320, 4096))
+                changed_capture_res, capture_width = imgui.slider_int(
+                    "Capture resolution##single_capture_resolution",
+                    current_capture_width,
+                    320,
+                    4096,
+                )
+                capture_width = int(np.clip(int(round(float(capture_width) / 64.0) * 64), 320, 4096))
+                capture_width, capture_height = clamp_capture_size(capture_width)
+                if changed_capture_res:
+                    state.scanner_single_capture_width = capture_width
+                    embedded = state.get('embedded_scanner')
+                    if embedded is not None:
+                        embedded.set_single_capture_resolution(capture_width)
+                imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
+                if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
+                    embedded = ensure_embedded_robot_viewer(single_capture=True)
+                    if embedded is not None:
+                        embedded.set_single_capture_resolution(capture_width)
+                        embedded.preview_single_target(
+                            int(state.get('scanner_single_row', 1)) - 1,
+                            int(state.get('scanner_single_col', 1)) - 1,
+                            int(state.get('scanner_single_angle', 1)) - 1,
+                            float(state.get('scanner_camera_zoom', 1.0)),
+                        )
+                        state.scanner_status = embedded.status
+                single_job = state.get('single_capture_job') or {}
+                single_job_busy = str(single_job.get('status', '')) in {
+                    'positioning', 'preparing', 'rendering', 'saving', 'cancelling',
+                }
+                capture_label = "Capture in progress...##single_capture_save" if single_job_busy else "Capture Image##single_capture_save"
+                if imgui.button(capture_label, (-1, 0)) and not single_job_busy:
+                    embedded = ensure_embedded_robot_viewer(single_capture=True)
+                    if embedded is not None:
+                        embedded.set_single_capture_resolution(capture_width)
+                        embedded.start_single_capture(
+                            int(state.get('scanner_single_row', 1)) - 1,
+                            int(state.get('scanner_single_col', 1)) - 1,
+                            int(state.get('scanner_single_angle', 1)) - 1,
+                            float(state.get('scanner_camera_zoom', 1.0)),
+                        )
+                        state.scanner_status = embedded.status
+                if single_job:
+                    progress = float(np.clip(single_job.get('progress', 0.0), 0.0, 1.0))
+                    imgui.text_disabled(f"Capture progress: {progress * 100.0:.0f}%")
+                    message = str(single_job.get('message', '')).strip()
+                    if message:
+                        imgui.text_wrapped(message)
+                    if single_job_busy and str(single_job.get('status')) != 'saving':
+                        if imgui.button("Cancel Capture##single_capture_cancel", (-1, 0)):
+                            embedded = state.get('embedded_scanner')
+                            if embedded is not None:
+                                embedded.cancel_single_capture()
+                                state.scanner_status = embedded.status
+            if not single_workflow and str(state.scanner_execution_mode) == "robot":
+                changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip))
+                changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
+                if changed_ip:
+                    state.scanner_robot_ip = ip
+                if changed_port:
+                    state.scanner_robot_port = int(port)
+
+        if imgui.collapsing_header("Random Pattern & Shared Colors##scan_pattern_section"):
+            pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+            repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+            spacing_x, spacing_y = _scanner_repeat_spacing(state)
+            batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
+            imgui.text_disabled(f"Template bitmap: {pattern_rows} x {pattern_cols} (randomizes 0/1 values per sample)")
+            changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
+            changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
+            changed_tex_res, new_tex_res = imgui.slider_int(
+                "Batch texture resolution##scanner_batch_texture_width",
+                batch_texture_width,
+                160,
+                4096,
+            )
+            new_tex_res = int(np.clip(int(round(float(new_tex_res) / 32.0) * 32), 160, 4096))
+            changed_sx, new_sx = imgui.slider_float(
+                "X repeat spacing##scanner_repeat_spacing_x",
+                spacing_x,
+                0.55,
+                1.45,
+                "%.2f",
+            )
+            changed_sy, new_sy = imgui.slider_float(
+                "Y repeat spacing##scanner_repeat_spacing_y",
+                spacing_y,
+                0.55,
+                1.45,
+                "%.2f",
+            )
+            imgui.text_disabled(f"Batch texture: {batch_texture_width} x {batch_texture_height} px (1.00 = edge-to-edge)")
+            changed_density, new_density = imgui.slider_float(
+                "Active stitch probability##scanner_density",
+                float(state.get('scanner_pattern_density', 0.62)),
+                0.05,
+                0.95,
+                "%.2f",
+            )
+            changed_seed, new_seed = imgui.input_int("Random seed##scanner_seed", int(state.get('scanner_random_seed', 1)))
+            pattern_rows_now, pattern_cols_now = state._scanner_pattern_size()
+            changed_prows, new_prows = imgui.slider_int(
+                "Pattern rows##scanner_pattern_rows", pattern_rows_now,
+                2, max(2, int(state.config['knit_parameters']['bitmap_rows'])),
+            )
+            changed_pcols, new_pcols = imgui.slider_int(
+                "Pattern columns##scanner_pattern_cols", pattern_cols_now,
+                2, int(state.SCANNER_PATTERN_MAX_COLS),
+            )
+            random_changed = (changed_rr or changed_rc or changed_tex_res or changed_sx or changed_sy
+                              or changed_density or changed_seed or changed_prows or changed_pcols)
+            if changed_rr:
+                state.scanner_pattern_repeat_rows = int(new_rr)
+            if changed_rc:
+                state.scanner_pattern_repeat_cols = int(new_rc)
+            if changed_tex_res:
+                state.scanner_batch_texture_width = int(new_tex_res)
+            if changed_sx:
+                state.scanner_repeat_spacing_x = float(new_sx)
+            if changed_sy:
+                state.scanner_repeat_spacing_y = float(new_sy)
+            if changed_density:
+                state.scanner_pattern_density = float(new_density)
+            if changed_seed:
+                state.scanner_random_seed = int(new_seed)
+            if changed_prows:
+                state.scanner_pattern_rows = int(new_prows)
+            if changed_pcols:
+                state.scanner_pattern_cols = int(new_pcols)
+            template_bitmap = np.asarray(state._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
+            if template_bitmap.ndim == 2 and template_bitmap.size:
+                tpl_rows, tpl_cols = int(template_bitmap.shape[0]), int(template_bitmap.shape[1])
+                pattern_rows_now, pattern_cols_now = state._scanner_pattern_size()
+                if (pattern_rows_now, pattern_cols_now) != (tpl_rows, tpl_cols):
+                    imgui.text_colored(
+                        (0.95, 0.75, 0.20, 1.0),
+                        f"Pattern is {pattern_rows_now}x{pattern_cols_now}; saved template is {tpl_rows}x{tpl_cols}.",
+                    )
+            if random_changed:
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    try:
+                        embedded.close()
+                    except Exception as exc:
+                        logging.warning("gui.draw_sidebar: %s", exc)
+                    state.embedded_scanner = None
+                state.scanner_status = "Random pattern settings changed; press Start Scanner to rebuild"
+            imgui.text("Preview mode")
+            if not state.get('scanner_color_mode'):
+                state.scanner_color_mode = 'realistic'
+            estimate_mode = str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
+            realistic_mode = not estimate_mode
+            if imgui.radio_button("Random fabric preview##scanner_preview_realistic", realistic_mode):
+                if estimate_mode:
+                    state.scanner_color_mode = 'realistic'
+                    state.scanner_status = "Showing actual generated fabric preview"
+            imgui.same_line()
+            if imgui.radio_button("Estimated color picker##scanner_preview_picker", estimate_mode):
+                if realistic_mode:
+                    state.scanner_color_mode = 'estimated'
+                    state.scanner_status = "Click a batch and edit its estimated display color"
+
+            imgui.separator()
+            imgui.text("Shared fabric colors")
+            palette = _ensure_scanner_shared_colors(state)
+            changed_color_count, color_count = imgui.slider_int(
+                "Number of colors##scanner_shared_color_count",
+                len(palette),
+                1,
+                12,
+            )
+            palette_changed = False
+            if changed_color_count:
+                palette = _ensure_scanner_shared_colors(state, int(color_count))
+                palette_changed = True
+            for color_idx, color in enumerate(palette):
+                changed_shared, new_shared = imgui.color_edit3(
+                    f"Color {color_idx + 1}##scanner_shared_color_{color_idx}",
+                    (float(color[0]), float(color[1]), float(color[2])),
+                )
+                if changed_shared:
+                    palette[color_idx] = [
+                        float(new_shared[0]),
+                        float(new_shared[1]),
+                        float(new_shared[2]),
                         1.0,
-                    ),
-                    imgui.ColorEditFlags_.no_tooltip,
-                    imgui.ImVec2(46, 28),
+                    ]
+                    state.scanner_color_variants = [list(c) for c in palette]
+                    palette_changed = True
+            if palette_changed:
+                state.scanner_estimated_color_overrides = []
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    try:
+                        embedded.close()
+                    except Exception as exc:
+                        logging.warning("gui.draw_sidebar: %s", exc)
+                    state.embedded_scanner = None
+                state.scanner_status = "Shared scanner colors changed; press Start Scanner to rebuild"
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+            if estimate_mode:
+                _draw_scanner_batch_color_grid(state)
+                rows = max(1, int(state.scanner_rows))
+                cols = max(1, int(state.scanner_cols))
+                selected = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
+                selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+                selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+                selected_index = selected_r * cols + selected_c
+                estimates = _scanner_estimated_cell_colors(state)
+                selected_rgb = [float(v) / 255.0 for v in estimates[selected_index].get("rgb", [128.0, 128.0, 128.0])[:3]]
+                imgui.text(f"Selected estimated batch: R{selected_r + 1} C{selected_c + 1}")
+                changed_batch_color, batch_color = imgui.color_edit3(
+                    "Estimated batch color##scanner_selected_estimated_color",
+                    (float(selected_rgb[0]), float(selected_rgb[1]), float(selected_rgb[2])),
                 )
+                if changed_batch_color:
+                    _set_scanner_estimated_batch_color(state, selected_r, selected_c, batch_color)
+                    state.scanner_status = f"Updated estimated color for R{selected_r + 1} C{selected_c + 1}"
+                    state.rebuild_spline_mesh(preserve_model_placement=False)
+                if imgui.small_button("Reset selected estimate##scanner_reset_selected_estimate"):
+                    overrides = state.get('scanner_estimated_color_overrides', [])
+                    if isinstance(overrides, list) and selected_index < len(overrides):
+                        overrides[selected_index] = None
+                        state.scanner_estimated_color_overrides = overrides
+                        _refresh_embedded_scanner_display_colors(state)
+                        state.rebuild_spline_mesh(preserve_model_placement=False)
                 imgui.same_line()
-                imgui.text(
-                    f"Estimated RGB: {estimated_rgb[0]:.0f}, {estimated_rgb[1]:.0f}, {estimated_rgb[2]:.0f}"
-                    f" | delta {estimate_delta:.1f}"
+                if imgui.small_button("Reset all estimates##scanner_reset_all_estimates"):
+                    state.scanner_estimated_color_overrides = []
+                    _refresh_embedded_scanner_display_colors(state)
+                    state.rebuild_spline_mesh(preserve_model_placement=False)
+
+        if imgui.collapsing_header("Scanner Lighting##scan_lighting_section"):
+            lighting_changed = False
+            lighting_enabled = bool(state.get('scanner_lighting_enabled', True))
+            changed_no_lighting, no_lighting = imgui.checkbox(
+                "No Lighting Effect##scanner_no_lighting",
+                not lighting_enabled,
+            )
+            if changed_no_lighting:
+                state.scanner_lighting_enabled = not bool(no_lighting)
+                lighting_enabled = bool(state.scanner_lighting_enabled)
+                lighting_changed = True
+            if not lighting_enabled:
+                imgui.text_disabled("Flat colors: shadows, highlights, and directional shading disabled.")
+                imgui.begin_disabled()
+            changed_az, new_az = imgui.slider_float(
+                "Sun direction##scanner_light_azimuth",
+                float(state.get('scanner_light_azimuth', -35.0)),
+                -180.0,
+                180.0,
+                "%.0f deg",
+            )
+            changed_el, new_el = imgui.slider_float(
+                "Sun height##scanner_light_elevation",
+                float(state.get('scanner_light_elevation', 48.0)),
+                10.0,
+                80.0,
+                "%.0f deg",
+            )
+            changed_si, new_si = imgui.slider_float(
+                "Light strength##scanner_light_sun",
+                float(state.get('scanner_light_sun_intensity', 0.68)),
+                0.20,
+                1.20,
+                "%.2f",
+            )
+            changed_sh, new_sh = imgui.slider_float(
+                "Soft shadow##scanner_light_shadow",
+                float(state.get('scanner_light_shadow', 0.20)),
+                0.0,
+                0.45,
+                "%.2f",
+            )
+            changed_sheen, new_sheen = imgui.slider_float(
+                "Yarn sheen##scanner_light_sheen",
+                float(state.get('scanner_light_sheen', 0.025)),
+                0.0,
+                0.10,
+                "%.3f",
+            )
+            if changed_az:
+                state.scanner_light_azimuth = float(new_az)
+                lighting_changed = True
+            if changed_el:
+                state.scanner_light_elevation = float(new_el)
+                lighting_changed = True
+            if changed_si:
+                state.scanner_light_sun_intensity = float(new_si)
+                lighting_changed = True
+            if changed_sh:
+                state.scanner_light_shadow = float(new_sh)
+                lighting_changed = True
+            if changed_sheen:
+                state.scanner_light_sheen = float(new_sheen)
+                lighting_changed = True
+            if imgui.small_button("Reset scanner lighting##scanner_light_reset"):
+                state.scanner_lighting_enabled = True
+                state.scanner_light_azimuth = -35.0
+                state.scanner_light_elevation = 48.0
+                state.scanner_light_sun_intensity = 0.68
+                state.scanner_light_shadow = 0.20
+                state.scanner_light_sheen = 0.025
+                lighting_changed = True
+            if not lighting_enabled:
+                imgui.end_disabled()
+            if lighting_changed:
+                embedded = state.get('embedded_scanner')
+                if embedded is not None:
+                    try:
+                        embedded.close()
+                    except Exception as exc:
+                        logging.warning("gui.draw_sidebar: %s", exc)
+                state.embedded_scanner = None
+                state.scanner_status = "Scanner lighting changed; press Start Scanner to rebuild"
+
+        if imgui.collapsing_header("Per-Sample RGB Analysis##scan_rgb_section", imgui.TreeNodeFlags_.default_open):
+            analysis_ready = embedded is not None and bool(getattr(embedded, "capture_records", []))
+            if not analysis_ready:
+                imgui.text_disabled("Capture scanner images first.")
+                imgui.begin_disabled()
+            if imgui.button("Analyze captured RGB##scanner_analyze_rgb", (-1, 0)):
+                result = embedded.analyze_captures(save_outputs=True)
+                _refresh_embedded_scanner_display_colors(state)
+                if result.get("cells"):
+                    state.scanner_status = f"RGB analysis saved for {len(result['cells'])} mini-squares"
+                else:
+                    state.scanner_status = result.get("summary", "No RGB analysis results")
+            if not analysis_ready:
+                imgui.end_disabled()
+            result = getattr(embedded, "analysis_results", None) if embedded is not None else None
+            has_analysis = bool(result and result.get("cells"))
+
+            rows = max(1, int(state.scanner_rows))
+            cols = max(1, int(state.scanner_cols))
+            cells_by_pos = {
+                (int(cell["row"]), int(cell["col"])): cell
+                for cell in result["cells"]
+            } if has_analysis else {}
+
+            selected = np.asarray(state.get('scanner_analysis_selected_cell', state.get('scanner_selected_cell', [0, 0])), dtype=np.int32).reshape(-1)
+            selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
+            selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
+            if cells_by_pos and (selected_r, selected_c) not in cells_by_pos:
+                selected_r, selected_c = next(iter(cells_by_pos.keys()))
+            state.scanner_analysis_selected_cell = [selected_r, selected_c]
+
+            estimate_by_pos = {
+                (int(item.get("row", 0)), int(item.get("col", 0))): item
+                for item in _scanner_estimated_cell_colors(state)
+            }
+            for pos, cell in cells_by_pos.items():
+                estimate_by_pos[pos] = {
+                    **estimate_by_pos.get(pos, {}),
+                    "row": int(pos[0]),
+                    "col": int(pos[1]),
+                    "rgb": [float(v) for v in cell.get("estimated_rgb", [26.0, 26.0, 26.0])[:3]],
+                    "active_ratio": float(cell.get("estimated_active_ratio", estimate_by_pos.get(pos, {}).get("active_ratio", 0.0))),
+                }
+
+            grid_gap = imgui.get_style().item_spacing.x
+            available_w = max(180.0, float(imgui.get_content_region_avail().x))
+            panel_w = max(86.0, (available_w - grid_gap) * 0.5) if has_analysis else available_w
+            cell_size = max(12.0, min(36.0, (panel_w - max(0, cols - 1) * 3.0) / max(cols, 1)))
+
+            def color_rgba(rgb):
+                return (
+                    float(np.clip(float(rgb[0]) / 255.0, 0.0, 1.0)),
+                    float(np.clip(float(rgb[1]) / 255.0, 0.0, 1.0)),
+                    float(np.clip(float(rgb[2]) / 255.0, 0.0, 1.0)),
+                    1.0,
                 )
-                fabric_px = int(selected_cell.get("fabric_pixel_count", 0))
-                total_px = int(selected_cell.get("analysis_total_pixels", 0))
-                if fabric_px > 0 and total_px > 0:
-                    pct = 100.0 * float(fabric_px) / max(float(total_px), 1.0)
-                    masks = ", ".join(str(v) for v in selected_cell.get("analysis_masks", []))
-                    imgui.text_disabled(f"Fabric pixels used: {fabric_px} / {total_px} ({pct:.1f}%)")
-                    if masks:
-                        imgui.text_disabled(f"Mask: {masks}")
-                imgui.text("Per-angle colors")
-                for angle_index, angle_result in enumerate(selected_cell["angles"]):
-                    angle_rgb = [float(v) for v in angle_result["rgb"]]
+
+            def draw_analysis_grid(title, source_by_pos, rgb_key, id_prefix):
+                nonlocal selected_r, selected_c
+                imgui.begin_group()
+                imgui.text(title)
+                imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(3, 3))
+                for r in range(rows):
+                    for c in range(cols):
+                        cell = source_by_pos.get((r, c))
+                        rgb = cell.get(rgb_key, [26.0, 26.0, 26.0]) if cell is not None else [26.0, 26.0, 26.0]
+                        rgba = color_rgba(rgb)
+                        imgui.push_style_color(imgui.Col_.button, rgba)
+                        imgui.push_style_color(imgui.Col_.button_hovered, (
+                            min(float(rgba[0]) + 0.12, 1.0),
+                            min(float(rgba[1]) + 0.12, 1.0),
+                            min(float(rgba[2]) + 0.12, 1.0),
+                            1.0,
+                        ))
+                        border_selected = r == selected_r and c == selected_c
+                        if border_selected:
+                            imgui.push_style_color(imgui.Col_.border, (1.0, 0.78, 0.15, 1.0))
+                            imgui.push_style_var(imgui.StyleVar_.frame_border_size, 2.0)
+                        clicked = imgui.button(f"##{id_prefix}_{r}_{c}", imgui.ImVec2(cell_size, cell_size))
+                        if border_selected:
+                            imgui.pop_style_var()
+                            imgui.pop_style_color()
+                        imgui.pop_style_color(2)
+                        if clicked and cell is not None:
+                            selected_r, selected_c = r, c
+                            state.scanner_analysis_selected_cell = [r, c]
+                        if c < cols - 1:
+                            imgui.same_line()
+                    if r < rows - 1:
+                        imgui.spacing()
+                imgui.pop_style_var()
+                imgui.end_group()
+
+            draw_analysis_grid("Estimated Color Grid", estimate_by_pos, "rgb", "estimated_rgb_result")
+            if has_analysis:
+                imgui.same_line()
+                draw_analysis_grid("Average RGB Color Grid", cells_by_pos, "overall_rgb", "actual_rgb_result")
+            else:
+                imgui.text_disabled("Average RGB grid appears after scanning and analyzing.")
+            state.scanner_analysis_selected_cell = [selected_r, selected_c]
+
+            if has_analysis:
+                imgui.text(f"Images analyzed: {int(result.get('image_count', 0))}")
+                json_path = result.get("json_path")
+                if json_path:
+                    imgui.text_disabled(f"Saved: {Path(json_path).name}")
+                used_dir = result.get("used_pixels_dir")
+                if used_dir:
+                    imgui.text_disabled(f"Used-pixel crops: {Path(used_dir).name}/")
+
+                selected_cell = cells_by_pos.get((selected_r, selected_c))
+                if selected_cell is not None:
+                    rgb = [float(v) for v in selected_cell["overall_rgb"]]
+                    estimated_rgb = [float(v) for v in selected_cell.get("estimated_rgb", [0.0, 0.0, 0.0])]
+                    estimate_delta = float(selected_cell.get("estimate_actual_delta_rgb", 0.0))
+                    imgui.separator()
+                    imgui.text(f"Selected mini-square: R{selected_r + 1} C{selected_c + 1}")
                     imgui.color_button(
-                        f"##angle_rgb_{selected_r}_{selected_c}_{angle_index}",
-                        (angle_rgb[0] / 255.0, angle_rgb[1] / 255.0, angle_rgb[2] / 255.0, 1.0),
+                        "##selected_overall_rgb",
+                        (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
                         imgui.ColorEditFlags_.no_tooltip,
-                        imgui.ImVec2(34, 22),
+                        imgui.ImVec2(46, 28),
+                    )
+                    imgui.same_line()
+                    imgui.text(f"All views average RGB: {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f}")
+                    imgui.color_button(
+                        "##selected_estimated_rgb",
+                        (
+                            estimated_rgb[0] / 255.0,
+                            estimated_rgb[1] / 255.0,
+                            estimated_rgb[2] / 255.0,
+                            1.0,
+                        ),
+                        imgui.ColorEditFlags_.no_tooltip,
+                        imgui.ImVec2(46, 28),
                     )
                     imgui.same_line()
                     imgui.text(
-                        f"{angle_result['angle']}: {angle_rgb[0]:.0f}, {angle_rgb[1]:.0f}, {angle_rgb[2]:.0f}"
+                        f"Estimated RGB: {estimated_rgb[0]:.0f}, {estimated_rgb[1]:.0f}, {estimated_rgb[2]:.0f}"
+                        f" | delta {estimate_delta:.1f}"
                     )
+                    fabric_px = int(selected_cell.get("fabric_pixel_count", 0))
+                    total_px = int(selected_cell.get("analysis_total_pixels", 0))
+                    if fabric_px > 0 and total_px > 0:
+                        pct = 100.0 * float(fabric_px) / max(float(total_px), 1.0)
+                        masks = ", ".join(str(v) for v in selected_cell.get("analysis_masks", []))
+                        imgui.text_disabled(f"Fabric pixels used: {fabric_px} / {total_px} ({pct:.1f}%)")
+                        if masks:
+                            imgui.text_disabled(f"Mask: {masks}")
+                    imgui.text("Per-angle colors")
+                    for angle_index, angle_result in enumerate(selected_cell["angles"]):
+                        angle_rgb = [float(v) for v in angle_result["rgb"]]
+                        imgui.color_button(
+                            f"##angle_rgb_{selected_r}_{selected_c}_{angle_index}",
+                            (angle_rgb[0] / 255.0, angle_rgb[1] / 255.0, angle_rgb[2] / 255.0, 1.0),
+                            imgui.ColorEditFlags_.no_tooltip,
+                            imgui.ImVec2(34, 22),
+                        )
+                        imgui.same_line()
+                        imgui.text(
+                            f"{angle_result['angle']}: {angle_rgb[0]:.0f}, {angle_rgb[1]:.0f}, {angle_rgb[2]:.0f}"
+                        )
         _maybe_persist_scanner_state(state)
-        imgui.text_wrapped(str(state.scanner_status))
 
     elif puzzle_active:
-        imgui.text("Puzzle Mode")
-        imgui.text_wrapped(
-            "Manual workflow for testing seamless repeat logic before automation: duplicate real geometry, capture it, detect colors, and inspect edge landmarks."
-        )
-        if imgui.collapsing_header("Stitch pattern (bitmap)##puzzle_pattern", imgui.TreeNodeFlags_.default_open):
-            imgui.text_disabled(
-                f"Editing the small {int(state.bitmap_size[0])} x {int(state.bitmap_size[1])} stitch bitmap "
-                "used to build the model this test tiles and captures."
-            )
+        imgui.text_disabled("Tile real geometry, capture a region, and verify seamless repeat edges.")
+        if imgui.collapsing_header("1. Stitch Pattern & Copies##puzzle_pattern", imgui.TreeNodeFlags_.default_open):
             _draw_bitmap_editor(state, id_suffix="_puzzle")
-        imgui.separator()
-        copies_x, copies_y = _puzzle_target_copies(state)
-        # Geometry is rebuilt when the slider is released rather than on every
-        # value it passes through: 9x9 is 81 copies of the model (16.3 M verts,
-        # 7.4 s per rebuild), so rebuilding per step meant a drag across the
-        # range spent ~13 s with the frame loop blocked.
-        changed_px, new_px = imgui.slider_int("Real geometry copies X##puzzle_copies_x", copies_x, 1, 9)
-        released_px = imgui.is_item_deactivated_after_edit()
-        changed_py, new_py = imgui.slider_int("Real geometry copies Y##puzzle_copies_y", copies_y, 1, 9)
-        released_py = imgui.is_item_deactivated_after_edit()
-        if changed_px:
-            if int(new_px) % 2 == 0:
-                new_px += 1
-            state.puzzle_copies_x = int(np.clip(new_px, 1, 9))
-        if changed_py:
-            if int(new_py) % 2 == 0:
-                new_py += 1
-            state.puzzle_copies_y = int(np.clip(new_py, 1, 9))
-        if changed_px or changed_py:
-            state.status_msg = (
-                f"Release to apply {int(state.puzzle_copies_x)} x "
-                f"{int(state.puzzle_copies_y)} geometry"
-            )
-        if released_px or released_py:
-            _puzzle_apply_geometry_copies(state, preserve=True)
-            state.status_msg = f"Puzzle geometry set to {int(state.puzzle_copies_x)} x {int(state.puzzle_copies_y)}"
-        if imgui.button("Apply 5 x 5 geometry##puzzle_apply_5x5", (-1, 0)):
-            state.puzzle_copies_x = 5
-            state.puzzle_copies_y = 5
-            _puzzle_apply_geometry_copies(state, preserve=True)
-            state.status_msg = "Puzzle geometry set to 5 x 5"
-        if imgui.button("Apply current copy settings##puzzle_apply", (-1, 0)):
-            _puzzle_apply_geometry_copies(state, preserve=True)
-            state.status_msg = "Puzzle geometry copies applied"
-        imgui.separator()
-        imgui.text("Screenshot capture frame")
-        rx, ry, rw, rh = _puzzle_capture_rect(state)
-        changed_rx, rx = imgui.slider_float("Frame X##puzzle_capture_rect_x", rx, 0.0, 0.95, "%.2f")
-        changed_ry, ry = imgui.slider_float("Frame Y##puzzle_capture_rect_y", ry, 0.0, 0.95, "%.2f")
-        changed_rw, rw = imgui.slider_float("Frame width##puzzle_capture_rect_w", rw, 0.05, 1.0, "%.2f")
-        changed_rh, rh = imgui.slider_float("Frame height##puzzle_capture_rect_h", rh, 0.05, 1.0, "%.2f")
-        if changed_rx or changed_ry or changed_rw or changed_rh:
-            _set_puzzle_capture_rect(state, [rx, ry, rw, rh])
-        imgui.text_disabled("Yellow frame in the 3D viewport shows the region that will be captured.")
-        imgui.separator()
-        changed_count, new_count = imgui.slider_int("Detected colors##puzzle_detect_color_count", int(state.get('puzzle_detect_color_count', 6)), 1, 12)
-        if changed_count:
-            state.puzzle_detect_color_count = int(new_count)
-        if imgui.button("Capture geometry preview##puzzle_capture", (-1, 0)):
-            image, points, landmarks = _puzzle_capture_geometry_image(state, renderer)
-            state.puzzle_capture_image = image
-            state.puzzle_projected_points = points
-            state.puzzle_edge_landmarks = landmarks
-            state.puzzle_detected_colors = _puzzle_detect_colors(image, int(state.get('puzzle_detect_color_count', 6))) if image is not None else []
-            state.puzzle_capture_texture_key = None
-            if image is not None:
-                state.status_msg = f"Puzzle capture: {len(points)} control points, {len(landmarks)} edge landmarks"
-            else:
-                state.status_msg = "Puzzle capture failed: 3D viewport has not rendered yet"
-        image = state.get('puzzle_capture_image', None)
-        if image is not None:
-            if imgui.button("Save puzzle capture##puzzle_save_capture", (-1, 0)):
-                output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
-                output_dir.mkdir(parents=True, exist_ok=True)
-                output_path = output_dir / f"puzzle_capture_{int(time.time())}.png"
-                image.save(output_path)
-                state.status_msg = f"Saved {output_path.name}"
-            imgui.text(f"Captured image: {image.size[0]} x {image.size[1]}")
-            colors = state.get('puzzle_detected_colors', [])
-            if colors:
-                imgui.text("Detected colors")
-                for idx, item in enumerate(colors):
-                    rgb = item.get("rgb", [0, 0, 0])
-                    imgui.color_button(
-                        f"##puzzle_color_{idx}",
-                        (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
-                        imgui.ColorEditFlags_.no_tooltip,
-                        imgui.ImVec2(34, 22),
-                    )
-                    imgui.same_line()
-                    imgui.text(f"{rgb[0]}, {rgb[1]}, {rgb[2]} | px {int(item.get('count', 0))}")
-            imgui.text(f"Control points: {len(state.get('puzzle_projected_points', []))}")
-            imgui.text(f"Edge landmarks: {len(state.get('puzzle_edge_landmarks', []))}")
-            texture = _upload_puzzle_texture(state, renderer, 'capture')
-            if texture is not None:
-                avail_w = max(120, int(imgui.get_content_region_avail().x))
-                preview_h = int(avail_w * image.size[1] / max(image.size[0], 1))
-                _draw_puzzle_capture_widget(state, image, texture, avail_w, preview_h)
-        else:
-            imgui.text_disabled("Capture a geometry preview to inspect colors and edge landmarks.")
-
-        imgui.separator()
-        imgui.text("Seamless tile / glue preview")
-        imgui.text_disabled(
-            "Crops one exact repeat period from the capture area and stitches copies "
-            "edge-to-edge to verify seamless tiling."
-        )
-        glue_cols = int(state.get('puzzle_glue_cols', 3))
-        glue_rows = int(state.get('puzzle_glue_rows', 3))
-        changed_gc, new_gc = imgui.slider_int("Glue copies X##puzzle_glue_cols", glue_cols, 1, 100)
-        changed_gr, new_gr = imgui.slider_int("Glue copies Y##puzzle_glue_rows", glue_rows, 1, 100)
-        if changed_gc:
-            state.puzzle_glue_cols = int(new_gc)
-        if changed_gr:
-            state.puzzle_glue_rows = int(new_gr)
-        changed_hl, new_hl = imgui.checkbox("Highlight tile edges##puzzle_glue_highlight", bool(state.get('puzzle_glue_highlight_edges', False)))
-        if changed_hl:
-            state.puzzle_glue_highlight_edges = bool(new_hl)
-        if imgui.button("Build seamless tile##puzzle_build_glue", (-1, 0)):
-            tile, glued, info = _puzzle_build_seamless_tile(
-                state, renderer,
-                int(state.get('puzzle_glue_cols', 3)),
-                int(state.get('puzzle_glue_rows', 3)),
-            )
-            state.puzzle_tile_image = tile
-            state.puzzle_glued_image = glued
-            state.puzzle_glue_info = info
-            state.puzzle_glued_texture_key = None
-            if glued is not None:
+            imgui.separator()
+            copies_x, copies_y = _puzzle_target_copies(state)
+            changed_px, new_px = imgui.slider_int("Copies X##puzzle_copies_x", copies_x, 1, 9)
+            released_px = imgui.is_item_deactivated_after_edit()
+            changed_py, new_py = imgui.slider_int("Copies Y##puzzle_copies_y", copies_y, 1, 9)
+            released_py = imgui.is_item_deactivated_after_edit()
+            if changed_px:
+                if int(new_px) % 2 == 0:
+                    new_px += 1
+                state.puzzle_copies_x = int(np.clip(new_px, 1, 9))
+            if changed_py:
+                if int(new_py) % 2 == 0:
+                    new_py += 1
+                state.puzzle_copies_y = int(np.clip(new_py, 1, 9))
+            if changed_px or changed_py:
                 state.status_msg = (
-                    f"Glued {info.get('cols', 0)} x {info.get('rows', 0)} "
-                    f"tiles ({info.get('tile_w', 0)} x {info.get('tile_h', 0)} px each)"
+                    f"Release to apply {int(state.puzzle_copies_x)} x "
+                    f"{int(state.puzzle_copies_y)} geometry"
                 )
-            else:
-                state.status_msg = "Seamless tile build failed: capture the 3D viewport first"
-        glued_image = state.get('puzzle_glued_image', None)
-        info = state.get('puzzle_glue_info', {}) or {}
-        if glued_image is not None:
-            skew_x = float(info.get('skew_x_px', 0.0))
-            skew_y = float(info.get('skew_y_px', 0.0))
-            imgui.text(f"Tile size: {info.get('tile_w', 0)} x {info.get('tile_h', 0)} px")
-            imgui.text(
-                f"World period X/Y: {info.get('x_period_world', 0.0):.2f} / {info.get('y_period_world', 0.0):.2f}"
-            )
-            skew_color = (1.0, 0.55, 0.2, 1.0) if (abs(skew_x) > 1.5 or abs(skew_y) > 1.5) else (0.6, 0.9, 0.6, 1.0)
-            imgui.text_colored(skew_color, f"Seam skew (should be ~0): x={skew_x:.2f}px, y={skew_y:.2f}px")
-            if abs(skew_x) > 1.5 or abs(skew_y) > 1.5:
-                imgui.text_wrapped(
-                    "Skew is non-trivial: the camera view is not axis-aligned with the repeat "
-                    "directions, so straight grid gluing will show a slight seam drift. "
-                    "Rotate the camera to a top-down view for a perfect seam."
+            if released_px or released_py:
+                _puzzle_apply_geometry_copies(state, preserve=True)
+                state.status_msg = f"Puzzle geometry set to {int(state.puzzle_copies_x)} x {int(state.puzzle_copies_y)}"
+            half_p = max(80.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
+            if imgui.button("Apply 5 x 5##puzzle_apply_5x5", (half_p, 0)):
+                state.puzzle_copies_x = 5
+                state.puzzle_copies_y = 5
+                _puzzle_apply_geometry_copies(state, preserve=True)
+                state.status_msg = "Puzzle geometry set to 5 x 5"
+            imgui.same_line()
+            if imgui.button("Apply Copies##puzzle_apply", (half_p, 0)):
+                _puzzle_apply_geometry_copies(state, preserve=True)
+                state.status_msg = "Puzzle geometry copies applied"
+
+        if imgui.collapsing_header("2. Capture Frame & Landmarks##puzzle_capture_section", imgui.TreeNodeFlags_.default_open):
+            rx, ry, rw, rh = _puzzle_capture_rect(state)
+            changed_rx, rx = imgui.slider_float("Frame X##puzzle_capture_rect_x", rx, 0.0, 0.95, "%.2f")
+            changed_ry, ry = imgui.slider_float("Frame Y##puzzle_capture_rect_y", ry, 0.0, 0.95, "%.2f")
+            changed_rw, rw = imgui.slider_float("Frame width##puzzle_capture_rect_w", rw, 0.05, 1.0, "%.2f")
+            changed_rh, rh = imgui.slider_float("Frame height##puzzle_capture_rect_h", rh, 0.05, 1.0, "%.2f")
+            if changed_rx or changed_ry or changed_rw or changed_rh:
+                _set_puzzle_capture_rect(state, [rx, ry, rw, rh])
+            changed_count, new_count = imgui.slider_int("Detected colors##puzzle_detect_color_count", int(state.get('puzzle_detect_color_count', 6)), 1, 12)
+            if changed_count:
+                state.puzzle_detect_color_count = int(new_count)
+            if imgui.button("Capture geometry preview##puzzle_capture", (-1, 0)):
+                image, points, landmarks = _puzzle_capture_geometry_image(state, renderer)
+                state.puzzle_capture_image = image
+                state.puzzle_projected_points = points
+                state.puzzle_edge_landmarks = landmarks
+                state.puzzle_detected_colors = _puzzle_detect_colors(image, int(state.get('puzzle_detect_color_count', 6))) if image is not None else []
+                state.puzzle_capture_texture_key = None
+                if image is not None:
+                    state.status_msg = f"Puzzle capture: {len(points)} control points, {len(landmarks)} edge landmarks"
+                else:
+                    state.status_msg = "Puzzle capture failed: 3D viewport has not rendered yet"
+            image = state.get('puzzle_capture_image', None)
+            if image is not None:
+                if imgui.button("Save puzzle capture##puzzle_save_capture", (-1, 0)):
+                    output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    output_path = output_dir / f"puzzle_capture_{int(time.time())}.png"
+                    image.save(output_path)
+                    state.status_msg = f"Saved {output_path.name}"
+                imgui.text(f"Captured image: {image.size[0]} x {image.size[1]} | pts: {len(state.get('puzzle_projected_points', []))} | landmarks: {len(state.get('puzzle_edge_landmarks', []))}")
+                colors = state.get('puzzle_detected_colors', [])
+                if colors:
+                    for idx, item in enumerate(colors):
+                        rgb = item.get("rgb", [0, 0, 0])
+                        imgui.color_button(
+                            f"##puzzle_color_{idx}",
+                            (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
+                            imgui.ColorEditFlags_.no_tooltip,
+                            imgui.ImVec2(28, 18),
+                        )
+                        imgui.same_line()
+                        imgui.text(f"{rgb[0]}, {rgb[1]}, {rgb[2]} ({int(item.get('count', 0))} px)")
+                texture = _upload_puzzle_texture(state, renderer, 'capture')
+                if texture is not None:
+                    avail_w = max(120, int(imgui.get_content_region_avail().x))
+                    preview_h = int(avail_w * image.size[1] / max(image.size[0], 1))
+                    _draw_puzzle_capture_widget(state, image, texture, avail_w, preview_h)
+
+        if imgui.collapsing_header("3. Seamless Tile & Glue Preview##puzzle_glue_section", imgui.TreeNodeFlags_.default_open):
+            glue_cols = int(state.get('puzzle_glue_cols', 3))
+            glue_rows = int(state.get('puzzle_glue_rows', 3))
+            changed_gc, new_gc = imgui.slider_int("Glue copies X##puzzle_glue_cols", glue_cols, 1, 100)
+            changed_gr, new_gr = imgui.slider_int("Glue copies Y##puzzle_glue_rows", glue_rows, 1, 100)
+            if changed_gc:
+                state.puzzle_glue_cols = int(new_gc)
+            if changed_gr:
+                state.puzzle_glue_rows = int(new_gr)
+            changed_hl, new_hl = imgui.checkbox("Highlight tile edges##puzzle_glue_highlight", bool(state.get('puzzle_glue_highlight_edges', False)))
+            if changed_hl:
+                state.puzzle_glue_highlight_edges = bool(new_hl)
+            if imgui.button("Build seamless tile##puzzle_build_glue", (-1, 0)):
+                tile, glued, info = _puzzle_build_seamless_tile(
+                    state, renderer,
+                    int(state.get('puzzle_glue_cols', 3)),
+                    int(state.get('puzzle_glue_rows', 3)),
                 )
-            if imgui.button("Save seamless tile##puzzle_save_glue", (-1, 0)):
-                output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
-                output_dir.mkdir(parents=True, exist_ok=True)
-                stamp = int(time.time())
-                tile_image = state.get('puzzle_tile_image', None)
-                if tile_image is not None:
-                    tile_image.save(output_dir / f"puzzle_tile_{stamp}.png")
-                glued_image.save(output_dir / f"puzzle_glued_{stamp}.png")
-                state.status_msg = f"Saved puzzle_tile_{stamp}.png and puzzle_glued_{stamp}.png"
-            glue_texture = _upload_puzzle_texture(state, renderer, 'glued')
-            if glue_texture is not None:
-                avail_w = max(120, int(imgui.get_content_region_avail().x))
-                preview_h = int(min(avail_w * glued_image.size[1] / max(glued_image.size[0], 1), 480))
-                glue_rect = draw_fitted_texture(glue_texture.glo, glued_image.size[0], glued_image.size[1], avail_w, preview_h, flip_y=True)
-                if bool(state.get('puzzle_glue_highlight_edges', False)):
-                    _draw_puzzle_glue_edge_overlay(glued_image, glue_rect, info)
-        else:
-            imgui.text_disabled("Build a seamless tile to preview the glued, repeated fabric.")
+                state.puzzle_tile_image = tile
+                state.puzzle_glued_image = glued
+                state.puzzle_glue_info = info
+                state.puzzle_glued_texture_key = None
+                if glued is not None:
+                    state.status_msg = (
+                        f"Glued {info.get('cols', 0)} x {info.get('rows', 0)} "
+                        f"tiles ({info.get('tile_w', 0)} x {info.get('tile_h', 0)} px each)"
+                    )
+                else:
+                    state.status_msg = "Seamless tile build failed: capture the 3D viewport first"
+            glued_image = state.get('puzzle_glued_image', None)
+            info = state.get('puzzle_glue_info', {}) or {}
+            if glued_image is not None:
+                skew_x = float(info.get('skew_x_px', 0.0))
+                skew_y = float(info.get('skew_y_px', 0.0))
+                imgui.text(f"Tile: {info.get('tile_w', 0)} x {info.get('tile_h', 0)} px | Period: {info.get('x_period_world', 0.0):.2f} / {info.get('y_period_world', 0.0):.2f}")
+                skew_color = (1.0, 0.55, 0.2, 1.0) if (abs(skew_x) > 1.5 or abs(skew_y) > 1.5) else (0.6, 0.9, 0.6, 1.0)
+                imgui.text_colored(skew_color, f"Seam skew: x={skew_x:.2f}px, y={skew_y:.2f}px")
+                if imgui.button("Save seamless tile##puzzle_save_glue", (-1, 0)):
+                    output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = int(time.time())
+                    tile_image = state.get('puzzle_tile_image', None)
+                    if tile_image is not None:
+                        tile_image.save(output_dir / f"puzzle_tile_{stamp}.png")
+                    glued_image.save(output_dir / f"puzzle_glued_{stamp}.png")
+                    state.status_msg = f"Saved puzzle_tile_{stamp}.png and puzzle_glued_{stamp}.png"
+                glue_texture = _upload_puzzle_texture(state, renderer, 'glued')
+                if glue_texture is not None:
+                    avail_w = max(120, int(imgui.get_content_region_avail().x))
+                    preview_h = int(min(avail_w * glued_image.size[1] / max(glued_image.size[0], 1), 480))
+                    glue_rect = draw_fitted_texture(glue_texture.glo, glued_image.size[0], glued_image.size[1], avail_w, preview_h, flip_y=True)
+                    if bool(state.get('puzzle_glue_highlight_edges', False)):
+                        _draw_puzzle_glue_edge_overlay(glued_image, glue_rect, info)
 
     if (
         str(state.get('app_mode', 'edit')) == 'scan'
@@ -2547,8 +2571,12 @@ def draw_sidebar(state, renderer, window=None):
             imgui.end()
 
 def draw_viewport(state, renderer, ref_tex, window):
-    imgui.set_next_window_pos((360, 20), cond=imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size((840, 820), cond=imgui.Cond_.first_use_ever)
+    reset_vp = bool(state.get('_layout_reset_viewport', False))
+    vp_cond = imgui.Cond_.always if reset_vp else imgui.Cond_.first_use_ever
+    imgui.set_next_window_pos((390, 20), cond=vp_cond)
+    imgui.set_next_window_size((820, 820), cond=vp_cond)
+    if reset_vp:
+        state._layout_reset_viewport = False
     imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
     if str(state.get('app_mode', 'edit')) == 'puzzle':
         renderer = state.puzzle_renderer
@@ -2557,6 +2585,26 @@ def draw_viewport(state, renderer, ref_tex, window):
         if str(state.get('app_mode', 'edit')) == 'puzzle'
         else "3D Viewport"
     )
+    imgui.same_line()
+    if imgui.small_button("Center##vp_center"):
+        state.center_model_in_viewport()
+    imgui.same_line()
+    if imgui.small_button("Front View##vp_front"):
+        state.camera.az = 0.0
+        state.camera.el = 0.0
+        state.center_model_in_viewport()
+    imgui.same_line()
+    if imgui.small_button("3D Angle##vp_angle"):
+        state.camera.az = float(np.radians(-30.0))
+        state.camera.el = float(np.radians(28.0))
+    imgui.same_line()
+    if imgui.small_button("Reset Transform##vp_reset_transform"):
+        state.model_t = np.zeros(3, dtype=np.float32)
+        state.model_rot = np.zeros(3, dtype=np.float32)
+        state.model_scale = np.ones(3, dtype=np.float32)
+        state.center_model_in_viewport()
+    imgui.same_line()
+    imgui.text_disabled("LMB: move | RMB/MMB: orbit | Wheel: zoom")
 
     avail_x, avail_y = imgui.get_content_region_avail()
     disp_w = max(1, int(avail_x))
@@ -3229,8 +3277,9 @@ def draw_viewport(state, renderer, ref_tex, window):
             prev = state.prev_mouse
             dx = mx - prev[0]
             dy = my - prev[1]
-            lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT)  == glfw.PRESS
-            rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+            lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT)   == glfw.PRESS
+            rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT)  == glfw.PRESS
+            mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
             shift_down = imgui.get_io().key_shift
 
             if not edit_controls_active:
@@ -3251,6 +3300,8 @@ def draw_viewport(state, renderer, ref_tex, window):
                     state.push_undo("Model transform")
                     state.model_drag_undo_active = True
                 state.model_t += pixel_drag_to_world_delta(dx, dy)
+            elif (mmb or (rmb and not shift_down)) and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
+                state.camera.orbit(dx, dy)
             elif edit_controls_active and lmb and not shift_down and not bbox_drag_active and not spline_drag_active and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
                 if not state.model_drag_undo_active:
                     state.push_undo("Model translate")

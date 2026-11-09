@@ -75,16 +75,20 @@ def main():
         io = imgui.get_io()
         io.config_windows_move_from_title_bar_only = True
         io.config_flags |= imgui.ConfigFlags_.docking_enable
-        io.config_flags |= imgui.ConfigFlags_.viewports_enable
         io.set_ini_filename(str(paths.LAYOUT_INI))
         impl = GlfwRenderer(window)
         resources.callback(impl.shutdown)
 
         style = imgui.get_style()
         style.window_menu_button_position = imgui.Dir_.none
-        if io.config_flags & imgui.ConfigFlags_.viewports_enable:
-            style.window_rounding = 0.0
-            style.color_(imgui.Col_.window_bg).w = 1.0
+        style.window_rounding = 6.0
+        style.child_rounding = 4.0
+        style.frame_rounding = 4.0
+        style.grab_rounding = 3.0
+        style.tab_rounding = 4.0
+        style.frame_padding = imgui.ImVec2(6.0, 4.0)
+        style.item_spacing = imgui.ImVec2(8.0, 6.0)
+        style.window_padding = imgui.ImVec2(10.0, 10.0)
 
         # ── moderngl (shares the existing GL context) ─────────────────────────────
         ctx = moderngl.create_context()
@@ -358,13 +362,6 @@ def main():
             ctx.clear(0.0, 0.0, 0.0, 1.0)
             imgui.render()
             impl.render(imgui.get_draw_data())
-
-            if io.config_flags & imgui.ConfigFlags_.viewports_enable:
-                backup_current_context = glfw.get_current_context()
-                imgui.update_platform_windows()
-                imgui.render_platform_windows_default()
-                glfw.make_context_current(backup_current_context)
-
             glfw.swap_buffers(window)
 
 if __name__ == "__main__":

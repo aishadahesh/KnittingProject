@@ -1270,24 +1270,33 @@ def _make_runner(state, controller, plan):
 # Panel
 # ============================================================================
 
-def draw_ur5_panel(state, renderer, window=None):
-    """The whole UR5 Robot Mode sidebar."""
-    controller = state.get("ur5_controller")
-    if controller is None:
-        controller = UR5ModeController(state, renderer.ctx, window)
-        state.ur5_controller = controller
-
-    controller.update_preview()
-
+def _draw_ur5_controls_column(state, controller, renderer):
     _draw_safety_bar(state, controller)
-    _draw_simple_page(state, controller, renderer)
-    # Everything the simple page leaves at its default, unchanged, behind one closed header at the end.
-    if not imgui.collapsing_header("All settings and tools##ur5_everything"):
+    expert_view = bool(state.get("_ur5_expert_view", False))
+    half = max(90.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
+    is_light = str(state.get("ui_theme", "dark")) == "light"
+    active_col = (0.18, 0.50, 0.82, 1.0) if is_light else (0.22, 0.52, 0.82, 1.0)
+    if not expert_view:
+        imgui.push_style_color(imgui.Col_.button, active_col)
+    if imgui.button("Guided Workflow##ur5_mode_guided", (half, 26)):
+        state._ur5_expert_view = False
+        expert_view = False
+    if not expert_view:
+        imgui.pop_style_color()
+    imgui.same_line()
+    if expert_view:
+        imgui.push_style_color(imgui.Col_.button, active_col)
+    if imgui.button("All Settings & Tools##ur5_mode_expert", (half, 26)):
+        state._ur5_expert_view = True
+        expert_view = True
+    if expert_view:
+        imgui.pop_style_color()
+    imgui.separator()
+
+    if not expert_view:
+        _draw_simple_page(state, controller, renderer)
         return
-    imgui.push_style_color(imgui.Col_.text, COLOR_MUTED)
-    imgui.text_wrapped("1 Setup: speed, lens, tool  |  2 Position: focus, fabric corners, free drive  |  3 Capture: every pattern and its settings  |  4 Results: colours, Scan Mode grid  |  5 Free capture: hand-held")
-    imgui.pop_style_color()
-    # Its own id scope: the simple page above draws some of the same widgets.
+
     imgui.push_id("ur5_everything")
     if imgui.begin_tab_bar("##ur5_tabs"):
         for label, draw in UR5_TABS:
@@ -1297,6 +1306,43 @@ def draw_ur5_panel(state, renderer, window=None):
                 imgui.end_tab_item()
         imgui.end_tab_bar()
     imgui.pop_id()
+
+
+def draw_ur5_panel(state, renderer, window=None):
+    """The whole UR5 Robot Mode sidebar."""
+    controller = state.get("ur5_controller")
+    if controller is None:
+        controller = UR5ModeController(state, renderer.ctx, window)
+        state.ur5_controller = controller
+
+    controller.update_preview()
+
+    if bool(state.get("ur5_show_scene", False)):
+        _draw_ur5_controls_column(state, controller, renderer)
+        return
+
+    imgui.begin_child("ur5_controls", imgui.ImVec2(480, 0), imgui.ChildFlags_.borders)
+    _draw_ur5_controls_column(state, controller, renderer)
+    imgui.end_child()
+
+    imgui.same_line()
+    imgui.begin_child("ur5_workspace", imgui.ImVec2(0, 0), imgui.ChildFlags_.borders)
+    imgui.push_id("ur5_workspace")
+    imgui.separator_text("Live Camera & Jog")
+    _draw_live_preview(state, controller)
+    if controller.robot.connected:
+        _draw_jog_pad(state, controller)
+    imgui.separator_text("Checked Capture Path")
+    plan = controller.plan
+    if plan is not None:
+        runner = controller.runner
+        active = runner.progress.target_index if runner is not None and runner.running else controller.rehearse_index
+        _draw_viewpoint_preview(plan, active, float(state.get("teleop_max_rise", 0.19)) if plan.pattern == "orbit" else None)
+        _draw_viewpoint_rows(plan, active)
+    else:
+        imgui.text_disabled("Press 'Check path' in Step 3 / Capture to preview viewpoints.")
+    imgui.pop_id()
+    imgui.end_child()
 
 
 def _draw_simple_page(state, controller, renderer):
