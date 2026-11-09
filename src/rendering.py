@@ -864,7 +864,7 @@ def upload_rgb_texture(ctx, texture, rgb):
     return texture
 
 
-def draw_fitted_texture(texture_id, tex_w, tex_h, avail_w, avail_h, flip_y=False, zoom=1.0, pan=(0.0, 0.0)):
+def draw_fitted_texture(texture_id, tex_w, tex_h, avail_w, avail_h, flip_y=True, zoom=1.0, pan=(0.0, 0.0)):
     """Draws a texture centered inside the available region while preserving aspect."""
     if tex_w <= 0 or tex_h <= 0 or avail_w <= 1 or avail_h <= 1:
         return None

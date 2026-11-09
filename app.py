@@ -34,7 +34,6 @@ from app_state import AppState
 from scanner_storage import ScannerStorage
 from gui import (
      draw_menu_bar,
-     draw_orbit_viewport,
      draw_sidebar,
      draw_viewport,
 )
@@ -344,18 +343,7 @@ def main():
             ctx.screen.use()
 
             # ── 3D Viewport ───────────────────────────────────────────────────────
-            # UR5 Robot Mode only draws the knit preview when asked: the arm and the
-            # cell are TeleopApp's to show, and re-rendering the tiled scan layout
-            # every frame beside it was the heaviest thing the app did there.
-            mode_now = str(state.get("app_mode", "edit"))
-            if mode_now not in ("database", "model") and (mode_now != "ur5" or bool(state.get("ur5_show_scene", False))):
-                # Re-evaluate after draw_sidebar: its mode buttons can switch into
-                # or out of Puzzle during this same frame.
-                draw_viewport(state, state.active_scene_renderer(), ref_tex, window)
-                # Edit Mode only: the other modes drive the shared model/camera
-                # themselves, and a second live view of it would fight them.
-                if str(state.get('app_mode', 'edit')) == 'edit':
-                    draw_orbit_viewport(state, window)
+            draw_viewport(state, state.active_scene_renderer(), ref_tex, window)
 
             # ── Final GL clear + imgui draw ───────────────────────────────────────
             ctx.screen.use()

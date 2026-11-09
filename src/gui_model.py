@@ -1250,42 +1250,21 @@ def _draw_periodic(view, state) -> None:
 
 
 def _draw_view_options(view) -> None:
-    if view.periodic is not None or view.crochet is not None:
-        imgui.text("Equation yarn:")
-        for i, name in enumerate(SOURCES):
-            if (i == 1 and view.periodic is None) or (i == 2 and view.crochet is None):
-                continue
-            imgui.same_line()
-            if imgui.radio_button(f"{name}##model_source{i}", view.source == i):
-                view.source = i
+    imgui.text("View:")
     for i, name in enumerate(SHOWS):
-        if i:
-            imgui.same_line()
+        imgui.same_line()
         if imgui.radio_button(f"{name}##model_show{i}", view.show == i):
             view.show = i
     if view.extraction is None and view.show:
         imgui.same_line()
-        imgui.text_colored(COLOR_MUTED, "(extract the equations first)")
-    if view.show in (1, 2, 3):
-        imgui.set_next_item_width(230)
-        _, view.colouring = imgui.combo("Equation yarn colour##model_colour", int(view.colouring), list(COLOURINGS))
-        if view.colouring == 1:
-            imgui.same_line()
-            imgui.set_next_item_width(120)
-            _, view.heat_mm = imgui.slider_float("red at (mm)##model_heat", float(view.heat_mm), 0.1, 2.0, "%.2f")
-            for label, colour in (("on the scan", (0.15, 0.35, 0.95, 1.0)), (f"{view.heat_mm / 3:.2f} mm", (0.15, 0.80, 0.45, 1.0)),
-                                  (f"{2 * view.heat_mm / 3:.2f} mm", (0.95, 0.85, 0.20, 1.0)), (f">= {view.heat_mm:.2f} mm", (0.90, 0.20, 0.15, 1.0)),
-                                  ("underside (never seen)", (0.35, 0.35, 0.38, 1.0))):
-                imgui.text_colored(colour, "■")
-                imgui.same_line()
-                imgui.text(label)
-                imgui.same_line()
-            imgui.new_line()
-    if view.show == 3:
-        imgui.set_next_item_width(200)
-        _, view.overlay = imgui.slider_float("Equation yarn opacity##model_overlay", float(view.overlay), 0.0, 1.0, "%.2f")
-    imgui.text_colored(COLOR_MUTED, "Drag to turn, right-drag to move, wheel to zoom")
+        imgui.text_colored(COLOR_MUTED, "(extract equations first)")
+    if view.gl is not None:
+        imgui.same_line()
+        imgui.set_next_item_width(150)
+        _, view.style = imgui.combo("Style##model_style", int(view.style), list(splat_gl.STYLES))
     imgui.same_line()
+    _, view.by_height = imgui.checkbox("Height colour##model_height", bool(view.by_height))
+
     if imgui.small_button("Reset view##model_reset"):
         view.camera = (0.0, 70.0, 1.0, (0.0, 0.0))
     imgui.same_line()
@@ -1294,41 +1273,39 @@ def _draw_view_options(view) -> None:
     imgui.same_line()
     if imgui.small_button("Edge-on##model_edge"):
         view.camera = (view.camera[0], 3.0, view.camera[2], view.camera[3])
-    if imgui.is_item_hovered():
-        imgui.set_tooltip("Looks along the cloth: a flat picture would vanish to a line, the model shows its thickness.")
     imgui.same_line()
     _, view.spin = imgui.checkbox("Spin##model_spin", bool(view.spin))
     imgui.same_line()
     _, view.wiggle = imgui.checkbox("Wiggle##model_wiggle", bool(view.wiggle))
-    if imgui.is_item_hovered():
-        imgui.set_tooltip("Rocks the view a few degrees either way: in a 3D model the near yarn slides\n"
-                          "over the far yarn and the table; a flat picture would only skew as one piece.")
-    imgui.same_line()
-    _, view.by_height = imgui.checkbox("Colour by height##model_height", bool(view.by_height))
-    if view.gl is not None:
-        imgui.same_line()
-        imgui.set_next_item_width(150)
-        _, view.style = imgui.combo("Draw##model_style", int(view.style), list(splat_gl.STYLES))
-        if imgui.is_item_hovered():
-            imgui.set_tooltip("Soft splat: the picture as trained.\n"
-                              "Gaussian ellipses: every Gaussian solid out to one standard deviation, rimmed -\n"
-                              "its size, stretch and turn. Gaussian centres: only their middles, as dots.\n"
-                              "Soft splat + Gaussian outlines: the picture with each Gaussian's outline in it;\n"
-                              "turn it and the outlines change shape as flattened 3D ellipsoids do.\n"
-                              "Gaussian axes: each Gaussian's longest axis as a 3D line - red along the cloth's x,\n"
-                              "green along its y, blue standing up out of it.\n"
-                              "Soft splat + Gaussian axes: those axes on the model; the ones behind the cloth stay hidden.")
     if view.plane is not None:
         relief_mm = (view.plane[4] - view.plane[3]) * float(view.mm_per_unit)
-        imgui.text_colored(COLOR_MUTED, f"Relief above the cloth's bow: {relief_mm:.2f} mm (2nd to 98th percentile of "
-                                        f"{len(view.splat['positions']):,} Gaussians); a flat picture would be 0.")
-    if imgui.is_item_hovered():
-        imgui.set_tooltip("Each Gaussian coloured by how far it stands above the cloth's smooth bow:\n"
-                          "blue low, red high. The yarn's crossings and the openings' rims show as relief.")
+        imgui.same_line()
+        imgui.text_colored(COLOR_MUTED, f"| Relief: {relief_mm:.2f} mm ({len(view.splat['positions']):,} Gaussians)")
+
+    if view.periodic is not None or view.crochet is not None:
+        imgui.text("Equation source:")
+        for i, name in enumerate(SOURCES):
+            if (i == 1 and view.periodic is None) or (i == 2 and view.crochet is None):
+                continue
+            imgui.same_line()
+            if imgui.radio_button(f"{name}##model_source{i}", view.source == i):
+                view.source = i
+    if view.show in (1, 2, 3):
+        imgui.set_next_item_width(210)
+        _, view.colouring = imgui.combo("Yarn colour##model_colour", int(view.colouring), list(COLOURINGS))
+        if view.colouring == 1:
+            imgui.same_line()
+            imgui.set_next_item_width(110)
+            _, view.heat_mm = imgui.slider_float("Max error (mm)##model_heat", float(view.heat_mm), 0.1, 2.0, "%.2f")
+        if view.show == 3:
+            imgui.same_line()
+            imgui.set_next_item_width(140)
+            _, view.overlay = imgui.slider_float("Overlay opacity##model_overlay", float(view.overlay), 0.0, 1.0, "%.2f")
+    imgui.separator()
 
 
 def draw_model_panel(state, renderer) -> None:
-    """Model Mode's whole window: controls on the left, the pictures on the right."""
+    """Gaussian Splatting sidebar controls inside 'Knitting Control'."""
     view = _view(state)
     _poll_loader(view)
     _poll_extractor(view)
@@ -1336,56 +1313,76 @@ def draw_model_panel(state, renderer) -> None:
     _poll_crochet(view)
     _poll_fabric_job(view)
     _poll_yarns_job(view)
-    if imgui.begin_child("model_controls", (CONTROLS_WIDTH, 0)):
-        if imgui.collapsing_header("Model##model_section", imgui.TreeNodeFlags_.default_open):
-            _draw_model_choice(view)
-            if view.models and view.index >= 0:
-                _draw_drive(view, view.models[view.index])
-        if imgui.collapsing_header("Fabric colour##model_fabric_section", imgui.TreeNodeFlags_.default_open):
-            _draw_fabric_colours(view)
-        if imgui.collapsing_header("Loop equations##model_eq_section", imgui.TreeNodeFlags_.default_open):
+
+    _draw_model_choice(view)
+    imgui.separator()
+    if imgui.begin_tab_bar("##splat_sidebar_tabs"):
+        tab_eq, _ = imgui.begin_tab_item("Equations")
+        if tab_eq:
             _draw_extraction(view)
             _draw_comparison(view.extraction)
             _draw_strands(view)
-        if imgui.collapsing_header("Crochet model (posts and chains)##model_crochet_section", imgui.TreeNodeFlags_.default_open):
-            _draw_crochet(view, state)
-        if imgui.collapsing_header("Knit repeating loops##model_periodic_section"):
-            _draw_periodic(view, state)
-        if view.status:
-            imgui.separator()
-            imgui.text_wrapped(view.status)
-    imgui.end_child()
-    imgui.same_line()
-    if imgui.begin_child("model_pictures", (0, 0)):
-        _draw_view_options(view)
-        if view.spin and not view.dragging:
-            azimuth, elevation, zoom, pan = view.camera
-            azimuth = ((azimuth + SPIN_DEG_PER_S * float(imgui.get_io().delta_time) + 180.0) % 360.0) - 180.0
-            view.camera = (azimuth, elevation, zoom, pan)
-        if view.wiggle and not view.dragging:
-            offset = WIGGLE_DEG * float(np.sin(2.0 * np.pi * WIGGLE_HZ * time.monotonic()))
-            azimuth, elevation, zoom, pan = view.camera
-            view.camera = (azimuth + offset - view.wiggle_offset, elevation, zoom, pan)
-            view.wiggle_offset = offset
-        if view.splat is None or view.frame is None:
-            imgui.text_colored(COLOR_MUTED, "Loading the model..." if view.loader is not None else "No model loaded.")
-        else:
-            ctx = renderer.ctx
-            avail = max(200.0, imgui.get_content_region_avail().x)
-            have_tubes = view.extraction is not None
-            if view.show == 2 and have_tubes:
-                half = (avail - imgui.get_style().item_spacing.x) * 0.5
-                rects = [_draw_picture(view, ctx, "scan", half, "Scan")]
-                imgui.same_line()
-                rects.append(_draw_picture(view, ctx, "equations", half, _model_caption(view)))
-            elif view.show == 1 and have_tubes:
-                rects = [_draw_picture(view, ctx, "equations", avail, _model_caption(view))]
-            elif view.show == 3 and have_tubes:
-                rects = [_draw_picture(view, ctx, "overlay", avail, "Equation yarn over the scan")]
+            imgui.end_tab_item()
+
+        tab_fit, _ = imgui.begin_tab_item("Stitch Fit")
+        if tab_fit:
+            if imgui.collapsing_header("Crochet (posts & chains)##model_crochet_section", imgui.TreeNodeFlags_.default_open):
+                _draw_crochet(view, state)
+            if imgui.collapsing_header("Knit repeating loops##model_periodic_section", imgui.TreeNodeFlags_.default_open):
+                _draw_periodic(view, state)
+            imgui.end_tab_item()
+
+        tab_col, _ = imgui.begin_tab_item("Colors & Yarns")
+        if tab_col:
+            _draw_fabric_colours(view)
+            imgui.end_tab_item()
+
+        tab_drive, _ = imgui.begin_tab_item("Drive")
+        if tab_drive:
+            if view.models and view.index >= 0:
+                _draw_drive(view, view.models[view.index])
             else:
-                rects = [_draw_picture(view, ctx, "scan", avail, "Scan")]
-            _handle_mouse(view, rects)
-    imgui.end_child()
-    if view.gl is not None:               # splats no picture drew this frame are let go
+                imgui.text_disabled("Select a trained splat first.")
+            imgui.end_tab_item()
+
+        imgui.end_tab_bar()
+
+    if view.status:
+        imgui.separator()
+        imgui.text_wrapped(view.status)
+
+
+def draw_model_viewport(state, renderer) -> None:
+    """Gaussian Splatting 3D viewer inside '3D View'."""
+    view = _view(state)
+    _draw_view_options(view)
+    if view.spin and not view.dragging:
+        azimuth, elevation, zoom, pan = view.camera
+        azimuth = ((azimuth + SPIN_DEG_PER_S * float(imgui.get_io().delta_time) + 180.0) % 360.0) - 180.0
+        view.camera = (azimuth, elevation, zoom, pan)
+    if view.wiggle and not view.dragging:
+        offset = WIGGLE_DEG * float(np.sin(2.0 * np.pi * WIGGLE_HZ * time.monotonic()))
+        azimuth, elevation, zoom, pan = view.camera
+        view.camera = (azimuth + offset - view.wiggle_offset, elevation, zoom, pan)
+        view.wiggle_offset = offset
+    if view.splat is None or view.frame is None:
+        imgui.text_colored(COLOR_MUTED, "Loading Gaussian splat..." if view.loader is not None else "No Gaussian splat loaded.")
+    else:
+        ctx = renderer.ctx
+        avail = max(200.0, imgui.get_content_region_avail().x)
+        have_tubes = view.extraction is not None
+        if view.show == 2 and have_tubes:
+            half = (avail - imgui.get_style().item_spacing.x) * 0.5
+            rects = [_draw_picture(view, ctx, "scan", half, "Gaussian Splat (Scan)")]
+            imgui.same_line()
+            rects.append(_draw_picture(view, ctx, "equations", half, _model_caption(view)))
+        elif view.show == 1 and have_tubes:
+            rects = [_draw_picture(view, ctx, "equations", avail, _model_caption(view))]
+        elif view.show == 3 and have_tubes:
+            rects = [_draw_picture(view, ctx, "overlay", avail, "Equation yarn over Gaussian Splat")]
+        else:
+            rects = [_draw_picture(view, ctx, "scan", avail, "Gaussian Splat (Scan)")]
+        _handle_mouse(view, rects)
+    if view.gl is not None:
         view.gl.forget(keep=view.gl_used)
         view.gl_used = set()

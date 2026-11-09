@@ -163,9 +163,7 @@ def _draw_one_frame(gui, app_state, renderer, mode, window=None, ref_tex=None):
         draw_mode_windows = getattr(gui, "draw_mode_windows", None)
         if draw_mode_windows is not None:
             draw_mode_windows(app_state, scene_renderer, window)
-        if mode != "database":
-            # app.py skips the viewport in Database Mode, which takes the window over.
-            gui.draw_viewport(app_state, scene_renderer, ref_tex, window)
+        gui.draw_viewport(app_state, scene_renderer, ref_tex, window)
         imgui.render()
     return int(imgui.get_draw_data().total_vtx_count)
 
@@ -291,19 +289,21 @@ def test_vertex_counts_are_recorded_per_mode(imgui_context, state, gl_context, r
 
 
 def test_reset_layout_brings_the_controls_back_in_front(imgui_context, state, gl_context, ref_tex, tmp_path, monkeypatch):
-    """Windows docked into one full-screen panel covered the control window and every mode button
-    with it; Reset Layout must undock them and put the controls back, at their own size, in front."""
+    """Knitting Control and 3D View keep fixed positions and sizes across all modes and after Reset Layout."""
     import gui
     import paths
 
     monkeypatch.setattr(paths, "LAYOUT_INI", tmp_path / "imgui_layout.ini")
     app_state, renderer = state
-    _draw_one_frame(gui, app_state, renderer, "model", gl_context.window, ref_tex)   # the big Model Mode window
     gui._reset_layout(app_state)
-    _draw_one_frame(gui, app_state, renderer, "edit", gl_context.window, ref_tex)
-    window = imgui.internal.find_window_by_name("Knitting Control")
-    assert (window.pos.x, window.pos.y) == (20, 20)
-    assert (window.size.x, window.size.y) == (360, 820)
+    for mode in MODES:
+        _draw_one_frame(gui, app_state, renderer, mode, gl_context.window, ref_tex)
+        ctrl_win = imgui.internal.find_window_by_name("Knitting Control")
+        vp_win = imgui.internal.find_window_by_name("3D View")
+        assert (ctrl_win.pos.x, ctrl_win.pos.y) == (20, 20)
+        assert (ctrl_win.size.x, ctrl_win.size.y) == (360, 820)
+        assert (vp_win.pos.x, vp_win.pos.y) == (390, 20)
+        assert (vp_win.size.x, vp_win.size.y) == (1190, 820)
     assert not app_state.get("_layout_reset_pending", False)
 
 

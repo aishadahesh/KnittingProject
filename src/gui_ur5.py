@@ -1309,29 +1309,36 @@ def _draw_ur5_controls_column(state, controller, renderer):
 
 
 def draw_ur5_panel(state, renderer, window=None):
-    """The whole UR5 Robot Mode sidebar."""
+    """UR5 Robot Mode sidebar controls inside 'Knitting Control'."""
     controller = state.get("ur5_controller")
     if controller is None:
         controller = UR5ModeController(state, renderer.ctx, window)
         state.ur5_controller = controller
 
     controller.update_preview()
-
-    if bool(state.get("ur5_show_scene", False)):
-        _draw_ur5_controls_column(state, controller, renderer)
-        return
-
-    imgui.begin_child("ur5_controls", imgui.ImVec2(480, 0), imgui.ChildFlags_.borders)
     _draw_ur5_controls_column(state, controller, renderer)
-    imgui.end_child()
 
-    imgui.same_line()
-    imgui.begin_child("ur5_workspace", imgui.ImVec2(0, 0), imgui.ChildFlags_.borders)
+
+def draw_ur5_viewport(state, renderer, window=None):
+    """UR5 Robot Mode visual workspace inside '3D View'."""
+    controller = state.get("ur5_controller")
+    if controller is None:
+        controller = UR5ModeController(state, renderer.ctx, window)
+        state.ur5_controller = controller
+
+    avail_w = max(240.0, float(imgui.get_content_region_avail().x))
+    left_w = max(240.0, (avail_w - imgui.get_style().item_spacing.x) * 0.5)
+
     imgui.push_id("ur5_workspace")
+    imgui.begin_child("ur5_vp_camera", imgui.ImVec2(left_w, 0), imgui.ChildFlags_.borders)
     imgui.separator_text("Live Camera & Jog")
     _draw_live_preview(state, controller)
     if controller.robot.connected:
         _draw_jog_pad(state, controller)
+    imgui.end_child()
+
+    imgui.same_line()
+    imgui.begin_child("ur5_vp_path", imgui.ImVec2(0, 0), imgui.ChildFlags_.borders)
     imgui.separator_text("Checked Capture Path")
     plan = controller.plan
     if plan is not None:
@@ -1341,8 +1348,8 @@ def draw_ur5_panel(state, renderer, window=None):
         _draw_viewpoint_rows(plan, active)
     else:
         imgui.text_disabled("Press 'Check path' in Step 3 / Capture to preview viewpoints.")
-    imgui.pop_id()
     imgui.end_child()
+    imgui.pop_id()
 
 
 def _draw_simple_page(state, controller, renderer):

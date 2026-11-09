@@ -673,37 +673,27 @@ def _draw_database_summary_page(state, renderer):
         imgui.text_disabled("No filters selected.")
     state.database_filter_values = selected_filters
 
-    all_selected_id = int(state.get("database_selected_capture_id", 0))
-    all_selected_item = next((item for item in all_captures if int(item.get("id", -1)) == all_selected_id), None)
-    if str(state.get("database_view_mode", "results")) == "image" and all_selected_item is not None:
-        _draw_database_image_preview(state, renderer, all_selected_item)
-        return
-
     imgui.separator()
     imgui.text("Group by")
     group_specs = _database_group_specs()
     group_labels = [label for label, _key in group_specs]
     current_group_key = state.get("database_group_by", None)
     current_group_index = next((i for i, (_label, key) in enumerate(group_specs) if key == current_group_key), 0)
-    imgui.set_next_item_width(220)
+    imgui.set_next_item_width(-1)
     changed_group, new_group_index = imgui.combo("##db_group_by", current_group_index, group_labels)
     if changed_group:
         current_group_key = group_specs[new_group_index][1]
         state.database_group_by = current_group_key
 
-    if imgui.collapsing_header("Detailed checkbox filters"):
+    if imgui.collapsing_header("Detailed checkbox filters", imgui.TreeNodeFlags_.default_open):
         if imgui.small_button("Clear filters##database_clear_filters"):
             selected_filters = {}
-        imgui.same_line()
-        imgui.text_disabled("Choose one or more options. Results update immediately.")
         for label, key in _database_filter_specs():
             options = sorted({_database_filter_value(item, key) for item in captures}, key=lambda x: str(x).lower())
             options = [value for value in options if value not in (None, "")]
             active = set(selected_filters.get(key, []))
-            title = f"{label} ({len(active)} selected)##db_filter_{key}"
+            title = f"{label} ({len(active)})##db_filter_{key}"
             if imgui.tree_node(title):
-                if len(options) > 80:
-                    imgui.text_disabled(f"Showing first 80 of {len(options)} options. Use other filters to narrow the list.")
                 for idx, option in enumerate(options[:80]):
                     checked = option in active
                     changed, new_checked = imgui.checkbox(f"{option}##db_filter_{key}_{idx}", checked)
@@ -721,9 +711,48 @@ def _draw_database_summary_page(state, renderer):
 
     selected_filters = _database_selected_filters(state)
     filtered = [item for item in captures if _database_matches_filters(item, selected_filters)]
-
     imgui.separator()
-    imgui.text(f"Results: {len(filtered)} / {len(captures)} shown")
+    imgui.text(f"Matching results: {len(filtered)} / {len(captures)}")
+    if state.scanner_status:
+        imgui.text_wrapped(str(state.scanner_status))
+
+
+def draw_database_viewport(state, renderer):
+    storage = _scanner_storage(state)
+    if storage is None:
+        imgui.text_disabled("Scanner database is not available.")
+        return
+    try:
+        summary = storage.cached_database_summary()
+    except Exception as exc:
+        imgui.text_wrapped(f"Could not load scanner dataset: {exc}")
+        return
+
+    all_captures = list(summary.get("captures", []))
+    patterns = list(summary.get("patterns", []))
+    if not all_captures and not patterns:
+        imgui.text_disabled("No saved scanner patterns or captured images yet. Run Scan Mode to populate the dataset.")
+        return
+
+    available_captures = []
+    missing_captures = []
+    for item in all_captures:
+        (available_captures if _database_capture_file_exists(state, item) else missing_captures).append(item)
+    show_missing = bool(state.get("database_show_missing", False))
+    captures = available_captures + (missing_captures if show_missing else [])
+
+    all_selected_id = int(state.get("database_selected_capture_id", 0))
+    all_selected_item = next((item for item in all_captures if int(item.get("id", -1)) == all_selected_id), None)
+    if str(state.get("database_view_mode", "results")) == "image" and all_selected_item is not None:
+        _draw_database_image_preview(state, renderer, all_selected_item)
+        return
+
+    selected_filters = _database_selected_filters(state)
+    filtered = [item for item in captures if _database_matches_filters(item, selected_filters)]
+    current_group_key = state.get("database_group_by", None)
+
+    imgui.text(f"Database Results ({len(filtered)} / {len(captures)} shown)")
+    imgui.separator()
 
     if imgui.collapsing_header("Image results", imgui.TreeNodeFlags_.default_open):
         imgui.text_disabled("Click a thumbnail (or its Open button) for the full-size preview and metadata.")
@@ -742,7 +771,7 @@ def _draw_database_summary_page(state, renderer):
             imgui.text_disabled(f"Showing first {len(shown)} of {len(filtered)} images. Add filters to narrow the rest.")
 
     if imgui.collapsing_header("Analysis results"):
-        imgui.text_disabled("Saved RGB analysis summaries. Use filters above to compare related experiments.")
+        imgui.text_disabled("Saved RGB analysis summaries. Use filters in the sidebar to compare related experiments.")
         analyses = list(summary.get("analyses", []))
         visible_analysis_count = 0
         for analysis in reversed(analyses[-20:]):
@@ -791,6 +820,3 @@ def _draw_database_summary_page(state, renderer):
                 imgui.tree_pop()
         if visible_analysis_count == 0:
             imgui.text_disabled("No analysis rows match the current filters.")
-
-    imgui.separator()
-    imgui.text_wrapped(str(state.scanner_status))

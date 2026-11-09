@@ -30,7 +30,7 @@ from rendering import (draw_fitted_texture, project_to_screen, transform_points,
 from fabric_scanner import clamp_capture_size
 import paths
 from embedded_scanner import EmbeddedMujocoScanner
-from gui_database import _draw_database_summary_page
+from gui_database import _draw_database_summary_page, draw_database_viewport
 # Moved to scanner_core (see its docstring). Re-imported under their original
 # names so every call site in this file is unchanged.
 from scanner_core import (
@@ -286,14 +286,7 @@ def draw_menu_bar(state):
                 state.undo_last()
             imgui.end_menu()
         if imgui.begin_menu("Mode"):
-            for mode_id, mode_label in (
-                ('edit', "Edit"),
-                ('scan', "Scan"),
-                ('puzzle', "Puzzle"),
-                ('database', "Database"),
-                ('model', "Model"),
-                ('ur5', "UR5 Robot"),
-            ):
+            for mode_id, mode_label, _ in MODE_SPECS:
                 clicked_mode, _ = imgui.menu_item(mode_label, "", current_mode == mode_id)
                 if clicked_mode:
                     _set_app_mode(state, mode_id)
@@ -432,6 +425,8 @@ def _open_model_in_edit(state, request):
 
 
 def _set_app_mode(state, mode):
+    if mode in ('splat', 'splatting'):
+        mode = 'model'
     mode = mode if mode in ('edit', 'scan', 'puzzle', 'database', 'ur5', 'model') else 'edit'
     current_mode = str(state.get('app_mode', 'edit'))
     if current_mode == mode:
@@ -1033,7 +1028,7 @@ MODE_SPECS = (
     ('scan', "Scan", "Simulate multi-angle UR5e fabric scanning in MuJoCo"),
     ('puzzle', "Puzzle", "Test seamless tile repeat and landmark extraction"),
     ('database', "Database", "Browse captured images, metadata, and RGB analyses"),
-    ('model', "Model", "Inspect 3D Gaussian splats and fit yarn/stitch equations"),
+    ('model', "Splatting", "Inspect 3D Gaussian splats and fit yarn/stitch equations"),
     ('ur5', "UR5 Robot", "Connect to physical UR5e or TeleopApp, capture, and reconstruct"),
 )
 
@@ -1200,20 +1195,14 @@ def _draw_appearance_controls(state, rebuild_current_mesh, is_knit=True):
 def draw_sidebar(state, renderer, window=None):
     _apply_ui_theme(state)
     current_mode = str(state.get('app_mode', 'edit'))
-    wide_layout = current_mode in ('database', 'model') or (current_mode == 'ur5' and not bool(state.get('ur5_show_scene', False)))
-    if wide_layout:
-        imgui.set_next_window_pos((20, 20), cond=imgui.Cond_.always)
-        imgui.set_next_window_size((1280, 840), cond=imgui.Cond_.always)
-        state._was_wide_layout = True
-    else:
-        reset = bool(state.get('_layout_reset_pending', False)) or bool(state.get('_was_wide_layout', False))
-        cond = imgui.Cond_.always if reset else imgui.Cond_.first_use_ever
-        imgui.set_next_window_pos((20, 20), cond=cond)
-        imgui.set_next_window_size((360, 820), cond=cond)
-        if reset:
-            imgui.set_next_window_focus()
-            state._layout_reset_pending = False
-            state._was_wide_layout = False
+    reset = bool(state.get('_layout_reset_pending', False)) or not bool(state.get('_sidebar_sized_once', False))
+    cond = imgui.Cond_.always if reset else imgui.Cond_.first_use_ever
+    imgui.set_next_window_pos((20, 20), cond=cond)
+    imgui.set_next_window_size((360, 820), cond=cond)
+    state._sidebar_sized_once = True
+    if reset:
+        imgui.set_next_window_focus()
+        state._layout_reset_pending = False
     imgui.begin("Knitting Control")
 
     def rebuild_current_mesh(preserve=True):
@@ -1340,7 +1329,7 @@ def draw_sidebar(state, renderer, window=None):
     ur5_active = current_mode == 'ur5'
     model_active = current_mode == 'model'
 
-    cols_per_row = 6 if wide_layout else 3
+    cols_per_row = 3
     spacing_x = imgui.get_style().item_spacing.x
     avail_w = imgui.get_content_region_avail().x
     mode_btn_w = max(72.0, (avail_w - spacing_x * (cols_per_row - 1)) / cols_per_row)
@@ -2365,11 +2354,6 @@ def draw_sidebar(state, renderer, window=None):
                         )
                         imgui.same_line()
                         imgui.text(f"{rgb[0]}, {rgb[1]}, {rgb[2]} ({int(item.get('count', 0))} px)")
-                texture = _upload_puzzle_texture(state, renderer, 'capture')
-                if texture is not None:
-                    avail_w = max(120, int(imgui.get_content_region_avail().x))
-                    preview_h = int(avail_w * image.size[1] / max(image.size[0], 1))
-                    _draw_puzzle_capture_widget(state, image, texture, avail_w, preview_h)
 
         if imgui.collapsing_header("3. Seamless Tile & Glue Preview##puzzle_glue_section", imgui.TreeNodeFlags_.default_open):
             glue_cols = int(state.get('puzzle_glue_cols', 3))
@@ -2417,13 +2401,6 @@ def draw_sidebar(state, renderer, window=None):
                         tile_image.save(output_dir / f"puzzle_tile_{stamp}.png")
                     glued_image.save(output_dir / f"puzzle_glued_{stamp}.png")
                     state.status_msg = f"Saved puzzle_tile_{stamp}.png and puzzle_glued_{stamp}.png"
-                glue_texture = _upload_puzzle_texture(state, renderer, 'glued')
-                if glue_texture is not None:
-                    avail_w = max(120, int(imgui.get_content_region_avail().x))
-                    preview_h = int(min(avail_w * glued_image.size[1] / max(glued_image.size[0], 1), 480))
-                    glue_rect = draw_fitted_texture(glue_texture.glo, glued_image.size[0], glued_image.size[1], avail_w, preview_h, flip_y=True)
-                    if bool(state.get('puzzle_glue_highlight_edges', False)):
-                        _draw_puzzle_glue_edge_overlay(glued_image, glue_rect, info)
 
     if (
         str(state.get('app_mode', 'edit')) == 'scan'
@@ -2434,6 +2411,8 @@ def draw_sidebar(state, renderer, window=None):
 
     embedded = state.get('embedded_scanner')
     if str(state.get('app_mode', 'edit')) == 'scan' and embedded is not None:
+        scan_vp = str(state.get('_scan_vp_mode', 'split'))
+        embedded.preview_visible = scan_vp in ('split', 'camera')
         try:
             needs_update = (
                 getattr(embedded, 'running', False)
@@ -2452,137 +2431,308 @@ def draw_sidebar(state, renderer, window=None):
                 logging.warning("Scanner cleanup: %s", cleanup_error)
             state.embedded_scanner = None
 
-    if str(state.get('app_mode', 'edit')) == 'scan':
-        imgui.separator()
-        embedded = state.get('embedded_scanner')
-        # Folding this away genuinely stops the work, not just the drawing: the
-        # live view costs a full camera render per target -- more than the saved
-        # capture -- and the scanner only produces it while this is open.
-        shown = imgui.collapsing_header("Robot Camera View", imgui.TreeNodeFlags_.default_open)
-        if embedded is not None:
-            embedded.preview_visible = bool(shown)
-        if shown:
-            imgui.text_disabled("Live image from the UR5 gripper camera")
-            preview_w = max(120, int(imgui.get_content_region_avail().x))
-            preview_h = int(preview_w * 0.75)
-            if embedded is None:
-                imgui.dummy((preview_w, preview_h))
-                imgui.text_wrapped("Camera preview waiting for scan. Press Start Scanner Now.")
-            elif embedded.camera_texture is None:
-                imgui.dummy((preview_w, preview_h))
-                imgui.text_wrapped("Camera preview waiting for the first scanner frame.")
-            else:
-                draw_fitted_texture(
-                    embedded.camera_texture.glo,
-                    embedded.camera_preview_width,
-                    embedded.camera_preview_height,
-                    preview_w,
-                    preview_h,
-                    flip_y=False,
-                )
-        else:
-            imgui.text_disabled("Live view paused -- scanning runs faster while this is closed.")
-
     if state.status_msg:
         imgui.separator()
         imgui.text_colored((0.4, 0.9, 0.4, 1.0), str(state.status_msg))
     state.maybe_autosave()
     imgui.end()
 
-    embedded = state.get('embedded_scanner')
-    if str(state.get('app_mode', 'edit')) == 'scan' and embedded is not None and embedded.texture is not None:
-        imgui.set_next_window_size((760, 540), cond=imgui.Cond_.first_use_ever)
-        imgui.begin("Robot Viewer")
-        imgui.text(str(embedded.status))
-        view_changed = False
-        changed_zoom, zoom = imgui.slider_float("Zoom##scanner_view_zoom", float(embedded.view_zoom), 0.45, 2.50, "%.2fx")
-        if changed_zoom:
-            embedded.set_zoom(zoom)
-            view_changed = True
-        if imgui.small_button("Zoom in##scanner_view"):
-            embedded.zoom_in()
-            view_changed = True
-        imgui.same_line()
-        if imgui.small_button("Zoom out##scanner_view"):
-            embedded.zoom_out()
-            view_changed = True
-        imgui.same_line()
-        if imgui.small_button("Reset view##scanner_view"):
-            embedded.reset_view()
-            view_changed = True
-        if imgui.small_button("Rotate left##scanner_view"):
-            embedded.rotate_view(delta_azimuth=-12.0)
-            view_changed = True
-        imgui.same_line()
-        if imgui.small_button("Rotate right##scanner_view"):
-            embedded.rotate_view(delta_azimuth=12.0)
-            view_changed = True
-        imgui.same_line()
-        if imgui.small_button("Tilt up##scanner_view"):
-            embedded.rotate_view(delta_elevation=8.0)
-            view_changed = True
-        imgui.same_line()
-        if imgui.small_button("Tilt down##scanner_view"):
-            embedded.rotate_view(delta_elevation=-8.0)
-            view_changed = True
-        imgui.separator()
-        imgui.text("UR5 Robot Simulator")
-        avail = imgui.get_content_region_avail()
-        main_w = max(1, int(avail.x))
-        main_h = max(1, int(avail.y))
-        rect = draw_fitted_texture(embedded.texture.glo, embedded.width, embedded.height, main_w, main_h, flip_y=False)
-        if rect is not None:
-            x, y, w, h = rect
-            io = imgui.get_io()
-            mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
-            image_hovered = (x <= mx <= x + w and y <= my <= y + h and imgui.is_window_hovered())
-            if image_hovered:
-                if float(io.mouse_wheel) != 0.0:
-                    embedded.set_zoom(embedded.view_zoom * float(np.exp(float(io.mouse_wheel) * 0.16)))
-                    view_changed = True
-                if window is not None:
-                    lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
-                    rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-                    mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
-                    dx, dy = float(io.mouse_delta.x), float(io.mouse_delta.y)
-                    if (abs(dx) > 0.0 or abs(dy) > 0.0) and lmb:
-                        embedded.orbit_view(dx, dy)
-                        view_changed = True
-                    elif (abs(dx) > 0.0 or abs(dy) > 0.0) and (rmb or mmb):
-                        embedded.pan_view(dx, dy)
-                        view_changed = True
-            imgui.text_disabled("Mouse over simulator: wheel zoom, left-drag rotate, right/middle-drag pan")
-        if view_changed:
-            embedded._render_frame()
-        imgui.end()
 
-    if str(state.get('app_mode', 'edit')) == 'puzzle' and state.get('puzzle_capture_image', None) is not None:
-        image = state.get('puzzle_capture_image')
-        texture = _upload_puzzle_texture(state, renderer, 'capture')
-        if image is not None and texture is not None:
-            imgui.set_next_window_size((760, 620), cond=imgui.Cond_.first_use_ever)
-            imgui.begin("Puzzle Capture Inspector")
-            imgui.text("Captured Image")
-            imgui.text_disabled("White dots are real loop control points. Green dots are detected X/Y edge landmarks. Click the image to inspect pixel RGB.")
-            avail = imgui.get_content_region_avail()
-            inspector_w = max(240, int(avail.x))
-            inspector_h = max(240, int(avail.y - 40))
-            _draw_puzzle_capture_widget(state, image, texture, inspector_w, inspector_h)
-            imgui.end()
+def _draw_scan_simulator_canvas(state, embedded, window, height=0):
+    if embedded is None:
+        imgui.text_disabled("Simulator not initialized. Press Start Scan in Knitting Control.")
+        return
+    if embedded.texture is None:
+        imgui.text_disabled("Waiting for simulator frame...")
+        return
+    view_changed = False
+    imgui.text("UR5 Robot Simulator")
+    imgui.same_line()
+    imgui.set_next_item_width(90)
+    changed_zoom, zoom = imgui.slider_float("##scanner_view_zoom", float(embedded.view_zoom), 0.45, 2.50, "%.2fx")
+    if changed_zoom:
+        embedded.set_zoom(zoom)
+        view_changed = True
+    imgui.same_line()
+    if imgui.small_button("Reset##scanner_view"):
+        embedded.reset_view()
+        view_changed = True
+    imgui.same_line()
+    if imgui.small_button("Rot L##scanner_view"):
+        embedded.rotate_view(delta_azimuth=-12.0)
+        view_changed = True
+    imgui.same_line()
+    if imgui.small_button("Rot R##scanner_view"):
+        embedded.rotate_view(delta_azimuth=12.0)
+        view_changed = True
+    imgui.same_line()
+    if imgui.small_button("Tilt +##scanner_view"):
+        embedded.rotate_view(delta_elevation=8.0)
+        view_changed = True
+    imgui.same_line()
+    if imgui.small_button("Tilt -##scanner_view"):
+        embedded.rotate_view(delta_elevation=-8.0)
+        view_changed = True
+    avail = imgui.get_content_region_avail()
+    main_w = max(1, int(avail.x))
+    main_h = max(1, int(height if height > 0 else avail.y - 24))
+    rect = draw_fitted_texture(embedded.texture.glo, embedded.width, embedded.height, main_w, main_h, flip_y=True)
+    if rect is not None:
+        x, y, w, h = rect
+        io = imgui.get_io()
+        mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
+        image_hovered = (x <= mx <= x + w and y <= my <= y + h and imgui.is_window_hovered())
+        if image_hovered:
+            if float(io.mouse_wheel) != 0.0:
+                embedded.set_zoom(embedded.view_zoom * float(np.exp(float(io.mouse_wheel) * 0.16)))
+                view_changed = True
+            if window is not None:
+                lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+                rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+                mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
+                dx, dy = float(io.mouse_delta.x), float(io.mouse_delta.y)
+                if (abs(dx) > 0.0 or abs(dy) > 0.0) and lmb:
+                    embedded.orbit_view(dx, dy)
+                    view_changed = True
+                elif (abs(dx) > 0.0 or abs(dy) > 0.0) and (rmb or mmb):
+                    embedded.pan_view(dx, dy)
+                    view_changed = True
+        imgui.text_disabled("Wheel: zoom | LMB drag: rotate | RMB/MMB drag: pan")
+    if view_changed:
+        embedded._render_frame()
+
+
+def _draw_scan_gripper_camera_canvas(embedded, height=0):
+    imgui.text("Live Gripper Camera")
+    imgui.same_line()
+    imgui.text_disabled("(UR5 wrist camera feed)")
+    avail = imgui.get_content_region_avail()
+    preview_w = max(120, int(avail.x))
+    preview_h = max(90, int(height if height > 0 else avail.y - 8))
+    if embedded is None:
+        imgui.dummy((preview_w, preview_h))
+        imgui.text_disabled("Camera preview waiting for scan. Press Start Scan.")
+    elif embedded.camera_texture is None:
+        imgui.dummy((preview_w, preview_h))
+        imgui.text_disabled("Camera preview waiting for the first scanner frame.")
+    else:
+        draw_fitted_texture(
+            embedded.camera_texture.glo,
+            embedded.camera_preview_width,
+            embedded.camera_preview_height,
+            preview_w,
+            preview_h,
+            flip_y=True,
+        )
+
+
+def _draw_puzzle_inspector_canvas(state, renderer, height=0):
+    imgui.text("Captured Frame & Landmarks")
+    imgui.same_line()
+    imgui.text_disabled("(White: loop pts | Green: edge landmarks | Click to inspect RGB)")
+    image = state.get('puzzle_capture_image', None)
+    if image is None:
+        imgui.text_disabled("No puzzle frame captured yet. Click 'Capture geometry preview' in Knitting Control.")
+        return
+    texture = _upload_puzzle_texture(state, renderer, 'capture')
+    if texture is None:
+        return
+    avail = imgui.get_content_region_avail()
+    w = max(120, int(avail.x))
+    h = max(120, int(height if height > 0 else avail.y - 36))
+    _draw_puzzle_capture_widget(state, image, texture, w, h)
+
+
+def _draw_puzzle_glue_canvas(state, renderer, height=0):
+    imgui.text("Seamless Glued Tile")
+    glued_image = state.get('puzzle_glued_image', None)
+    info = state.get('puzzle_glue_info', {}) or {}
+    if glued_image is None:
+        imgui.text_disabled("No seamless tile built yet. Click 'Build seamless tile' in Knitting Control.")
+        return
+    glue_texture = _upload_puzzle_texture(state, renderer, 'glued')
+    if glue_texture is None:
+        return
+    avail = imgui.get_content_region_avail()
+    w = max(120, int(avail.x))
+    h = max(120, int(height if height > 0 else avail.y - 8))
+    glue_rect = draw_fitted_texture(glue_texture.glo, glued_image.size[0], glued_image.size[1], w, h, flip_y=True)
+    if bool(state.get('puzzle_glue_highlight_edges', False)):
+        _draw_puzzle_glue_edge_overlay(glued_image, glue_rect, info)
+
+
+def _draw_orbit_canvas(state, window):
+    orbit_renderer = getattr(state, 'orbit_renderer', None)
+    orbit_camera = getattr(state, 'orbit_camera', None)
+    if orbit_renderer is None or orbit_camera is None:
+        imgui.text_disabled("No orbit renderer attached.")
+        return
+    imgui.text("3D Orbit Grid")
+    imgui.same_line()
+    if imgui.small_button("Reset Orbit##orbit_reset"):
+        orbit_camera.az = float(np.radians(-30.0))
+        orbit_camera.el = float(np.radians(28.0))
+        orbit_camera.dist = 32.0
+    imgui.same_line()
+    imgui.text_disabled("LMB drag: orbit | Wheel: zoom")
+    avail_x, avail_y = imgui.get_content_region_avail()
+    disp_w = max(1, int(avail_x))
+    disp_h = max(1, int(avail_y))
+    orbit_renderer.resize(disp_w, disp_h)
+    orbit_camera.target = (np.asarray(state.mesh_center, dtype=np.float32)
+                           + np.asarray(state.model_t, dtype=np.float32)).astype(np.float32)
+    model_mat = state.current_model_matrix()
+    mvp = (orbit_camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
+    mv = (orbit_camera.mv(disp_w, disp_h) @ model_mat).astype(np.float32)
+    orbit_renderer.render(
+        mvp, mv,
+        state.get_material_uniforms(),
+        camera=orbit_camera,
+        visible_rows=state.row_visible,
+        model_mat=model_mat,
+        show_grid=True,
+    )
+    draw_fitted_texture(
+        orbit_renderer.texture_id,
+        disp_w,
+        disp_h,
+        avail_x,
+        avail_y,
+        flip_y=True,
+    )
+    is_hovered = imgui.is_item_hovered()
+    mx, my = imgui.get_mouse_pos()
+    if is_hovered:
+        wheel = float(imgui.get_io().mouse_wheel)
+        if wheel != 0.0:
+            zoom_factor = float(np.exp(wheel * 0.12))
+            orbit_camera.dist = float(np.clip(float(orbit_camera.dist) / zoom_factor, 1.0, 200.0))
+    if window is not None and glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
+        if state.get('orbit_dragging', False):
+            prev = state.get('prev_orbit_mouse', None)
+            if prev is not None:
+                orbit_camera.orbit(mx - prev[0], my - prev[1])
+            state.prev_orbit_mouse = (mx, my)
+        elif is_hovered:
+            state.orbit_dragging = True
+            state.prev_orbit_mouse = (mx, my)
+    else:
+        state.orbit_dragging = False
+        state.prev_orbit_mouse = None
+
 
 def draw_viewport(state, renderer, ref_tex, window):
-    reset_vp = bool(state.get('_layout_reset_viewport', False))
+    reset_vp = bool(state.get('_layout_reset_viewport', False)) or not bool(state.get('_viewport_sized_once', False))
     vp_cond = imgui.Cond_.always if reset_vp else imgui.Cond_.first_use_ever
     imgui.set_next_window_pos((390, 20), cond=vp_cond)
-    imgui.set_next_window_size((820, 820), cond=vp_cond)
-    if reset_vp:
+    imgui.set_next_window_size((1190, 820), cond=vp_cond)
+    state._viewport_sized_once = True
+    if state.get('_layout_reset_viewport', False):
         state._layout_reset_viewport = False
     imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
-    if str(state.get('app_mode', 'edit')) == 'puzzle':
+
+    current_mode = str(state.get('app_mode', 'edit'))
+    if current_mode == 'database':
+        draw_database_viewport(state, renderer)
+        imgui.end()
+        return
+
+    if current_mode == 'model':
+        gui_model.draw_model_viewport(state, renderer)
+        imgui.end()
+        return
+
+    if current_mode == 'ur5':
+        show_scene = bool(state.get('ur5_show_scene', False))
+        imgui.text("UR5 Workspace:")
+        imgui.same_line()
+        if imgui.radio_button("Camera & Capture Path##ur5_vp_cam", not show_scene):
+            state.ur5_show_scene = False
+            show_scene = False
+        imgui.same_line()
+        if imgui.radio_button("3D Knit Layout##ur5_vp_scene", show_scene):
+            state.ur5_show_scene = True
+            show_scene = True
+        imgui.separator()
+        if not show_scene:
+            gui_ur5.draw_ur5_viewport(state, renderer, window)
+            imgui.end()
+            return
+
+    split_right_mode = None
+    if current_mode == 'edit':
+        edit_vp = str(state.get('_edit_vp_mode', 'split'))
+        imgui.text("Edit View:")
+        for key, label in (('split', "Split: 3D + Orbit Grid"), ('3d', "3D Fabric Only"), ('orbit', "3D Orbit Grid Only")):
+            imgui.same_line()
+            if imgui.radio_button(f"{label}##edit_vp_{key}", edit_vp == key):
+                state._edit_vp_mode = key
+                edit_vp = key
+        if edit_vp == 'orbit':
+            imgui.separator()
+            _draw_orbit_canvas(state, window)
+            imgui.end()
+            return
+        if edit_vp == 'split':
+            split_right_mode = 'edit_orbit'
+    elif current_mode == 'scan':
+        scan_vp = str(state.get('_scan_vp_mode', 'split'))
+        imgui.text("Scan View:")
+        for key, label in (
+            ('split', "Split: Fabric + Robot"),
+            ('fabric', "3D Fabric Grid"),
+            ('simulator', "UR5 Robot Simulator"),
+            ('camera', "Gripper Camera"),
+        ):
+            imgui.same_line()
+            if imgui.radio_button(f"{label}##scan_vp_{key}", scan_vp == key):
+                state._scan_vp_mode = key
+                scan_vp = key
+        embedded = state.get('embedded_scanner')
+        if embedded is not None:
+            embedded.preview_visible = scan_vp in ('split', 'camera')
+        if scan_vp == 'simulator':
+            imgui.separator()
+            _draw_scan_simulator_canvas(state, embedded, window)
+            imgui.end()
+            return
+        if scan_vp == 'camera':
+            imgui.separator()
+            _draw_scan_gripper_camera_canvas(embedded)
+            imgui.end()
+            return
+        if scan_vp == 'split':
+            split_right_mode = 'scan_robot'
+    elif current_mode == 'puzzle':
         renderer = state.puzzle_renderer
+        puzzle_vp = str(state.get('_puzzle_vp_mode', 'split'))
+        imgui.text("Puzzle View:")
+        for key, label in (
+            ('split', "Split: 3D + Previews"),
+            ('3d', "3D Puzzle Only"),
+            ('capture', "Captured Frame & Landmarks"),
+            ('glue', "Seamless Glued Tile"),
+        ):
+            imgui.same_line()
+            if imgui.radio_button(f"{label}##puzzle_vp_{key}", puzzle_vp == key):
+                state._puzzle_vp_mode = key
+                puzzle_vp = key
+        if puzzle_vp == 'capture':
+            imgui.separator()
+            _draw_puzzle_inspector_canvas(state, renderer)
+            imgui.end()
+            return
+        if puzzle_vp == 'glue':
+            imgui.separator()
+            _draw_puzzle_glue_canvas(state, renderer)
+            imgui.end()
+            return
+        if puzzle_vp == 'split':
+            split_right_mode = 'puzzle_previews'
+
     imgui.text(
         "3D Puzzle Viewport"
-        if str(state.get('app_mode', 'edit')) == 'puzzle'
+        if current_mode == 'puzzle'
         else "3D Viewport"
     )
     imgui.same_line()
@@ -2606,7 +2756,8 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.same_line()
     imgui.text_disabled("LMB: move | RMB/MMB: orbit | Wheel: zoom")
 
-    avail_x, avail_y = imgui.get_content_region_avail()
+    total_avail_x, avail_y = imgui.get_content_region_avail()
+    avail_x = max(240.0, (total_avail_x - 8.0) * 0.52) if split_right_mode else total_avail_x
     disp_w = max(1, int(avail_x))
     disp_h = max(1, int(avail_y))
     renderer.resize(disp_w, disp_h)
@@ -3497,80 +3648,34 @@ def draw_viewport(state, renderer, ref_tex, window):
     else:
         state.prev_mouse = None
 
+    if split_right_mode is not None:
+        right_w = max(180.0, total_avail_x - avail_x - 8.0)
+        imgui.set_cursor_screen_pos(imgui.ImVec2(draw_pos.x + avail_x + 8.0, draw_pos.y))
+        if imgui.begin_child("##vp_split_right", imgui.ImVec2(right_w, avail_y), imgui.ChildFlags_.borders):
+            if split_right_mode == 'edit_orbit':
+                _draw_orbit_canvas(state, window)
+            elif split_right_mode == 'scan_robot':
+                embedded = state.get('embedded_scanner')
+                top_h = max(140.0, (avail_y - 90.0) * 0.56)
+                _draw_scan_simulator_canvas(state, embedded, window, height=top_h)
+                imgui.separator()
+                bot_h = max(100.0, imgui.get_content_region_avail().y - 36.0)
+                _draw_scan_gripper_camera_canvas(embedded, height=bot_h)
+            elif split_right_mode == 'puzzle_previews':
+                top_h = max(140.0, (avail_y - 90.0) * 0.50)
+                _draw_puzzle_inspector_canvas(state, renderer, height=top_h)
+                imgui.separator()
+                bot_h = max(120.0, imgui.get_content_region_avail().y - 32.0)
+                _draw_puzzle_glue_canvas(state, renderer, height=bot_h)
+        imgui.end_child()
+
     imgui.end()
 
 
 def draw_orbit_viewport(state, window):
-    """Second, freely-orbitable view of the same model, over a ground grid.
-
-    The main viewport locks the camera and only lets the model be transformed;
-    this one is the opposite, so the fabric can be inspected from any angle
-    without disturbing the edit view's framing.
-    """
+    """Second, freely-orbitable view of the same model, over a ground grid."""
     imgui.set_next_window_pos((1220, 20), cond=imgui.Cond_.first_use_ever)
     imgui.set_next_window_size((360, 370), cond=imgui.Cond_.first_use_ever)
     imgui.begin("3D Orbit View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
-
-    # getattr, not state.get(): orbit_camera/orbit_renderer are live objects
-    # held on the instance and deliberately kept out of state._data, so the
-    # dict-style accessor would always report them as missing.
-    orbit_renderer = getattr(state, 'orbit_renderer', None)
-    orbit_camera = getattr(state, 'orbit_camera', None)
-    if orbit_renderer is None or orbit_camera is None:
-        imgui.text_disabled("No orbit renderer attached.")
-        imgui.end()
-        return
-
-    avail_x, avail_y = imgui.get_content_region_avail()
-    disp_w = max(1, int(avail_x))
-    disp_h = max(1, int(avail_y))
-    orbit_renderer.resize(disp_w, disp_h)
-    orbit_camera.target = (np.asarray(state.mesh_center, dtype=np.float32)
-                           + np.asarray(state.model_t, dtype=np.float32)).astype(np.float32)
-
-    model_mat = state.current_model_matrix()
-    mvp = (orbit_camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
-    mv = (orbit_camera.mv(disp_w, disp_h) @ model_mat).astype(np.float32)
-    orbit_renderer.render(
-        mvp, mv,
-        state.get_material_uniforms(),
-        camera=orbit_camera,
-        visible_rows=state.row_visible,
-        model_mat=model_mat,
-        show_grid=True,
-    )
-
-    draw_fitted_texture(
-        orbit_renderer.texture_id,
-        disp_w,
-        disp_h,
-        avail_x,
-        avail_y,
-        flip_y=True,
-    )
-
-    is_hovered = imgui.is_item_hovered()
-    mx, my = imgui.get_mouse_pos()
-
-    if is_hovered:
-        wheel = float(imgui.get_io().mouse_wheel)
-        if wheel != 0.0:
-            zoom_factor = float(np.exp(wheel * 0.12))
-            orbit_camera.dist = float(np.clip(float(orbit_camera.dist) / zoom_factor, 1.0, 200.0))
-
-    # Drag continues once started even if the cursor leaves the window, so a
-    # fast orbit does not stop dead at the edge.
-    if glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-        if state.get('orbit_dragging', False):
-            prev = state.get('prev_orbit_mouse', None)
-            if prev is not None:
-                orbit_camera.orbit(mx - prev[0], my - prev[1])
-            state.prev_orbit_mouse = (mx, my)
-        elif is_hovered:
-            state.orbit_dragging = True
-            state.prev_orbit_mouse = (mx, my)
-    else:
-        state.orbit_dragging = False
-        state.prev_orbit_mouse = None
-
+    _draw_orbit_canvas(state, window)
     imgui.end()
