@@ -11,12 +11,12 @@ Module layout (dependencies point one way, no cycles):
 draw_orbit_viewport from here. Names moved into scanner_core kept their original
 spelling and are re-imported below, so call sites in this file are unchanged.
 """
+import logging
 import os
 import json
 import numpy as np
 import glfw
 import time
-import queue
 import threading
 from types import SimpleNamespace
 from pathlib import Path
@@ -24,11 +24,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog as _filedialog
 from imgui_bundle import imgui, imguizmo
-from PIL import Image
 
 from rendering import (draw_fitted_texture, project_to_screen, transform_points,
-                       upload_rgb_texture, MeshRenderer)
-from rgb_analysis import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
+                       upload_rgb_texture)
 from fabric_scanner import clamp_capture_size
 import paths
 from embedded_scanner import EmbeddedMujocoScanner
@@ -38,16 +36,14 @@ from gui_database import _draw_database_summary_page
 from scanner_core import (
     _clamp_scanner_selected_cell, _ensure_scanner_shared_colors,
     _generate_scanner_random_patterns, _maybe_persist_scanner_state,
-    _persist_scanner_state, _puzzle_apply_geometry_copies,
+    _puzzle_apply_geometry_copies,
     _puzzle_build_seamless_tile, _puzzle_capture_geometry_image, _puzzle_capture_rect,
     _puzzle_detect_colors, _puzzle_target_copies,
-    _refresh_embedded_scanner_display_colors, _scan_render_tiled_pattern_images,
-    _scanner_base_palette, _scanner_batch_colors_for_simulator,
+    _refresh_embedded_scanner_display_colors, _scanner_base_palette, _scanner_batch_colors_for_simulator,
     _scanner_batch_texture_size, _scanner_capture_image_size,
     _scanner_display_batch_colors, _scanner_estimated_cell_colors,
     _scanner_generate_tiled_layout, _scanner_lighting_settings,
-    _scanner_material_uniforms, _scanner_pattern_database_payload,
-    _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
+    _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
     _scanner_shared_cell_color_sets, _scanner_storage, _set_puzzle_capture_rect,
     _set_scanner_estimated_batch_color, _upload_puzzle_texture,
 )
@@ -437,8 +433,8 @@ def _set_app_mode(state, mode):
         if controller is not None:
             try:
                 controller.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("gui._set_app_mode: %s", exc)
             state.ur5_controller = None
     if mode != 'edit' and bool(state.get('sim_active', False)):
         # Stop the solver before handing the model to Scan/Puzzle/Database.
@@ -452,8 +448,8 @@ def _set_app_mode(state, mode):
     if embedded is not None:
         try:
             embedded.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("gui._set_app_mode: %s", exc)
         state.embedded_scanner = None
     # Puzzle owns its model, pattern and undo history. Swap workspaces only
     # after the scanner has closed, so an in-flight temporary scan render has
@@ -1032,8 +1028,8 @@ def draw_sidebar(state, renderer, window=None):
             if auto_start and not getattr(embedded, 'running', False):
                 try:
                     embedded.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.warning("gui.ensure_embedded_robot_viewer: %s", exc)
                 state.embedded_scanner = None
             else:
                 return embedded
@@ -1087,8 +1083,8 @@ def draw_sidebar(state, renderer, window=None):
         if embedded is not None:
             try:
                 embedded.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("gui.start_scanner_process: %s", exc)
             state.embedded_scanner = None
         _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
@@ -1289,11 +1285,6 @@ def draw_sidebar(state, renderer, window=None):
         return
 
     if edit_active:
-        if bool(state.get('scanner_preview_grid_enabled', False)):
-            state.scanner_preview_grid_enabled = False
-            state.display_copies = np.array([0, 0], dtype=np.int32)
-            state.rebuild_spline_mesh(preserve_model_placement=False)
-
         if _draw_fabric_type(state) == 'crochet':
             _draw_crochet_editor(state)
             if imgui.collapsing_header("Fit to a scan##crochet_scan_fit", imgui.TreeNodeFlags_.default_open):
@@ -1309,7 +1300,6 @@ def draw_sidebar(state, renderer, window=None):
             _draw_scan_fit(state, 'knit', renderer)
 
         if imgui.collapsing_header("Loop Heights", imgui.TreeNodeFlags_.default_open):
-            state._sync_loop_heights()
             params = state.config['knit_parameters']['parameters']
             default_idx = state._lh_idx[0] if state._lh_idx else None
             lo, hi = (0.0, 6.0)
@@ -1586,16 +1576,6 @@ def draw_sidebar(state, renderer, window=None):
         # -- Scanning section: scan layout, random patterns, and capture setup --
         rows = max(1, int(state.scanner_rows))
         cols = max(1, int(state.scanner_cols))
-        preview_mismatch = (
-            not bool(state.get('scanner_preview_grid_enabled', False))
-            or int(state.get('scanner_preview_rows', 0)) != rows
-            or int(state.get('scanner_preview_cols', 0)) != cols
-        )
-        if preview_mismatch:
-            state.scanner_preview_grid_enabled = True
-            state.scanner_preview_rows = rows
-            state.scanner_preview_cols = cols
-            state.rebuild_spline_mesh(preserve_model_placement=False)
         changed_r, new_r = imgui.slider_int("Layout rows##scanner_rows", rows, 1, 12)
         changed_c, new_c = imgui.slider_int("Layout columns##scanner_cols", cols, 1, 16)
         changed_a, new_a = imgui.slider_int("Angles per square##scanner_angles", int(state.scanner_angles), 1, 16)
@@ -1613,8 +1593,8 @@ def draw_sidebar(state, renderer, window=None):
             if embedded is not None:
                 try:
                     embedded.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.warning("gui.draw_sidebar: %s", exc)
                 state.embedded_scanner = None
                 state.scanner_status = "Scanner layout changed; press Start Scanner to generate new random patterns"
             state.rebuild_spline_mesh(preserve_model_placement=False)
@@ -1724,8 +1704,8 @@ def draw_sidebar(state, renderer, window=None):
             if embedded is not None:
                 try:
                     embedded.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.warning("gui.draw_sidebar: %s", exc)
                 state.embedded_scanner = None
             state.scanner_status = "Random pattern settings changed; press Start Scanner to rebuild"
         imgui.text("Preview mode")
@@ -1777,8 +1757,8 @@ def draw_sidebar(state, renderer, window=None):
             if embedded is not None:
                 try:
                     embedded.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.warning("gui.draw_sidebar: %s", exc)
                 state.embedded_scanner = None
             state.scanner_status = "Shared scanner colors changed; press Start Scanner to rebuild"
             state.rebuild_spline_mesh(preserve_model_placement=False)
@@ -1896,8 +1876,8 @@ def draw_sidebar(state, renderer, window=None):
             if embedded is not None:
                 try:
                     embedded.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.warning("gui.draw_sidebar: %s", exc)
             state.embedded_scanner = None
             state.scanner_status = "Scanner lighting changed; press Start Scanner to rebuild"
 
@@ -2522,8 +2502,8 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_status = f"Embedded scanner error: {exc}"
             try:
                 embedded.close()
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                logging.warning("Scanner cleanup: %s", cleanup_error)
             state.embedded_scanner = None
 
     if str(state.get('app_mode', 'edit')) == 'scan':
@@ -2649,9 +2629,6 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.set_next_window_size((840, 820), cond=imgui.Cond_.first_use_ever)
     imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
     if str(state.get('app_mode', 'edit')) == 'puzzle':
-        # Validate immediately before drawing.  This is the last ownership
-        # boundary, after sidebar callbacks and any completed Scan work.
-        state.ensure_puzzle_scene()
         renderer = state.puzzle_renderer
     imgui.text(
         "3D Puzzle Viewport"
@@ -3314,7 +3291,6 @@ def draw_viewport(state, renderer, ref_tex, window):
         return -1
 
     def local_radius_value(flat_idx):
-        state._ensure_spline_radius_rows()
         row_idx = np.searchsorted(state._row_starts, flat_idx, side="right") - 1
         if not (0 <= row_idx < len(state.spline_radius_rows)):
             return float(state.params[state._pidx['radius']])
@@ -3350,7 +3326,6 @@ def draw_viewport(state, renderer, ref_tex, window):
             dy = my - prev[1]
             lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT)  == glfw.PRESS
             rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-            mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE)== glfw.PRESS
             shift_down = imgui.get_io().key_shift
 
             if not edit_controls_active:

@@ -18,6 +18,7 @@ watermarked so a synthetic frame can never be mistaken for a real capture.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -130,8 +131,8 @@ class OpenCVCameraBackend(CameraBackend):
         # ago, which for a moving robot is a picture of the wrong pose.
         try:
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("robot_camera.open: %s", exc)
         self.actual_size = (
             int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
             int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
@@ -162,16 +163,16 @@ class OpenCVCameraBackend(CameraBackend):
             if manual and exposure not in (0.0, -1.0):
                 self._capture.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
             taken["exposure"] = bool(manual)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("robot_camera.lock_exposure: %s", exc)
         try:
             temperature = self._capture.get(cv2.CAP_PROP_WB_TEMPERATURE)
             fixed = self._capture.set(cv2.CAP_PROP_AUTO_WB, 0.0)
             if fixed and temperature > 0:
                 self._capture.set(cv2.CAP_PROP_WB_TEMPERATURE, float(temperature))
             taken["white_balance"] = bool(fixed)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("robot_camera.lock_exposure: %s", exc)
         self.exposure_locked = taken
         return taken
 
@@ -212,8 +213,8 @@ class OpenCVCameraBackend(CameraBackend):
         if self._capture is not None:
             try:
                 self._capture.release()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("robot_camera.close: %s", exc)
             self._capture = None
 
     def describe(self) -> str:
@@ -337,8 +338,8 @@ class _SuppressOpenCVLogging:
         if self._logging is not None and self._previous is not None:
             try:
                 self._logging.setLogLevel(self._previous)
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("robot_camera.__exit__: %s", exc)
         return False
 
 
@@ -396,14 +397,14 @@ def list_devices(max_devices: int = 10) -> list[dict[str, Any]]:
                                 "is_real": True,
                             })
                             found = True
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logging.warning("robot_camera.list_devices: %s", exc)
                     finally:
                         if capture is not None:
                             try:
                                 capture.release()
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logging.warning("robot_camera.list_devices: %s", exc)
                     if found:
                         break
                 misses = 0 if found else misses + 1
@@ -485,8 +486,8 @@ class RobotCamera:
             thread.join(timeout=1.5)
         try:
             self.backend.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("robot_camera.stop: %s", exc)
         with self._new_frame:
             self._new_frame.notify_all()
         self.status = "Camera stopped"

@@ -21,7 +21,6 @@ not its relief: that needs tilted views.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import shutil
 import sys
@@ -34,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 import gaussian_splatting  # noqa: E402
 import gui_captures  # noqa: E402
+from persistence import write_json
 
 HALF = 4                     # pictures correlated at a quarter size (enough: every pair votes)
 MAX_PAIR_STEP_MM = 22.0     # direct neighbours: a 37 mm two-step does not overlap a 25 mm frame
@@ -225,7 +225,7 @@ def main() -> None:
                                         "pairs": len(pairs), "pairs_agreeing": agree, "margin": margin, "camera_height_m": camera_height},
                   **({"mirrored": True} if mirror else {}), "ply_file_path": gaussian_splatting.SEED_PLY_NAME,
                   "exposure_equalised": bool(gains), "frames": frames}
-    (output / "transforms.json").write_text(json.dumps(transforms, indent=2), encoding="utf-8")
+    write_json(output / 'transforms.json', transforms, indent=2)
     gaussian_splatting._write_colmap_model(output / "sparse" / "0", colmap_images, intrinsics)
     print(f"camera {camera_height * 100:.1f} cm over the cloth (for a {args.focal:.0f} px lens); "
           f"{len(frames)} pictures and {len(points)} seed points written to {output}")

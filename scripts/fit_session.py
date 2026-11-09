@@ -10,7 +10,6 @@ See src/session_fit.py for how. Only the pictures the arm took (with a pose) are
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -23,6 +22,7 @@ import gui_captures  # noqa: E402
 import hand_eye  # noqa: E402
 import lens  # noqa: E402
 import session_fit  # noqa: E402
+from persistence import write_json
 
 
 def main() -> None:
@@ -64,7 +64,7 @@ def main() -> None:
     print(f"exported {dataset.image_count} of {len(records)} pictures to {dataset.root}")
     report = {"session": args.session, "rounds": fitted["rounds"], "lens": {k: float(v) for k, v in lens_fit.items()},
               "mirrored": fitted["mirrored"], "start": fitted["start"], "exported": dataset.image_count, "offered": len(records)}
-    (folder / args.output / "fit_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    write_json(folder / args.output / 'fit_report.json', report, indent=2)
 
 
 if __name__ == "__main__":

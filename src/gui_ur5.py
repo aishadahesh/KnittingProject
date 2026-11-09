@@ -18,6 +18,7 @@ inside three functions to dodge the cycle -- that is gone.
 
 from __future__ import annotations
 
+import logging
 import json
 import re
 import threading
@@ -37,6 +38,7 @@ import gaussian_splatting
 import gui_captures
 import hand_eye
 import paths
+from persistence import write_json
 import robot_camera
 import scan_geometry
 import scanner_core
@@ -256,7 +258,6 @@ class UR5ModeController:
         self.video_extract_result = ""
         self.status = "UR5 Robot Mode ready"
         self.devices: list[dict] = []
-        self.devices_scanned = False
         # Names which run was asked for and is awaiting confirmation - "scan", "capture",
         # or "" for none. The arm does not move while one is pending.
         self.pending_start = ""
@@ -325,7 +326,6 @@ class UR5ModeController:
 
     def scan_devices(self) -> None:
         self.devices = self._simulated_cameras() + robot_camera.list_devices()
-        self.devices_scanned = True
         real = [d for d in self.devices if d.get("is_real")]
         self.status = (
             f"Found {len(real)} camera(s)" if real
@@ -423,8 +423,8 @@ class UR5ModeController:
         if self.preview_texture is not None:
             try:
                 self.preview_texture.release()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("gui_ur5.stop_camera: %s", exc)
             self.preview_texture = None
             self._preview_size = (0, 0)
 
@@ -1058,8 +1058,8 @@ class UR5ModeController:
         try:
             path = taught_set_path(name)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"name": path.stem, "tool_offset": float(self.state.get("teleop_tool_offset", 0.0306)),
-                                        "views": views}, indent=2))
+            write_json(path, {"name": path.stem, "tool_offset": float(self.state.get("teleop_tool_offset", 0.0306)),
+                                        "views": views}, indent=2)
         except Exception as exc:
             self.status = f"Could not save taught views: {exc}"
             return
@@ -1365,7 +1365,7 @@ def _draw_simple_page(state, controller, renderer):
     if header(1, "Connect the arm and the camera", connected and camera_on, not (connected and camera_on)):
         _draw_connection(state, controller)
         labels = [str(device["label"]) for device in controller.devices] or ["(none)"]
-        if not controller.devices_scanned:
+        if imgui.button("Find cameras##simple_camera_scan"):
             controller.scan_devices()
         selected = int(np.clip(int(state.get("ur5_camera_device", 0)), 0, len(labels) - 1))
         changed_device, selected = imgui.combo("Camera##simple_camera_device", selected, labels)
@@ -1619,9 +1619,6 @@ def _draw_teleop_status(transport):
 
 
 def _draw_camera_setup(state, controller):
-    if not controller.devices_scanned:
-        controller.scan_devices()
-
     if imgui.button("Rescan cameras##ur5_camera_scan", (-1, 0)):
         controller.scan_devices()
     if not robot_camera.opencv_available():
@@ -2150,7 +2147,6 @@ def _draw_teacher(state, controller):
     """Record the camera where the hand left it, the list of what has been taught, and the sets on disk."""
     robot = controller.robot
     running = controller.runner is not None and controller.runner.running
-    half = max(90.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
 
     imgui.separator_text("Taught views")
     imgui.text_colored(COLOR_MUTED, "Jog the camera to each view you want (2 Position), then Record view here.")
@@ -2968,7 +2964,7 @@ def _draw_splat_advanced(state, controller, session_id, folder, records, shown, 
                 if extras:
                     solve_folder = scans / f"combined_{time.strftime('%Y%m%d_%H%M%S')}"
                     solve_folder.mkdir(parents=True)
-                    (solve_folder / "combined.json").write_text(json.dumps({"sessions": [str(folder), *(str(scans / other) for other in extras)]}))
+                    write_json(solve_folder / "combined.json", {"sessions": [str(folder), *(str(scans / other) for other in extras)]})
                 controller.robot_solver = _start_pose_solve(controller, solve_folder, count,
                                                             float(state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)),
                                                             COLMAP_DATASET_NAME)

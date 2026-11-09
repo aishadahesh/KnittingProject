@@ -550,7 +550,7 @@ def run_simulation_step(ctrl_rows, period_offset_x, period_offset_y, config, J_c
     return ctrl_rows
 
 
-def eval_energy(flat_P, ctrl_rows, period_offset_x, period_offset_y, config, L0_array, dhat, filter_collisions=True):
+def eval_energy(flat_P, ctrl_rows, period_offset_x, period_offset_y, config, L0_array, dhat):
     num_ctrl_rows = len(ctrl_rows)
     ctrl_offset = 0
     perturbed_ctrl_rows = []

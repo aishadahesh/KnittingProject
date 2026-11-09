@@ -15,7 +15,6 @@ three things properly, and both are judged by the same targets (readiness).
 
 from __future__ import annotations
 
-import json
 import math
 import queue
 import threading
@@ -27,6 +26,7 @@ import numpy as np
 from PIL import Image
 
 import robot_camera
+from persistence import write_json
 
 # Distance bands, relative to the first picture (the whole fabric, straight down): label, what to
 # shoot, the band's lower and upper bound, and how many pictures it needs. Generous for a flat
@@ -406,7 +406,7 @@ class FreeCaptureSession:
             **view,
             **frame.metadata(),
         }
-        path.with_suffix(".json").write_text(json.dumps(record, indent=2))
+        write_json(path.with_suffix('.json'), record, indent=2)
         with self._lock:
             self.records.append(record)
             self._features.append(found)

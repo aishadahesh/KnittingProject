@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import threading
@@ -6,6 +7,7 @@ import numpy as np
 
 import crochet_core
 import paths
+from persistence import json_ready, state_value, write_json
 
 from knitting_core import (
     anchor_bitmap, compute_knitting_faces, row_base_pitch,
@@ -42,18 +44,6 @@ class AppState:
     # at all, which breaks the fabric into disconnected motifs once it is tiled.
     # Low enough that cells still look meaningfully different from one another.
     SCANNER_INACTIVE_LOOP_HEIGHT_SCALE = 0.45
-
-    @staticmethod
-    def _json_ready(value):
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, np.generic):
-            return value.item()
-        if isinstance(value, (list, tuple)):
-            return [AppState._json_ready(v) for v in value]
-        if isinstance(value, dict):
-            return {k: AppState._json_ready(v) for k, v in value.items()}
-        return value
 
     @staticmethod
     def _clone(v):
@@ -120,33 +110,6 @@ class AppState:
         }
         for attr, cast_fn in _SCHEMA_CASTS.items():
             super().__setattr__(attr, cast_fn(app_config[attr]))
-        extra_saved_keys = (
-            'fabric_type', 'crochet_params', 'crochet_stitches',
-            'app_mode', 'loop_heights', 'loop_height_overrides', 'scanner_layout_pattern', 'scanner_color_mode', 'ui_theme',
-            'scanner_random_seed', 'scanner_pattern_density', 'scanner_pattern_rows', 'scanner_pattern_cols',
-            'scanner_pattern_repeat_rows', 'scanner_pattern_repeat_cols',
-            'scanner_repeat_spacing_x', 'scanner_repeat_spacing_y', 'scanner_capture_mode',
-            'scanner_lighting_enabled', 'scanner_light_azimuth', 'scanner_light_elevation', 'scanner_light_sun_intensity',
-            'scanner_light_shadow', 'scanner_light_sheen',
-            'scanner_camera_workflow', 'scanner_single_row', 'scanner_single_col', 'scanner_single_angle', 'scanner_camera_zoom',
-            'puzzle_copies_x', 'puzzle_copies_y', 'puzzle_capture_width', 'puzzle_capture_height', 'puzzle_detect_color_count',
-            'puzzle_capture_rect',
-            # UR5 Robot Mode settings. ur5_controller is deliberately absent: it
-            # holds live threads and GL handles, and is not state to save.
-            'ur5_robot_ip', 'ur5_transport', 'ur5_speed_limit', 'ur5_dwell', 'ur5_save_images', 'ur5_video',
-            'ur5_capture_width', 'ur5_camera_device', 'ur5_lighting_condition', 'ur5_workspace_center',
-            'ur5_splat_fov', 'ur5_splat_camera_offset', 'ur5_splat_command',
-            'ur5_camera_autofocus', 'ur5_camera_focus', 'ur5_min_sharpness', 'ur5_fabric_check', 'ur5_min_coverage',
-            'ur5_show_detection', 'ur5_home_joints', 'ur5_camera_image_turn', 'ur5_show_scene', 'ur5_jog_step', 'ur5_expert', 'ur5_splat_object_only',
-            'free_auto', 'free_auto_interval', 'free_require_sides',
-            'teleop_address', 'teleop_pattern', 'teleop_angles', 'teleop_arc', 'teleop_elevation',
-            'teleop_rings', 'teleop_max_rise', 'teleop_view_radius', 'teleop_subject_distance',
-            'teleop_tool_offset', 'teleop_move_seconds', 'teleop_speed_deg_s',
-            'teleop_grid_rows', 'teleop_grid_cols', 'teleop_camera_height', 'teleop_orbit_radius', 'teleop_max_tilt',
-            'teleop_taught_views', 'teleop_taught_set', 'teleop_fabric_corners', 'teleop_fabric_z', 'teleop_grid_overlap', 'teleop_sweep_overlap', 'teleop_grid_views', 'teleop_grid_passes', 'teleop_overview_height', 'teleop_overview_joints',
-            'teleop_splat_views', 'teleop_splat_layers',
-        )
-        super().__setattr__('saved_state_keys', tuple(dict.fromkeys((*self.saved_state_keys, *extra_saved_keys))))
 
         # Auto-coerce flat numeric lists to np.float32 arrays, leaving other structures intact
         def _coerce(val):
@@ -180,8 +143,8 @@ class AppState:
             initial_bitmap = np.asarray(initial_data.get('bitmap', []), dtype=np.float32)
             if initial_bitmap.ndim == 2 and initial_bitmap.size:
                 initial_pattern_rows, initial_pattern_cols = [int(v) for v in initial_bitmap.shape]
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("app_state.__init__: %s", exc)
 
         # 5. Overlay computed defaults depending on config.json or runtime pathing
         computed_defaults = {
@@ -191,156 +154,10 @@ class AppState:
             'bitmap': np.ones((3, config_data['knit_parameters']['bitmap_loops']), dtype=np.float32),
             'bitmap_size': np.array([3, config_data['knit_parameters']['bitmap_loops']], dtype=np.int32),
             'display_copies': np.array([0, 0], dtype=np.int32),
-            # Edit Mode's fabric: 'knit' (the loop rows above) or 'crochet' (crochet_core's posts and
-            # chains, from its own parameters and a stitch grid: rows x stitches, 1 a post, 0 open).
-            'fabric_type': 'knit',
             'crochet_params': crochet_core.CrochetParams().as_dict(),
             'crochet_stitches': np.array([[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float32),
-            'app_mode': 'edit',
-            # Incremented for every mode transition. Temporary Scan work records
-            # this value and is forbidden from restoring across a transition.
-            'mode_epoch': 0,
-            'scanner_layout_pattern': 'grid',
-            'scanner_random_seed': 1,
-            'scanner_pattern_density': 0.62,
             'scanner_pattern_rows': initial_pattern_rows,
             'scanner_pattern_cols': initial_pattern_cols,
-            'scanner_pattern_repeat_rows': 3,
-            'scanner_pattern_repeat_cols': 3,
-            'scanner_repeat_spacing_x': 1.0,
-            'scanner_repeat_spacing_y': 1.0,
-            'scanner_lighting_enabled': True,
-            'scanner_light_azimuth': -35.0,
-            'scanner_light_elevation': 48.0,
-            'scanner_light_sun_intensity': 0.68,
-            'scanner_light_shadow': 0.20,
-            'scanner_light_sheen': 0.025,
-            'scanner_capture_mode': 'natural',
-            'scanner_camera_workflow': 'path',
-            'scanner_single_row': 1,
-            'scanner_single_col': 1,
-            'scanner_single_angle': 1,
-            'scanner_camera_zoom': 1.0,
-            # Transient UI-facing summary of the asynchronous high-resolution
-            # single-capture pipeline. The scanner owns the actual worker job;
-            # AppState only exposes progress without leaking thread objects.
-            'single_capture_job': None,
-            'single_capture_job_seq': 0,
-            # ── UR5 Robot Mode ───────────────────────────────────────────────
-            # The real arm. Separate from the scanner_robot_* keys, which drive
-            # Scan Mode's fire-and-forget URScript send: this mode holds a live
-            # RTDE connection and must not inherit that path's settings.
-            # Defaults are deliberately timid -- dry run, quarter speed -- so
-            # opening the mode cannot command hardware by itself.
-            # This cell's arm. It was the campus address 132.74.121.230, which no longer
-            # answers, so a Direct RTDE connect spent the OS TCP timeout failing.
-            'ur5_robot_ip': '192.168.0.101',
-            'ur5_transport': 'teleop',
-            'ur5_speed_limit': 0.25,
-            'ur5_dwell': 0.2,
-            'ur5_save_images': True,
-            'ur5_video': True,
-            'ur5_capture_width': 640,
-            'ur5_camera_device': 0,
-            'ur5_lighting_condition': '',
-            'ur5_workspace_center': [-0.45, -0.08, 0.30],
-            'ur5_splat_fov': 38.0,
-            # Capture quality. Focus is the camera's own UVC control - most webcam autofocus
-            # hunts at close range. A capture below the sharpness is retaken; one with less
-            # fabric than the coverage (by MobileSAM) is flagged and left out of the analysis.
-            'ur5_camera_autofocus': True,
-            'ur5_camera_focus': 0.0,
-            'ur5_min_sharpness': 150.0,
-            'ur5_fabric_check': True,
-            'ur5_min_coverage': 0.8,
-            'ur5_show_detection': True,
-            # Home, once straightened (lens down, image squared to the cloth); empty until then,
-            # and Home is ur5_robot.DEFAULT_HOME_JOINTS, the pose taught by hand.
-            'ur5_home_joints': [],
-            # How the camera's image is turned on the tool, measured by Calibrate camera turn;
-            # empty until then, which means the image's axes are taken to be the tool's.
-            'ur5_camera_image_turn': [],
-            # Whether UR5 Robot Mode also renders the knit scan preview in the 3D View - off, as it
-            # is the heaviest per-frame work there and TeleopApp already shows the cell.
-            'ur5_show_scene': False,
-            # UR5 Robot Mode shows one simple page unless Expert is ticked.
-            'ur5_expert': False,
-            'ur5_splat_object_only': True,
-            # How far one press of the Position tab's jog pad moves the camera.
-            'ur5_jog_step': 0.01,
-            'ur5_splat_camera_offset': 0.12,
-            'ur5_splat_command': '',
-            # 5 Free capture: whether pictures are taken by themselves while the camera is held, and how often.
-            'free_auto': False,
-            'free_auto_interval': 1.5,
-            # Whether "enough" asks for tilted views from around the fabric; off, top-down views suffice.
-            'free_require_sides': True,
-            # The capture path this mode flies when it drives the arm through TeleopApp.
-            # The tool offset is the measured camera mount, not a guess: it is what makes a
-            # planned tool point and the arm's actual camera the same place.
-            'teleop_address':           'localhost:50052',
-            'teleop_pattern':           'grid',
-            'teleop_angles':            6,
-            'teleop_arc':               360.0,
-            'teleop_elevation':         75.0,
-            'teleop_rings':             3,
-            'teleop_max_rise':          0.19,
-            'teleop_view_radius':       0.06,
-            'teleop_subject_distance':  0.20,
-            'teleop_tool_offset':       0.0306,
-            'teleop_move_seconds':      6.0,
-            'teleop_speed_deg_s':       12.0,
-            # The low grid: straight-down views this close to the fabric plane, which is
-            # what keeps every frame sharp and at one scale.
-            'teleop_grid_rows':         3,
-            'teleop_grid_cols':         3,
-            # The capture height (Z): how far over the fabric plane the camera looks straight down
-            # from. Grid, centred and Move over fabric all take it, so it is the one zoom control.
-            'teleop_camera_height':     0.05,
-            # The orbit's own radius. Not teleop_subject_distance, which only estimates where
-            # the fabric is when no corner is marked - shrinking that would raise the plane.
-            'teleop_orbit_radius':      0.10,
-            # How far the centred pattern may tilt from straight down at most; each direction is
-            # further limited to what keeps the whole frame on the fabric.
-            'teleop_max_tilt':          20.0,
-            # Teacher mode: the views posed by hand, as [{"name", "joints"}], and the name
-            # of the set they were last saved as or loaded from.
-            'teleop_taught_views':      [],
-            'teleop_taught_set':        'default',
-            # The fabric's corners as camera points [x, y, z], touched in free drive. One gives
-            # its height, three or more its outline; none, and the height is estimated from Home.
-            'teleop_fabric_corners':    [],
-            # The fabric plane's height from a ruler, lens to cloth, when no corner is touched; None is unset.
-            'teleop_fabric_z':          None,
-            # How much neighbouring grid frames share when the grid fills a fabric outline.
-            'teleop_grid_overlap':      0.3,
-            'teleop_sweep_overlap':     0.65,
-            'teleop_grid_views':        1,
-            'teleop_grid_passes':       3,
-            'teleop_overview_height':   None,
-            'teleop_overview_joints':   None,
-            # The splat dome: views in each ring, and how many distances it is flown at.
-            'teleop_splat_views':       12,
-            'teleop_splat_layers':      2,
-            'puzzle_copies_x': 5,
-            'puzzle_copies_y': 5,
-            'puzzle_capture_width': 960,
-            'puzzle_capture_height': 680,
-            'puzzle_detect_color_count': 6,
-            'puzzle_capture_rect': [0.08, 0.08, 0.84, 0.84],
-            # Puzzle Mode owns a complete model workspace. These snapshots are
-            # deliberately transient (and excluded from undo snapshots below):
-            # nesting a snapshot inside itself would recurse forever, and the
-            # normal params autosave continues to describe the Edit workspace.
-            'puzzle_model_snapshot': None,
-            'puzzle_initial_snapshot': None,
-            'puzzle_undo_stack': [],
-            'workspace_model_snapshot': None,
-            'workspace_undo_stack': None,
-            'ui_theme': 'dark',
-            # Seeded empty: _sync_loop_heights fills it from loop_height_1..n.
-            # A hard-coded block here became stale the moment those parameters
-            # differed from it, and then outranked them for good.
             'loop_heights': np.empty((0, 0), dtype=np.float32),
             'loop_height_overrides': np.zeros((0, 0), dtype=bool),
             'mesh_center': np.zeros(3, dtype=np.float32),
@@ -349,38 +166,12 @@ class AppState:
                 for i in range(3)
             ],
             'row_visible': np.ones(3, dtype=bool),
-            'mi_cam_dist_mult': float(config_data['rendering']['camera_dist_mult']),
-            'mi_cam_fov': float(config_data['rendering']['camera_fov']),
             'period_offset_x': np.array([float(config_data['knit_parameters']['bitmap_loops']), 0.0, 0.0], dtype=np.float32),
-            # Y tiling period. Only the yarn simulation reads this (periodic
-            # collision topology); the scanner's display/preview tiling still
-            # derives its own Y spacing from the mesh bounds.
             'period_offset_y': np.array(
                 [0.0, 3.0 * (float(config_data['knit_parameters']['parameters'][pidx['dy']]['initial']) if 'dy' in pidx else 1.0), 0.0],
                 dtype=np.float32,
             ),
-            # ── Yarn simulation ──────────────────────────────────────────────
-            # Edit Mode only. The solver runs on a background thread and mutates
-            # ctrl_rows, so it must stay off in Scan/Puzzle/Database, which
-            # snapshot and rewrite that same geometry.
-            'sim_active': False,
-            'sim_k_s': 1000.0,
-            'sim_k_b': 10.0,
-            'sim_k_c': 1.0,
-            'sim_dhat': 0.1,
-            'sim_show_forces': True,
-            'sim_needs_jacobian_rebuild': True,
-            # Kept separate from sim_needs_jacobian_rebuild: one means "the
-            # cached Jacobian is stale", the other "the solver moved geometry
-            # that the GL thread still has to upload". feat/simulation used a
-            # single flag for both, which made every solver step also refresh
-            # the rest lengths and so hold the stretch energy near zero.
-            'sim_mesh_dirty': False,
             'sim_L0': np.array([]),
-            'sim_e_el': 0.0,
-            'sim_e_b': 0.0,
-            'sim_e_col': 0.0,
-            'sim_delta_P': None,
         }
         for k, v in computed_defaults.items():
             state_defaults[k] = AppState._clone(_coerce(v))
@@ -424,7 +215,7 @@ class AppState:
     # Live objects rather than state: they must bypass _data so they are never
     # cloned, snapshotted, undone or written to params.json.
     _DIRECT_ATTRS = (
-        'camera', 'optimizer', 'renderer', 'puzzle_renderer',
+        'camera', 'renderer', 'puzzle_renderer',
         'orbit_camera', 'orbit_renderer', '_data',
     )
 
@@ -515,8 +306,8 @@ class AppState:
                 np.asarray(row, dtype=np.float32)
                 for row in data.get('spline_radius_rows', [])
             ]
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("app_state._scanner_template: %s", exc)
 
         template = {
             'params': params,
@@ -695,7 +486,7 @@ class AppState:
             self.samples_per_loop,
             loop_heights=loop_heights,
         )
-        stitch_width = float(params[self._pidx['stitch_width']]) if 'stitch_width' in self._pidx else 1.0
+        stitch_width = float(params[self._pidx['stitch_width']])
         period_offset_x = np.array(
             [float(bitmap.shape[1]) * stitch_width, 0.0, 0.0], dtype=np.float32
         )
@@ -730,8 +521,6 @@ class AppState:
         row_count = max(1, int(self.bitmap_size[0]))
         x_period = self._display_copy_x_period(verts_list, radius)
         y_period = self._display_copy_y_period(verts_list, radius)
-        depth_gap = max(float(radius) * 2.4, 1e-6)
-        z_period = self._display_copy_z_period(verts_list, depth_gap)
         scanner_preview = bool(self.get('scanner_preview_grid_enabled', False))
         if scanner_preview:
             template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
@@ -856,14 +645,6 @@ class AppState:
                 display_meta.append(copied_meta)
         return display_vl, display_fl, display_meta
 
-    def _x_copy_period_for_ctrl_row(self, row, radius):
-        row = np.asarray(row, dtype=np.float32)
-        if len(row) > 1:
-            period = row[-1] - row[0]
-            if abs(float(period[0])) > max(float(radius), 1e-6) * 0.25:
-                return np.array([float(period[0]), 0.0, 0.0], dtype=np.float32)
-        return np.array([self._display_copy_x_period([], radius), 0.0, 0.0], dtype=np.float32)
-
     def _display_copy_z_period(self, verts_list, depth_gap):
         base_bounds = np.vstack([np.asarray(verts, dtype=np.float32) for verts, _ in verts_list])
         z_span = float(base_bounds[:, 2].max() - base_bounds[:, 2].min())
@@ -959,7 +740,6 @@ class AppState:
         mesh builds. The periods live here because every input to them --
         control rows, params, radius profiles -- is state.
         """
-        self._ensure_spline_radius_rows()
         radius = max(float(self.params[self._pidx['radius']]), 1e-6)
         radius_profiles = [np.asarray(row, dtype=np.float32) for row in self.spline_radius_rows]
         base_vl = build_spline_mesh(
@@ -1055,26 +835,6 @@ class AppState:
         if str(self.get('app_mode', 'edit')) == 'puzzle' and self.puzzle_renderer is not None:
             return self.puzzle_renderer
         return self.renderer
-
-    def ensure_puzzle_scene(self):
-        """Keep Scan meshes out of Puzzle's dedicated GPU scene.
-
-        Scan generation temporarily replaces the shared model with random
-        bitmaps.  All Scan uploads are explicitly routed away from Puzzle, but
-        this boundary also validates the GPU scene before display so a delayed
-        or future Scan path cannot leave random cells visible in Puzzle Mode.
-        """
-        if str(self.get('app_mode', 'edit')) != 'puzzle' or self.puzzle_renderer is None:
-            return
-        mesh_meta = getattr(self.puzzle_renderer, 'mesh_meta', None)
-        contaminated = mesh_meta is not None and any('scanner_cell' in item for item in mesh_meta)
-        empty = not getattr(self.puzzle_renderer, 'mesh_pick_data', None)
-        if contaminated or empty:
-            self.scanner_preview_grid_enabled = False
-            self.rebuild_spline_mesh(
-                preserve_model_placement=True,
-                target_renderer=self.puzzle_renderer,
-            )
 
     def rebuild_spline_mesh(self, preserve_model_placement=True, target_renderer=None):
         """Build the current model and upload it to the requested renderer.
@@ -1779,9 +1539,9 @@ class AppState:
             for i, name in enumerate(p["name"] for p in self.config['knit_parameters']['parameters'])
             if (span := self.loop_height_span(name)) is None or span <= self.bitmap_size[0]
         }
-        gui_state = {k: AppState._json_ready(self._data[k]) for k in self.saved_state_keys if k in self._data}
+        gui_state = {k: json_ready(self._data[k]) for k in self.saved_state_keys if k in self._data}
         for attr in self.camera_attributes:
-            gui_state[f'camera_{attr}'] = AppState._json_ready(getattr(self.camera, attr))
+            gui_state[f'camera_{attr}'] = json_ready(getattr(self.camera, attr))
 
         data = {
             'format_version': 2,
@@ -1794,8 +1554,7 @@ class AppState:
             'gui_state': gui_state,
         }
         try:
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
+            write_json(path, data)
             self.save_path  = path
             self.autosave_last_time = time.monotonic()
             if not silent:
@@ -1844,99 +1603,82 @@ class AppState:
         else:
             self.save_params(target_path, silent=True)
 
-    def load_params(self, path):
-        try:
-            with open(path, 'r') as f:
-                data = json.load(f)
-            p_dict = data.get('params', {})
-            for i, pd in enumerate(self.config['knit_parameters']['parameters']):
-                if pd["name"] in p_dict:
-                    lo, hi = pd["range"]
-                    self.params[i] = float(np.clip(p_dict[pd["name"]], lo, hi))
-
-            if 'bitmap' in data:
-                self.bitmap = np.array(data['bitmap'], dtype=np.float32)
-                self.bitmap_size = np.array(self.bitmap.shape, dtype=np.int32)
-            # A file can hold a pattern the editor would now refuse to create.
-            # Kept alongside the pre-repair bitmap because the saved control
-            # rows below carry the flat bottom row it produced, and those have
-            # to be reconciled too or the model reports repaired and still
-            # draws the bar.
-            pre_anchor_bitmap = np.asarray(self.bitmap, dtype=np.float32).copy()
-            anchored_columns = self._anchor_bitmap()
-
-            loaded_spline_rows = data.get('spline_control_rows')
-            loaded_radius_rows = data.get('spline_radius_rows')
-            gui_state = data.get('gui_state', {})
-            get_val = lambda k, d=None: gui_state.get(k, data.get(k, d))
-
-            for key in self.saved_state_keys:
-                val = get_val(key)
-                if val is not None:
-                    default_val = self._state_defaults.get(key)
-                    if isinstance(default_val, np.ndarray):
-                        arr = np.array(val, dtype=default_val.dtype)
-                        if key == 'model_scale' and arr.size == 1:
-                            arr = np.array([float(arr.item()), float(arr.item()), float(arr.item())], dtype=default_val.dtype)
-                        self._data[key] = arr
+    def load_params(self, path, *, restore_mode=False):
+        with self.sim_lock:
+            previous = self._data
+            camera = {attr: self._clone(getattr(self.camera, attr)) for attr in self.camera_attributes}
+            self._data = self._clone(previous)
+            uploading = False
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if data.get('format_version') != 2:
+                    raise ValueError('Expected model format_version 2')
+                definitions = self.config['knit_parameters']['parameters']
+                self.params = [float(np.clip(data['params'].get(p['name'], p['initial']), *p['range']))
+                               for p in definitions]
+                self.bitmap = np.asarray(data['bitmap'], dtype=np.float32)
+                if self.bitmap.ndim != 2 or not self.bitmap.size or not np.isfinite(self.bitmap).all():
+                    raise ValueError('bitmap must be a finite, nonempty 2D array')
+                if not np.isfinite(self.params).all():
+                    raise ValueError('parameters must be finite')
+                pre_anchor_bitmap = self.bitmap.copy()
+                anchored_columns = self._anchor_bitmap()
+                gui_state = data['gui_state']
+                for key in self.saved_state_keys:
+                    if key not in gui_state or key == 'bitmap_size' or (key == 'app_mode' and not restore_mode):
+                        continue
+                    default = self._state_defaults.get(key)
+                    value = state_value(gui_state[key], default)
+                    if isinstance(default, np.ndarray):
+                        if default.ndim == 1 and default.size and value.shape != default.shape and key != 'row_visible':
+                            raise ValueError(f'{key} must have shape {default.shape}')
+                    self._data[key] = value
+                for attr in self.camera_attributes:
+                    key = f'camera_{attr}'
+                    if key in gui_state:
+                        value = np.asarray(gui_state[key], dtype=float)
+                        if value.shape != np.shape(camera[attr]) or not np.isfinite(value).all():
+                            raise ValueError(f'{key} has invalid shape or values')
+                        setattr(self.camera, attr, value if value.ndim else float(value))
+                self._sync_loop_heights()
+                self._sync_row_colors(self.bitmap_size[0])
+                self._sync_row_visibility(self.bitmap_size[0])
+                self.mode = 'spline'
+                self.camera.fov_deg = self.view_fov
+                self.rebuild_spline_from_params(rebuild_mesh=False)
+                rows = [np.asarray(row, dtype=np.float32) for row in data['spline_control_rows']]
+                if rows:
+                    if len(rows) != self.bitmap.shape[0] or any(
+                        row.ndim != 2 or row.shape[1] != 3 or len(row) < 2 or not np.isfinite(row).all()
+                        for row in rows
+                    ):
+                        raise ValueError('spline rows must match bitmap rows and contain finite 3D points')
+                    radii = [np.asarray(row, dtype=np.float32) for row in data['spline_radius_rows']]
+                    if len(radii) != len(rows) or any(
+                        radius.shape != (len(row),) or not np.isfinite(radius).all() or np.any(radius <= 0)
+                        for row, radius in zip(rows, radii)
+                    ):
+                        raise ValueError('spline radii must be positive and match control points')
+                    self.ctrl_rows = rows
+                    self.spline_radius_rows = radii
+                    self._rebuild_spline_points()
+                    self.sync_period_offset_to_model_width()
+                    self.sync_period_offset_y_to_row_count()
+                    if anchored_columns.size:
+                        self._reconcile_rows_after_anchor(pre_anchor_bitmap)
                     else:
-                        self._data[key] = val
-
-            for attr in self.camera_attributes:
-                field = f'camera_{attr}'
-                val = get_val(field)
-                if val is not None:
-                    setattr(self.camera, attr, np.array(val, dtype=float) if isinstance(val, list) else float(val))
-
-            self._sync_loop_heights()
-
-            row_vis = get_val('row_visible')
-            if row_vis is not None:
-                self.row_visible = np.array(row_vis, dtype=bool)
-            elif 'loop_visible' in data:
-                self.row_visible = np.any(np.array(data['loop_visible'], dtype=bool), axis=1)
-
-            self._sync_row_colors(self.bitmap_size[0])
-            self._sync_row_visibility(self.bitmap_size[0])
-            self.mode = 'spline'
-            self.camera.fov_deg = self.view_fov
-            self.load_path = path
-            self.status_msg = _with_anchor_note(f'Loaded ← {os.path.basename(path)}', anchored_columns)
-            # 'period_offset' is the pre-split key; keep reading it so params
-            # files written before period_offset_x/_y still load.
-            legacy_period = data.get('period_offset')
-            self.period_offset_x = np.array(
-                data.get('period_offset_x', legacy_period if legacy_period is not None
-                         else [float(self.bitmap_size[1]), 0.0, 0.0]),
-                dtype=np.float32,
-            )
-            saved_period_y = data.get('period_offset_y')
-            if saved_period_y is not None:
-                self.period_offset_y = np.array(saved_period_y, dtype=np.float32)
-            self.rebuild_spline_from_params()
-            if loaded_spline_rows:
-                self.ctrl_rows = [np.array(row, dtype=np.float32) for row in loaded_spline_rows]
-                if loaded_radius_rows and len(loaded_radius_rows) == len(self.ctrl_rows):
-                    self.spline_radius_rows = [
-                        np.array(row, dtype=np.float32)
-                        for row in loaded_radius_rows
-                    ]
-                else:
-                    self.spline_radius_rows = []
-                self._ensure_spline_radius_rows()
-                self._rebuild_spline_points()
-                self.sync_period_offset_to_model_width()
-                # Y as well as X. rebuild_spline_from_params above has already
-                # overwritten whatever the file held with a parametric value,
-                # and only X was being re-measured afterwards -- so a saved
-                # model loaded with a stale Y period every time.
-                self.sync_period_offset_y_to_row_count()
-                if anchored_columns.size:
-                    # Gives the repaired bottom row its loop while leaving the
-                    # rows above exactly as they were saved.
-                    self._reconcile_rows_after_anchor(pre_anchor_bitmap)
-                else:
-                    self.param_ref_ctrl_rows = [row.copy() for row in self._fresh_rebuild_rows()]
+                        self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
+                uploading = True
                 self.rebuild_spline_mesh(preserve_model_placement=False)
-        except Exception as e:
-            self.status_msg = f"Load error: {e}"
+                self.load_path = path
+                self.status_msg = _with_anchor_note(f'Loaded {os.path.basename(path)}', anchored_columns)
+                return True
+            except Exception as exc:
+                self._data = previous
+                for attr, value in camera.items():
+                    setattr(self.camera, attr, value)
+                if uploading:
+                    self.rebuild_spline_mesh()
+                self.status_msg = f'Load error: {exc}'
+                return False

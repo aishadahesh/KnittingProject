@@ -14,6 +14,7 @@ Nothing in this module may import imgui; a test enforces it. The names are
 re-imported into gui.py, so call sites there are unchanged.
 """
 
+import logging
 import contextlib
 import copy
 import hashlib
@@ -28,6 +29,7 @@ from PIL import Image, ImageDraw
 from fabric_scanner import clamp_capture_size
 from knitting_core import build_parametric_control_rows
 from rendering import pil_to_texture
+from persistence import write_json
 
 
 def _default_scanner_palette_from_model(state):
@@ -120,8 +122,8 @@ def _scanner_estimated_cell_colors(state):
                 try:
                     rgb = np.clip(np.asarray(override[:3], dtype=np.float32), 0.0, 1.0)
                     overridden = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.warning("scanner_core._scanner_estimated_cell_colors: %s", exc)
         active_ratio = float(np.mean(bitmap > 0.5))
         estimates.append({
             "row": int(cell_index // cols),
@@ -1094,8 +1096,8 @@ def _maybe_persist_scanner_state(state, force=False):
             storage.save_scanner_state(state)
             object.__setattr__(state, "_scanner_db_last_signature", signature)
             object.__setattr__(state, "_scanner_db_last_save", now)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.warning("scanner_core._maybe_persist_scanner_state: %s", exc)
 
 
 def _refresh_embedded_scanner_display_colors(state):
@@ -1235,8 +1237,8 @@ def _upload_puzzle_texture(state, renderer, slot):
     if texture is not None:
         try:
             texture.release()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("scanner_core._upload_puzzle_texture: %s", exc)
     texture = pil_to_texture(renderer.ctx, image)
     state[f'puzzle_{slot}_texture'] = texture
     state[f'puzzle_{slot}_texture_key'] = key
@@ -1356,9 +1358,7 @@ def _scanner_store_cached_tiles(state, digest, preview, per_cell):
             cell.tile.save(folder / f"cell_{index:03d}.png")
             entries.append({"cols": int(cell.cols), "rows": int(cell.rows)})
         preview.save(folder / "preview.png")
-        with (folder / "manifest.json").open("w", encoding="utf-8") as handle:
-            json.dump({"version": _TILE_CACHE_VERSION, "digest": digest,
-                       "cells": entries}, handle, indent=2)
+        write_json(folder / 'manifest.json', {'version': _TILE_CACHE_VERSION, 'digest': digest, 'cells': entries}, indent=2)
         # Keep a few recent settings' worth and drop the rest.
         folders = sorted(
             (p for p in root.iterdir() if p.is_dir()),
@@ -1366,8 +1366,8 @@ def _scanner_store_cached_tiles(state, digest, preview, per_cell):
         )
         for stale in folders[_TILE_CACHE_KEEP:]:
             shutil.rmtree(stale, ignore_errors=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.warning("scanner_core._scanner_store_cached_tiles: %s", exc)
 
 
 def _scanner_tiled_layout_cache_key(state):

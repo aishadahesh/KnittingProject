@@ -10,14 +10,9 @@ These tests pin both halves: the fabric's own convention, and that the grid is
 drawn to match it. Bottom-up is also how a knitting chart is read.
 """
 
-import sys
-from pathlib import Path
 
-import numpy as np
 import pytest
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 from app_state import AppState  # noqa: E402
 from rendering import Camera  # noqa: E402

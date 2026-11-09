@@ -1,13 +1,10 @@
 """Finding each yarn's own Gaussians: yarns made of small flat Gaussians on twisted plies, crossing,
 touching, and passing out of sight."""
 
-import sys
-from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import yarn_tracks  # noqa: E402
 
 RADIUS = 0.5            # mm; 1 unit = 1 mm here

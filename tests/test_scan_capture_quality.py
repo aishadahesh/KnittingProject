@@ -14,16 +14,12 @@ obvious at the 2000 px one the resolution slider now allows:
 No GL and no MuJoCo: render_camera_image is pure PIL/numpy over a plan.
 """
 
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 import fabric_scanner as fs  # noqa: E402
 from scanner_core import TiledFabricTexture  # noqa: E402

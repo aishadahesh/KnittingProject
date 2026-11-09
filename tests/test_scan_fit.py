@@ -2,13 +2,9 @@
 and each stitch's place read from the picture as a post or an opening."""
 
 import math
-import sys
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import scan_fit  # noqa: E402
 import strand_equations  # noqa: E402
 from test_lace_lattice import _lace_splat  # noqa: E402

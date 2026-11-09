@@ -43,7 +43,7 @@
       },
       {
         "title": "Review",
-        "subtitle": "Render, save, load, and run the existing optimizer."
+        "subtitle": "Save and load the current model."
       }
     ],
     "texture_param_keys": [
@@ -130,8 +130,6 @@
       "render_light_intensity",
       "render_ao_strength",
       "render_ao_radius",
-      "mi_cam_dist_mult",
-      "mi_cam_fov",
       "view_fov",
       "viewport_zoom",
       "viewport_pan",
@@ -151,7 +149,6 @@
       "model_rot",
       "model_scale",
       "model_t",
-      "bitmap_size",
       "single_model_color",
       "render_texture_color",
       "render_light_color",
@@ -170,7 +167,99 @@
       "scanner_robot_port",
       "scanner_color_variants",
       "scanner_cell_color_sets",
-      "scanner_selected_cell"
+      "scanner_selected_cell",
+      "fabric_type",
+      "crochet_params",
+      "crochet_stitches",
+      "app_mode",
+      "loop_heights",
+      "loop_height_overrides",
+      "scanner_layout_pattern",
+      "scanner_color_mode",
+      "ui_theme",
+      "scanner_random_seed",
+      "scanner_pattern_density",
+      "scanner_pattern_rows",
+      "scanner_pattern_cols",
+      "scanner_pattern_repeat_rows",
+      "scanner_pattern_repeat_cols",
+      "scanner_repeat_spacing_x",
+      "scanner_repeat_spacing_y",
+      "scanner_capture_mode",
+      "scanner_lighting_enabled",
+      "scanner_light_azimuth",
+      "scanner_light_elevation",
+      "scanner_light_sun_intensity",
+      "scanner_light_shadow",
+      "scanner_light_sheen",
+      "scanner_camera_workflow",
+      "scanner_single_row",
+      "scanner_single_col",
+      "scanner_single_angle",
+      "scanner_camera_zoom",
+      "puzzle_copies_x",
+      "puzzle_copies_y",
+      "puzzle_capture_width",
+      "puzzle_capture_height",
+      "puzzle_detect_color_count",
+      "puzzle_capture_rect",
+      "ur5_robot_ip",
+      "ur5_transport",
+      "ur5_speed_limit",
+      "ur5_dwell",
+      "ur5_save_images",
+      "ur5_video",
+      "ur5_capture_width",
+      "ur5_camera_device",
+      "ur5_lighting_condition",
+      "ur5_workspace_center",
+      "ur5_splat_fov",
+      "ur5_splat_camera_offset",
+      "ur5_splat_command",
+      "ur5_camera_autofocus",
+      "ur5_camera_focus",
+      "ur5_min_sharpness",
+      "ur5_fabric_check",
+      "ur5_min_coverage",
+      "ur5_show_detection",
+      "ur5_home_joints",
+      "ur5_camera_image_turn",
+      "ur5_show_scene",
+      "ur5_jog_step",
+      "ur5_expert",
+      "ur5_splat_object_only",
+      "free_auto",
+      "free_auto_interval",
+      "free_require_sides",
+      "teleop_address",
+      "teleop_pattern",
+      "teleop_angles",
+      "teleop_arc",
+      "teleop_elevation",
+      "teleop_rings",
+      "teleop_max_rise",
+      "teleop_view_radius",
+      "teleop_subject_distance",
+      "teleop_tool_offset",
+      "teleop_move_seconds",
+      "teleop_speed_deg_s",
+      "teleop_grid_rows",
+      "teleop_grid_cols",
+      "teleop_camera_height",
+      "teleop_orbit_radius",
+      "teleop_max_tilt",
+      "teleop_taught_views",
+      "teleop_taught_set",
+      "teleop_fabric_corners",
+      "teleop_fabric_z",
+      "teleop_grid_overlap",
+      "teleop_sweep_overlap",
+      "teleop_grid_views",
+      "teleop_grid_passes",
+      "teleop_overview_height",
+      "teleop_overview_joints",
+      "teleop_splat_views",
+      "teleop_splat_layers"
     ],
     "texture_control_groups": [
       {
@@ -523,13 +612,23 @@
       "spline_point_drag_active": false,
       "spline_grab_active": false,
       "spline_grab_key_was_down": false,
-      "spline_grab_start_mouse": [0.0, 0.0],
-      "spline_grab_start_pos": [0.0, 0.0, 0.0],
+      "spline_grab_start_mouse": [
+        0.0,
+        0.0
+      ],
+      "spline_grab_start_pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
       "spline_keyboard_edit_active": false,
       "spline_keyboard_step": 0.025,
       "radius_grab_active": false,
       "radius_grab_key_was_down": false,
-      "radius_grab_start_mouse": [0.0, 0.0],
+      "radius_grab_start_mouse": [
+        0.0,
+        0.0
+      ],
       "radius_grab_start_value": 0.0,
       "radius_grab_point_idx": -1,
       "radius_grab_start_rows": [],
@@ -545,37 +644,73 @@
     },
     "viewport": {
       "mouse_in_vp": false,
-      "vp_origin": [0.0, 0.0],
+      "vp_origin": [
+        0.0,
+        0.0
+      ],
       "vp_scale": 1.0,
       "viewport_zoom": 1.0,
-      "viewport_pan": [0.0, 0.0],
+      "viewport_pan": [
+        0.0,
+        0.0
+      ],
       "hover_mesh_idx": -1,
       "selected_mesh_idx": -1,
       "view_fov": 45.0,
-      "model_rot": [0.0, 0.0, 0.0],
-      "model_scale": [1.0, 1.0, 1.0],
+      "model_rot": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "model_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
       "model_rot_dragging": false,
-      "model_t": [0.0, 0.0, 0.0],
+      "model_t": [
+        0.0,
+        0.0,
+        0.0
+      ],
       "model_drag_undo_active": false,
       "gizmo_edit_active": false
     },
     "overlay": {
       "show_ref_bg": true,
       "ref_bg_alpha": 1.0,
-      "ref_bg_scale": [1.0, 1.0],
+      "ref_bg_scale": [
+        1.0,
+        1.0
+      ],
       "ref_bg_lock_dimensions": true,
       "ref_bg_lock_zoom": false,
       "ref_bg_rotation": 0.0,
-      "ref_bg_offset": [0.0, 0.0]
+      "ref_bg_offset": [
+        0.0,
+        0.0
+      ]
     },
     "material": {
       "model_alpha": 1.0,
-      "single_model_color": [0.85, 0.12, 0.10],
+      "single_model_color": [
+        0.85,
+        0.12,
+        0.1
+      ],
       "use_row_colors": false,
-      "render_texture_color": [0.8, 0.4, 0.3]
+      "render_texture_color": [
+        0.8,
+        0.4,
+        0.3
+      ]
     },
     "rendering": {
-      "render_light_color": [1.0, 1.0, 1.0],
+      "render_light_color": [
+        1.0,
+        1.0,
+        1.0
+      ],
       "render_light_intensity": 0.9,
       "render_ao_strength": 0.5,
       "render_ao_radius": 0.15
@@ -595,13 +730,158 @@
       "scanner_robot_ip": "132.74.121.230",
       "scanner_robot_port": 30001,
       "scanner_color_variants": [
-        [0.85, 0.12, 0.10],
-        [0.10, 0.39, 0.82],
-        [0.98, 0.78, 0.16],
-        [0.16, 0.10, 0.04]
+        [
+          0.85,
+          0.12,
+          0.1
+        ],
+        [
+          0.1,
+          0.39,
+          0.82
+        ],
+        [
+          0.98,
+          0.78,
+          0.16
+        ],
+        [
+          0.16,
+          0.1,
+          0.04
+        ]
       ],
       "scanner_cell_color_sets": [],
-      "scanner_selected_cell": [0, 0]
+      "scanner_selected_cell": [
+        0,
+        0
+      ],
+      "scanner_layout_pattern": "grid",
+      "scanner_random_seed": 1,
+      "scanner_pattern_density": 0.62,
+      "scanner_pattern_repeat_rows": 3,
+      "scanner_pattern_repeat_cols": 3,
+      "scanner_repeat_spacing_x": 1.0,
+      "scanner_repeat_spacing_y": 1.0,
+      "scanner_lighting_enabled": true,
+      "scanner_light_azimuth": -35.0,
+      "scanner_light_elevation": 48.0,
+      "scanner_light_sun_intensity": 0.68,
+      "scanner_light_shadow": 0.2,
+      "scanner_light_sheen": 0.025,
+      "scanner_capture_mode": "natural",
+      "scanner_camera_workflow": "path",
+      "scanner_single_row": 1,
+      "scanner_single_col": 1,
+      "scanner_single_angle": 1,
+      "scanner_camera_zoom": 1.0
+    },
+    "workspace": {
+      "fabric_type": "knit",
+      "app_mode": "edit",
+      "mode_epoch": 0,
+      "single_capture_job": null,
+      "single_capture_job_seq": 0,
+      "workspace_model_snapshot": null,
+      "workspace_undo_stack": null,
+      "ui_theme": "dark"
+    },
+    "ur5": {
+      "ur5_robot_ip": "192.168.0.101",
+      "ur5_transport": "teleop",
+      "ur5_speed_limit": 0.25,
+      "ur5_dwell": 0.2,
+      "ur5_save_images": true,
+      "ur5_video": true,
+      "ur5_capture_width": 640,
+      "ur5_camera_device": 0,
+      "ur5_lighting_condition": "",
+      "ur5_workspace_center": [
+        -0.45,
+        -0.08,
+        0.3
+      ],
+      "ur5_splat_fov": 38.0,
+      "ur5_camera_autofocus": true,
+      "ur5_camera_focus": 0.0,
+      "ur5_min_sharpness": 150.0,
+      "ur5_fabric_check": true,
+      "ur5_min_coverage": 0.8,
+      "ur5_show_detection": true,
+      "ur5_home_joints": [],
+      "ur5_camera_image_turn": [],
+      "ur5_show_scene": false,
+      "ur5_expert": false,
+      "ur5_splat_object_only": true,
+      "ur5_jog_step": 0.01,
+      "ur5_splat_camera_offset": 0.12,
+      "ur5_splat_command": ""
+    },
+    "free": {
+      "free_auto": false,
+      "free_auto_interval": 1.5,
+      "free_require_sides": true
+    },
+    "teleop": {
+      "teleop_address": "localhost:50052",
+      "teleop_pattern": "grid",
+      "teleop_angles": 6,
+      "teleop_arc": 360.0,
+      "teleop_elevation": 75.0,
+      "teleop_rings": 3,
+      "teleop_max_rise": 0.19,
+      "teleop_view_radius": 0.06,
+      "teleop_subject_distance": 0.2,
+      "teleop_tool_offset": 0.0306,
+      "teleop_move_seconds": 6.0,
+      "teleop_speed_deg_s": 12.0,
+      "teleop_grid_rows": 3,
+      "teleop_grid_cols": 3,
+      "teleop_camera_height": 0.05,
+      "teleop_orbit_radius": 0.1,
+      "teleop_max_tilt": 20.0,
+      "teleop_taught_views": [],
+      "teleop_taught_set": "default",
+      "teleop_fabric_corners": [],
+      "teleop_fabric_z": null,
+      "teleop_grid_overlap": 0.3,
+      "teleop_sweep_overlap": 0.65,
+      "teleop_grid_views": 1,
+      "teleop_grid_passes": 3,
+      "teleop_overview_height": null,
+      "teleop_overview_joints": null,
+      "teleop_splat_views": 12,
+      "teleop_splat_layers": 2
+    },
+    "puzzle": {
+      "puzzle_copies_x": 5,
+      "puzzle_copies_y": 5,
+      "puzzle_capture_width": 960,
+      "puzzle_capture_height": 680,
+      "puzzle_detect_color_count": 6,
+      "puzzle_capture_rect": [
+        0.08,
+        0.08,
+        0.84,
+        0.84
+      ],
+      "puzzle_model_snapshot": null,
+      "puzzle_initial_snapshot": null,
+      "puzzle_undo_stack": []
+    },
+    "sim": {
+      "sim_active": false,
+      "sim_k_s": 1000.0,
+      "sim_k_b": 10.0,
+      "sim_k_c": 1.0,
+      "sim_dhat": 0.1,
+      "sim_show_forces": true,
+      "sim_needs_jacobian_rebuild": true,
+      "sim_mesh_dirty": false,
+      "sim_e_el": 0.0,
+      "sim_e_b": 0.0,
+      "sim_e_col": 0.0,
+      "sim_delta_P": null
     }
   }
 }

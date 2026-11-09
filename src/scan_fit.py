@@ -36,6 +36,7 @@ import crochet_fit
 import gaussian_splatting
 import lace_lattice
 import strand_equations
+from persistence import write_json
 
 
 def prepare(model: dict, progress=lambda message: None) -> dict:
@@ -354,7 +355,7 @@ GRID_FILE = "stitch_grid.json"
 def save_grid(output_dir, lattice: dict) -> Path:
     """The stitch grid lined up by eye, beside the model (fit_stitch_model.py --lattice reads it)."""
     path = Path(output_dir) / GRID_FILE
-    path.write_text(json.dumps({k: lattice[k] for k in ("angle_deg", "shift", "stitch_width", "row_height")}, indent=1), encoding="utf-8")
+    write_json(path, {k: lattice[k] for k in ('angle_deg', 'shift', 'stitch_width', 'row_height')}, indent=1)
     return path
 
 

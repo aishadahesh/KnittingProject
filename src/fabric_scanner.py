@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFilter
 from scipy.spatial.transform import Rotation
-from knitting_core import build_parametric_control_rows
+from knitting_core import build_parametric_control_rows, eval_centerline
 import paths
 
 
@@ -180,10 +180,7 @@ def _normalize_scanner_lighting(settings=None) -> dict[str, float]:
     if isinstance(settings, dict):
         for key, value in settings.items():
             if key in lighting:
-                try:
-                    lighting[key] = float(value)
-                except (TypeError, ValueError):
-                    pass
+                lighting[key] = float(value)
     lighting["elevation"] = float(np.clip(lighting["elevation"], 5.0, 85.0))
     lighting["enabled"] = 1.0 if float(lighting.get("enabled", 1.0)) >= 0.5 else 0.0
     lighting["ambient"] = float(np.clip(lighting["ambient"], 0.10, 0.90))
@@ -361,49 +358,9 @@ def _load_saved_model_curves(model_json: str | None) -> list[np.ndarray]:
         if not ctrl_rows:
             return _fallback_model_curves()
 
-        bitmap = np.asarray(saved.get("bitmap", np.ones((len(ctrl_rows), 1))), dtype=np.float32)
-        # "period_offset" is the pre-split key; model files written before the
-        # x/y split still carry it, so fall back to it before the bitmap default.
-        saved_period = saved.get("period_offset_x", saved.get("period_offset"))
-        if saved_period is None:
-            saved_period = [float(max(1, bitmap.shape[1])), 0.0, 0.0]
-        period = np.asarray(saved_period, dtype=np.float32)
-
-        curves = []
-        for row_idx, row in enumerate(ctrl_rows):
-            cp = np.asarray(row[:, :2], dtype=np.float32)
-            cp_aug = np.vstack((cp, cp[0] + period[:2]))
-            seg_lens = np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6)
-            t = np.concatenate(([0.0], np.cumsum(seg_lens)))
-            samples = max(80, len(cp) * 8)
-            to = np.linspace(t[0], t[-1], samples, dtype=np.float32)
-            detrended = cp_aug - period[:2][None, :] * (t / t[-1])[:, None]
-            if len(cp) == 2:
-                pts = np.column_stack([np.interp(to, t, detrended[:, i]) for i in range(2)])
-            else:
-                from scipy.interpolate import CubicSpline
-                pts = np.column_stack([CubicSpline(t, detrended[:, i], bc_type="periodic")(to) for i in range(2)])
-            pts = pts + period[:2][None, :] * (to / t[-1])[:, None]
-
-            if row_idx < bitmap.shape[0]:
-                straight_cols = np.flatnonzero(np.asarray(bitmap[row_idx], dtype=np.float32) <= 0.5)
-                if len(straight_cols):
-                    samples_per_col = max(1, len(cp) // max(1, bitmap.shape[1]))
-                    for col_idx in straight_cols:
-                        start = int(col_idx) * samples_per_col
-                        end = min((int(col_idx) + 1) * samples_per_col, len(cp_aug) - 1)
-                        if end <= start:
-                            continue
-                        t0, t1 = float(t[start]), float(t[end])
-                        span = (to >= t0) & (to <= t1)
-                        if np.any(span):
-                            alpha = ((to[span] - t0) / max(t1 - t0, 1e-6))[:, None]
-                            pts[span] = cp_aug[start] * (1.0 - alpha) + cp_aug[end] * alpha
-
-            curves.append(pts.astype(np.float32))
-
-        if not curves:
-            return _fallback_model_curves()
+        period = np.asarray(saved['period_offset_x'], dtype=float)
+        curves = [eval_centerline(row, period, max(80, len(row) * 8))[:, :2].astype(np.float32)
+                  for row in ctrl_rows]
 
         all_pts = np.vstack(curves)
         min_xy = all_pts.min(axis=0)
@@ -1726,15 +1683,12 @@ def _detect_knitting_patch(full_image: Image.Image) -> tuple[tuple[int, int, int
         return (0, 0, w, h), 0.0
 
     blob = mask
-    try:
-        from scipy import ndimage
-        labeled, num_labels = ndimage.label(mask)
-        if num_labels >= 1:
-            sizes = ndimage.sum(mask, labeled, index=range(1, num_labels + 1))
-            largest_label = int(np.argmax(sizes)) + 1
-            blob = labeled == largest_label
-    except Exception:
-        pass
+    from scipy import ndimage
+    labeled, num_labels = ndimage.label(mask)
+    if num_labels >= 1:
+        sizes = ndimage.sum(mask, labeled, index=range(1, num_labels + 1))
+        largest_label = int(np.argmax(sizes)) + 1
+        blob = labeled == largest_label
 
     ys, xs = np.where(blob)
     if xs.size < 1:

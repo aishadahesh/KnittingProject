@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import moderngl
 from PIL import Image
@@ -151,43 +152,9 @@ void main() {
 # Raw centreline segments and the contact points the collision barrier is acting
 # on, drawn straight from the solver's own geometry rather than the display mesh.
 
-LINE_VERT = """
-#version 330
-in  vec3 in_pos;
-uniform mat4 mvp;
-void main() {
-    gl_Position = mvp * vec4(in_pos, 1.0);
-}
-"""
 
-LINE_FRAG = """
-#version 330
-uniform vec3 line_color;
-out vec4 f_color;
-void main() {
-    f_color = vec4(line_color, 1.0);
-}
-"""
 
-COLLISION_PT_VERT = """
-#version 330
-in  vec3 in_pos;
-uniform mat4 mvp;
-void main() {
-    gl_Position = mvp * vec4(in_pos, 1.0);
-    gl_PointSize = 18.0;
-}
-"""
 
-COLLISION_PT_FRAG = """
-#version 330
-out vec4 f_color;
-void main() {
-    vec2 c = gl_PointCoord * 2.0 - 1.0;
-    if (dot(c, c) > 1.0) discard;
-    f_color = vec4(1.0, 0.0, 0.0, 1.0);
-}
-"""
 
 # Ground plane for the orbit view: an analytic grid shaded in the fragment
 # stage, so line density stays even regardless of how far the camera is.
@@ -355,15 +322,6 @@ def look_at(eye, center, up=(0, 1, 0)):
         [0.,   0.,   0.,    1.             ],
     ], dtype=np.float32)
 
-def perspective(fov_rad, aspect, near=0.01, far=500.0):
-    f = 1.0 / np.tan(fov_rad / 2)
-    return np.array([
-        [f/aspect, 0,  0,                           0                          ],
-        [0,        f,  0,                           0                          ],
-        [0,        0,  (far+near)/(near-far),       2*far*near/(near-far)      ],
-        [0,        0, -1,                           0                          ],
-    ], dtype=np.float32)
-
 def orthographic(left, right, bottom, top, near=-1000.0, far=1000.0):
     return np.array([
         [2.0 / (right - left), 0, 0, -(right + left) / (right - left)],
@@ -473,9 +431,10 @@ class MeshRenderer:
         self.depth_prog = ctx.program(vertex_shader=DEPTH_VERT, fragment_shader=DEPTH_FRAG)
         # Full-screen quad for background (triangle strip)
         quad = np.array([[-1,-1],[1,-1],[-1,1],[1,1]], dtype=np.float32)
+        self.bg_vbo = ctx.buffer(quad.tobytes())
         self.bg_vao = ctx.vertex_array(
             self.bg_prog,
-            [(ctx.buffer(quad.tobytes()), '2f', 'in_pos')],
+            [(self.bg_vbo, '2f', 'in_pos')],
         )
         # Grid plane: one large quad, with the grid itself drawn analytically in
         # the fragment shader (see GRID_FRAG). Only drawn when show_grid is set,
@@ -502,26 +461,31 @@ class MeshRenderer:
         self.depth_tex = None
         self.fbo = None
         self.meshes = []      # list of (vao, outline_vao, depth_vao, n_indices, color, row_idx)
+        self.mesh_buffers = []
         self.mesh_pick_data = []
         # Keep the semantic mesh metadata beside the GPU buffers.  Mode
         # isolation checks use this to reject a Scan grid before it can be
         # displayed by Puzzle Mode; row_idx alone cannot distinguish the two.
         self.mesh_meta = []
         self.pt_vao = None
+        self.pt_buffer = None
         self.n_pts  = 0
-        # Simulation debug overlays; stay empty unless set_debug_lines /
-        # set_collision_pts are fed.
-        self.line_prog = ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
-        self.line_vao  = None
-        self.n_lines   = 0
-        self.collision_pt_prog = ctx.program(vertex_shader=COLLISION_PT_VERT, fragment_shader=COLLISION_PT_FRAG)
-        self.collision_pt_vao  = None
-        self.n_collision_pts   = 0
         self.resize(vp_w, vp_h)
 
     @property
     def texture_id(self):
         return self.fbo.color_attachments[0].glo
+
+    def close(self):
+        self.set_meshes([], [])
+        self.set_ctrl_pts([])
+        for name in ('bg_vao', 'grid_vao', 'bg_vbo', 'grid_vbo', 'grid_ibo',
+                     'fbo', 'color_tex', 'depth_tex', 'prog', 'outline_prog',
+                     'pt_prog', 'bg_prog', 'depth_prog', 'grid_prog'):
+            resource = getattr(self, name)
+            if resource is not None:
+                resource.release()
+                setattr(self, name, None)
 
     def resize(self, vp_w, vp_h):
         vp_w = max(1, int(vp_w))
@@ -573,6 +537,9 @@ class MeshRenderer:
             outline_vao.release()
             depth_vao.release()
         self.meshes.clear()
+        for buffer in self.mesh_buffers:
+            buffer.release()
+        self.mesh_buffers.clear()
         self.mesh_pick_data.clear()
         self.mesh_meta = [dict(item) for item in meta] if meta is not None else []
         if prepared is None:
@@ -581,6 +548,7 @@ class MeshRenderer:
             pos_vbo = self.ctx.buffer(pos_bytes)
             norm_vbo = self.ctx.buffer(norm_bytes)
             ibo = self.ctx.buffer(tri_bytes)
+            self.mesh_buffers.extend((pos_vbo, norm_vbo, ibo))
             vao = self.ctx.vertex_array(self.prog, [
                 (pos_vbo,  '3f', 'in_pos'),
                 (norm_vbo, '3f', 'in_norm'),
@@ -655,46 +623,19 @@ class MeshRenderer:
 
         return best_idx
 
-    def set_debug_lines(self, V, edges):
-        """Upload the solver's raw centreline (vertices + edge pairs) for the
-        debug overlay. Pass empty/None to clear it."""
-        if self.line_vao is not None:
-            self.line_vao.release()
-            self.line_vao = None
-        self.n_lines = 0
-        if V is None or edges is None or len(V) == 0 or len(edges) == 0:
-            return
-        edges = np.asarray(edges)
-        # Two endpoints per edge, expanded into a flat segment list for GL_LINES.
-        seg_verts = np.asarray(V, dtype=np.float32)[edges.flatten()]
-        vbo = self.ctx.buffer(seg_verts.tobytes())
-        self.line_vao = self.ctx.vertex_array(self.line_prog, [(vbo, '3f', 'in_pos')])
-        self.n_lines = len(edges) * 2
-
-    def set_collision_pts(self, pts):
-        """Upload contact points (N, 3) for the debug overlay. Pass empty/None
-        to clear it."""
-        if self.collision_pt_vao is not None:
-            self.collision_pt_vao.release()
-            self.collision_pt_vao = None
-        self.n_collision_pts = 0
-        if pts is None or len(pts) == 0:
-            return
-        pts = np.asarray(pts, dtype=np.float32)
-        vbo = self.ctx.buffer(pts.tobytes())
-        self.collision_pt_vao = self.ctx.vertex_array(self.collision_pt_prog, [(vbo, '3f', 'in_pos')])
-        self.n_collision_pts = len(pts)
-
     def set_ctrl_pts(self, flat_pts):
         if self.pt_vao:
             self.pt_vao.release()
             self.pt_vao = None
+        if self.pt_buffer is not None:
+            self.pt_buffer.release()
+            self.pt_buffer = None
         self.n_pts = len(flat_pts)
         if self.n_pts == 0:
             return
         pts = np.asarray(flat_pts, dtype=np.float32)
-        vbo = self.ctx.buffer(pts.tobytes())
-        self.pt_vao = self.ctx.vertex_array(self.pt_prog, [(vbo, '3f', 'in_pos')])
+        self.pt_buffer = self.ctx.buffer(pts.tobytes())
+        self.pt_vao = self.ctx.vertex_array(self.pt_prog, [(self.pt_buffer, '3f', 'in_pos')])
 
     def get_row_for_mesh_index(self, mesh_idx):
         if mesh_idx < 0 or mesh_idx >= len(self.meshes):
@@ -870,21 +811,6 @@ class MeshRenderer:
                 self.pt_prog['n_real'].value   = n_real_pts if n_real_pts >= 0 else self.n_pts
             self.pt_vao.render(moderngl.POINTS, vertices=self.n_pts)
 
-        # ── Simulation debug overlays ────────────────────────────────────────
-        if self.line_vao is not None and self.n_lines > 0:
-            self.ctx.disable(moderngl.DEPTH_TEST)
-            self.ctx.disable(moderngl.CULL_FACE)
-            self.line_prog['mvp'].write(mvp.T.tobytes())
-            self.line_prog['line_color'].value = (0.0, 1.0, 0.8)
-            self.line_vao.render(moderngl.LINES, vertices=self.n_lines)
-
-        if self.collision_pt_vao is not None and self.n_collision_pts > 0:
-            self.ctx.disable(moderngl.DEPTH_TEST)
-            self.ctx.disable(moderngl.CULL_FACE)
-            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
-            self.collision_pt_prog['mvp'].write(mvp.T.tobytes())
-            self.collision_pt_vao.render(moderngl.POINTS, vertices=self.n_collision_pts)
-
         self.ctx.screen.use()
 
 # %% IMAGE TEXTURE HELPER ─────────────────────────────────────────────────────
@@ -941,8 +867,8 @@ def upload_rgb_texture(ctx, texture, rgb):
         if texture is not None:
             try:
                 texture.release()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("rendering.upload_rgb_texture: %s", exc)
         texture = ctx.texture((width, height), 4, rgba.tobytes())
         texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
     else:

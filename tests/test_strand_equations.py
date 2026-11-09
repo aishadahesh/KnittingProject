@@ -2,12 +2,9 @@
 back as strands that lie on it."""
 
 import math
-import sys
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import strand_equations  # noqa: E402
 
 

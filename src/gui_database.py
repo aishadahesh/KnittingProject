@@ -9,17 +9,16 @@ It shows both simulated and real UR5 captures; the Robot and Robot session
 filters are what separate them.
 """
 
+import logging
 import json
-import time
 from pathlib import Path
 
 import numpy as np
 from imgui_bundle import imgui
 from PIL import Image
 
-from rendering import draw_fitted_texture, pil_to_texture, upload_rgb_texture
+from rendering import upload_rgb_texture
 from scanner_core import _scanner_storage
-import paths
 
 
 def _database_resolve_image_path(state, image_path):
@@ -53,8 +52,8 @@ def _database_prune_texture_cache(cache, current_frame, max_entries=200):
         if old is not None:
             try:
                 old[0].release()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("gui_database._database_prune_texture_cache: %s", exc)
 
 
 def _database_image_texture(state, renderer, image_path, max_side=280):
@@ -570,15 +569,16 @@ def _draw_database_summary_page(state, renderer):
         for cached in stale_cache.values():
             try:
                 cached[0].release()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("gui_database._draw_database_summary_page: %s", exc)
         # Refresh is also where the exported JSON map is brought up to date --
         # it is the control that promises exactly that.
         try:
             storage.write_json_index()
-        except Exception:
-            pass
-        state.scanner_status = "Dataset refreshed: re-checked saved files against the database"
+        except Exception as exc:
+            state.scanner_status = f"Dataset refresh failed: {exc}"
+        else:
+            state.scanner_status = "Dataset refreshed: re-checked saved files against the database"
     imgui.same_line()
     imgui.text_disabled("Re-checks saved image files on disk. JSON map: " + str(storage.json_index_path))
 

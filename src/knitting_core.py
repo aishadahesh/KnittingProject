@@ -1,31 +1,6 @@
-import ctypes
-import glob
-import os
-import sys
 import numpy as np
 from scipy.interpolate import CubicSpline
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-
-
-def _preload_linux_nvidia_libs():
-    if not sys.platform.startswith("linux"):
-        return
-    for p in sys.path:
-        if not p.endswith("site-packages"):
-            continue
-        root = os.path.join(p, "nvidia")
-        if not os.path.isdir(root):
-            continue
-        for so in sorted(glob.glob(os.path.join(root, "**/*.so*"), recursive=True)):
-            try:
-                ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
-            except Exception:
-                pass
-        return
-
-
-_preload_linux_nvidia_libs()
 
 def compute_bitmap_scale_factors(bitmap):
     """Return active spans; zero bitmap cells remain inactive."""
@@ -105,14 +80,7 @@ def build_parametric_control_rows(params, bitmap, pidx, lh_idx, spl=5, loop_heig
     stitch_bulge = float(p[pidx["stitch_bulge"]])
     stitch_z = float(p[pidx["stitch_z"]])
     dy = float(p[pidx["dy"]])
-    # How wide one stitch is. This used to be hard-coded at one unit per column
-    # while loop height stayed free, so raising the height gave tall narrow
-    # loops that overlapped their neighbours instead of a proper knit -- which
-    # is why a regenerated model looked nothing like the tuned one saved in
-    # initial_params.json. That saved geometry is this same formula with x
-    # scaled by 3.706, so the width is now a parameter and the automatic build
-    # can reproduce it. Older files simply lack the key and load the default.
-    stitch_width = float(p[pidx["stitch_width"]]) if "stitch_width" in pidx else 1.0
+    stitch_width = float(p[pidx["stitch_width"]])
     if loop_heights is None:
         height_grid = _height_grid_from_params(p, bitmap_array, lh_idx)
     else:
@@ -334,6 +302,13 @@ def build_surface_fiber_meshes(
 
 
 
+def _row_period(cp, period):
+    period = np.asarray(period, dtype=float)
+    if period.shape != (3,):
+        raise ValueError("period must be a 3D vector")
+    return -period if len(cp) > 1 and np.dot(cp[-1] - cp[0], period) < 0 else period
+
+
 def eval_centerline(cp, D, nout, t=None, to=None):
     """Samples one periodic row centreline.
 
@@ -347,6 +322,7 @@ def eval_centerline(cp, D, nout, t=None, to=None):
     one control point at a time.
     """
     cp = np.asarray(cp, dtype=float)
+    D = _row_period(cp, D)
     if len(cp) <= 1:
         return np.repeat(cp, nout, axis=0)
     cp_aug = np.concatenate((cp, (cp[0] + D)[None, :]), axis=0)
@@ -365,11 +341,7 @@ def _centerline_sample_count(period_offset_x, config):
     """Samples per row. Shared so the mesh, the simulation centrelines and the
     Jacobian all agree on nout -- if they disagree the Jacobian silently stops
     matching the geometry it is supposed to differentiate."""
-    D = np.asarray(period_offset_x, dtype=float)
-    if D.ndim == 0:
-        bitmap_width = float(D)
-    else:
-        bitmap_width = float(np.linalg.norm(D))
+    bitmap_width = float(np.linalg.norm(period_offset_x))
     res = config["knit_parameters"]["loop_res"]
     return max(3, res * int(round(bitmap_width)) + 1)
 
@@ -406,6 +378,7 @@ def build_row_spline_jacobian(cp, D, nout):
     combine into a valid Jacobian.
     """
     cp = np.asarray(cp, dtype=float)
+    D = _row_period(cp, D)
     num_ctrl = len(cp)
     if num_ctrl <= 1:
         return np.ones((nout, 1))
@@ -433,10 +406,7 @@ def build_spline_mesh(
     rad, rat = p[pidx["radius"]], p[pidx["ellipse_ratio"]]
     seg = config["knit_parameters"]["segments"]
 
-    if isinstance(period_offset_x, (int, float, np.integer, np.floating)):
-        D = np.array([float(period_offset_x), 0.0, 0.0], dtype=float)
-    else:
-        D = np.asarray(period_offset_x, dtype=float)
+    D = np.asarray(period_offset_x, dtype=float)
 
     nout = _centerline_sample_count(period_offset_x, config)
     a = np.linspace(0, 2 * np.pi, seg, endpoint=False)
@@ -446,16 +416,7 @@ def build_spline_mesh(
         cp = np.asarray(r, dtype=float)
         if len(cp) == 0:
             continue
-        # eval_centerline closes a row periodically by appending cp[0] + D,
-        # which assumes the row runs the same way D points. Rows alternate
-        # direction, so on a right-to-left row cp[0] is already at the far end
-        # and adding D threw the closing point a whole period past it: the row
-        # was drawn out to x=13.46 on a model only 7.41 wide, which is the long
-        # straight tail those rows trailed off to one side. Point the period the
-        # way this row actually travels.
-        row_period = D
-        if len(cp) > 1 and float(np.dot(cp[-1] - cp[0], D)) < 0.0:
-            row_period = -D
+        row_period = _row_period(cp, D)
         pts = eval_centerline(cp, row_period, nout)
         if len(cp) <= 1:
             ctrl_sample_idx = np.zeros(nout, dtype=float)
@@ -482,8 +443,8 @@ def build_spline_mesh(
         else:
             T = np.zeros_like(pts)
             T[1:-1] = (pts[2:] - pts[:-2]) / 2.0
-            T[0] = (pts[1] - (pts[-2] - D)) / 2.0
-            T[-1] = ((pts[1] + D) - pts[-2]) / 2.0
+            T[0] = (pts[1] - (pts[-2] - row_period)) / 2.0
+            T[-1] = ((pts[1] + row_period) - pts[-2]) / 2.0
         T /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
         U = np.cross(T, [0, 0, 1])
         b = np.linalg.norm(U, axis=1) < 1e-6

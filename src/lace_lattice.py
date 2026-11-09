@@ -259,16 +259,6 @@ def fold_sharpness(values: np.ndarray, coordinate: np.ndarray, period: float, bi
     return float((count * centred ** 2).sum() / max(len(values) * values.var(), 1e-12))
 
 
-def best_period(values: np.ndarray, coordinate: np.ndarray, low: float, high: float) -> float:
-    """The period in [low, high] mm the values fold onto most sharply - the smallest that does, since
-    folding onto two or three periods is sharp too."""
-    periods = np.arange(low, high, 0.01)
-    sharpness = np.array([fold_sharpness(values, coordinate, p) for p in periods])
-    smooth = ndimage.uniform_filter1d(sharpness, 3)
-    peaks = np.flatnonzero((smooth >= np.roll(smooth, 1)) & (smooth >= np.roll(smooth, -1)) & (smooth >= 0.8 * smooth.max()))
-    return float(periods[peaks[0]] if len(peaks) else periods[int(np.argmax(smooth))])
-
-
 def _reduce(a: np.ndarray, b: np.ndarray):
     """Gauss's reduction: the same lattice from its shortest, most nearly square pair of steps."""
     a, b = np.asarray(a, float), np.asarray(b, float)

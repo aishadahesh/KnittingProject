@@ -14,14 +14,10 @@ move together and that the heights still land exactly.
 No GL needed.
 """
 
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 from app_state import AppState  # noqa: E402
 from knitting_core import build_parametric_control_rows  # noqa: E402

@@ -14,9 +14,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any
-
-import numpy as np
-
+from persistence import json_ready, state_value, write_json
 
 DB_DIR_NAME = "scanner_data"
 DB_FILE_NAME = "scanner.db"
@@ -58,20 +56,6 @@ SCAN_CONFIG_KEYS = (
 # different workflow), scanner_robot_ip/port, app_mode, ui_theme.
 
 
-def _json_ready(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_ready(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    return value
-
-
 def scan_config_signature(settings: dict[str, Any]) -> str:
     """Identity of a scan configuration, for spotting a repeat of one.
 
@@ -84,7 +68,7 @@ def scan_config_signature(settings: dict[str, Any]) -> str:
     digest would call them different every time.
     """
     def canonical(value):
-        value = _json_ready(value)
+        value = json_ready(value)
         if isinstance(value, float):
             return round(value, 6)
         if isinstance(value, bool):
@@ -108,6 +92,12 @@ def _state_get(state, key: str, default=None):
 
 def database_path(project_root: str | Path) -> Path:
     return Path(project_root) / DB_DIR_NAME / DB_FILE_NAME
+
+
+def _scanner_state_fields(data):
+    return {key: value for key, value in data.items()
+            if key not in {'scanner_storage', 'scanner_process', 'embedded_scanner'}
+            and (key.startswith('scanner_') or key in {'app_mode', 'ui_theme'})}
 
 
 class ScannerStorage:
@@ -251,14 +241,7 @@ class ScannerStorage:
             )
 
     def scanner_state_snapshot(self, state) -> dict[str, Any]:
-        data = getattr(state, "_data", {})
-        snapshot = {}
-        for key, value in data.items():
-            if key in {"scanner_storage", "scanner_process", "embedded_scanner"}:
-                continue
-            if str(key).startswith("scanner_") or key in {"app_mode", "ui_theme"}:
-                snapshot[str(key)] = _json_ready(value)
-        return snapshot
+        return json_ready(_scanner_state_fields(getattr(state, "_data", {})))
 
     def save_scanner_state(self, state) -> None:
         snapshot = self.scanner_state_snapshot(state)
@@ -280,23 +263,15 @@ class ScannerStorage:
             row = conn.execute("SELECT state_json FROM scanner_state WHERE id = 1").fetchone()
         if row is None:
             return False
+        data = getattr(state, "_data", {})
+        fields = _scanner_state_fields(data)
         try:
             snapshot = json.loads(row[0])
-        except json.JSONDecodeError:
+            restored = {key: state_value(value, fields[key]) for key, value in snapshot.items() if key in fields}
+        except (ValueError, TypeError, AttributeError) as exc:
+            state.scanner_status = f"Restore error: {exc}"
             return False
-        data = getattr(state, "_data", {})
-        for key, value in snapshot.items():
-            if key in data:
-                current = data[key]
-                if isinstance(current, np.ndarray):
-                    try:
-                        data[key] = np.asarray(value, dtype=current.dtype)
-                    except Exception:
-                        data[key] = np.asarray(value)
-                else:
-                    data[key] = value
-            elif str(key).startswith("scanner_"):
-                data[key] = value
+        data.update(restored)
         return True
 
     def pattern_signature(self, state) -> str:
@@ -313,7 +288,7 @@ class ScannerStorage:
             "scanner_repeat_spacing_y",
             "scanner_color_variants",
         ]
-        payload = {key: _json_ready(_state_get(state, key)) for key in keys}
+        payload = {key: json_ready(_state_get(state, key)) for key in keys}
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     def save_pattern_set(self, state, patterns, estimates) -> str:
@@ -335,8 +310,8 @@ class ScannerStorage:
                 (
                     signature,
                     json.dumps(settings, sort_keys=True),
-                    json.dumps(_json_ready(patterns), sort_keys=True),
-                    json.dumps(_json_ready(estimates), sort_keys=True),
+                    json.dumps(json_ready(patterns), sort_keys=True),
+                    json.dumps(json_ready(estimates), sort_keys=True),
                     now,
                     now,
                 ),
@@ -392,14 +367,14 @@ class ScannerStorage:
                     int(record.get("target_index", 0)),
                     str(record.get("angle", "")),
                     str(record.get("capture_mode", _state_get(state, "scanner_capture_mode", "natural"))),
-                    json.dumps(_json_ready(settings), sort_keys=True),
-                    json.dumps(_json_ready(record.get("rgb", [])), sort_keys=True),
-                    json.dumps(_json_ready(record), sort_keys=True),
+                    json.dumps(json_ready(settings), sort_keys=True),
+                    json.dumps(json_ready(record.get("rgb", [])), sort_keys=True),
+                    json.dumps(json_ready(record), sort_keys=True),
                     now,
                     str(record.get("robot_mode", "simulation")),
                     str(record.get("session_id", "")) or None,
                     str(record.get("robot_ip", "")) or None,
-                    json.dumps(_json_ready(target_position)) if target_position is not None else None,
+                    json.dumps(json_ready(target_position)) if target_position is not None else None,
                     str(record.get("lighting_condition", "")) or None,
                     str(record.get("splat_output_path", "")) or None,
                     scan_config_signature(settings),
@@ -478,7 +453,7 @@ class ScannerStorage:
                     str(session.get("camera_backend", "")),
                     1 if session.get("camera_is_real") else 0,
                     str(session.get("pattern_signature", "")),
-                    json.dumps(_json_ready(session.get("settings", {})), sort_keys=True),
+                    json.dumps(json_ready(session.get("settings", {})), sort_keys=True),
                     str(session.get("status", "running")),
                     int(session.get("capture_count", 0)),
                     str(session.get("splat_output_path", "")) or None,
@@ -565,7 +540,7 @@ class ScannerStorage:
                 INSERT INTO analyses (pattern_signature, result_json, created_at)
                 VALUES (?, ?, ?)
                 """,
-                (signature, json.dumps(_json_ready(result), sort_keys=True), now),
+                (signature, json.dumps(json_ready(result), sort_keys=True), now),
             )
         # Skipped when state is absent: the real UR5 analysis runs off-thread
         # and walking the live state there would race the UI.
@@ -761,7 +736,7 @@ class ScannerStorage:
             },
             "latest_analysis_by_pattern": latest_analysis_by_signature,
         }
-        return _json_ready(summary)
+        return json_ready(summary)
 
     def cached_database_summary(self) -> dict[str, Any]:
         """database_summary() memoised against the write counter.
@@ -781,8 +756,7 @@ class ScannerStorage:
         """Exports the whole database to captures_index.json, unconditionally."""
         summary = self.cached_database_summary()
         self.json_index_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.json_index_path.open("w", encoding="utf-8") as handle:
-            json.dump(summary, handle, indent=2)
+        write_json(self.json_index_path, summary)
         self._index_dirty = False
         return self.json_index_path
 

@@ -26,7 +26,7 @@ are surfaced rather than hidden:
 
 from __future__ import annotations
 
-import json
+import logging
 import math
 import os
 import shutil
@@ -41,6 +41,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 import lens
+from persistence import write_json
 
 
 # Camera sits ahead of the tool flange looking along tool +Z. A placeholder for
@@ -586,7 +587,7 @@ def export_dataset(
     gains = exposure_gains([Path(str(c.get("path") or c.get("image_path") or "")) for c in captures]) if equalise_exposure and not object_only else {}
     if gains:
         spread = np.array(list(gains.values()))
-        warnings.append(f"exposure and white balance equalised across the pictures (gains {spread.min():.2f}-{spread.max():.2f})")
+        logging.info("Exposure gains: %.2f-%.2f", spread.min(), spread.max())
     # Without a mount calibration the image's axes are assumed to be the tool's, unless a turn was
     # calibrated. A grid or sweep scan can measure its own: it did here, and found the image mirrored.
     measured_turn = None
@@ -760,8 +761,7 @@ def export_dataset(
     if frames and not seed:
         warnings.append("no fabric height recorded with the captures: the trainer starts from random points")
     transforms_path = output_dir / "transforms.json"
-    with transforms_path.open("w", encoding="utf-8") as handle:
-        json.dump(transforms, handle, indent=2)
+    write_json(transforms_path, transforms, indent=2)
 
     _write_colmap_model(colmap_dir, colmap_images, intrinsics)
 
@@ -921,12 +921,12 @@ class SplatTrainer:
 
                 threading.Thread(target=end_if_stuck, daemon=True, name="gsplat-stop").start()
                 return
-            except OSError:
-                pass
+            except OSError as exc:
+                logging.warning("gaussian_splatting.stop: %s", exc)
         try:
             process.terminate()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("gaussian_splatting.stop: %s", exc)
         self.status = "Training stopped"
 
     def output_artifacts(self) -> list[Path]:

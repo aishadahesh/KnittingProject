@@ -1,15 +1,12 @@
 """Regression tests for the non-blocking single-image capture pipeline."""
 
 import queue
-import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 from embedded_scanner import EmbeddedMujocoScanner  # noqa: E402
 from fabric_scanner import _detect_knitting_patch  # noqa: E402
@@ -112,3 +109,47 @@ def test_background_save_is_atomic_and_signals_completion(tmp_path):
     assert output.exists()
     assert Image.open(output).getpixel((0, 0)) == (12, 34, 56)
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_batch_capture_finishes_and_queues_images(tmp_path):
+    scanner = EmbeddedMujocoScanner.__new__(EmbeddedMujocoScanner)
+    scanner.args = SimpleNamespace(image_dir=str(tmp_path), capture_mode="natural")
+    scanner.plan = SimpleNamespace(station_cells=[(0, 0)], view_names=["top"])
+    scanner.scanner = SimpleNamespace(CAMERA_CAPTURE_FOCUSED="focused")
+    preview = []
+    saved = []
+    records = []
+    scanner._show_robot_camera_image = lambda image, **kwargs: preview.append(image)
+    scanner._queue_image_save = lambda image, path: saved.append((image, path))
+    scanner._record_capture_analysis = lambda *args, **kwargs: records.append(args)
+    image = Image.new("RGB", (64, 48))
+
+    scanner._capture_stage_finish({"result": {"full_image": image}, "target_index": 0, "station_id": 0})
+
+    assert preview == [image]
+    assert len(records) == len(saved) == 1
+    assert saved[0][0] is image
+    assert saved[0][1].parent == tmp_path
+
+
+def test_image_write_failure_is_preserved_when_cleanup_also_fails(tmp_path, monkeypatch, caplog):
+    scanner = EmbeddedMujocoScanner.__new__(EmbeddedMujocoScanner)
+    scanner._save_queue = queue.Queue()
+    scanner._save_stop = threading.Event()
+    scanner._save_stop.set()
+    group = {"remaining": 1, "errors": [], "done": threading.Event()}
+
+    def fail_save(*args, **kwargs):
+        raise OSError("image write failed")
+
+    def fail_cleanup(*args, **kwargs):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    scanner._queue_image_save(SimpleNamespace(save=fail_save), tmp_path / "capture.png", save_group=group)
+    scanner._save_worker()
+
+    assert group["errors"] == ["image write failed"]
+    assert group["done"].is_set()
+    assert scanner._save_queue.unfinished_tasks == 0
+    assert "cleanup failed" in caplog.text

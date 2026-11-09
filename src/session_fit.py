@@ -26,7 +26,6 @@ mount, the fitted lens with its distortion, and the triangulated points, coloure
 
 from __future__ import annotations
 
-import json
 import math
 import shutil
 import time
@@ -38,6 +37,7 @@ from scipy.spatial.transform import Rotation
 
 import gaussian_splatting
 import hand_eye
+from persistence import write_json
 
 FEATURES_PER_PICTURE = 2500
 RATIO = 0.8
@@ -200,25 +200,6 @@ def _tracks(matches: dict, counts: list[int]) -> list[list[tuple[int, int]]]:
         if len({image for image, _ in observed}) == len(observed) and len(observed) >= 2:
             tracks.append(sorted(observed))
     return tracks
-
-
-def _triangulate(tracks, pictures, cameras, lens) -> tuple[np.ndarray, np.ndarray]:
-    points, ok = np.zeros((len(tracks), 3)), np.zeros(len(tracks), bool)
-    w2c = [np.linalg.inv(c)[:3] for c in cameras]
-    for t, track in enumerate(tracks):
-        rows = []
-        for image, key in track:
-            x, y = _undistort(pictures.keypoints[image][key][None], lens)[0]
-            p = w2c[image]
-            rows += [x * p[2] - p[0], y * p[2] - p[1]]
-        _, _, vt = np.linalg.svd(np.array(rows))
-        if abs(vt[-1, 3]) < 1e-12:
-            continue
-        point = vt[-1, :3] / vt[-1, 3]
-        depths = [(w2c[image] @ np.r_[point, 1.0])[2] for image, _ in track]
-        if min(depths) > 0.005:
-            points[t], ok[t] = point, True
-    return points, ok
 
 
 def _points_for(track_of, image_of, seen, cameras, lens, count):
@@ -428,7 +409,6 @@ def export_dataset(captures, fitted: dict, output_dir: str | Path, *, session_id
                    max_picture_px: float = 3.0, equalise_exposure: bool = True) -> gaussian_splatting.SplatDataset:
     """The session as a splatting dataset placed by the fitted mount and lens. A picture whose own
     points fit worse than `max_picture_px` (it moved, or the arm missed) is left out."""
-    from PIL import Image
 
     output_dir = Path(output_dir)
     images_dir, colmap_dir = output_dir / "images", output_dir / "sparse" / "0"
@@ -476,7 +456,7 @@ def export_dataset(captures, fitted: dict, output_dir: str | Path, *, session_id
         "frames": frames,
     }
     transforms_path = output_dir / "transforms.json"
-    transforms_path.write_text(json.dumps(transforms, indent=2), encoding="utf-8")
+    write_json(transforms_path, transforms, indent=2)
     gaussian_splatting._write_colmap_model(colmap_dir, colmap_images, intrinsics)
     return gaussian_splatting.SplatDataset(root=output_dir, image_count=len(frames), transforms_path=transforms_path,
                                            colmap_dir=colmap_dir, session_id=str(session_id), warnings=warnings, offered=len(captures))

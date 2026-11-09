@@ -100,23 +100,5 @@
         "delta": 0.01
       }
     ]
-  },
-  "rendering": {
-    "mitsuba_variant": "cuda_ad_rgb",
-    "mitsuba_variant_fallback": "llvm_ad_rgb",
-    "mitsuba_variant_fallback2": "scalar_rgb",
-    "output_dir": "opt_outputs",
-    "camera_dist_mult": 1.1,
-    "camera_fov": 40.0,
-    "spp_optimization": 8
-  },
-  "optimization": {
-    "learning_rate": 0.02,
-    "loss_weights": {
-      "l2": 1.0
-    },
-    "loss_center_crop": [1.0, 1.0],
-    "max_epochs": 30,
-    "patience": 8
   }
 }

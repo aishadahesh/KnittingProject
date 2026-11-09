@@ -6,9 +6,7 @@ ONNX sessions, so the real model files are not needed here.
 
 import math
 from pathlib import Path
-import threading
 import time
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -451,8 +449,8 @@ def test_the_orbit_radius_no_longer_moves_the_estimated_fabric():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    near = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, orbit_radius=0.10)
-    far = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, orbit_radius=0.18)
+    near = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, orbit_radius=0.10, subject_distance=0.30)
+    far = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, orbit_radius=0.18, subject_distance=0.30)
     assert near.fabric_z == pytest.approx(far.fabric_z)
     for plan, radius in ((near, 0.10), (far, 0.18)):
         for point in plan.viewpoints:

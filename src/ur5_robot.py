@@ -21,6 +21,7 @@ button remains the actual safety device.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -353,15 +354,15 @@ class RTDETransport(UR5Transport):
         if self.control is not None:
             try:
                 self.control.stopScript()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("ur5_robot.disconnect: %s", exc)
         for handle in (self.control, self.receive, self.io):
             if handle is None:
                 continue
             try:
                 handle.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("ur5_robot.disconnect: %s", exc)
         self.control = None
         self.receive = None
         self.io = None
@@ -393,12 +394,12 @@ class RTDETransport(UR5Transport):
             return RobotState(connected=False, error=str(exc), updated_at=time.monotonic())
         try:
             state.speed_scale = float(self.receive.getSpeedScaling())
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("ur5_robot.read_state: %s", exc)
         try:
             state.program_running = bool(self.control.isProgramRunning()) if self.control else False
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("ur5_robot.read_state: %s", exc)
         return state
 
     def move_to_pose(self, pose, speed: float, acceleration: float) -> None:
@@ -458,10 +459,7 @@ class RTDETransport(UR5Transport):
     def stop(self, deceleration: float = 2.0) -> None:
         if self.control is None:
             return
-        try:
-            self.control.stopL(float(deceleration))
-        except Exception:
-            pass
+        self.control.stopL(float(deceleration))
 
     def protective_stop(self) -> None:
         if self.control is None:
@@ -469,38 +467,30 @@ class RTDETransport(UR5Transport):
         # Decelerate first, then latch the controller into protective stop.
         # Order matters: the stop command is what actually arrests motion, and
         # it must be issued before anything that can throw.
-        try:
-            self.control.stopL(4.0)
-        except Exception:
-            pass
-        try:
-            self.control.triggerProtectiveStop()
-        except Exception:
-            pass
+        failures = []
+        for name, action in (('decelerate', lambda: self.control.stopL(4.0)),
+                             ('protective stop', self.control.triggerProtectiveStop)):
+            try:
+                action()
+            except Exception as exc:
+                failures.append(f'{name}: {exc}')
+        if failures:
+            raise RuntimeError('; '.join(failures))
 
     def reset_stop(self) -> None:
         if self.control is None:
             return
-        try:
-            self.control.reuploadScript()
-        except Exception:
-            pass
+        self.control.reuploadScript()
 
     def set_speed_scale(self, fraction: float) -> None:
         fraction = float(np.clip(float(fraction), 0.01, 1.0))
         if self.io is not None:
-            try:
-                self.io.setSpeedSlider(fraction)
-            except Exception:
-                pass
+            self.io.setSpeedSlider(fraction)
 
     def pose_within_limits(self, pose) -> bool:
         if self.control is None:
             return True
-        try:
-            return bool(self.control.isPoseWithinSafetyLimits([float(v) for v in pose]))
-        except Exception:
-            return True
+        return bool(self.control.isPoseWithinSafetyLimits([float(v) for v in pose]))
 
 
 class DryRunTransport(UR5Transport):
@@ -696,8 +686,8 @@ class UR5Robot:
             thread.join(timeout=1.0)
         try:
             self.transport.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("ur5_robot.disconnect: %s", exc)
         self.state = RobotState(connected=False)
         self.status = "Not connected"
 
@@ -817,6 +807,9 @@ class UR5Robot:
             self.transport.stop(2.0)
         except Exception as exc:
             self.last_error = str(exc)
+            self.stop_requested = True
+            self.status = f'Pause failed: {exc}'
+            return
         self.status = "Paused"
 
     def resume(self) -> bool:
@@ -833,6 +826,8 @@ class UR5Robot:
             self.transport.reset_stop()
         except Exception as exc:
             self.last_error = str(exc)
+            self.status = f'Reset failed: {exc}'
+            return False
         self.stop_requested = False
         self.paused = False
         self.refresh()

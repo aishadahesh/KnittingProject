@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
+from persistence import write_json
 
 GRID_MM = 0.1
 MIN_OPACITY = 0.3
@@ -757,5 +758,5 @@ def save(result: Extraction, path) -> Path:
                      "coefficients": {axis: row.tolist() for axis, row in zip("xyz", s.coefficients)}, "equations": s.equations()}
                     for s in result.strands],
     }
-    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    write_json(path, payload, indent=1)
     return path

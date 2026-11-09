@@ -1,5 +1,8 @@
 # Python virtual environment
 .venv/
+.venv-splat/
+.pytest_cache/
+.ruff_cache/
 .python-version
 
 # Python bytecode/cache
@@ -9,6 +12,7 @@ __pycache__/
 
 # Local config & outputs
 imgui_layout.ini
+imgui.ini
 opt_outputs/
 scanner_data/
 scanner_images/

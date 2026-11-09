@@ -17,13 +17,9 @@ No GL needed.
 
 import json
 import sqlite3
-import sys
-from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 from app_state import AppState  # noqa: E402
 from rendering import Camera  # noqa: E402

@@ -2,13 +2,10 @@
 scanned as a splat would see it, must come back as the numbers it was made with."""
 
 import math
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import knitting_core  # noqa: E402
 import lace_lattice  # noqa: E402
 import strand_equations  # noqa: E402

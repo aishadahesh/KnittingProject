@@ -267,5 +267,9 @@ def test_switching_connection_stops_a_camera_read_through_teleop(tmp_path, monke
     assert controller.camera.start()
 
     monkeypatch.setitem(gui_ur5.TRANSPORTS, "rtde", gui_ur5.TRANSPORTS["rtde"]._replace(build=ur5_robot.DryRunTransport))
-    controller.connect("127.0.0.1", "rtde")
-    assert controller.camera is None
+    monkeypatch.setattr(robot_camera, "list_devices", lambda: [])
+    try:
+        assert controller.connect("127.0.0.1", "rtde")
+        assert controller.camera is None
+    finally:
+        controller.close()

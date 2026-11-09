@@ -1,12 +1,9 @@
 """Crochet from its equations: what each stitch is made of, an opening where a stitch is left out,
 and the meshes Edit Mode draws."""
 
-import sys
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import crochet_core  # noqa: E402
 
 P = crochet_core.CrochetParams(stitch_width=1.0, row_height=2.5, wraps=1, yarn_radius=0.3)
@@ -16,8 +13,6 @@ def test_a_post_is_two_legs_a_wrap_per_yarn_over_and_a_top():
     one = crochet_core.build(np.ones((1, 1)), P, with_rows=True)
     assert [closed for _, closed, _ in one] == [False, False, False, True]      # 2 legs, 1 wrap, the V top
     treble = crochet_core.build(np.ones((1, 1)), crochet_core.CrochetParams(wraps=2))
-    wrap = treble[2][0]
-    turns = np.unwrap(np.arctan2(wrap[:, 2], wrap[:, 0] - wrap[0, 0] + 0.0))
     assert len(treble) == 4                    # still one wrap curve, now going round twice
     legs = one[0][0]
     assert abs(legs[0, 1] - 0.0) < 1e-9 and abs(legs[-1, 1] - P.row_height) < 1e-9     # foot to top of the row

@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import gaussian_splatting  # noqa: E402
+from persistence import write_json
 
 MAX_COLOURS = 8               # groups the k-means starts from, before merging
 MERGE_DELTA_E = 12.0          # neighbourhood colours (CIELAB) closer than this are one yarn
@@ -386,7 +387,7 @@ def main() -> None:
                   "quarter; 'corrected' maps the board paper's white to reflectance %.2f and black to %.2f"
                   % (NEIGHBOURS, MERGE_DELTA_E, f" down to {args.colours} colours" if args.colours else "", WHITE_REFLECTANCE, BLACK_REFLECTANCE),
     }
-    (args.run / "fabric_colours.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+    write_json(args.run / 'fabric_colours.json', report, indent=1)
     yarns = [c for c in colours if c["role"] == "yarn"]
     strip = [dict(c, share=c["share"] / sum(y["share"] for y in yarns)) for c in yarns]
     swatches(strip, args.run / "fabric_colours.png", "corrected" if reference is not None else "rgb")

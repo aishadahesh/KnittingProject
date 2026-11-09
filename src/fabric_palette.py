@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from paths import CONFIG_DIR
+from persistence import write_json
 
 PALETTES_DIR = CONFIG_DIR / "fabric_palettes"
 COLOURS_FILE, LABELS_FILE = "fabric_colours.json", "fabric_colours_labels.npy"
@@ -236,7 +237,7 @@ def save_colour(name: str, colour, source: str, folder: Path = PALETTES_DIR) -> 
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{safe}.json"
     entries = [{"rgb": [round(float(v), 4) for v in c], "hex": hex_of(c)} for c in np.asarray(colour, dtype=np.float64).reshape(-1, 3)]
-    path.write_text(json.dumps({"name": safe, "source": source, "colours": entries}, indent=1), encoding="utf-8")
+    write_json(path, {'name': safe, 'source': source, 'colours': entries}, indent=1)
     return path
 
 

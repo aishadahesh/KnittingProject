@@ -20,7 +20,6 @@ flat, the pictures were blurred, or the camera was refocused between them.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -30,6 +29,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from paths import CONFIG_DIR  # noqa: E402
 from lens import INTRINSICS_JSON  # noqa: E402
+from persistence import write_json
 
 
 def take_pictures(camera: int, count: int, folder: Path, columns: int, rows: int, detector=None) -> list[Path]:
@@ -163,7 +163,7 @@ def main() -> None:
         raise SystemExit("give --pictures <folder> or --camera <index>")
     result = calibrate_charuco(pictures) if args.charuco else calibrate(pictures, args.columns, args.rows)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    write_json(Path(args.output), result, indent=2)
     print(f"Lens: {result['fov_degrees']:.1f} deg across, fx {result['fx']:.1f} fy {result['fy']:.1f} px, centre ({result['cx']:.1f}, {result['cy']:.1f}), "
           f"k1 {result['k1']:+.4f} k2 {result['k2']:+.4f}; reprojection error {result['reprojection_error_px']:.2f} px over {len(result['pictures_used'])} pictures")
     print(f"Written to {args.output}. " + ("A board scan needs no mount calibration; keep this focus for the scan." if args.charuco

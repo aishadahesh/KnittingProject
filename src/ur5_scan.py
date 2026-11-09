@@ -20,6 +20,7 @@ has two consequences the code is shaped around:
 
 from __future__ import annotations
 
+import logging
 import json
 import math
 import threading
@@ -37,6 +38,7 @@ import free_capture
 import rgb_analysis
 import robot_camera
 import ur5_robot
+from persistence import write_json
 
 
 ROBOT_MODE_REAL = "real_ur5"
@@ -131,7 +133,7 @@ class VideoSampler:
         frame.image.save(path)
         record = {"path": str(path), "video_frame": True, "capture_view": f"video {self.kept}", "standing": standing,
                   "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"), "sharpness": sharpness, **frame.metadata()}
-        path.with_suffix(".json").write_text(json.dumps(record, indent=2))
+        write_json(path.with_suffix('.json'), record, indent=2)
         if self.on_kept is not None:
             self.on_kept(self.kept)
 
@@ -178,7 +180,7 @@ class LiveVideo:
         finally:
             if writer is not None:
                 writer.release()
-            (self.sampler.folder / VIDEO_STILLS).write_text(json.dumps(self.sampler.stills))
+            write_json(self.sampler.folder / VIDEO_STILLS, self.sampler.stills, indent=None)
 
 
 def extract_from_video(folder: Path, fabric_check=None, min_coverage: float = 0.0, on_kept=None) -> VideoSampler:
@@ -312,8 +314,8 @@ class RealScanRunner:
                 with (Path(self.output_dir) / RUN_LOG).open("a", encoding="utf-8") as log:
                     log.write(f"{time.strftime('%H:%M:%S')}  {fields.get('status', '')}"
                               + (f"  [error: {fields['error']}]" if fields.get("error") else "") + "\n")
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("ur5_scan._set: %s", exc)
 
     @property
     def running(self) -> bool:
@@ -395,7 +397,7 @@ class RealScanRunner:
 
     def pause(self) -> None:
         self.robot.pause()
-        self._set(paused=True, status="Paused")
+        self._set(paused=True, status=self.robot.status, error=self.robot.last_error if self.robot.stop_requested else "")
 
     def resume(self) -> bool:
         if not self.robot.resume():
@@ -409,8 +411,10 @@ class RealScanRunner:
         self._stop.set()
         try:
             self.robot.transport.stop(2.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.robot.stop_requested = True
+            self._set(status=f"Stop failed: {exc}", error=str(exc))
+            return
         self._set(status="Stopping scan")
 
     def emergency_stop(self) -> None:
@@ -615,7 +619,7 @@ class RealScanRunner:
             except Exception as exc:
                 record["fabric_check_error"] = str(exc)
         try:
-            (self.output_dir / f"{stem}.json").write_text(json.dumps(record, indent=2, default=str))
+            write_json(self.output_dir / f'{stem}.json', record, indent=2, default=str)
         except Exception as exc:
             self._set(error=f"Could not write the capture's details: {exc}")
         self.capture_records.append(record)
@@ -688,8 +692,8 @@ class RealScanRunner:
                 capture_count=len(self.capture_records),
             )
             self.storage.flush_json_index()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("ur5_scan._finish_session: %s", exc)
 
     # -- analysis ----------------------------------------------------------
 
@@ -736,8 +740,7 @@ class RealScanRunner:
         if save_outputs:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             json_path = self.output_dir / "per_sample_rgb_analysis.json"
-            with json_path.open("w", encoding="utf-8") as handle:
-                json.dump(result, handle, indent=2)
+            write_json(json_path, result, indent=2)
             self._write_swatches(result["cells"])
             result["json_path"] = str(json_path)
             result["used_pixels_dir"] = str(debug_dir)
@@ -746,8 +749,8 @@ class RealScanRunner:
         if self.storage is not None:
             try:
                 self.storage.save_analysis(None, result, signature=self.pattern_signature)
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("ur5_scan.analyze: %s", exc)
         return result
 
     def _write_swatches(self, cells) -> None:

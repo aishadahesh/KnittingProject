@@ -1,18 +1,4 @@
-"""Structural invariants for the GUI modules.
-
-These are the rules the module layout has to keep obeying, written as tests so
-they survive the refactor rather than living in a comment that goes stale. They
-parse source with `ast` instead of importing, so they cost nothing and work
-without a display.
-
-The one that matters most is `test_no_module_imports_a_foreign_mode`. The whole
-point of splitting `gui.py` per mode is that scan-mode code stops living
-alongside edit-mode code; without a check, the two drift back together one
-convenience import at a time.
-"""
-
 import ast
-import sys
 from pathlib import Path
 
 import pytest
@@ -21,8 +7,7 @@ import pytest
 SRC = Path(__file__).resolve().parent.parent / "src"
 APP = Path(__file__).resolve().parent.parent / "app.py"
 
-# One module per mode. A module here may not import another module here.
-MODE_MODULES = ("gui_edit", "gui_scan", "gui_puzzle", "gui_database", "gui_ur5", "gui_model")
+MODE_MODULES = ("gui_database", "gui_ur5", "gui_model")
 
 # Modules that must stay usable without a UI: they are imported by headless
 # callers (tests, scripts, the scan runner) where imgui does not exist.
@@ -30,12 +15,8 @@ IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core", "embedded_scanner",
                       "rgb_analysis", "robot_camera", "ur5_robot", "ur5_scan",
                       "gaussian_splatting", "free_capture", "paths", "strand_equations",
                       "lace_lattice", "crochet_core", "crochet_fit", "scan_fit", "crochet_stitches",
-                      "splat_gl", "fabric_palette", "yarn_tracks", "fit_yarns", "drive_store")
-
-
-def _existing(names):
-    """Only the modules that exist yet -- the split lands in stages."""
-    return [name for name in names if (SRC / f"{name}.py").exists()]
+                      "splat_gl", "fabric_palette", "yarn_tracks", "fit_yarns", "drive_store",
+                      "knitting_core", "persistence")
 
 
 def _parse(path: Path) -> ast.Module:
@@ -78,7 +59,6 @@ def test_app_imports_only_the_documented_entry_points():
     }
     assert imported_from_gui, "app.py should import its drawing entry points from gui"
     # Whatever app.py asks for, gui must actually provide.
-    sys.path.insert(0, str(SRC))
     import gui
 
     for name in imported_from_gui:
@@ -87,7 +67,7 @@ def test_app_imports_only_the_documented_entry_points():
 
 def test_no_top_level_name_is_defined_twice():
     """A moved function must not be left behind in its old home as well."""
-    modules = _existing(("gui", "gui_common", "scanner_core", "embedded_scanner", *MODE_MODULES))
+    modules = ("gui", "gui_captures", "scanner_core", "embedded_scanner", *MODE_MODULES)
     owner: dict[str, str] = {}
     clashes = []
     for name in modules:
@@ -110,7 +90,7 @@ def test_no_module_imports_a_foreign_mode():
     every mode is its whole job.
     """
     violations = []
-    for name in _existing(MODE_MODULES):
+    for name in MODE_MODULES:
         imported = _imported_names(_parse(SRC / f"{name}.py"))
         for other in MODE_MODULES:
             if other != name and other in imported:
@@ -126,12 +106,12 @@ def test_no_mode_module_imports_gui():
     from quietly returning.
     """
     offenders = [
-        name for name in _existing(MODE_MODULES)
+        name for name in MODE_MODULES
         if "gui" in _imported_names(_parse(SRC / f"{name}.py"))
     ]
     assert not offenders, (
         "these modules import gui, creating a cycle: " + ", ".join(offenders)
-        + " -- the shared helpers belong in scanner_core or gui_common"
+        + " -- share logic through scanner_core"
     )
 
 
@@ -139,8 +119,6 @@ def test_no_mode_module_imports_gui():
 def test_core_modules_are_imgui_free(module):
     """Logic modules stay importable without a UI toolkit."""
     path = SRC / f"{module}.py"
-    if not path.exists():
-        pytest.skip(f"{module}.py does not exist yet")
     imported = _imported_names(_parse(path))
     assert "imgui" not in imported and "imgui_bundle" not in imported, (
         f"{module}.py imports imgui; it is meant to be usable headlessly"

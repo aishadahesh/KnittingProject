@@ -43,6 +43,7 @@ import gaussian_splatting
 import hand_eye
 import lens
 from paths import CONFIG_DIR
+from persistence import write_json
 
 BOARD_JSON = CONFIG_DIR / "charuco_board.json"
 # A4 landscape with 10 mm squares: 28 x 19 squares is 280 x 190 mm, inside a printer's margins. At
@@ -77,7 +78,7 @@ def load_board_spec(path: Path = BOARD_JSON) -> dict | None:
 
 def save_board_spec(spec: dict, path: Path = BOARD_JSON) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    write_json(Path(path), spec, indent=2)
 
 
 def make_board(spec: dict):
@@ -607,7 +608,7 @@ def export_dataset(captures, output_dir: str | Path, *, session_id: str = "", sp
         "frames": frames,
     }
     transforms_path = output_dir / "transforms.json"
-    transforms_path.write_text(json.dumps(transforms, indent=2), encoding="utf-8")
+    write_json(transforms_path, transforms, indent=2)
     gaussian_splatting._write_colmap_model(colmap_dir, colmap_images, intrinsics)
     return gaussian_splatting.SplatDataset(root=output_dir, image_count=len(frames), transforms_path=transforms_path,
                                            colmap_dir=colmap_dir, session_id=str(session_id), warnings=warnings, offered=len(captures))

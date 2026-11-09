@@ -1,12 +1,9 @@
 """fit_yarns: a region's Gaussians, and a fit's saved cloth frame carried back into the splat."""
 
 import json
-import sys
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import fit_yarns  # noqa: E402
 import scan_fit  # noqa: E402
 

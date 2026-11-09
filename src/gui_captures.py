@@ -9,6 +9,7 @@ and is the one place released when the mode closes.
 
 from __future__ import annotations
 
+import logging
 import json
 import threading
 import time
@@ -123,8 +124,8 @@ def release(controller) -> None:
     for texture, _ in state.textures.values():
         try:
             texture.release()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("gui_captures.release: %s", exc)
     state.textures.clear()
 
 

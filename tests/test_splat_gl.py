@@ -1,12 +1,9 @@
 """The GPU splat renderer: the same picture as the CPU one, and the height colours that show relief."""
 
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import gaussian_splatting  # noqa: E402
 import splat_gl  # noqa: E402
 

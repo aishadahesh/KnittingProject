@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import pickle
 import sys
 import time
@@ -35,6 +34,7 @@ import robot_camera  # noqa: E402
 import scan_geometry  # noqa: E402
 import ur5_robot  # noqa: E402
 import ur5_scan  # noqa: E402
+from persistence import write_json
 
 WORK = ROOT / "robot_scans" / "_freedrive"
 HOLD_FILE, STOP_FILE = WORK / "HOLD", WORK / "STOP"
@@ -155,7 +155,7 @@ def freedrive(cfg: dict) -> None:
         state = robot.refresh()
         held = {"joints": [float(v) for v in robot.joints_now()], "tcp_pose": [float(v) for v in state.tcp_pose],
                 "held_at": time.strftime("%Y-%m-%d %H:%M:%S")}
-        HELD_JSON.write_text(json.dumps(held, indent=2), encoding="utf-8")
+        write_json(HELD_JSON, held, indent=2)
         log(f"HELD - joints (deg) {np.round(np.degrees(held['joints']), 1).tolist()}, TCP {np.round(held['tcp_pose'][:3], 4).tolist()} m")
     finally:
         if camera is not None:
@@ -190,7 +190,7 @@ def lift(cfg: dict, height: float) -> None:
         reached = np.linalg.norm(np.asarray(state.tcp_pose[:3]) - np.asarray(target[:3]))
         held = {"joints": [float(v) for v in robot.joints_now()], "tcp_pose": [float(v) for v in state.tcp_pose],
                 "held_at": time.strftime("%Y-%m-%d %H:%M:%S"), "lifted_m": float(height), "subject_from": held.get("subject_from", held)}
-        HELD_JSON.write_text(json.dumps(held, indent=2), encoding="utf-8")
+        write_json(HELD_JSON, held, indent=2)
         log(f"LIFTED - TCP z {state.tcp_pose[2]:.4f} ({reached * 1000:.1f} mm from target)")
     finally:
         robot.disconnect()
@@ -257,7 +257,7 @@ def plan(cfg: dict, per_ring: int, rings: int, layers: int, max_tilt: float, rad
                "from_joints": held["joints"], "skipped_views": [f"{name}: {reason}" for name, reason in result.skipped[:20]]}
     with PLAN_PICKLE.open("wb") as handle:
         pickle.dump(result, handle)
-    PLAN_JSON.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_json(PLAN_JSON, summary, indent=2)
     log(f"PLAN ({time.monotonic() - started:.0f} s to solve): {summary['views']} views, {summary['skipped']} skipped, "
         f"{summary['nudged']} nudged to a safe neighbour; camera {summary['camera_height_cm'][0]}-{summary['camera_height_cm'][1]} cm "
         f"over the fabric; lowest clearance {summary['lowest_clearance_mm']} mm; lens aim off centre "

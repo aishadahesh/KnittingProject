@@ -2,16 +2,14 @@
 frame is kept whatever its sharpness, and the recorded video gives the same choice again."""
 
 import json
-import sys
-import time
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PIL import Image, ImageFilter
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 import robot_camera  # noqa: E402
 import ur5_scan  # noqa: E402
@@ -61,21 +59,23 @@ def test_a_standing_frame_is_kept_however_pale_and_a_moving_one_must_match_it(tm
 def test_the_recorded_video_gives_the_same_pictures_again(tmp_path):
     pytest.importorskip("cv2")
 
-    class Camera:
-        def __init__(self):
-            self.frames = list(frames(lambda index: min(1700, index * 12), 60))
-            self.at = -1
+    sequence = iter(frames(lambda index: min(1700, index * 12), 60))
+    finished = threading.Event()
 
-        def latest_frame(self):
-            self.at = min(self.at + 1, len(self.frames) - 1)
-            return self.frames[self.at]
+    def latest_frame():
+        frame = next(sequence, None)
+        if frame is None:
+            finished.set()
+        elif frame.index == 20:
+            live.still()
+        return frame
 
-    live = ur5_scan.LiveVideo(Camera(), ur5_scan.VideoSampler(tmp_path))
+    live = ur5_scan.LiveVideo(SimpleNamespace(latest_frame=latest_frame), ur5_scan.VideoSampler(tmp_path))
     live.start()
-    time.sleep(0.6)
-    live.still()
-    time.sleep(1.5)
-    live.stop()
+    try:
+        assert finished.wait(30), live.sampler.error
+    finally:
+        live.stop()
     chosen_live = live.sampler.kept
     assert (tmp_path / ur5_scan.VIDEO_FILE).is_file() and live.sampler.stills
 

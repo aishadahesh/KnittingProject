@@ -1,4 +1,4 @@
-"""Does adding these pictures make the Gaussian splat better or worse? Trains it both ways and measures.
+r"""Does adding these pictures make the Gaussian splat better or worse? Trains it both ways and measures.
 
     .venv-splat\Scripts\python.exe scripts\splat_ablation.py --sessions ur5_20261008_143729 ur5_20261007_180059
     .venv-splat\Scripts\python.exe scripts\splat_ablation.py --latest 3 --per-image 12 --iterations 2000
@@ -29,6 +29,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+from persistence import write_json
+
 SCRIPTS = ROOT / "scripts"
 BIN = ROOT / ".venv-splat" / "Scripts"
 MIN_NOISE_DB = 0.1
@@ -51,7 +54,7 @@ def solve_poses(sessions: list[Path], poses: Path, fov: float) -> None:
         print(f"Reusing the poses in {poses} (delete it to solve again)", flush=True)
         return
     poses.mkdir(parents=True, exist_ok=True)
-    (poses / "combined.json").write_text(json.dumps({"sessions": [str(session) for session in sessions]}))
+    write_json(poses / "combined.json", {"sessions": [str(session) for session in sessions]})
     subprocess.run([sys.executable, str(SCRIPTS / "solve_poses.py"), "--session", str(poses), "--output", str(poses), "--fov", str(fov)], check=True)
 
 
@@ -69,7 +72,7 @@ def run_experiment(name: str, train: list[dict], held_out: list[dict], meta: dic
     transforms = dict(meta, frames=frames, train_filenames=[f["file_path"] for f in train], val_filenames=[f["file_path"] for f in held_out],
                       test_filenames=[f["file_path"] for f in held_out])
     data = poses / f"experiment_{name}.json"
-    data.write_text(json.dumps(transforms))
+    write_json(data, transforms)
     print(f"[{name}] training on {len(train)} pictures, judged on {len(held_out)}", flush=True)
     powershell(f'$env:MAX_JOBS = "4"; & "{BIN / "ns-train.exe"}" splatfacto --data "{data}" --output-dir "{out}" --max-num-iterations {iterations} '
                f'--vis tensorboard --viewer.quit-on-train-completion True nerfstudio-data --eval-mode filename '
@@ -119,7 +122,7 @@ def main() -> None:
             return
         row = run_experiment(name, subset, held_out, meta, poses, work, args.iterations)
         results.append(row)
-        (work / "results.json").write_text(json.dumps(results, indent=2))
+        write_json(work / "results.json", results)
     run("all", train)
     run("all_repeat", train)
     for group in groups:

@@ -461,9 +461,9 @@ def test_the_grid_looks_straight_down_from_the_asked_height():
     import scan_geometry
     from scipy.spatial.transform import Rotation
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=3, camera_height=0.09)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=3, camera_height=0.09, fabric_z=0.20)
     mj, model, data, site_id = scan_geometry.load_model()
-    fabric_z = scan_geometry.fabric_height(mj, model, data, site_id, 0.20)
+    fabric_z = plan.fabric_z
 
     assert len(plan.viewpoints) + len(plan.skipped) == 6
     assert plan.clear, [point.problems for point in plan.refused]
@@ -480,7 +480,7 @@ def test_every_grid_cell_is_its_own_station():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=2)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=2, fabric_z=0.20)
     assert sorted(plan.station_cells) == [(0, 0), (0, 1), (1, 0), (1, 1)]
     for view, station in zip(plan.viewpoints, plan.station_ids):
         assert plan.station_cells[station] == view.cell
@@ -490,7 +490,7 @@ def test_a_grid_move_is_one_frame_less_the_overlap_not_a_reconfiguration():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=3, camera_height=0.05, grid_overlap=0.3)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=3, camera_height=0.05, grid_overlap=0.3, fabric_z=0.20)
     assert not plan.skipped and not any(point.adjustment for point in plan.viewpoints)
     steps = np.linalg.norm(np.diff(plan.poses[:, :3], axis=0), axis=1)
     assert steps == pytest.approx([scan_geometry.frame_side(0.05, 55.0) * 0.7] * len(steps), abs=1e-6)
@@ -501,7 +501,7 @@ def test_a_sweep_is_the_grid_with_its_stations_closer_together_each_with_a_plann
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="sweep", grid_rows=2, grid_cols=3, camera_height=0.05, sweep_overlap=0.65)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="sweep", grid_rows=2, grid_cols=3, camera_height=0.05, sweep_overlap=0.65, fabric_z=0.20)
     assert not plan.skipped and not any(point.adjustment for point in plan.viewpoints)
     steps = np.linalg.norm(np.diff(plan.poses[:, :3], axis=0), axis=1)
     assert steps == pytest.approx([scan_geometry.frame_side(0.05, 55.0) * 0.35] * len(steps), abs=1e-6)
@@ -516,7 +516,7 @@ def test_a_taught_plan_flies_the_recorded_joints_in_order():
 
     taught = [{"name": "near", "joints": HOME_JOINTS},
               {"name": "turned", "joints": list(np.array(HOME_JOINTS) + np.radians([8.0, 0.0, 0.0, 0.0, 0.0, 0.0]))}]
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="taught", taught=taught)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="taught", taught=taught, fabric_z=0.20)
 
     assert plan.view_names == ["near", "turned"]
     assert plan.configs == pytest.approx(np.array([entry["joints"] for entry in taught]))
@@ -528,7 +528,7 @@ def test_a_taught_plan_with_nothing_taught_refuses():
     import scan_geometry
 
     with pytest.raises(RuntimeError, match="No taught views"):
-        scan_geometry.build_capture_plan(HOME_JOINTS, pattern="taught", taught=[])
+        scan_geometry.build_capture_plan(HOME_JOINTS, pattern="taught", taught=[], fabric_z=0.20)
 
 
 # ============================================================================
@@ -577,7 +577,7 @@ def test_only_the_move_out_of_where_the_arm_stands_may_start_on_the_fabric():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id, low = _below_home(0.15)
+    mj, model, data, site_id, low = _below_home(0.30)
     resting = scan_geometry.lowest_point(mj, model, data, site_id, low, 0.0306)
     assert resting < scan_geometry.lowest_point(mj, model, data, site_id, HOME_JOINTS, 0.0306) - 0.10
 
@@ -609,19 +609,22 @@ def test_no_planned_viewpoint_is_judged_by_where_the_one_before_it_stood():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    _, _, _, _, low = _below_home(0.15)
-    plan = scan_geometry.build_capture_plan(low, pattern="orbit", count=5, rings=3)
+    _, _, _, _, low = _below_home(0.30)
+    plan = scan_geometry.build_capture_plan(low, pattern="orbit", count=5, rings=3, fabric_z=0.20)
     assert all(point.floor == scan_geometry.FABRIC_CLEARANCE for point in plan.viewpoints[1:])
     for point in plan.viewpoints:
-        assert point.clear == (point.clearance >= point.floor and point.standing >= scan_geometry.FABRIC_CLEARANCE
-                               and not point.contacts and not point.path_contacts)
+        assert point.clear
+        assert point.clearance >= point.floor
+        assert point.standing >= scan_geometry.FABRIC_CLEARANCE
+        assert point.arm_clearance >= scan_geometry.ARM_CLEARANCE
+        assert not point.contacts and not point.path_contacts
 
 
 def test_an_orbit_circles_the_fabric_under_the_camera_not_a_point_inside_the_table():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id, low = _below_home(0.15)
+    mj, model, data, site_id, low = _below_home(0.30)
     fabric_z = scan_geometry.lowest_point(mj, model, data, site_id, low, 0.0306) - 0.01
     plan = scan_geometry.build_capture_plan(low, pattern="orbit", count=3, rings=1, fabric_z=fabric_z)
 
@@ -651,7 +654,7 @@ def test_an_unreachable_view_is_replaced_by_the_nearest_safe_one_or_skipped():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=6, rings=3)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=6, rings=3, fabric_z=0.20)
     assert plan.viewpoints
     assert plan.clear, [point.problems for point in plan.refused]
     assert len(plan.viewpoints) + len(plan.skipped) == 18
@@ -663,7 +666,7 @@ def test_grid_views_out_of_reach_move_up_or_inward_never_down():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=3, grid_cols=3, grid_overlap=0.0, camera_height=0.09)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=3, grid_cols=3, grid_overlap=0.0, camera_height=0.09, fabric_z=0.20)
     for point in plan.viewpoints:
         assert point.position[2] - plan.fabric_z >= 0.09 - 1e-6
         assert point.adjustment == "" or "higher" in point.adjustment or "nearer the centre" in point.adjustment
@@ -673,7 +676,7 @@ def test_a_taught_view_is_never_moved_only_kept_or_skipped():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    _, _, _, _, low = _below_home(0.15)
+    _, _, _, _, low = _below_home(0.30)
     taught = [{"name": "good", "joints": HOME_JOINTS}, {"name": "on the cloth", "joints": list(low)}]
     mj, model, data, site_id = scan_geometry.load_model()
     fabric_z = scan_geometry.lowest_point(mj, model, data, site_id, low, 0.0306) - 0.005

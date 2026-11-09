@@ -36,6 +36,7 @@ from scipy.spatial.transform import Rotation
 
 import lens
 from paths import CONFIG_DIR
+from persistence import write_json
 
 HAND_EYE_JSON = CONFIG_DIR / "hand_eye.json"
 
@@ -282,7 +283,6 @@ def _size_mismatch(rows, params, fx, width) -> float:
     # Only the depths matter here, not the focal length, so a measured lens needs no special case.
     """How far the fitted camera depths disagree with the object's apparent size: the size in
     pixels should scale as 1/depth. Zero when they agree; used to choose the field of view."""
-    rotation = Rotation.from_rotvec(params[3:6]).as_matrix()
     ratios = []
     for row in rows:
         camera = row["tcp"] @ hand_eye_from_params(params[3:6], params[6:9])
@@ -296,7 +296,7 @@ def _size_mismatch(rows, params, fx, width) -> float:
 def save_calibration(calibration: dict, path: Path = HAND_EYE_JSON) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(calibration, indent=2), encoding="utf-8")
+    write_json(path, calibration, indent=2)
     return path
 
 

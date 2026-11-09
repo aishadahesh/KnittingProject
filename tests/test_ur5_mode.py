@@ -9,7 +9,6 @@ ones pinned down here.
 
 import math
 import os
-import sys
 import time
 from types import SimpleNamespace
 
@@ -17,7 +16,6 @@ import numpy as np
 import pytest
 from PIL import Image
 
-# src/ is put on the path by the project-root conftest.py.
 import gaussian_splatting
 import rgb_analysis
 import robot_camera
@@ -47,6 +45,57 @@ def camera():
     cam.start()
     yield cam
     cam.stop()
+
+
+def test_failed_pause_latches_stop_and_failed_reset_keeps_it(robot, monkeypatch):
+    def fail(*args):
+        raise OSError("controller unavailable")
+
+    monkeypatch.setattr(robot.transport, "stop", fail)
+    monkeypatch.setattr(robot.transport, "reset_stop", fail)
+    robot.pause()
+    assert robot.paused and robot.stop_requested
+    assert "Pause failed" in robot.status
+    assert not robot.resume()
+    assert not robot.reset()
+    assert robot.stop_requested and robot.paused
+    assert "Reset failed" in robot.status
+
+
+def test_protective_stop_attempts_both_commands_and_reports_failure():
+    calls = []
+
+    def stop(deceleration):
+        calls.append("decelerate")
+        raise OSError("deceleration failed")
+
+    transport = ur5_robot.RTDETransport()
+    transport.control = SimpleNamespace(stopL=stop, triggerProtectiveStop=lambda: calls.append("latch"))
+    with pytest.raises(RuntimeError, match="deceleration failed"):
+        transport.protective_stop()
+    assert calls == ["decelerate", "latch"]
+
+
+def test_failed_safety_query_never_approves_a_pose():
+    def fail(pose):
+        raise OSError("safety query failed")
+
+    transport = ur5_robot.RTDETransport()
+    transport.control = SimpleNamespace(isPoseWithinSafetyLimits=fail)
+    with pytest.raises(OSError, match="safety query failed"):
+        transport.pose_within_limits(np.zeros(6))
+
+
+def test_scan_stop_reports_transport_failure(robot, plan, monkeypatch):
+    def fail(deceleration):
+        raise OSError("stop failed")
+
+    runner = ur5_scan.RealScanRunner(robot, None, plan)
+    monkeypatch.setattr(robot.transport, "stop", fail)
+    runner.stop()
+    assert runner.progress.error == "stop failed"
+    assert "Stop failed" in runner.progress.status
+    assert robot.stop_requested
 
 
 @pytest.fixture
@@ -473,7 +522,7 @@ def test_export_writes_both_dataset_formats(tmp_path):
     dataset = gaussian_splatting.export_dataset(captures, tmp_path / "ds", session_id="s1")
 
     assert dataset.image_count == 1
-    assert dataset.warnings == []
+    assert dataset.warnings == ["no fabric height recorded with the captures: the trainer starts from random points"]
     assert dataset.transforms_path.exists()
     for name in ("cameras.txt", "images.txt", "points3D.txt"):
         assert (dataset.colmap_dir / name).exists()
@@ -713,7 +762,7 @@ def test_a_capture_plan_only_offers_reachable_collision_free_poses():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
 
     assert len(plan.viewpoints) == 3
     assert plan.clear and not plan.refused
@@ -726,7 +775,7 @@ def test_every_capture_viewpoint_is_photographed():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
     runner = ur5_scan.RealScanRunner(ur5_robot.UR5Robot(ur5_robot.DryRunTransport()), None, plan)
     assert runner.scan_targets == list(range(len(plan.view_names)))
 
@@ -735,7 +784,7 @@ def test_a_capture_records_the_geometry_it_was_taken_from():
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, fabric_z=0.20)
     recorded = plan.capture_metadata(1)
 
     assert recorded["capture_pattern"] == "orbit"
@@ -752,7 +801,7 @@ def test_a_capture_run_stores_one_image_per_viewpoint(tmp_path, robot, camera):
     pytest.importorskip("mujoco")
     import scan_geometry
 
-    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3)
+    plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
     storage = ScannerStorage(tmp_path)
     runner = ur5_scan.RealScanRunner(
         robot, camera, plan, storage,

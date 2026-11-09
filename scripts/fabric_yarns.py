@@ -33,6 +33,7 @@ import gaussian_splatting  # noqa: E402
 import fit_yarns  # noqa: E402
 import strand_equations  # noqa: E402
 import yarn_tracks  # noqa: E402
+from persistence import write_json
 
 YARNS_FILE, YARNS_JSON = "fabric_yarns.npy", "fabric_yarns.json"
 
@@ -121,7 +122,7 @@ def main() -> None:
     report = {**extra, "radius_mm": round(found["radius"] * mm, 3), "yarns": yarns,
               "candidates": int(candidates.sum()), "linked": int((found["pieces"] >= 0).sum()),
               "pieces": int(found["pieces"].max() + 1) if (found["pieces"] >= 0).any() else 0}
-    (args.run / YARNS_JSON).write_text(json.dumps(report, indent=1), encoding="utf-8")
+    write_json(args.run / YARNS_JSON, report, indent=1)
     spans = sorted((y["span_mm"] for y in yarns), reverse=True)
     if source == "fit":
         print(f"from the fit: {extra['curves']} curves, {len(yarns)} yarns (rows); yarn Gaussians to their curve: median "

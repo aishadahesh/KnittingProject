@@ -51,6 +51,7 @@ import paths
 import splat_gl
 import strand_equations
 from rendering import draw_fitted_texture, upload_rgb_texture
+from persistence import write_json
 
 COLOR_OK = (0.25, 0.80, 0.40, 1.0)
 COLOR_WARN = (0.95, 0.75, 0.20, 1.0)
@@ -1024,8 +1025,7 @@ def _draw_model_choice(view) -> None:
         imgui.text_colored(COLOR_WARN, "No model_scale.json: scale guessed (cameras taken to be 9 cm away).")
         imgui.same_line()
         if imgui.small_button("Save scale##model_scale_save"):
-            (model["output"] / strand_equations.SCALE_FILE).write_text(
-                json.dumps({"mm_per_unit": view.mm_per_unit, "source": "entered in Model Mode"}, indent=1), encoding="utf-8")
+            write_json(model['output'] / strand_equations.SCALE_FILE, {'mm_per_unit': view.mm_per_unit, 'source': 'entered in Model Mode'}, indent=1)
             model["mm_per_unit"] = view.mm_per_unit
 
 

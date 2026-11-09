@@ -76,6 +76,7 @@ import crochet_stitches  # noqa: E402
 import gaussian_splatting  # noqa: E402
 import lace_lattice  # noqa: E402
 import strand_equations  # noqa: E402
+from persistence import write_json
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OPEN_TERMS, CLOSED_TERMS = 10, 8
@@ -580,7 +581,7 @@ class StitchModel(torch.nn.Module):
 
 def stitch_instances(scene, start: crochet_fit.CrochetFit):
     """Every stitch over the cloth: (column, row) per (kind, parity), from the repeat's grid tiled out."""
-    cells, p = start.cells, start.params
+    p = start.params
     cloth, low = ndimage.binary_dilation(scene["cloth"], iterations=10), scene["low"]
     rows_px, cols_px = np.nonzero(cloth)
     x, y = low[0] + cols_px * 0.1, low[1] + rows_px * 0.1
@@ -813,7 +814,7 @@ def save(model, scene, start, scores, out: Path, pairs):
                       "flat_centre": np.asarray(scene["flat_centre"]).tolist(), "flat_axes": np.asarray(scene["flat_axes"]).tolist()},
             **({"region": scene["region"]} if scene.get("region") else {}),
             "scores": scores}
-    (out / "stitch_model.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
+    write_json(out / 'stitch_model.json', data, indent=1)
     (out / "renders").mkdir(exist_ok=True)
     for i, image, target, mask in pairs:
         side = np.hstack([image, target]) * 255

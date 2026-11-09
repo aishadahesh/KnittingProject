@@ -135,7 +135,7 @@ def test_a_calibrated_export_places_the_object_where_the_pictures_show_it(tmp_pa
         in_camera = c2w[:3, :3].T @ (target - c2w[:3, 3])
         u = fx * in_camera[0] / in_camera[2] + WIDTH / 2.0
         v = fx * in_camera[1] / in_camera[2] + HEIGHT / 2.0
-        seen, _, _ = hand_eye.find_target(frame["file_path"])
+        seen, _, _ = hand_eye.find_target(dataset.root / frame["file_path"])
         assert abs(u - seen[0]) < 2.0 and abs(v - seen[1]) < 2.0
 
 

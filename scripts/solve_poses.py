@@ -28,6 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from persistence import write_json
+
 # Sparse points with a larger reprojection error than this are left out of the plane fit.
 PLANE_FIT_MAX_ERROR_PX = 2.0
 
@@ -80,7 +83,6 @@ def mask_board(images: Path, output: Path) -> dict[str, float]:
     Returns each masked picture's masked share."""
     import cv2
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     import charuco
 
     spec = charuco.load_board_spec()
@@ -114,7 +116,7 @@ def drop_stray_cameras(transforms_path: Path) -> list[str]:
     if strays:
         transforms["frames"] = [f for f, d in zip(frames, distance) if d <= limit]
         transforms["stray_cameras_dropped"] = strays
-        transforms_path.write_text(json.dumps(transforms, indent=2), encoding="utf-8")
+        write_json(transforms_path, transforms)
         print(f"dropped {len(strays)} stray camera(s) placed far from the rest: {', '.join(strays)}", flush=True)
     return strays
 
@@ -267,14 +269,14 @@ def main() -> None:
         transforms = json.loads((output / "transforms.json").read_text())
         for frame in transforms["frames"]:
             frame["mask_path"] = f"masks/{Path(frame['file_path']).name}"
-        (output / "transforms.json").write_text(json.dumps(transforms, indent=2))
+        write_json(output / "transforms.json", transforms)
     report = measure(recon_dir, names, len(models))
     report["stray_cameras"] = strays
     if masked:
         report["board_masked_share"] = masked
     report["registered"] -= len(strays)
     report["unregistered"] += strays
-    (output / "pose_report.json").write_text(json.dumps(report, indent=2))
+    write_json(output / "pose_report.json", report)
     print(f"Placed {report['registered']} of {report['total']} pictures in {len(models)} model(s), "
           f"mean reprojection error {report['mean_reprojection_error_px']:.2f} px", flush=True)
 

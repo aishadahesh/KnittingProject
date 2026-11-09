@@ -1,13 +1,10 @@
 """Stitch families round the openings: each one's yarn leaves the opening clear and closes the
 lattice's other places, and the families differ as their stitches do."""
 
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import crochet_stitches  # noqa: E402
 
 W, H, R = 9.6, 8.6, 0.35

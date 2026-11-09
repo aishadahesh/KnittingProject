@@ -25,7 +25,6 @@ MuJoCo inverse kinematics (`scan_geometry`) and sent with `gotoJointAngles`.
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 
@@ -249,9 +248,6 @@ class TeleopAppTransport(ur5_robot.UR5Transport):
 
     def measured_joints(self):
         return [float(self._refresh().get("q", {}).get(joint, 0.0)) for joint in geo.TELEOP_JOINTS]
-
-    def planned_joints(self):
-        return [float(self._refresh().get("plannedQ", {}).get(joint, 0.0)) for joint in geo.TELEOP_JOINTS]
 
     # -- motion ------------------------------------------------------------
 

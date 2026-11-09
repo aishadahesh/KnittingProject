@@ -15,14 +15,11 @@ Skips cleanly where no GL context can be created, so a headless CI still gets
 the static checks in test_gui_structure.py.
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 moderngl = pytest.importorskip("moderngl")
 imgui_bundle = pytest.importorskip("imgui_bundle")
@@ -95,6 +92,7 @@ def imgui_context():
     io = imgui.get_io()
     io.display_size = imgui.ImVec2(1600, 900)
     io.delta_time = 1.0 / 60.0
+    io.set_ini_filename(None)
     # imgui 1.92 builds its font atlas lazily and expects the backend to own
     # textures. Claiming that here is what lets new_frame run with no backend
     # attached (io.fonts.get_tex_data_as_rgba32() no longer exists).
@@ -126,12 +124,23 @@ def state(gl_context, tmp_path):
     app_state.save_path = str(tmp_path / "params.json")
     app_state.load_path = str(tmp_path / "params.json")
     app_state.autosave_enabled = False
+    app_state.scanner_rows = 1
+    app_state.scanner_cols = 1
+    app_state.scanner_pattern_repeat_rows = 1
+    app_state.scanner_pattern_repeat_cols = 1
     # Build the mesh, as app.py does at startup. Without it the renderer has no
     # pick data, and draw_viewport's geometry closures all return early -- which
     # let a NameError inside one of them pass the suite and still crash the app.
     app_state.rebuild_spline_from_params()
     assert renderer.mesh_pick_data, "fixture must produce pick data for the viewport paths"
-    return app_state, renderer
+    yield app_state, renderer
+    for key in ('embedded_scanner', 'ur5_controller'):
+        controller = app_state.get(key)
+        if controller is not None:
+            controller.close()
+    glfw.make_context_current(gl_context.window)
+    renderer.close()
+    puzzle_renderer.close()
 
 
 def _draw_one_frame(gui, app_state, renderer, mode, window=None, ref_tex=None):
@@ -210,9 +219,15 @@ def test_scan_mode_draws_without_the_mujoco_runtime(imgui_context, state, gl_con
     assert app_state.get("embedded_scanner") is None
 
 
-def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_context, ref_tex):
+def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_context, ref_tex, monkeypatch):
     """Drawing the UR5 panel must not connect to a robot or open a camera."""
     import gui
+    import robot_camera
+
+    def refuse_probe(*args, **kwargs):
+        pytest.fail("Drawing opened camera discovery")
+
+    monkeypatch.setattr(robot_camera, "list_devices", refuse_probe)
 
     app_state, renderer = state
     gl = gl_context
@@ -221,6 +236,19 @@ def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_co
     assert controller is not None
     assert controller.robot.connected is False
     assert controller.camera is None
+
+
+def test_replacing_geometry_and_closing_renderer_releases_gpu_resources(state):
+    app_state, renderer = state
+    buffers = list(renderer.mesh_buffers) + [renderer.pt_buffer]
+    assert all(buffer is not None for buffer in buffers)
+    app_state.rebuild_spline_mesh()
+    assert all(isinstance(buffer.mglo, moderngl.InvalidObject) for buffer in buffers)
+
+    resources = list(renderer.mesh_buffers) + [renderer.pt_buffer, renderer.fbo, renderer.bg_vbo]
+    renderer.close()
+    renderer.close()
+    assert all(isinstance(resource.mglo, moderngl.InvalidObject) for resource in resources)
 
 
 def test_capture_path_draws_a_checked_plan(imgui_context, state, gl_context, ref_tex):
@@ -238,7 +266,7 @@ def test_capture_path_draws_a_checked_plan(imgui_context, state, gl_context, ref
     gl = gl_context
     _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex)
     controller = app_state.get("ur5_controller")
-    controller.plan = scan_geometry.build_capture_plan(ur5_robot.DEFAULT_HOME_JOINTS, pattern="spin", count=3)
+    controller.plan = scan_geometry.build_capture_plan(ur5_robot.DEFAULT_HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
 
     assert _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex) > 0
     assert controller.robot.connected is False

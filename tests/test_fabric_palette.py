@@ -1,12 +1,9 @@
 """The fabric's colour for a model, putting one colour on the whole fabric, and saved colours."""
 
 import json
-import sys
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import fabric_palette  # noqa: E402
 
 LUMA = np.array([0.2126, 0.7152, 0.0722])

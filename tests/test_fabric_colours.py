@@ -1,13 +1,10 @@
 """Reading a fabric's yarns from Gaussians coloured by the photos: grouping, the table, the openings' rims."""
 
-import sys
 from pathlib import Path
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "scripts"))
 import fabric_colours as F  # noqa: E402
 
 

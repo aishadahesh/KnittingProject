@@ -11,7 +11,7 @@ through) and fabric_scanner (the plan and the camera model); a test enforces
 that it never imports imgui.
 """
 
-import json
+import logging
 import os
 import queue
 import threading
@@ -35,6 +35,7 @@ from scanner_core import (
     _scanner_pattern_repeats, _scanner_repeat_spacing, _scanner_shared_cell_color_sets,
     _scanner_storage, _generate_scanner_random_patterns,
 )
+from persistence import write_json
 
 
 def _unique_scan_run_id(image_dir: Path) -> str:
@@ -220,20 +221,6 @@ class EmbeddedMujocoScanner:
             self.camera.elevation = -20.0
             self.scene_handle = SimpleNamespace(user_scn=self.renderer.scene, sync=lambda: None)
         except Exception:
-            # Some MuJoCo/OpenGL backends leave a partially initialized Renderer
-            # whose __del__ expects _mjr_context. Avoid a noisy ignored exception.
-            try:
-                import mujoco.renderer as _mj_renderer
-                if hasattr(_mj_renderer, "Renderer") and not hasattr(_mj_renderer.Renderer, "_codex_safe_del"):
-                    def _safe_del(obj):
-                        try:
-                            obj.close()
-                        except Exception:
-                            pass
-                    _mj_renderer.Renderer.__del__ = _safe_del
-                    _mj_renderer.Renderer._codex_safe_del = True
-            except Exception:
-                pass
             self.close()
             raise
         finally:
@@ -741,7 +728,7 @@ class EmbeddedMujocoScanner:
         image, patch_image, debug_image, detection = self._unpack_capture_result(result)
         if image is None:
             return None
-        self._show_robot_camera_image(job.get("preview_image", image), hold_seconds=0.45)
+        self._show_robot_camera_image(image, hold_seconds=0.45)
         active_row, active_col = self.plan.station_cells[station_id]
         clean_view = self.plan.view_names[target_index].replace(" ", "_")
         clean_mode = "focused_batch" if capture_mode == self.scanner.CAMERA_CAPTURE_FOCUSED else "natural"
@@ -773,7 +760,7 @@ class EmbeddedMujocoScanner:
             self._publish_single_capture(job, "failed", 1.0, "Single capture produced no image")
             return
 
-        self._show_robot_camera_image(image, hold_seconds=0.45)
+        self._show_robot_camera_image(job.get("preview_image", image), hold_seconds=0.45)
         output_dir = Path(getattr(self, "scan_output_dir", Path(self.args.image_dir)))
         active_row, active_col = self.plan.station_cells[job["station_id"]]
         clean_view = self.plan.view_names[job["target_index"]].replace(" ", "_")
@@ -857,8 +844,8 @@ class EmbeddedMujocoScanner:
             except Exception as exc:
                 try:
                     temp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    logging.warning("Capture cleanup: %s", cleanup_error)
                 if save_group is None:
                     self.status = f"Could not save scan image: {exc}"
                 else:
@@ -921,8 +908,8 @@ class EmbeddedMujocoScanner:
             storage = _scanner_storage(self.app_state)
             if storage is not None:
                 storage.record_capture(self.app_state, record)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner._record_capture_analysis: %s", exc)
         self.analysis_results = None
 
     def analyze_captures(self, save_outputs=True):
@@ -964,8 +951,7 @@ class EmbeddedMujocoScanner:
         if save_outputs:
             output_dir.mkdir(parents=True, exist_ok=True)
             json_path = output_dir / "per_sample_rgb_analysis.json"
-            with json_path.open("w", encoding="utf-8") as handle:
-                json.dump(result, handle, indent=2)
+            write_json(json_path, result, indent=2)
             swatch_w, swatch_h = 72, 54
             for cell in cells:
                 row = int(cell["row"])
@@ -987,8 +973,8 @@ class EmbeddedMujocoScanner:
             storage = _scanner_storage(self.app_state)
             if storage is not None:
                 storage.save_analysis(self.app_state, result)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.analyze_captures: %s", exc)
         return result
 
     # -- Scanning section: robot motion and target selection -------------------
@@ -1078,8 +1064,8 @@ class EmbeddedMujocoScanner:
             storage = _scanner_storage(self.app_state)
             if storage is not None:
                 storage.flush_json_index()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner._flush_capture_index: %s", exc)
 
     def close(self):
         self.running = False
@@ -1102,49 +1088,45 @@ class EmbeddedMujocoScanner:
                 self._save_stop.set()
             if hasattr(self, '_save_thread') and self._save_thread.is_alive():
                 self._save_thread.join(timeout=1.5)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if self.window is not None:
                 glfw.make_context_current(self.window)
                 self.gl_ctx.screen.use()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if self.texture is not None:
                 self.texture.release()
                 self.texture = None
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if self.camera_texture is not None:
                 self.camera_texture.release()
                 self.camera_texture = None
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if getattr(self, "_pattern_renderer", None) is not None:
-                if self._pattern_renderer.fbo is not None:
-                    self._pattern_renderer.fbo.release()
-                    self._pattern_renderer.color_tex.release()
-                    if self._pattern_renderer.depth_tex is not None:
-                        self._pattern_renderer.depth_tex.release()
+                self._pattern_renderer.close()
                 self._pattern_renderer = None
                 # Any cached fresh renders belong to the renderer just released.
                 if getattr(self, "plan", None) is not None:
                     self.plan.scan_render_capture_fn = None
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if self.mj_context is not None:
                 self.mj_context.make_current()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if self.renderer is not None:
                 self.renderer.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         try:
             if self.mj_context is not None:
                 if hasattr(self.mj_context, 'free'):
@@ -1153,16 +1135,16 @@ class EmbeddedMujocoScanner:
                     self.mj_context.close()
                 if hasattr(self.mj_context, '_context'):
                     self.mj_context._context = None
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
         self.renderer = None
         self.mj_context = None
         try:
             if self.window is not None:
                 glfw.make_context_current(self.window)
                 self.gl_ctx.screen.use()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("embedded_scanner.close: %s", exc)
 
     def _upload_frame(self, frame):
         if self.window is not None:

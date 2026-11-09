@@ -1,10 +1,8 @@
 """drive_store: which of a model's files go to Drive, and reading rclone's progress."""
 
 import json
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import drive_store  # noqa: E402
 
 

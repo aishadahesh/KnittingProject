@@ -110,34 +110,31 @@ def fabric_rgb_stats(image, debug_path=None):
         center = pts.mean(axis=0)
         centered = pts - center
         cov = centered.T @ centered / max(float(len(pts) - 1), 1.0)
-        try:
-            _, vecs = np.linalg.eigh(cov)
-            axes = vecs[:, ::-1].astype(np.float32)
-            outline_proj = centered @ axes
-            lo = outline_proj.min(axis=0)
-            hi = outline_proj.max(axis=0)
-            margin = 4.0
-            if np.all((hi - lo) > margin * 3.0):
-                yy, xx = np.mgrid[0:h, 0:w]
-                grid = np.column_stack((xx.reshape(-1), yy.reshape(-1))).astype(np.float32)
-                proj = (grid - center) @ axes
-                mask = (
-                    (proj[:, 0] >= lo[0] + margin)
-                    & (proj[:, 0] <= hi[0] - margin)
-                    & (proj[:, 1] >= lo[1] + margin)
-                    & (proj[:, 1] <= hi[1] - margin)
-                ).reshape(h, w)
-                mask &= ~green
-                if int(mask.sum()) >= 32:
-                    brightness = work.max(axis=2)
-                    saturation = work.max(axis=2) - work.min(axis=2)
-                    color_mask = mask & (brightness > 42.0) & (saturation > 16.0)
-                    if int(color_mask.sum()) >= 32:
-                        return finish(color_mask, "fabric-outline color mask")
-                    else:
-                        return finish(mask, "fabric-outline mask")
-        except Exception:
-            pass
+        _, vecs = np.linalg.eigh(cov)
+        axes = vecs[:, ::-1].astype(np.float32)
+        outline_proj = centered @ axes
+        lo = outline_proj.min(axis=0)
+        hi = outline_proj.max(axis=0)
+        margin = 4.0
+        if np.all((hi - lo) > margin * 3.0):
+            yy, xx = np.mgrid[0:h, 0:w]
+            grid = np.column_stack((xx.reshape(-1), yy.reshape(-1))).astype(np.float32)
+            proj = (grid - center) @ axes
+            mask = (
+                (proj[:, 0] >= lo[0] + margin)
+                & (proj[:, 0] <= hi[0] - margin)
+                & (proj[:, 1] >= lo[1] + margin)
+                & (proj[:, 1] <= hi[1] - margin)
+            ).reshape(h, w)
+            mask &= ~green
+            if int(mask.sum()) >= 32:
+                brightness = work.max(axis=2)
+                saturation = work.max(axis=2) - work.min(axis=2)
+                color_mask = mask & (brightness > 42.0) & (saturation > 16.0)
+                if int(color_mask.sum()) >= 32:
+                    return finish(color_mask, "fabric-outline color mask")
+                else:
+                    return finish(mask, "fabric-outline mask")
 
     # Fallback: estimate the scanner background from image edges and keep
     # pixels that differ from that background enough to be fabric. This is the

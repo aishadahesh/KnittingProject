@@ -12,13 +12,9 @@ writes the preference, which is what would lose it across a mode switch.
 No GL needed; the gate is a pure function of state.
 """
 
-import sys
-from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
 
 from app_state import AppState  # noqa: E402
 from rendering import Camera  # noqa: E402

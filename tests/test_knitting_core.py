@@ -1,269 +1,133 @@
+import json
 import os
+import subprocess
 import sys
 
-# Add project root to sys.path to resolve knitting_core
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-# Force JAX to use CPU backend
-import jax
-jax.config.update("jax_platform_name", "cpu")
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-
-
-def test_core_module_imports():
-    # Verify that importing knitting_core does not pull in GUI-related libraries
-    import knitting_core
-    assert "moderngl" not in sys.modules
-    assert "imgui_bundle" not in sys.modules
-    assert "gui" not in sys.modules
-    assert "app_state" not in sys.modules
-
-
-import json
-import pytest
 import numpy as np
+import pytest
 
-@pytest.fixture
-def config_fixture():
-    # Via paths rather than a bare filename: these were relative to the working
-    # directory, so they only resolved when pytest happened to be run from the
-    # project root, and not at all now that they live in config/.
-    import paths
-
-    with open(paths.CONFIG_JSON, "r") as f:
-        return json.load(f)
-
-@pytest.fixture
-def params_fixture():
-    import paths
-
-    with open(paths.PARAMS_JSON, "r") as f:
-        return json.load(f)
-
-def test_fixtures_load(config_fixture, params_fixture):
-    assert "knit_parameters" in config_fixture
-    assert "params" in params_fixture
-    assert "bitmap" in params_fixture
-
-
-import jax.numpy as jnp
+import paths
 from knitting_core import (
-    _scale_factors_jax, eval_curve
-)
-
-def test_scale_factors_jax():
-    bitmap = jnp.array([[1.0, 0.0], [1.0, 1.0]], dtype=jnp.float32)
-    factors = _scale_factors_jax(bitmap)
-    assert factors.shape == (2, 2)
-    assert np.all(factors >= 0.0)
-
-def test_eval_curve():
-    t = jnp.linspace(0.0, 2.0 * jnp.pi, 10)
-    hl = jnp.ones(10)
-    lh = 1.5
-    sb = 0.25
-    sz = 0.1
-    
-    pos = eval_curve(t, hl, lh, sb, sz)
-    assert pos.shape == (10, 3)
-
-
-from knitting_core import (
+    build_parametric_control_rows,
+    build_row_spline_jacobian,
+    build_spline_mesh,
+    build_surface_fiber_meshes,
+    compute_bitmap_scale_factors,
     compute_knitting_faces,
-    build_parametric_control_rows, build_spline_mesh
+    eval_centerline,
+    evaluate_centerlines,
 )
 
-def test_mesh_generation(config_fixture):
-    seg = config_fixture["knit_parameters"]["segments"]
-    # Mock vertex list for 1 row, 2 points
-    verts = np.zeros((2 * seg, 3), dtype=np.float32)
-    vl = [(verts, 2)]
-    fl = compute_knitting_faces(seg, vl)
-    assert len(fl) == 1
-    faces = fl[0]
-    assert isinstance(faces, np.ndarray)
-    assert faces.ndim == 2
-    assert faces.shape[1] == 4  # quads
 
-def test_spline_construction(config_fixture, params_fixture):
-    params_dict = params_fixture["params"]
-    config_params = config_fixture["knit_parameters"]["parameters"]
-    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
-    
-    pidx = {p["name"]: i for i, p in enumerate(config_params)}
-    lh_params = sorted(
-        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
-        key=lambda name: int(name.split("_")[-1])
-    )
-    lh_idx = tuple(pidx[name] for name in lh_params)
-    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
-    
-    # Build parametric control rows
-    ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
-    assert len(ctrl_rows) == bitmap.shape[0]
-    for row in ctrl_rows:
-        assert isinstance(row, np.ndarray)
-        assert row.shape[1] == 3
-        
-    # Build spline mesh
-    spline_mesh = build_spline_mesh(ctrl_rows, params_list, config_fixture, pidx, bitmap.shape[1])
-    assert len(spline_mesh) == len(ctrl_rows)
-    for pts, nout in spline_mesh:
-        assert pts.shape[1] == 3
-        assert isinstance(nout, int)
-
-
-def test_zero_pattern_segments_ignore_loop_height(config_fixture, params_fixture):
-    params_dict = params_fixture["params"]
-    config_params = config_fixture["knit_parameters"]["parameters"]
-    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
-    pidx = {p["name"]: i for i, p in enumerate(config_params)}
-    lh_params = sorted(
-        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
-        key=lambda name: int(name.split("_")[-1])
-    )
-    lh_idx = tuple(pidx[name] for name in lh_params)
-    spl = 5
+@pytest.fixture
+def model():
+    config = json.loads(paths.CONFIG_JSON.read_text())
+    definitions = config["knit_parameters"]["parameters"]
+    params = np.array([p["initial"] for p in definitions])
+    pidx = {p["name"]: i for i, p in enumerate(definitions)}
+    heights = tuple(pidx[name] for name in sorted(
+        (name for name in pidx if name.startswith("loop_height_")),
+        key=lambda name: int(name.rsplit("_", 1)[1]),
+    ))
     bitmap = np.ones((3, 4), dtype=np.float32)
-    bitmap[1, 2] = 0.0
+    period = np.array([bitmap.shape[1] * params[pidx["stitch_width"]], 0.0, 0.0])
+    return config, params, pidx, heights, bitmap, period
 
-    low_params = list(params_list)
-    high_params = list(params_list)
-    for idx in lh_idx:
-        low_params[idx] = 0.5
-        high_params[idx] = 8.0
 
-    low_rows = build_parametric_control_rows(low_params, bitmap, pidx, lh_idx, spl=spl)
-    high_rows = build_parametric_control_rows(high_params, bitmap, pidx, lh_idx, spl=spl)
-    lo, hi = 2 * spl, 3 * spl
-    low_segment = low_rows[1][lo:hi]
-    high_segment = high_rows[1][lo:hi]
-
-    np.testing.assert_allclose(low_segment, high_segment, atol=1e-6)
-    np.testing.assert_allclose(low_segment[:, 1], params_list[pidx["dy"]], atol=1e-6)
-    np.testing.assert_allclose(low_segment[:, 2], 0.0, atol=1e-6)
-
-    mesh = build_spline_mesh(
-        high_rows,
-        high_params,
-        config_fixture,
-        pidx,
-        [float(bitmap.shape[1]), 0.0, 0.0],
-        pattern_bitmap=bitmap,
-        samples_per_loop=spl,
+def test_core_import_has_no_application_or_runtime_side_effects():
+    script = """
+import os
+import sys
+before = dict(os.environ)
+import knitting_core
+assert dict(os.environ) == before
+assert not {'moderngl', 'imgui_bundle', 'gui', 'app_state', 'jax', 'mitsuba'} & sys.modules.keys()
+"""
+    subprocess.run(
+        [sys.executable, "-c", script], check=True,
+        env={**os.environ, "PYTHONPATH": str(paths.SRC_DIR)},
     )
-    segments = config_fixture["knit_parameters"]["segments"]
-    centers = mesh[1][0].reshape(mesh[1][1], segments, 3).mean(axis=1)
-    cp = np.asarray(high_rows[1], dtype=float)
-    cp_aug = np.concatenate((cp, (cp[0] + np.array([float(bitmap.shape[1]), 0.0, 0.0]))[None, :]), axis=0)
-    t = np.concatenate(([0.0], np.cumsum(np.maximum(np.linalg.norm(np.diff(cp_aug, axis=0), axis=1), 1e-6))))
-    to = np.linspace(t[0], t[-1], mesh[1][1])
-    in_zero_span = (to >= t[2 * spl]) & (to <= t[3 * spl])
-    assert np.ptp(centers[in_zero_span, 1]) < 1e-4
-    assert np.ptp(centers[in_zero_span, 2]) < 1e-4
 
 
-from knitting_core import build_surface_fiber_meshes
+def test_scale_factors_cover_inactive_cells_without_mutating_bitmap():
+    bitmap = np.array([[1, 1], [0, 1], [0, 0], [1, 0]], dtype=float)
+    original = bitmap.copy()
+    np.testing.assert_array_equal(compute_bitmap_scale_factors(bitmap), [[3, 1], [0, 3], [0, 0], [1, 0]])
+    np.testing.assert_array_equal(bitmap, original)
 
-def test_fiber_meshes():
-    # Mock base vertices: List of (verts, count)
-    # Each row contains (n_points * segments) vertices. Let n_points = 2, segments = 6
-    segments = 6
-    n_points = 2
-    verts_row = np.arange(n_points * segments * 3, dtype=np.float32).reshape(-1, 3)
-    base_vl = [(verts_row, n_points)]
-    
-    # 1. Disabled case
-    out_vl, meta = build_surface_fiber_meshes(
-        base_vl=base_vl,
-        segments=segments,
-        enabled=False,
-        count=3,
-        radius=0.1,
-        radius_scale=1.0,
-        lift=0.0,
-        surface_arc=0.5,
-        randomness=0.0,
-        twist=0.0
+
+def test_mesh_faces_join_adjacent_rings(model):
+    config, *_ = model
+    segments = config["knit_parameters"]["segments"]
+    faces, = compute_knitting_faces(segments, [(np.zeros((2 * segments, 3)), 2)])
+    assert faces.shape == (segments, 4)
+    np.testing.assert_array_equal(faces[-1], [segments - 1, 0, segments, 2 * segments - 1])
+
+
+def test_inactive_control_points_ignore_loop_height(model):
+    _, params, pidx, heights, bitmap, _ = model
+    bitmap[1, 2] = 0
+    low = params.copy()
+    high = params.copy()
+    low[list(heights)] = 0.5
+    high[list(heights)] = 8.0
+    low_rows = build_parametric_control_rows(low, bitmap, pidx, heights)
+    high_rows = build_parametric_control_rows(high, bitmap, pidx, heights)
+    np.testing.assert_allclose(low_rows[1][6:11], high_rows[1][6:11])
+    np.testing.assert_allclose(high_rows[1][6:11, 1], params[pidx["dy"]])
+    np.testing.assert_allclose(high_rows[1][6:11, 2], 0)
+
+
+@pytest.mark.parametrize("variable_radius", [False, True])
+def test_mesh_and_simulation_share_periodic_centerlines(model, variable_radius):
+    config, params, pidx, heights, bitmap, period = model
+    rows = build_parametric_control_rows(params, bitmap, pidx, heights)
+    assert all(row.shape == (bitmap.shape[1] * 5 + 1, 3) for row in rows)
+    radius = [np.linspace(0.1, 0.3, len(row)) for row in rows] if variable_radius else None
+    mesh = build_spline_mesh(rows, params, config, pidx, period, radius_ctrl_rows=radius)
+    vertices, edges, _, nout = evaluate_centerlines(rows, period, config)
+    assert len(mesh) == len(rows)
+    assert edges.shape == (len(rows) * (nout - 1), 2)
+    segments = config["knit_parameters"]["segments"]
+    for index, (points, count) in enumerate(mesh):
+        assert count == nout
+        rings = points.reshape(nout, segments, 3)
+        np.testing.assert_allclose(rings.mean(axis=1), vertices[index * nout:(index + 1) * nout], atol=1e-6)
+        direction = 1 if index % 2 == 0 else -1
+        np.testing.assert_allclose(rings[0] + direction * period, rings[-1], atol=1e-5)
+        assert np.isfinite(points).all()
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_spline_jacobian_uses_the_same_row_direction(direction):
+    points = np.array([[0.0, 0.0, 0.0], [1.0, 0.4, 0.1], [2.0, -0.2, 0.0]])[::direction]
+    period = np.array([3.0, 0.0, 0.0])
+    signed = direction * period
+    augmented = np.vstack([points, points[0] + signed])
+    knots = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(augmented, axis=0), axis=1))]
+    samples = np.linspace(0.0, knots[-1], 20)
+    jacobian = build_row_spline_jacobian(points, period, 20)
+    moved = points.copy()
+    moved[1, 1] += 1e-4
+    difference = (eval_centerline(moved, period, 20, knots, samples)
+                  - eval_centerline(points, period, 20, knots, samples)) / 1e-4
+    np.testing.assert_allclose(difference[:, 1], jacobian[:, 1], atol=1e-9)
+
+
+def test_period_is_a_vector():
+    with pytest.raises(ValueError, match="3D vector"):
+        eval_centerline(np.zeros((2, 3)), 2.0, 5)
+
+
+@pytest.mark.parametrize("enabled, count", [(False, 1), (True, 3)])
+def test_fiber_meshes(model, enabled, count):
+    config, params, pidx, heights, bitmap, period = model
+    rows = build_parametric_control_rows(params, bitmap, pidx, heights)[:1]
+    base = build_spline_mesh(rows, params, config, pidx, period)
+    meshes, metadata = build_surface_fiber_meshes(
+        base, config["knit_parameters"]["segments"], enabled, 3,
+        radius=0.1, radius_scale=1.0, lift=0.0, surface_arc=0.5, randomness=0.0, twist=0.0,
     )
-    assert len(out_vl) == len(base_vl)
-    assert meta[0]["row"] == 0
-    
-    # 2. Enabled case
-    out_vl, meta = build_surface_fiber_meshes(
-        base_vl=base_vl,
-        segments=segments,
-        enabled=True,
-        count=3,
-        radius=0.1,
-        radius_scale=1.0,
-        lift=0.0,
-        surface_arc=0.5,
-        randomness=0.0,
-        twist=0.0
-    )
-    # We expect count=3 fiber meshes produced
-    assert len(out_vl) == 3
-    assert len(meta) == 3
-    for entry in meta:
-        assert entry["row"] == 0
-
-
-def test_spline_mesh_with_variable_radius(config_fixture, params_fixture):
-    params_dict = params_fixture["params"]
-    config_params = config_fixture["knit_parameters"]["parameters"]
-    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
-    pidx = {p["name"]: i for i, p in enumerate(config_params)}
-    lh_params = sorted(
-        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
-        key=lambda name: int(name.split("_")[-1])
-    )
-    lh_idx = tuple(pidx[name] for name in lh_params)
-    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
-
-    ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
-    
-    # Define variable radius rows matching ctrl_rows shapes
-    radius_ctrl_rows = [
-        np.full(len(row), 0.35, dtype=np.float32)
-        for row in ctrl_rows
-    ]
-    
-    spline_mesh = build_spline_mesh(
-        ctrl_rows, params_list, config_fixture, pidx, bitmap.shape[1],
-        radius_ctrl_rows=radius_ctrl_rows
-    )
-    assert len(spline_mesh) == len(ctrl_rows)
-    for pts, nout in spline_mesh:
-        assert pts.shape[1] == 3
-        assert isinstance(nout, int)
-
-
-def test_periodic_spline_continuity(config_fixture, params_fixture):
-    from knitting_core import build_parametric_control_rows, build_spline_mesh
-    params_dict = params_fixture["params"]
-    config_params = config_fixture["knit_parameters"]["parameters"]
-    params_list = [params_dict.get(p["name"], p["initial"]) for p in config_params]
-    pidx = {p["name"]: i for i, p in enumerate(config_params)}
-    lh_params = sorted(
-        [p["name"] for p in config_params if p["name"].startswith("loop_height_")],
-        key=lambda name: int(name.split("_")[-1])
-    )
-    lh_idx = tuple(pidx[name] for name in lh_params)
-    bitmap = np.asarray(params_fixture["bitmap"], dtype=np.float32)
-    
-    # 1. Verify control point lengths are cols * spl (bitmap.shape[1] * 5)
-    ctrl_rows = build_parametric_control_rows(params_list, bitmap, pidx, lh_idx)
-    assert ctrl_rows[0].shape[0] == bitmap.shape[1] * 5
-    
-    # 2. Build mesh and check periodic boundary alignment
-    spline_mesh = build_spline_mesh(ctrl_rows, params_list, config_fixture, pidx, [float(bitmap.shape[1]), 0.0, 0.0])
-    seg = config_fixture["knit_parameters"]["segments"]
-    D = np.array([float(bitmap.shape[1]), 0.0, 0.0])
-    for pts, nout in spline_mesh:
-        # First ring of vertices (start) + period translation must match the last ring (end) exactly
-        np.testing.assert_allclose(pts[:seg] + D, pts[-seg:], atol=1e-4)
-
-
-
-
+    assert len(meshes) == len(metadata) == count
+    assert all(entry["row"] == 0 for entry in metadata)
+    assert all(np.isfinite(points).all() for points, _ in meshes)
