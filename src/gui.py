@@ -35,17 +35,15 @@ from gui_database import _draw_database_summary_page
 # names so every call site in this file is unchanged.
 from scanner_core import (
     _clamp_scanner_selected_cell, _ensure_scanner_shared_colors,
-    _generate_scanner_random_patterns, _maybe_persist_scanner_state,
+    _maybe_persist_scanner_state,
     _puzzle_apply_geometry_copies,
     _puzzle_build_seamless_tile, _puzzle_capture_geometry_image, _puzzle_capture_rect,
     _puzzle_detect_colors, _puzzle_target_copies,
-    _refresh_embedded_scanner_display_colors, _scanner_base_palette, _scanner_batch_colors_for_simulator,
-    _scanner_batch_texture_size, _scanner_capture_image_size,
+    _refresh_embedded_scanner_display_colors, _scanner_batch_texture_size, _scanner_capture_image_size,
     _scanner_display_batch_colors, _scanner_estimated_cell_colors,
-    _scanner_generate_tiled_layout, _scanner_lighting_settings,
-    _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
-    _scanner_shared_cell_color_sets, _scanner_storage, _set_puzzle_capture_rect,
-    _set_scanner_estimated_batch_color, _upload_puzzle_texture,
+    _scanner_generate_tiled_layout, _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
+    _scanner_storage, _set_puzzle_capture_rect,
+    _set_scanner_estimated_batch_color, _upload_puzzle_texture, build_scanner_plan_args,
 )
 
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
@@ -53,7 +51,6 @@ from scanner_core import (
 import gui_ur5
 import gui_model
 import crochet_core
-import crochet_fit
 import scan_fit
 
 # Per-step solver displacements are tiny next to the model, so the force overlay
@@ -390,31 +387,11 @@ def _open_model_in_edit(state, request):
         state.status_msg = f"Crochet from the scan: {rows} rows x {stitches} stitches"
         return
     state.fabric_type = 'knit'
-    _apply_knit_pattern(state, request['parameters'], request['bitmap'])
+    state.apply_knit_pattern(request['parameters'], request['bitmap'])
     state.display_copies = np.array([1, 1], dtype=np.int32)
     state.rebuild_spline_mesh(preserve_model_placement=False)
     state.center_model_on_view()
     state.status_msg = f"Pattern from the scan: {state.bitmap.shape[0]} rows x {state.bitmap.shape[1]} stitches"
-
-
-def _apply_knit_pattern(state, parameters, bitmap):
-    """Knit loop parameters (mm, by name, clipped to their ranges) and a stitch bitmap, made Edit Mode's."""
-    ranges = {p['name']: p['range'] for p in state.config['knit_parameters']['parameters']}
-    params = list(state.params)
-    for name, value in parameters.items():
-        if name in state._pidx:
-            low, high = ranges[name]
-            params[state._pidx[name]] = float(np.clip(value, low, high))
-    state.params = params
-    bitmap = np.asarray(bitmap, dtype=np.float32)
-    max_rows = int(state.config['knit_parameters']['bitmap_rows'])
-    bitmap = bitmap[:max_rows, :32]
-    state.bitmap = bitmap.copy()
-    state.bitmap_size = np.array(bitmap.shape, dtype=np.int32)
-    state._sync_row_colors(bitmap.shape[0])
-    state._sync_row_visibility(bitmap.shape[0])
-    state.clear_loop_height_overrides()
-    state.on_bitmap_change()
 
 
 def _set_app_mode(state, mode):
@@ -704,7 +681,7 @@ def _finish_scan_fit(state, renderer):
         view.message = (f"{result.stitch_name}: stitch {p.stitch_width:.2f} mm, row {p.row_height:.2f} mm, yarn r {p.yarn_radius:.2f} mm, "
                         f"twist {p.twist:.2f}, lean {p.lean:+.2f} mm")
     else:
-        _apply_knit_pattern(state, result.edit_parameters(), result.bitmap)
+        state.apply_knit_pattern(result.edit_parameters(), result.bitmap)
         view.message = (f"stitch {result.stitch_width:.2f} mm, rows {result.row_pitch:.2f} mm apart, loop {result.loop_height:.2f} mm, "
                         f"bulge {result.stitch_bulge:.2f}")
     state.rebuild_spline_mesh(preserve_model_placement=False)
@@ -761,8 +738,8 @@ def _start_grid(state, renderer):
             cameras, lens, train, _ = scan_fit.load_cameras(model["run"], model["dataset"])
             lattice = scan_fit.load_grid(model["output"])
             if lattice is None:
-                start = crochet_fit.fit(prepared["extraction"], stitches=int(grid_size[1]), rows=int(grid_size[0]), wraps=wraps,
-                                        rows_along_holes=True, refine=False)
+                start = scan_fit.fit(prepared["extraction"], stitches=int(grid_size[1]), rows=int(grid_size[0]), wraps=wraps,
+                                     rows_along_holes=True, refine=False)
                 lattice = scan_fit.lattice_from_fit(start)
             photos = scan_fit.read_photos(cameras)
             holder.update(prepared=prepared, cameras=cameras, lens=lens, train=train, photos=photos, lattice=lattice,
@@ -890,7 +867,7 @@ def _draw_scan_fit(state, fabric, renderer):
     view = _SCAN_FIT
     _finish_scan_fit(state, renderer)
     if view.models is None:
-        view.models = gui_model.find_models()
+        view.models = scan_fit.find_models()
         measured = [i for i, m in enumerate(view.models) if m["mm_per_unit"] is not None]
         view.index = max(measured, key=lambda i: view.models[i]["psnr"] or 0.0) if measured else (0 if view.models else -1)
     if not view.models:
@@ -1018,8 +995,8 @@ def draw_sidebar(state, renderer, window=None):
     def rebuild_current_mesh(preserve=True):
         state.rebuild_spline_mesh(preserve_model_placement=preserve)
 
-    def ensure_embedded_robot_viewer(auto_start=False):
-        if not auto_start and bool(state.get('_embedded_scanner_viewer_failed', False)):
+    def ensure_embedded_robot_viewer(auto_start=False, single_capture=False):
+        if not auto_start and not single_capture and bool(state.get('_embedded_scanner_viewer_failed', False)):
             return None
         _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
@@ -1032,6 +1009,11 @@ def draw_sidebar(state, renderer, window=None):
                     logging.warning("gui.ensure_embedded_robot_viewer: %s", exc)
                 state.embedded_scanner = None
             else:
+                if single_capture:
+                    embedded.running = False
+                    embedded.paused = True
+                    embedded.args.capture_mode = str(state.get('scanner_capture_mode', 'natural'))
+                    embedded.args.camera_zoom = float(state.get('scanner_camera_zoom', 1.0))
                 return embedded
         try:
             tiled_full_image, tiled_per_cell = _scanner_generate_tiled_layout(state, renderer)
@@ -1045,21 +1027,25 @@ def draw_sidebar(state, renderer, window=None):
             )
             state.embedded_scanner = embedded
             state._embedded_scanner_viewer_failed = False
-            if not auto_start:
+            if single_capture:
+                embedded.running = False
+                embedded.paused = True
+                embedded.args.capture_mode = str(state.get('scanner_capture_mode', 'natural'))
+                embedded.args.camera_zoom = float(state.get('scanner_camera_zoom', 1.0))
+            elif not auto_start:
                 state.scanner_status = embedded.status
             return embedded
         except Exception as exc:
             state.embedded_scanner = None
-            state._embedded_scanner_viewer_failed = True
-            label = "scanner" if auto_start else "Robot Viewer"
-            state.scanner_status = f"Could not start embedded MuJoCo {label}: {exc}"
+            if not single_capture:
+                state._embedded_scanner_viewer_failed = True
+            label = "single capture preview" if single_capture else ("embedded MuJoCo scanner" if auto_start else "embedded MuJoCo Robot Viewer")
+            state.scanner_status = f"Could not start {label}: {exc}"
             return None
 
     def start_scanner_process(force=False):
         mode = str(state.scanner_execution_mode)
         embedded = state.get('embedded_scanner')
-        # Continuing or already running is not a new scan, so neither reaches
-        # the duplicate check below.
         if embedded is not None and mode == "simulation":
             if getattr(embedded, 'paused', False) and not getattr(embedded, 'single_capture_mode', False):
                 embedded.resume()
@@ -1069,9 +1055,6 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_status = "Scanner already running"
                 return
 
-        # Asked before anything is torn down or written, so cancelling really
-        # does leave everything as it was -- the running scanner is still up and
-        # no images, rows or params have been touched.
         if not force:
             existing = _scan_duplicate_runs(state)
             if existing:
@@ -1094,47 +1077,12 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_status = "Embedded MuJoCo scanner running"
             return
 
-        cell_color_sets = _scanner_shared_cell_color_sets(state)
-        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-        spacing_x, spacing_y = _scanner_repeat_spacing(state)
-        lighting = _scanner_lighting_settings(state)
-        batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
         try:
             import fabric_scanner as scanner
 
-            args = SimpleNamespace(
-                rows=int(state.scanner_rows),
-                cols=int(state.scanner_cols),
-                number_of_angles=int(state.scanner_angles),
-                width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
-                length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
-                edge_margin=0.004,
-                square_margin=0.006,
-                surface_wave=0.003,
-                view_radius=0.018,
-                angle_lift=0.014,
-                approach_lift=0.040,
-                center=[-0.45, -0.08, 0.30],
-                max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-                palette=_scanner_base_palette(state),
-                cell_color_sets=cell_color_sets,
-                model_json=str(state.save_path),
+            args = build_scanner_plan_args(
+                state,
                 model_curves=None,
-                cell_model_curves=_generate_scanner_random_patterns(state),
-                random_patterns=True,
-                pattern_rows=int(pattern_rows),
-                pattern_cols=int(pattern_cols),
-                pattern_repeat_rows=int(repeat_rows),
-                pattern_repeat_cols=int(repeat_cols),
-                pattern_repeat_spacing_x=float(spacing_x),
-                pattern_repeat_spacing_y=float(spacing_y),
-                batch_texture_width=int(batch_texture_width),
-                batch_texture_height=int(batch_texture_height),
-                pattern_density=float(state.get('scanner_pattern_density', 0.62)),
-                random_seed=int(state.get('scanner_random_seed', 1)),
-                scanner_lighting=lighting,
-                display_batch_colors=_scanner_batch_colors_for_simulator(state),
                 robot_ip=str(state.scanner_robot_ip),
                 robot_port=int(state.scanner_robot_port),
                 robot_vel=0.015,
@@ -1160,32 +1108,6 @@ def draw_sidebar(state, renderer, window=None):
             state.scanner_status = embedded.status
             return
         state.scanner_status = "Scanner idle"
-
-    def ensure_embedded_single_capture():
-        _clamp_scanner_selected_cell(state)
-        state.save_params(state.save_path, silent=True)
-        embedded = state.get('embedded_scanner')
-        if embedded is None:
-            try:
-                tiled_full_image, tiled_per_cell = _scanner_generate_tiled_layout(state, renderer)
-                embedded = EmbeddedMujocoScanner(
-                    state,
-                    renderer.ctx,
-                    window,
-                    preview_image=tiled_full_image,
-                    per_cell_images=tiled_per_cell,
-                    auto_start=False,
-                )
-                state.embedded_scanner = embedded
-            except Exception as exc:
-                state.embedded_scanner = None
-                state.scanner_status = f"Could not start single capture preview: {exc}"
-                return None
-        embedded.running = False
-        embedded.paused = True
-        embedded.args.capture_mode = str(state.get('scanner_capture_mode', 'natural'))
-        embedded.args.camera_zoom = float(state.get('scanner_camera_zoom', 1.0))
-        return embedded
 
     current_mode = str(state.get('app_mode', 'edit'))
     edit_active = current_mode == 'edit'
@@ -2021,7 +1943,7 @@ def draw_sidebar(state, renderer, window=None):
                     embedded.set_single_capture_resolution(capture_width)
             imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
             if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
-                embedded = ensure_embedded_single_capture()
+                embedded = ensure_embedded_robot_viewer(single_capture=True)
                 if embedded is not None:
                     embedded.set_single_capture_resolution(capture_width)
                     embedded.preview_single_target(
@@ -2037,7 +1959,7 @@ def draw_sidebar(state, renderer, window=None):
             }
             capture_label = "Capture in progress...##single_capture_save" if single_job_busy else "Capture Image##single_capture_save"
             if imgui.button(capture_label, (-1, 0)) and not single_job_busy:
-                embedded = ensure_embedded_single_capture()
+                embedded = ensure_embedded_robot_viewer(single_capture=True)
                 if embedded is not None:
                     embedded.set_single_capture_resolution(capture_width)
                     embedded.start_single_capture(
@@ -3094,25 +3016,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             # Read the viewport origin here rather than reusing ox/oy from the
             # bounding-box block above: that block only runs when gizmo_bounds
             # exists, so those names are not always bound at this point.
-            origin_x, origin_y = float(state.vp_origin[0]), float(state.vp_origin[1])
-
-            def force_point_to_screen(pt_world):
-                """One point to viewport-relative pixels, for the force arrows.
-
-                Distinct from rendering.project_to_screen: it takes a single
-                point and offsets by the viewport origin. It was called
-                project_to_screen, which shadowed the shared helper throughout
-                draw_viewport and broke the closures defined above it.
-                """
-                h = np.array([pt_world[0], pt_world[1], pt_world[2], 1.0], dtype=np.float32) @ view_proj.T
-                if h[3] < 1e-6:
-                    return None
-                ndc = h[:3] / h[3]
-                return (
-                    origin_x + (float(ndc[0]) * 0.5 + 0.5) * disp_w,
-                    origin_y + (1.0 - (float(ndc[1]) * 0.5 + 0.5)) * disp_h,
-                )
-
+            origin = np.array([float(state.vp_origin[0]), float(state.vp_origin[1])], dtype=np.float32)
             for idx in visible_ctrl_indices:
                 idx = int(idx)
                 # Virtual (period) control points have no simulated counterpart.
@@ -3120,9 +3024,10 @@ def draw_viewport(state, renderer, ref_tex, window):
                     continue
                 p0_local = state.flat_pts_all[idx].astype(np.float32)
                 p1_local = p0_local + delta_P[idx] * FORCE_ARROW_SCALE
-                p0 = force_point_to_screen(transform_points([p0_local], model_mat)[0])
-                p1 = force_point_to_screen(transform_points([p1_local], model_mat)[0])
-                if p0 and p1:
+                screen, valid, _ = project_to_screen(transform_points([p0_local, p1_local], model_mat), view_proj, disp_w, disp_h)
+                if bool(np.all(valid)):
+                    p0 = tuple((origin + screen[0]).tolist())
+                    p1 = tuple((origin + screen[1]).tolist())
                     dl.add_line(p0, p1, force_color, 2.0)
                     dl.add_circle_filled(p1, 3.0, force_color)
 

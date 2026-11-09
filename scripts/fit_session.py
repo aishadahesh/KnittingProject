@@ -20,7 +20,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 import gui_captures  # noqa: E402
 import hand_eye  # noqa: E402
-import lens  # noqa: E402
 import session_fit  # noqa: E402
 from persistence import write_json
 
@@ -48,7 +47,7 @@ def main() -> None:
     print(f"{args.session}: {len(records)} pictures, fabric plane z {plane_z:.4f} m")
     started = time.monotonic()
     fitted = session_fit.fit(records, calibration, plane_z, mirrored={"auto": None, "yes": True, "no": False}[args.mirrored],
-                             measured_lens=lens.load_intrinsics())
+                             measured_lens=hand_eye.load_intrinsics())
     lens_fit = fitted["lens"]
     print(f"fitted in {time.monotonic() - started:.0f} s: lens f {lens_fit['f']:.1f} px "
           f"({np.degrees(2 * np.arctan(fitted['size'][0] / (2 * lens_fit['f']))):.1f} deg across), centre ({lens_fit['cx']:.1f}, {lens_fit['cy']:.1f}), "

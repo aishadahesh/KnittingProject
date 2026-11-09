@@ -38,6 +38,7 @@ import numpy as np
 
 SAMPLES_PER_MM = 24
 TEMPLATE_SAMPLES = 96
+FAMILIES = ("mesh", "trellis", "vstitch", "shell")
 
 
 @dataclass
@@ -48,8 +49,6 @@ class CrochetParams:
     yarn_radius: float = 0.3       # mm
     twist: float = 0.75            # turns the two legs make round each other up one post
     lean: float = 0.0              # mm the top of a post sits sideways from its foot
-    # A learned stitch, as fitted to photos: [{"kind": "post"|"chain", "parity": 0|1, "part", "closed",
-    # "coefficients": [[x terms], [y terms], [z terms]]}, ...] - or None for the hand-made curves.
     templates: list | None = None
 
     def as_dict(self) -> dict:
@@ -57,7 +56,7 @@ class CrochetParams:
 
 
 def template_basis(samples: int, closed: bool, count: int) -> np.ndarray:
-    """The Fourier basis a template's coefficients multiply: `count` columns (see the module docstring)."""
+    """The Fourier basis a template's coefficients multiply: `count` columns."""
     t = np.linspace(0.0, 1.0, samples, endpoint=not closed)
     if closed:
         columns = [np.ones_like(t)]
@@ -68,17 +67,22 @@ def template_basis(samples: int, closed: bool, count: int) -> np.ndarray:
     return np.stack(columns, axis=1)
 
 
+def hand_parts(p: CrochetParams, parity: int) -> dict[str, list]:
+    """Hand-made stitch curves at the origin for one row parity: {'post': [...], 'chain': [...]}."""
+    direction = 1 if parity == 0 else -1
+    top = (top_loop(0.0, p.row_height, p, direction), True, "top")
+    return {
+        "post": [(leg, False, "leg") for leg in post_legs(0.0, 0.0, p, direction)]
+                + [(wrap, False, "wrap") for wrap in post_wraps(0.0, 0.0, p, direction)] + [top],
+        "chain": [top],
+    }
+
+
 def hand_templates(p: CrochetParams, open_terms: int = 10, closed_terms: int = 8) -> list:
-    """The hand-made stitch (posts, wraps, tops) as templates: each curve's Fourier coefficients by
-    least squares - the starting point a fit to photos learns from."""
+    """The hand-made stitch (posts, wraps, tops) as templates: each curve's Fourier coefficients by least squares."""
     templates = []
     for parity in (0, 1):
-        direction = 1 if parity == 0 else -1
-        top = (top_loop(0.0, p.row_height, p, direction), True, "top")
-        parts = {"post": [(leg, False, "leg") for leg in post_legs(0.0, 0.0, p, direction)]
-                         + [(wrap, False, "wrap") for wrap in post_wraps(0.0, 0.0, p, direction)] + [top],
-                 "chain": [top]}
-        for kind, curves in parts.items():
+        for kind, curves in hand_parts(p, parity).items():
             for points, closed, part in curves:
                 scaled = points / np.array([p.stitch_width, p.row_height, 1.0])
                 count = 1 + 2 * closed_terms if closed else 2 + open_terms
@@ -241,3 +245,84 @@ def equations(p: CrochetParams) -> list[str]:
         f"V top:      x = xᵢ + {0.62 * w:.2f} cos t,  y = y₀ + {h:.2f} ± {0.35 * r:.2f} cos t,  z = {1.3 * r:.2f} sin t",
         f"a stitch every {w:.2f} mm along the row; a row {h:.2f} mm tall",
     ]
+
+
+def _motif_count(length_mm: float) -> int:
+    return max(int(length_mm * 12), 16)
+
+
+def twisted(p0, p1, r: float, turns: float, bow: float = 0.0) -> list[np.ndarray]:
+    """Two strands wound round the line p0 -> p1 (in the fabric's plane), bowed sideways by `bow` mm."""
+    p0, p1 = np.array([*p0, 0.0][:3], dtype=float), np.array([*p1, 0.0][:3], dtype=float)
+    along = p1 - p0
+    length = float(np.linalg.norm(along))
+    s = np.linspace(0.0, 1.0, _motif_count(length))
+    e = np.array([-along[1], along[0], 0.0]) / max(length, 1e-9)
+    z = np.array([0.0, 0.0, 1.0])
+    centre = p0 + s[:, None] * along + (bow * np.sin(math.pi * s))[:, None] * e
+    return [
+        centre + r * (np.cos(2 * math.pi * turns * s + k * math.pi)[:, None] * e
+                      + np.sin(2 * math.pi * turns * s + k * math.pi)[:, None] * z)
+        for k in (0, 1)
+    ]
+
+
+def flat_loop(middle, half_width: float, half_height: float, depth: float, angle: float = 0.0) -> np.ndarray:
+    """A closed loop lying in the fabric round `middle`, its long axis at `angle` (radians)."""
+    t = np.linspace(0.0, 2 * math.pi, _motif_count(4 * max(half_width, half_height)), endpoint=False)
+    a = np.array([math.cos(angle), math.sin(angle), 0.0])
+    b = np.array([-math.sin(angle), math.cos(angle), 0.0])
+    m = np.array([middle[0], middle[1], 0.0])
+    return (m + (half_width * np.cos(t))[:, None] * a + (half_height * np.sin(t))[:, None] * b
+            + (depth * np.sin(t))[:, None] * np.array([0.0, 0.0, 1.0]))
+
+
+def chain_turns(length_mm: float, r: float) -> float:
+    return float(min(length_mm / max(6.0 * r, 1e-6), 4.0))
+
+
+def _mesh(W: float, H: float, r: float, arch: float, post: bool) -> list:
+    top = (0.0, H)
+    pieces = []
+    foot = (0.0, H - 0.3 * H) if post else top
+    for side in (-1, 1):
+        corner = (side * W / 2, 0.0)
+        length = math.dist(corner, foot)
+        for strand in twisted(corner, foot, r, chain_turns(length, r), -side * arch * length):
+            pieces.append((strand, False, "chain"))
+    if post:
+        for leg in twisted(foot, (0.0, H + 0.1 * H), r, 0.75):
+            pieces.append((leg, False, "post"))
+    pieces.append((flat_loop(top if not post else (0.0, H + 0.1 * H), 2.2 * r, 1.4 * r, 1.2 * r), True, "knot"))
+    return pieces
+
+
+def motif(name: str, W: float, H: float, r: float) -> list:
+    """One opening's share of the yarn for a stitch family: [(points mm, closed, part)]."""
+    if name == "mesh":
+        return _mesh(W, H, r, arch=0.06, post=False)
+    if name == "trellis":
+        return _mesh(W, H, r, arch=0.16, post=True)
+    if name == "vstitch":
+        foot, pieces = (0.0, -H / 2), []
+        for side in (-1, 1):
+            for leg in twisted(foot, (side * 0.3 * W, H / 2), r, 0.75):
+                pieces.append((leg, False, "post"))
+        pieces.append((flat_loop((0.0, H / 2), 0.52 * W, 0.6 * r, 1.3 * r), True, "top"))
+        return pieces
+    if name == "shell":
+        foot, pieces = np.array([W / 2, -H / 2]), []
+        for angle in np.radians([-60.0, -30.0, 0.0, 30.0, 60.0]):
+            top = foot + np.array([0.38 * W * math.sin(angle), H * math.cos(angle)])
+            for leg in twisted(foot, top, r, 0.75):
+                pieces.append((leg, False, "post"))
+        t = np.linspace(math.radians(-70.0), math.radians(70.0), _motif_count(1.6 * H))
+        edge = np.stack([foot[0] + 0.38 * W * np.sin(t), foot[1] + H * np.cos(t), np.zeros_like(t)], axis=1)
+        for k in (0, 1):
+            turn = 2 * math.pi * chain_turns(1.6 * H, r) * np.linspace(0.0, 1.0, len(t)) + k * math.pi
+            normal = np.stack([np.sin(t), np.cos(t) * 0.38 * W / H, np.zeros_like(t)], axis=1)
+            normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+            strand = edge + r * (np.cos(turn)[:, None] * normal + np.sin(turn)[:, None] * np.array([0.0, 0.0, 1.0]))
+            pieces.append((strand, False, "top"))
+        return pieces
+    raise ValueError(f"unknown stitch family {name!r}; one of {', '.join(FAMILIES)}")

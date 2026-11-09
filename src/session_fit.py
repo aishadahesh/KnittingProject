@@ -54,12 +54,6 @@ HUBER_PX = 2.0
 MAX_EVALUATIONS = 400
 
 
-def _matrix(rotvec, translation) -> np.ndarray:
-    out = np.eye(4)
-    out[:3, :3], out[:3, 3] = Rotation.from_rotvec(np.asarray(rotvec, dtype=float)).as_matrix(), np.asarray(translation, dtype=float)
-    return out
-
-
 def arm_matrices(captures) -> list[np.ndarray]:
     """Each picture's arm pose, in the one frame a session's mount is fitted in (hand_eye.arm_pose)."""
     return [hand_eye.tcp_matrix(hand_eye.arm_pose(c)) for c in captures]
@@ -230,12 +224,12 @@ def _adjust(tracks, points, pictures, arms, mount, lens, refine_lens=True):
     image_of = np.array([o[1] for o in observations])
     seen = np.array([o[2] for o in observations], dtype=float)
     lens_keys = ("f", "cx", "cy", "k1", "k2")
-    start = np.concatenate([Rotation.from_matrix(mount[:3, :3]).as_rotvec(), mount[:3, 3],
+    start = np.concatenate([hand_eye.params_from_matrix(mount),
                             [lens[k] for k in lens_keys] if refine_lens else []])
     arms = np.asarray(arms)
 
     def unpack(x):
-        return _matrix(x[:3], x[3:6]), ({**lens, **dict(zip(lens_keys, x[6:11]))} if refine_lens else dict(lens))
+        return hand_eye.hand_eye_from_params(x[:3], x[3:6]), ({**lens, **dict(zip(lens_keys, x[6:11]))} if refine_lens else dict(lens))
 
     def evaluate(x):
         fitted_mount, fitted_lens = unpack(x)

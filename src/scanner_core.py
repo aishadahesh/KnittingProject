@@ -23,12 +23,14 @@ import shutil
 import time
 from pathlib import Path
 
+from types import SimpleNamespace
+
 import numpy as np
 from PIL import Image, ImageDraw
 
-from fabric_scanner import clamp_capture_size
+from fabric_scanner import _loop_heights_for_random_bitmap, clamp_capture_size
 from knitting_core import build_parametric_control_rows
-from rendering import pil_to_texture
+from rendering import pil_to_texture, project_to_screen
 from persistence import write_json
 
 
@@ -277,13 +279,7 @@ def _puzzle_project_points(pts, mvp, vp_w, vp_h):
     pts = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
     if pts.shape[0] == 0:
         return np.empty((0, 2), dtype=np.float32)
-    homog = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float32)], axis=1)
-    clip = homog @ mvp.T
-    w = np.where(np.abs(clip[:, 3]) > 1e-8, clip[:, 3], 1.0)
-    ndc = clip[:, :3] / w[:, None]
-    px = (ndc[:, 0] + 1.0) * 0.5 * vp_w
-    py = (1.0 - ndc[:, 1]) * 0.5 * vp_h
-    return np.stack([px, py], axis=1)
+    return project_to_screen(pts, mvp, vp_w, vp_h)[0]
 
 
 def _puzzle_tiled_control_points(state):
@@ -1018,25 +1014,13 @@ def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density
         params = np.asarray(state.params, dtype=np.float32)
         source = np.empty((0, 0), dtype=np.float32)
 
-    heights = np.zeros_like(bitmap, dtype=np.float32)
-    for row_idx in range(pattern_rows):
-        if getattr(state, '_lh_idx', ()):
-            idx = state._lh_idx[min(row_idx, len(state._lh_idx) - 1)]
-            heights[row_idx, :] = float(params[idx])
-        else:
-            heights[row_idx, :] = 3.0
-    if source.ndim == 2 and source.size:
-        keep_rows = min(pattern_rows, source.shape[0])
-        keep_cols = min(pattern_cols, source.shape[1])
-        heights[:keep_rows, :keep_cols] = source[:keep_rows, :keep_cols]
-
     ctrl_rows = build_parametric_control_rows(
         params,
         bitmap,
         state._pidx,
         state._lh_idx,
         state.samples_per_loop,
-        loop_heights=heights * (bitmap > 0.5),
+        loop_heights=_loop_heights_for_random_bitmap(params, bitmap, getattr(state, '_lh_idx', ()), source),
     )
     return _normalize_scanner_curves(ctrl_rows)
 
@@ -1052,6 +1036,64 @@ def _generate_scanner_random_patterns(state):
         _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed + cell * 9973, density, repeat_rows, repeat_cols)
         for cell in range(rows * cols)
     ]
+
+
+def build_scanner_plan_args(state, **overrides) -> SimpleNamespace:
+    """Shared argument namespace for fabric_scanner.build_plan across Scan Mode and UR5 Mode."""
+    import fabric_scanner as scanner
+
+    pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
+    repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
+    spacing_x, spacing_y = _scanner_repeat_spacing(state)
+    batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
+    capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
+    single_capture_width, single_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
+    cell_model_curves = _generate_scanner_random_patterns(state)
+    fields = dict(
+        rows=int(state.scanner_rows),
+        cols=int(state.scanner_cols),
+        number_of_angles=int(state.scanner_angles),
+        width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
+        length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
+        edge_margin=0.004,
+        square_margin=0.006,
+        surface_wave=0.003,
+        view_radius=0.018,
+        angle_lift=0.014,
+        approach_lift=0.040,
+        center=[-0.45, -0.08, 0.30],
+        max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
+        speed=float(state.scanner_speed),
+        dwell=float(state.scanner_dwell),
+        add_camera=bool(state.scanner_add_camera),
+        save_images=bool(state.scanner_save_images),
+        image_dir=str((Path(state.project_root) / 'scanner_images').resolve()),
+        image_every=str(state.scanner_image_every),
+        capture_mode=str(state.get('scanner_capture_mode', 'natural')),
+        camera_zoom=float(state.get('scanner_camera_zoom', 1.0)),
+        capture_image_size=(int(capture_width), int(capture_height)),
+        single_capture_image_size=(single_capture_width, single_capture_height),
+        palette=_scanner_base_palette(state),
+        cell_color_sets=_scanner_shared_cell_color_sets(state),
+        model_json=str(state.save_path),
+        model_curves=cell_model_curves[0] if cell_model_curves else None,
+        cell_model_curves=cell_model_curves,
+        random_patterns=True,
+        pattern_rows=int(pattern_rows),
+        pattern_cols=int(pattern_cols),
+        pattern_repeat_rows=int(repeat_rows),
+        pattern_repeat_cols=int(repeat_cols),
+        pattern_repeat_spacing_x=float(spacing_x),
+        pattern_repeat_spacing_y=float(spacing_y),
+        batch_texture_width=int(batch_texture_width),
+        batch_texture_height=int(batch_texture_height),
+        pattern_density=float(state.get('scanner_pattern_density', 0.62)),
+        random_seed=int(state.get('scanner_random_seed', 1)),
+        scanner_lighting=_scanner_lighting_settings(state),
+        display_batch_colors=_scanner_batch_colors_for_simulator(state),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
 def _clamp_scanner_selected_cell(state):

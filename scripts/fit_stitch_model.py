@@ -71,10 +71,9 @@ from scipy import ndimage
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 import crochet_core  # noqa: E402
-import crochet_fit  # noqa: E402
-import crochet_stitches  # noqa: E402
 import gaussian_splatting  # noqa: E402
 import lace_lattice  # noqa: E402
+import scan_fit  # noqa: E402
 import strand_equations  # noqa: E402
 from persistence import write_json
 
@@ -104,29 +103,6 @@ def find_run_and_dataset(output: Path):
         raise SystemExit(f"no trained run under {output}")
     run = max(runs, key=lambda p: p.stat().st_mtime)
     return run, output.parent / run.parent.parent.name
-
-
-def load_cameras(run: Path, dataset: Path):
-    """Every training picture's camera in the splat's frame (OpenCV axes) and its lens, plus nerfstudio's split."""
-    transforms = json.loads((dataset / "transforms.json").read_text(encoding="utf-8"))
-    parser = json.loads((run / "dataparser_transforms.json").read_text(encoding="utf-8"))
-    move = np.eye(4)
-    move[:3, :] = np.array(parser["transform"])
-    if "applied_transform" in transforms:
-        applied = np.eye(4)
-        applied[:3, :] = np.array(transforms["applied_transform"])
-        move = move @ np.linalg.inv(applied)
-    cameras = []
-    for frame in transforms["frames"]:
-        c2w = move @ np.array(frame["transform_matrix"], dtype=np.float64)
-        c2w[:3, 3] *= float(parser["scale"])
-        c2w = c2w @ np.diag([1.0, -1.0, -1.0, 1.0])          # OpenGL -> OpenCV axes
-        cameras.append({"viewmat": np.linalg.inv(c2w), "path": (dataset / frame["file_path"]).resolve()})
-    lens = {k: float(transforms[k]) for k in ("fl_x", "fl_y", "cx", "cy", "w", "h")}
-    lens["dist"] = np.array([transforms.get(k, 0.0) for k in ("k1", "k2", "p1", "p2")])
-    count = len(cameras)
-    train = set(np.linspace(0, count - 1, int(math.ceil(count * 0.9)), dtype=int).tolist())   # nerfstudio's "fraction" split
-    return cameras, lens, [i for i in range(count) if i in train], [i for i in range(count) if i not in train]
 
 
 def intrinsics(lens, scale: float = 1.0) -> np.ndarray:
@@ -210,7 +186,7 @@ def table_colour(photos, openings) -> torch.Tensor:
 def region_ply(output: Path, group: int, out: Path):
     """One fabric colour group's Gaussians of splat_clean.ply (and the openings' rims nearest them) as a
     PLY of their own in `out`: (its path, the group's photo colour, the group as fabric_colours wrote it)."""
-    import fit_yarns
+    import yarn_tracks
 
     ply = output / "export" / "splat_clean.ply"
     colours = json.loads((output / "fabric_colours.json").read_text(encoding="utf-8"))["colours"]
@@ -219,7 +195,7 @@ def region_ply(output: Path, group: int, out: Path):
     if len(labels) != len(table) or not 0 <= group < len(colours) or colours[group]["role"] != "yarn":
         raise SystemExit(f"--region {group}: not one of the fabric's yarn colours (extract the fabric colours again?)")
     positions = np.stack([table["x"], table["y"], table["z"]], 1)
-    keep = fit_yarns.region_members(positions, labels, [c["role"] for c in colours], group)
+    keep = yarn_tracks.region_members(positions, labels, [c["role"] for c in colours], group)
     out.mkdir(parents=True, exist_ok=True)
     path = out / "region.ply"
     with path.open("wb") as handle:
@@ -275,7 +251,7 @@ def prepare(output: Path, run: Path, dataset: Path, stitches: int, rows: int, wr
                                 angle_deg=float(lattice["angle_deg"]), shift=tuple(lattice["shift"]), cells=np.ones((1, 1)))
     else:
         log(f"Reading the crochet: {rows} rows x {stitches} stitches per repeat, {wraps} yarn-over(s)")
-        start = crochet_fit.fit(extraction, stitches=stitches, rows=rows, wraps=wraps, rows_along_holes=True, refine=True)
+        start = scan_fit.fit(extraction, stitches=stitches, rows=rows, wraps=wraps, rows_along_holes=True, refine=True)
     maps = extraction.maps
     scene = {"ply": ply, "mm": float(mm_per_unit), "start": start, "extraction": extraction, "family": family,
              "flat_centre": flat_centre, "flat_axes": flat_axes,
@@ -344,20 +320,6 @@ def family_instances(scene, start):
     return {("motif", 0): places}
 
 
-def hand_template(params: crochet_core.CrochetParams, parity: int):
-    """crochet_core's hand-made stitch at the origin: {kind: [(points mm, closed, part)]}."""
-    direction = 1 if parity == 0 else -1
-    post = [(leg, False, "leg") for leg in crochet_core.post_legs(0.0, 0.0, params, direction)]
-    post += [(wrap, False, "wrap") for wrap in crochet_core.post_wraps(0.0, 0.0, params, direction)]
-    top = crochet_core.top_loop(0.0, params.row_height, params, direction)
-    return {"post": post + [(top, True, "top")], "chain": [(top, True, "top")]}
-
-
-def basis(samples: int, closed: bool, terms: int) -> np.ndarray:
-    t = np.linspace(0.0, 1.0, samples, endpoint=not closed)
-    return strand_equations._basis(t, closed, terms)
-
-
 class StitchModel(torch.nn.Module):
     """The lace as equations, drawn as Gaussians in the splat's frame (module docstring)."""
 
@@ -379,18 +341,18 @@ class StitchModel(torch.nn.Module):
             kind, parity = key[0], int(key[1]) % 2
             if family:
                 parts = [(points + np.outer(points[:, 1], [start.shear, 0.0, 0.0]), closed, part)
-                         for points, closed, part in crochet_stitches.motif(family, p.stitch_width, p.row_height, p.yarn_radius)]
+                         for points, closed, part in crochet_core.motif(family, p.stitch_width, p.row_height, p.yarn_radius)]
             else:
-                parts = hand_template(p, parity)[kind]
+                parts = crochet_core.hand_parts(p, parity)[kind]
             for points, closed, part in parts:
                 scaled = points / np.array([self.w0, self.h0, 1.0])
                 terms = CLOSED_TERMS if closed else OPEN_TERMS
                 length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
                 samples = max(int(length / STEP_MM), 12)
-                B = basis(len(scaled), closed, terms)
+                B = crochet_core.template_basis(len(scaled), closed, terms)
                 fitted = np.linalg.lstsq(B, scaled, rcond=None)[0]
                 self.curves.append({"key": key, "parity": parity, "kind": kind, "part": part, "closed": closed, "terms": terms,
-                                    "basis": torch.tensor(basis(samples, closed, terms), dtype=torch.float32, device=DEVICE)})
+                                    "basis": torch.tensor(crochet_core.template_basis(samples, closed, terms), dtype=torch.float32, device=DEVICE)})
                 coefficients.append(torch.nn.Parameter(torch.tensor(fitted, dtype=torch.float32)))
                 starts.append(fitted.copy())
         self.coefficients = torch.nn.ParameterList(coefficients)
@@ -579,7 +541,7 @@ class StitchModel(torch.nn.Module):
         return 1e-4 * smooth + 1e-3 * drift + 1e-2 * bend + 1e-1 * stretch + 1e-2 * slips
 
 
-def stitch_instances(scene, start: crochet_fit.CrochetFit):
+def stitch_instances(scene, start: scan_fit.CrochetFit):
     """Every stitch over the cloth: (column, row) per (kind, parity), from the repeat's grid tiled out."""
     p = start.params
     cloth, low = ndimage.binary_dilation(scene["cloth"], iterations=10), scene["low"]
@@ -589,7 +551,7 @@ def stitch_instances(scene, start: crochet_fit.CrochetFit):
     u, v = x * math.cos(a) + y * math.sin(a) - start.shift[0], -x * math.sin(a) + y * math.cos(a) - start.shift[1]
     c0, c1 = int(math.floor(u.min() / p.stitch_width)) - 1, int(math.ceil(u.max() / p.stitch_width)) + 1
     r0, r1 = int(math.floor(v.min() / p.row_height)) - 1, int(math.ceil(v.max() / p.row_height)) + 1
-    holes = crochet_fit.opening_mask(scene["extraction"].maps["support"])
+    holes = scan_fit.opening_mask(scene["extraction"].maps["support"])
     instances, grid = {}, {}
     for row in range(r0, r1):
         for column in range(c0, c1):
@@ -875,7 +837,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--per-stitch", action="store_true",
                         help="give each stitch of the repeat (rows x stitches) its own shape, not one per row parity")
-    parser.add_argument("--stitch", choices=crochet_stitches.FAMILIES, default=None,
+    parser.add_argument("--stitch", choices=crochet_core.FAMILIES, default=None,
                         help="fit a stitch family round each opening instead of filet posts and chains")
     parser.add_argument("--lattice", type=Path, default=None, help="the stitch grid lined up by eye (JSON: angle_deg, shift, stitch_width, row_height)")
     parser.add_argument("--try", dest="candidates", default="",
@@ -890,7 +852,7 @@ def main() -> None:
     if args.region is not None:
         args.ply, args.yarn_rgb, region = region_ply(args.output, args.region, out)
     run, dataset = find_run_and_dataset(args.output)
-    cameras, lens, train, heldout = load_cameras(run, dataset)
+    cameras, lens, train, heldout = scan_fit.load_cameras(run, dataset)
     log(f"{len(cameras)} pictures ({len(train)} to fit, {len(heldout)} held out), {DEVICE}")
     if args.candidates and not args.synthetic:
         args.stitches, args.rows = try_counts(args, run, dataset, cameras, lens, train, heldout)
@@ -936,7 +898,7 @@ def main() -> None:
             changed = crochet_core.CrochetParams(**{**start.params.as_dict(), "twist": 1.25})
             hand = {(c["parity"], c["kind"], c["part"]): [] for c in truth.curves}
             for parity in (0, 1):
-                for kind, parts in hand_template(changed, parity).items():
+                for kind, parts in crochet_core.hand_parts(changed, parity).items():
                     for points, closed, part in parts:
                         hand[(parity, kind, part)].append(points / np.array([truth.w0, truth.h0, 1.0]))
             seen = {}
@@ -944,7 +906,7 @@ def main() -> None:
                 key = (curve["parity"], curve["kind"], curve["part"])
                 points = hand[key][seen.get(key, 0)]
                 seen[key] = seen.get(key, 0) + 1
-                B = basis(len(points), curve["closed"], curve["terms"])
+                B = crochet_core.template_basis(len(points), curve["closed"], curve["terms"])
                 truth.coefficients[index].copy_(torch.tensor(np.linalg.lstsq(B, points, rcond=None)[0], dtype=torch.float32))
             viewmats = torch.tensor(np.stack([c["viewmat"] for c in cameras]), dtype=torch.float32, device=DEVICE)
             K = torch.tensor(intrinsics(lens), dtype=torch.float32, device=DEVICE)

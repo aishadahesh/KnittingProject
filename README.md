@@ -48,7 +48,7 @@ These checks do not verify physical robot operation or CUDA training.
 | `config/initial_params.json` | Frozen reset baseline and scanner fabric template |
 | `config/params.json` | Working model autosave; preserve local edits |
 | `src/knitting_core.py` | Pure knitted control rows, periodic centre lines, Jacobians, and meshes |
-| `src/crochet_core.py`, `src/crochet_stitches.py` | Crochet stitch equations and meshes |
+| `src/crochet_core.py` | Crochet stitch equations, topology, and meshes |
 | `src/yarn_simulation.py` | Stretch, bending, collision, and solver operations |
 | `src/rendering.py`, `src/splat_gl.py` | Mesh and Gaussian GPU rendering |
 | `src/gui.py` | Mode transitions and Edit, Scan, and Puzzle panels |
@@ -56,12 +56,12 @@ These checks do not verify physical robot operation or CUDA training.
 | `src/gui_captures.py` | Capture galleries and splat inspection |
 | `src/scanner_core.py`, `src/fabric_scanner.py`, `src/embedded_scanner.py` | Scan orchestration, geometry, and embedded simulation |
 | `src/scanner_storage.py`, `src/persistence.py` | SQLite metadata, state decoding, and atomic JSON writes |
-| `src/ur5_robot.py`, `src/teleop_transport.py`, `src/ur5_scan.py`, `src/robot_camera.py` | Robot and camera lifecycles and capture execution |
-| `src/scan_geometry.py` | Reachability, collision checks, and capture plans |
-| `src/charuco.py`, `src/hand_eye.py`, `src/lens.py`, `src/session_fit.py` | Board, mount, and lens calibration and camera fitting |
+| `src/ur5_robot.py`, `src/teleop_transport.py`, `src/ur5_scan.py`, `src/robot_camera.py` | Robot, simulated cell, and camera lifecycles and capture execution |
+| `src/scan_geometry.py`, `src/fabric_detector.py` | Reachability, collision checks, capture plans, and fabric/RGB view metrics |
+| `src/charuco.py`, `src/hand_eye.py`, `src/session_fit.py` | Board, mount, and lens calibration and camera fitting |
 | `src/gaussian_splatting.py`, `src/free_capture.py` | Dataset export, trainer processes, and handheld capture |
-| `src/scan_fit.py`, `src/crochet_fit.py`, `src/lace_lattice.py`, `src/strand_equations.py` | Fabric geometry extraction and fitting |
-| `src/fabric_palette.py`, `src/yarn_tracks.py`, `src/fit_yarns.py` | Colours and yarn assignment |
+| `src/scan_fit.py`, `src/lace_lattice.py`, `src/strand_equations.py` | Fabric and crochet geometry extraction and fitting |
+| `src/fabric_palette.py`, `src/yarn_tracks.py` | Colours and yarn assignment |
 | `src/drive_store.py` | User-requested scan/model transfers through rclone |
 | `scripts/` | CLI tools and training environment setup |
 | `hardware/` | Board print and camera mount designs |
@@ -94,8 +94,8 @@ Treat camera and robot coordinate conventions and units as part of each numerica
 UR5 Robot offers a simple workflow and an Expert panel with additional controls.
 Every automatic motion is planned and checked against the simulated arm.
 The software stop is not a substitute for the physical emergency stop.
-See [robot connection](docs/ROBOT_CONNECTION.md), [ChArUco scans](docs/CHARUCO_SCAN.md), and [stitch rescan procedure](docs/STITCH_RESCAN.md) for the cell's operating instructions.
-Mount geometry and calibration depend on the physical installation; see [camera mounts](hardware/endoscope_holder/README.md).
+Only one RTDE control session may connect to the UR5e controller at a time, so use either TeleopApp or direct RTDE.
+Place the fabric flat over the printed ChArUco board (`config/charuco_board.json`), capture focused views from ~9–12 cm standoff, and refit `config/hand_eye.json` and `config/camera_intrinsics.json` whenever the mount in `hardware/endoscope_holder/` is disturbed.
 
 `uv run --extra camera python scripts/fetch_mobilesam.py` downloads the optional fabric segmentation model.
 Calibration tools include `scripts/calibrate_lens.py` and `scripts/make_charuco_board.py`.

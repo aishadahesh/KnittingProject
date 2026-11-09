@@ -23,17 +23,13 @@ import glfw
 import numpy as np
 from PIL import Image
 
+from fabric_detector import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
 from fabric_scanner import clamp_capture_size
 from rendering import MeshRenderer, upload_rgb_texture
-from rgb_analysis import fabric_rgb_stats, summarize_capture_records as fabric_rgb_summary
 from scanner_core import (
     _persist_scanner_state, _scan_render_tiled_pattern_images,
-    _scanner_base_palette, _scanner_batch_colors_for_simulator,
-    _scanner_batch_texture_size, _scanner_capture_image_size,
-    _scanner_estimated_cell_colors, _scanner_lighting_settings,
-    _scanner_pattern_database_payload, _scanner_pattern_dimensions,
-    _scanner_pattern_repeats, _scanner_repeat_spacing, _scanner_shared_cell_color_sets,
-    _scanner_storage, _generate_scanner_random_patterns,
+    _scanner_estimated_cell_colors, _scanner_pattern_database_payload, _scanner_pattern_repeats, _scanner_shared_cell_color_sets,
+    _scanner_storage, build_scanner_plan_args,
 )
 from persistence import write_json
 
@@ -104,57 +100,8 @@ class EmbeddedMujocoScanner:
         self._capture_job = None
         self.camera_preview_width = int(scanner.CAMERA_IMAGE_SIZE[0])
         self.camera_preview_height = int(scanner.CAMERA_IMAGE_SIZE[1])
-        palette = _scanner_base_palette(state)
-        cell_sets = _scanner_shared_cell_color_sets(state)
         self.estimated_cell_colors = _scanner_estimated_cell_colors(state)
-        cell_model_curves = _generate_scanner_random_patterns(state)
-        pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-        repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-        spacing_x, spacing_y = _scanner_repeat_spacing(state)
-        lighting_settings = _scanner_lighting_settings(state)
-        batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
-        capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
-        single_capture_width, single_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
-        self.args = SimpleNamespace(
-            rows=int(state.scanner_rows),
-            cols=int(state.scanner_cols),
-            number_of_angles=int(state.scanner_angles),
-            width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
-            length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
-            edge_margin=0.004,
-            square_margin=0.006,
-            surface_wave=0.003,
-            view_radius=0.018,
-            angle_lift=0.014,
-            approach_lift=0.040,
-            # The simulated UR5 base frame is rotated exactly 180 degrees,
-            # so place the embedded visual fabric on the matching scanning side.
-            center=[-0.45, -0.08, 0.30],
-            max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-            speed=float(state.scanner_speed),
-            dwell=float(state.scanner_dwell),
-            add_camera=bool(state.scanner_add_camera),
-            save_images=bool(state.scanner_save_images),
-            image_dir=str((Path(state.project_root) / 'scanner_images').resolve()),
-            image_every=str(state.scanner_image_every),
-            capture_mode=str(state.get('scanner_capture_mode', 'natural')),
-            camera_zoom=float(state.get('scanner_camera_zoom', 1.0)),
-            capture_image_size=(int(capture_width), int(capture_height)),
-            single_capture_image_size=(single_capture_width, single_capture_height),
-            palette=palette,
-            cell_color_sets=cell_sets,
-            model_json=str(state.save_path),
-            model_curves=cell_model_curves[0] if cell_model_curves else None,
-            cell_model_curves=cell_model_curves,
-            pattern_repeat_rows=int(repeat_rows),
-            pattern_repeat_cols=int(repeat_cols),
-            pattern_repeat_spacing_x=float(spacing_x),
-            pattern_repeat_spacing_y=float(spacing_y),
-            batch_texture_width=int(batch_texture_width),
-            batch_texture_height=int(batch_texture_height),
-            scanner_lighting=lighting_settings,
-            display_batch_colors=_scanner_batch_colors_for_simulator(state),
-        )
+        self.args = build_scanner_plan_args(state)
         # The embedded viewer only needs the true scan targets. Keeping the
         # intermediate densified path for the GUI makes scanning much slower
         # without improving camera-capture accuracy.

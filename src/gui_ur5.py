@@ -25,7 +25,6 @@ import threading
 import time
 from collections import namedtuple
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 from imgui_bundle import imgui
@@ -42,7 +41,6 @@ from persistence import write_json
 import robot_camera
 import scan_geometry
 import scanner_core
-import sim_cell
 import teleop_transport
 import ur5_robot
 import ur5_scan
@@ -1113,19 +1111,19 @@ class UR5ModeController:
             texture, _ = scanner_core._scanner_generate_tiled_layout(self.state, renderer)
             if texture is None:
                 raise RuntimeError("Scan Mode could not render the knitted layout - check the pattern in Scan Mode")
-            corners = sim_cell.build(transport, texture)
+            corners = teleop_transport.build(transport, texture)
         except Exception as exc:
             self.status = f"Simulated cell not built: {exc}"
             return
         self.state.teleop_fabric_corners = corners
         self._set_fabric_plane(float(np.mean([corner[2] for corner in corners])))
         self.scan_devices()
-        self.status = (f"Simulated cell built: table and {sim_cell.FABRIC_WIDTH * 100:.0f} cm knitted fabric in TeleopApp, "
+        self.status = (f"Simulated cell built: table and {teleop_transport.FABRIC_WIDTH * 100:.0f} cm knitted fabric in TeleopApp, "
                        "its corners taken as the fabric outline. Start the camera 'TeleopApp: Gripper camera', then Check")
 
     def remove_sim_cell(self) -> None:
         try:
-            removed = sim_cell.remove(self.robot.transport)
+            removed = teleop_transport.remove(self.robot.transport)
         except Exception as exc:
             self.status = f"Simulated cell not removed: {exc}"
             return
@@ -1224,45 +1222,8 @@ def build_scan_plan(state):
     """
     import fabric_scanner as scanner
 
-    pattern_rows, pattern_cols = scanner_core._scanner_pattern_dimensions(state)
-    repeat_rows, repeat_cols = scanner_core._scanner_pattern_repeats(state)
-    spacing_x, spacing_y = scanner_core._scanner_repeat_spacing(state)
-    batch_texture_width, batch_texture_height = scanner_core._scanner_batch_texture_size(state)
-
-    args = SimpleNamespace(
-        rows=int(state.scanner_rows),
-        cols=int(state.scanner_cols),
-        number_of_angles=int(state.scanner_angles),
-        width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
-        length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
-        edge_margin=0.004,
-        square_margin=0.006,
-        surface_wave=0.003,
-        view_radius=0.018,
-        angle_lift=0.014,
-        approach_lift=0.040,
-        center=[float(v) for v in state.get("ur5_workspace_center", [-0.45, -0.08, 0.30])],
-        max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-        palette=scanner_core._scanner_base_palette(state),
-        cell_color_sets=scanner_core._scanner_shared_cell_color_sets(state),
-        model_json=str(state.save_path),
-        model_curves=None,
-        cell_model_curves=scanner_core._generate_scanner_random_patterns(state),
-        random_patterns=True,
-        pattern_rows=int(pattern_rows),
-        pattern_cols=int(pattern_cols),
-        pattern_repeat_rows=int(repeat_rows),
-        pattern_repeat_cols=int(repeat_cols),
-        pattern_repeat_spacing_x=float(spacing_x),
-        pattern_repeat_spacing_y=float(spacing_y),
-        batch_texture_width=int(batch_texture_width),
-        batch_texture_height=int(batch_texture_height),
-        pattern_density=float(state.get("scanner_pattern_density", 0.62)),
-        random_seed=int(state.get("scanner_random_seed", 1)),
-        scanner_lighting=scanner_core._scanner_lighting_settings(state),
-        display_batch_colors=scanner_core._scanner_batch_colors_for_simulator(state),
-    )
-    return scanner.build_plan(args)
+    center = [float(v) for v in state.get("ur5_workspace_center", [-0.45, -0.08, 0.30])]
+    return scanner.build_plan(scanner_core.build_scanner_plan_args(state, center=center, model_curves=None))
 
 
 def _make_runner(state, controller, plan):

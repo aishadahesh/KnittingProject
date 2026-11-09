@@ -36,11 +36,6 @@ def unanchored_columns(bitmap):
     return np.flatnonzero(bitmap_array[0, :] <= 0.5)
 
 
-def bitmap_is_anchored(bitmap):
-    """True when every column has a stitch in row 0 for the fabric to hang from."""
-    return unanchored_columns(bitmap).size == 0
-
-
 def anchor_bitmap(bitmap):
     """Return a legal copy of `bitmap`, plus the columns that had to be filled.
 

@@ -365,7 +365,6 @@ def test_edit_mode_fits_its_crochet_equations_to_a_scan(imgui_context, state, gl
     import time
 
     import gui
-    import gui_model
     import scan_fit
     import strand_equations
     from test_lace_lattice import _lace_splat
@@ -374,7 +373,7 @@ def test_edit_mode_fits_its_crochet_equations_to_a_scan(imgui_context, state, gl
     prepared = {"model": None, "splat": splat, "extraction": strand_equations.extract(splat, 1.0, (0.0, 0.0, 1.0)), "mm_per_unit": 1.0}
     fake_model = {"name": "synthetic lace", "ply": Path("synthetic.ply"), "mm_per_unit": 1.0, "psnr": 30.0, "run": None, "dataset": None}
     prepared["model"] = fake_model
-    monkeypatch.setattr(gui_model, "find_models", lambda: [fake_model])
+    monkeypatch.setattr(scan_fit, "find_models", lambda: [fake_model])
     monkeypatch.setattr(scan_fit, "prepare", lambda model, progress=None: prepared)
     gui._SCAN_FIT.models = None
     gui._SCAN_FIT.prepared = None

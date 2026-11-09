@@ -248,7 +248,7 @@ def test_a_pose_the_arm_reaches_is_solved_even_from_a_start_facing_away():
     fabric_z = scan_geometry.fabric_height(mj, model, data, site_id, 0.20)
     camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
     view = scan_geometry.Viewpoint("below", np.r_[camera[:2], fabric_z + 0.06],
-                                   scan_geometry.looking_down(np.array([np.pi, 0.0, 0.0])), elevation_deg=90.0)
+                                   scan_geometry.looking_down_along([1.0, 0.0]), elevation_deg=90.0)
     facing_away = np.array(HOME_JOINTS) + np.radians([120.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     solver = (mj, model, data, site_id, fabric_z, 0.0306, None)
 

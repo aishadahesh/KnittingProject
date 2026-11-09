@@ -622,19 +622,11 @@ def extract(splat, mm_per_unit: float, cloth_normal=None, tolerance_mm: float = 
     result = Extraction(strands, centre, axes, mm_per_unit, local[surface], colours[surface], mask, skeleton, np.array(low))
     result.maps = maps
     progress("Rebuilding the yarn from the equations")
-    result.tube = build_tubes(strands)
+    result.tube = polyline_tubes([(s.evaluate(np.linspace(0.0, 1.0, max(int(s.length_mm * 20.0), 6), endpoint=not s.closed)),
+                                   s.radius_mm, s.closed) for s in strands])
     progress("Comparing the rebuilt yarn with the scan")
-    result.comparison = compare(result)
+    result.comparison = compare_tube(result.tube, result.yarn_points_mm)
     return result
-
-
-def build_tubes(strands: list[Strand], samples_per_mm: float = 20.0) -> dict:
-    """A tube of each strand's radius round its equation's curve: vertices, faces, normals, and which strand each vertex is."""
-    curves = []
-    for strand in strands:
-        count = max(int(strand.length_mm * samples_per_mm), 6)
-        curves.append((strand.evaluate(np.linspace(0.0, 1.0, count, endpoint=not strand.closed)), strand.radius_mm, strand.closed))
-    return polyline_tubes(curves)
 
 
 def polyline_tubes(curves) -> dict:
@@ -678,12 +670,6 @@ def polyline_tubes(curves) -> dict:
         return {"vertices": np.zeros((0, 3)), "normals": np.zeros((0, 3)), "faces": np.zeros((0, 3), int), "strand": np.zeros(0, int)}
     return {"vertices": np.vstack(vertices), "normals": np.vstack(normals), "faces": np.vstack(faces).astype(np.int64),
             "strand": np.concatenate(owner)}
-
-
-def compare(result) -> dict:
-    """Distances between the scan's yarn and the rebuilt tubes, in mm (module docstring, step 6). Works
-    for anything with a `tube` and `yarn_points_mm` (the traced strands, or the repeating-loop model)."""
-    return compare_tube(result.tube, result.yarn_points_mm)
 
 
 def compare_tube(tube: dict, yarn_points_mm: np.ndarray) -> dict:

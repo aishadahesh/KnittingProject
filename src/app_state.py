@@ -1523,6 +1523,24 @@ class AppState:
         self._sync_loop_heights()
         self.rebuild_spline_from_params()
 
+    def apply_knit_pattern(self, parameters, bitmap):
+        """Apply fitted knit loop parameters (mm, by name) and stitch bitmap atomically."""
+        ranges = {p['name']: p['range'] for p in self.config['knit_parameters']['parameters']}
+        params = list(self.params)
+        for name, value in parameters.items():
+            if name in self._pidx:
+                low, high = ranges[name]
+                params[self._pidx[name]] = float(np.clip(value, low, high))
+        self.params = params
+        max_rows = int(self.config['knit_parameters']['bitmap_rows'])
+        bitmap = np.asarray(bitmap, dtype=np.float32)[:max_rows, :32].copy()
+        self.bitmap = bitmap
+        self.bitmap_size = np.array(bitmap.shape, dtype=np.int32)
+        self._sync_row_colors(bitmap.shape[0])
+        self._sync_row_visibility(bitmap.shape[0])
+        self.clear_loop_height_overrides()
+        self.on_bitmap_change()
+
     def loop_height_span(self, name):
         if name.startswith("loop_height_"):
             try:

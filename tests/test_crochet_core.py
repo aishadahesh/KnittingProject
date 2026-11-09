@@ -3,10 +3,12 @@ and the meshes Edit Mode draws."""
 
 
 import numpy as np
+import pytest
 
 import crochet_core  # noqa: E402
 
 P = crochet_core.CrochetParams(stitch_width=1.0, row_height=2.5, wraps=1, yarn_radius=0.3)
+W, H, R = 9.6, 8.6, 0.35
 
 
 def test_a_post_is_two_legs_a_wrap_per_yarn_over_and_a_top():
@@ -80,3 +82,35 @@ def test_a_per_stitch_learned_stitch_draws_each_place_its_own_shape():
     feet = sorted(round(float(points[0, 0]), 3) for points, _ in curves)
     # Row 0: columns 0..3 take slots (0,0),(0,1),(0,0),(0,1); row 1 the same in its own shapes.
     assert feet == sorted([0.2, 2 + 0.4, 4 + 0.2, 6 + 0.4, 0.6, 2 + 0.8, 4 + 0.6, 6 + 0.8])
+
+
+@pytest.mark.parametrize("name", crochet_core.FAMILIES)
+def test_the_openings_stay_open(name):
+    motif = crochet_core.motif(name, W, H, R)
+    points = np.concatenate([
+        p + np.array([(col + 0.5 * (row % 2)) * W, row * H, 0.0])
+        for row in range(4) for col in range(4) for p, _, _ in motif
+    ])
+    for middle in ((1 * W, 2 * H), (1.5 * W, 3 * H)):
+        nearest = np.linalg.norm(points[:, :2] - np.array(middle), axis=1).min()
+        assert nearest > 1.0, f"{name}: yarn {nearest:.2f} mm from an opening's middle"
+
+
+@pytest.mark.parametrize("name", crochet_core.FAMILIES)
+def test_the_curves_are_smooth_and_finite(name):
+    for points, closed, part in crochet_core.motif(name, W, H, R):
+        assert np.isfinite(points).all() and points.shape[1] == 3 and len(points) >= 16
+        steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        assert steps.max() < 0.5, f"{name} {part}: a jump of {steps.max():.2f} mm"
+        assert np.abs(points[:, 2]).max() < 3 * R
+
+
+def test_the_families_differ():
+    parts = {name: {part for _, _, part in crochet_core.motif(name, W, H, R)} for name in crochet_core.FAMILIES}
+    assert parts["mesh"] == {"chain", "knot"}
+    assert "post" in parts["trellis"] and "chain" in parts["trellis"]
+    assert parts["vstitch"] == {"post", "top"} and parts["shell"] == {"post", "top"}
+    posts = lambda name: sum(part == "post" for _, _, part in crochet_core.motif(name, W, H, R))
+    assert posts("shell") > posts("vstitch") > posts("trellis")
+    with pytest.raises(ValueError):
+        crochet_core.motif("filet", W, H, R)

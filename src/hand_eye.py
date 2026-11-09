@@ -34,28 +34,52 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-import lens
 from paths import CONFIG_DIR
 from persistence import write_json
 
 HAND_EYE_JSON = CONFIG_DIR / "hand_eye.json"
+INTRINSICS_JSON = CONFIG_DIR / "camera_intrinsics.json"
 
-# A pixel darker than this is the object (a dark nut on white paper); a picture needs at least
-# this many of them to count, and the blob must stay clear of the frame edge by this many pixels
-# or its centre is biased by what was cut off.
 TARGET_MAX_GREY = 60
 TARGET_MIN_PIXELS = 2000
 EDGE_MARGIN_PX = 3
-# The field of view is only weakly constrained by a single point, so it is searched on a grid and
-# the value whose fit also matches the object's apparent size at the two heights is kept.
 FOV_GRID_DEG = (30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0)
-
-
-# The arm's reported pose is trusted over the planned one only while the two agree: on a day the
-# controller carried a different tool-centre setting, the report sat 10 cm from the plan, while the
-# arm had in fact gone where it was sent.
 TRUST_REPORTED_WITHIN_M = 0.005
 TRUST_REPORTED_WITHIN_DEG = 3.0
+
+
+def load_intrinsics(path: Path = INTRINSICS_JSON) -> dict | None:
+    """The measured lens, or None when it has not been measured."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and "fx" in data else None
+
+
+def intrinsics_for(width: int, height: int, measured: dict) -> dict:
+    """The measured lens as nerfstudio's transforms.json keys, scaled to this picture size."""
+    sx, sy = width / float(measured["width"]), height / float(measured["height"])
+    fx = float(measured["fx"]) * sx
+    return {"fl_x": fx, "fl_y": float(measured["fy"]) * sy,
+            "cx": float(measured["cx"]) * sx, "cy": float(measured["cy"]) * sy, "w": int(width), "h": int(height),
+            "k1": float(measured.get("k1", 0.0)), "k2": float(measured.get("k2", 0.0)), "k3": float(measured.get("k3", 0.0)),
+            "p1": float(measured.get("p1", 0.0)), "p2": float(measured.get("p2", 0.0)), "camera_model": "OPENCV",
+            "camera_angle_x": 2.0 * float(np.arctan(width / (2.0 * fx)))}
+
+
+def project(points_cam: np.ndarray, intrinsics: dict) -> np.ndarray:
+    """Camera-frame points (x right, y down, z forward) to pixels, through the lens's distortion.
+    `intrinsics` holds fl_x, fl_y, cx, cy and optionally k1, k2, k3, p1, p2 (OpenCV's model)."""
+    z = np.maximum(points_cam[:, 2], 1e-6)
+    x, y = points_cam[:, 0] / z, points_cam[:, 1] / z
+    k1, k2, k3 = (float(intrinsics.get(k, 0.0)) for k in ("k1", "k2", "k3"))
+    p1, p2 = (float(intrinsics.get(k, 0.0)) for k in ("p1", "p2"))
+    r2 = x * x + y * y
+    radial = 1.0 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+    return np.stack([float(intrinsics["fl_x"]) * xd + float(intrinsics["cx"]), float(intrinsics["fl_y"]) * yd + float(intrinsics["cy"])], axis=1)
 
 
 def arm_pose(capture: dict):
@@ -75,19 +99,20 @@ def arm_pose(capture: dict):
     return planned
 
 
-def tcp_matrix(pose) -> np.ndarray:
-    pose = np.asarray(pose, dtype=float).reshape(-1)[:6]
-    matrix = np.eye(4)
-    matrix[:3, :3] = Rotation.from_rotvec(pose[3:6]).as_matrix()
-    matrix[:3, 3] = pose[:3]
-    return matrix
-
-
 def hand_eye_from_params(rotvec, translation) -> np.ndarray:
     matrix = np.eye(4)
     matrix[:3, :3] = Rotation.from_rotvec(np.asarray(rotvec, dtype=float)).as_matrix()
     matrix[:3, 3] = np.asarray(translation, dtype=float)
     return matrix
+
+
+def tcp_matrix(pose) -> np.ndarray:
+    pose = np.asarray(pose, dtype=float).reshape(-1)[:6]
+    return hand_eye_from_params(pose[3:6], pose[:3])
+
+
+def params_from_matrix(matrix: np.ndarray) -> np.ndarray:
+    return np.concatenate([Rotation.from_matrix(matrix[:3, :3]).as_rotvec(), matrix[:3, 3]])
 
 
 _loaded: dict = {}
@@ -171,9 +196,9 @@ def _residuals(params, tcps, uvs, fx, width, height):
     in_camera = np.einsum("nji,nj->ni", camera_rotations, target - camera_centres)
     in_camera[:, 2] = np.where(in_camera[:, 2] > 1e-3, in_camera[:, 2], 1e-3)
     if isinstance(fx, dict):
-        uv = lens.project(in_camera, fx)
+        uv = project(in_camera, fx)
     else:
-        uv = lens.project(in_camera, {"fl_x": fx, "fl_y": fx, "cx": width / 2.0, "cy": height / 2.0})
+        uv = project(in_camera, {"fl_x": fx, "fl_y": fx, "cx": width / 2.0, "cy": height / 2.0})
     return np.concatenate([uv[:, 0] - uvs[:, 0], uv[:, 1] - uvs[:, 1]])
 
 
@@ -212,10 +237,6 @@ def _levenberg_marquardt(params, tcps, uvs, fx, width, height, iterations=200, f
     return params, residual
 
 
-# The camera's turn about its own axis can be held at zero (image axes along the tool's) when a
-# sweep has shown the picture sliding straight along the camera's x as the arm moves along the
-# tool's x. On the mount calibrated here it is fitted: the dome of views pins it (holding it at
-# zero made the fit three times worse), and that mount is turned.
 ROLL_FIXED = False
 
 
@@ -230,15 +251,13 @@ def fit(captures, image_size=(640, 480), fov_grid=FOV_GRID_DEG, fov_degrees=None
     width, height = (int(v) for v in image_size)
     tcps = np.array([row["tcp"] for row in rows])
     uvs = np.array([row["uv"] for row in rows])
-    # The object's position starts under the first straight-down view, 5 cm along the tool axis.
     first = next((row for row in rows if row["straight_down"]), rows[0])
     start_target = first["tcp"][:3, 3] + first["tcp"][:3, :3] @ np.array([0.0, 0.0, 0.05])
 
-    # A measured lens settles the focal length, centre and distortion; only the mount is fitted.
-    measured = lens.load_intrinsics() if intrinsics is None else intrinsics
+    measured = load_intrinsics() if intrinsics is None else intrinsics
     results = []
     for fov in ([float(measured["fov_degrees"])] if measured else ([float(fov_degrees)] if fov_degrees else fov_grid)):
-        fx = lens.intrinsics_for(width, height, measured) if measured else width / (2.0 * math.tan(math.radians(fov) / 2.0))
+        fx = intrinsics_for(width, height, measured) if measured else width / (2.0 * math.tan(math.radians(fov) / 2.0))
         best = None
         for lift in (0.0, 0.03, 0.06):
             for back in (0.0, -0.03, -0.06, 0.03):
@@ -248,13 +267,21 @@ def fit(captures, image_size=(640, 480), fov_grid=FOV_GRID_DEG, fov_degrees=None
                 if best is None or rms < best[0]:
                     best = (rms, params, residual)
         rms, params, residual = best
-        results.append((fov, rms, params, residual, _size_mismatch(rows, params, fx, width)))
+        ratios = [
+            row["size_px"] * float(((row["tcp"] @ hand_eye_from_params(params[3:6], params[6:9]))[:3, :3].T
+                                    @ (params[0:3] - (row["tcp"] @ hand_eye_from_params(params[3:6], params[6:9]))[:3, 3]))[2])
+            for row in rows
+            if float(((row["tcp"] @ hand_eye_from_params(params[3:6], params[6:9]))[:3, :3].T
+                      @ (params[0:3] - (row["tcp"] @ hand_eye_from_params(params[3:6], params[6:9]))[:3, 3]))[2]) > 1e-3
+            and row["size_px"] > 0
+        ]
+        ratio_arr = np.array(ratios)
+        mismatch = float(np.std(ratio_arr) / np.mean(ratio_arr)) if len(ratio_arr) else 0.0
+        results.append((fov, rms, params, residual, mismatch))
 
     if measured or fov_degrees:
         fov, rms, params, residual, _ = results[0]
     else:
-        # Among fields of view whose fit is nearly as good as the best, the one whose camera depth
-        # agrees with how the object's size changed between heights.
         best_rms = min(result[1] for result in results)
         fov, rms, params, residual, _ = min((result for result in results if result[1] <= best_rms * 1.15),
                                             key=lambda result: result[4])
@@ -277,20 +304,6 @@ def fit(captures, image_size=(640, 480), fov_grid=FOV_GRID_DEG, fov_degrees=None
         "worst": [{"name": row["name"], "error_px": float(err)}
                   for row, err in sorted(zip(rows, per_picture), key=lambda pair: -pair[1])[:5]],
     }
-
-
-def _size_mismatch(rows, params, fx, width) -> float:
-    # Only the depths matter here, not the focal length, so a measured lens needs no special case.
-    """How far the fitted camera depths disagree with the object's apparent size: the size in
-    pixels should scale as 1/depth. Zero when they agree; used to choose the field of view."""
-    ratios = []
-    for row in rows:
-        camera = row["tcp"] @ hand_eye_from_params(params[3:6], params[6:9])
-        depth = float((camera[:3, :3].T @ (params[0:3] - camera[:3, 3]))[2])
-        if depth > 1e-3 and row["size_px"] > 0:
-            ratios.append(row["size_px"] * depth)   # = fx * object width: constant if depths are right
-    ratios = np.array(ratios)
-    return float(np.std(ratios) / np.mean(ratios)) if len(ratios) else 0.0
 
 
 def save_calibration(calibration: dict, path: Path = HAND_EYE_JSON) -> Path:

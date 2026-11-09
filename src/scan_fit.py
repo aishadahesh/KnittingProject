@@ -28,19 +28,272 @@ import json
 import math
 import subprocess
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 
-import crochet_fit
+import crochet_core
 import gaussian_splatting
 import lace_lattice
+import paths
 import strand_equations
 from persistence import write_json
 
+GRID_MM = strand_equations.GRID_MM
+ROW_MM = (1.2, 6.5)
+STITCH_MM = (0.6, 2.2)
+HOLE_SIZE_WEIGHT = 0.08
+RADIUS_STEPS = np.round(np.arange(0.6, 1.81, 0.2), 2)
+TWIST_STEPS = (0.25, 0.5, 0.75, 1.0, 1.5)
+LEAN_STEPS = np.round(np.arange(-0.4, 0.41, 0.2), 2)
+
+
+@dataclass
+class CrochetFit:
+    params: crochet_core.CrochetParams
+    angle_deg: float
+    cells: np.ndarray
+    shift: tuple
+    score: float
+    candidates: list = field(default_factory=list)
+    mm_per_unit: float = 1.0
+    centre: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    axes: np.ndarray = field(default_factory=lambda: np.eye(3))
+    yarn_points_mm: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    tile_scan: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    tile_model: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    tube: dict = field(default_factory=dict)
+    comparison: dict = field(default_factory=dict)
+
+    @property
+    def stitch_name(self) -> str:
+        return {1: "double crochet", 2: "treble crochet", 3: "double treble"}.get(self.params.wraps, f"{self.params.wraps} yarn-overs")
+
+    def to_splat_frame(self, points_mm: np.ndarray) -> np.ndarray:
+        return (points_mm @ self.axes + self.centre) / self.mm_per_unit
+
+    def summary(self) -> dict:
+        return {"median_radius_mm": self.params.yarn_radius, **self.comparison}
+
+
+def _rasterise(curves, radius: float, period_u: float, period_v: float, shape):
+    """The model's yarn on one repeat, seen from above: where it is (0/1) and its top's height (mm)."""
+    points = np.vstack([c for c, _ in curves])
+    iu = (np.mod(points[:, 0], period_u) / period_u * shape[1]).astype(int) % shape[1]
+    iv = (np.mod(points[:, 1], period_v) / period_v * shape[0]).astype(int) % shape[0]
+    top = np.full(shape, -np.inf)
+    np.maximum.at(top, (iv, iu), points[:, 2])
+    marks = np.isfinite(top)
+    big = np.tile(marks, (3, 3))
+    distance, nearest = ndimage.distance_transform_edt(~big, return_indices=True)
+    h, w = shape
+    distance = distance[h:2 * h, w:2 * w] * GRID_MM
+    near_rows, near_cols = nearest[0][h:2 * h, w:2 * w] % h, nearest[1][h:2 * h, w:2 * w] % w
+    presence = distance <= radius
+    height = np.where(presence, top[near_rows, near_cols] + np.sqrt(np.maximum(radius ** 2 - distance ** 2, 0.0)), 0.0)
+    return presence.astype(float), height
+
+
+def _match(model_presence, model_height, scan_presence, scan_relief):
+    """How well the model lines up with the folded scan at its best shift: (score, shift rows, shift cols)."""
+    def normalised(a):
+        a = a - a.mean()
+        return a / max(float(np.sqrt((a * a).sum())), 1e-12)
+
+    total = np.zeros(model_presence.shape)
+    for model, scan in ((model_presence, scan_presence), (model_height, scan_relief)):
+        m, s = normalised(model), normalised(scan)
+        total += np.real(np.fft.ifft2(np.fft.fft2(s) * np.conj(np.fft.fft2(m))))
+    best = np.unravel_index(int(np.argmax(total)), total.shape)
+    return float(total[best] / 2.0), int(best[0]), int(best[1])
+
+
+def opening_mask(support: np.ndarray) -> np.ndarray:
+    """The lace's openings as a mask: the empty patches the yarn closes round, of an opening's size."""
+    holes = lace_lattice.lace_holes(support)
+    label, count = ndimage.label(holes)
+    if not count:
+        return holes
+    area = ndimage.sum(np.ones_like(label), label, range(1, count + 1)) * GRID_MM ** 2
+    return np.r_[False, area >= lace_lattice.MIN_OPENING_MM2][label]
+
+
+def hole_size(holes: np.ndarray, angle_deg: float):
+    """The typical opening's size (along the rows, across them), mm."""
+    label, count = ndimage.label(holes)
+    if not count:
+        return None
+    a = math.radians(angle_deg)
+    sizes, areas = [], []
+    for index in range(1, count + 1):
+        rows, cols = np.nonzero(label == index)
+        x, y = cols * GRID_MM, rows * GRID_MM
+        u, v = x * math.cos(a) + y * math.sin(a), -x * math.sin(a) + y * math.cos(a)
+        sizes.append((np.ptp(u) + GRID_MM, np.ptp(v) + GRID_MM))
+        areas.append(len(rows) * GRID_MM ** 2)
+    areas, sizes = np.array(areas), np.array(sizes)
+    usual = (areas > 0.5 * np.median(areas)) & (areas < 2.0 * np.median(areas))
+    return tuple(np.median(sizes[usual if usual.any() else slice(None)], axis=0))
+
+
+def model_hole_size(stitches: np.ndarray, p: crochet_core.CrochetParams):
+    """The model's opening (along, across) mm."""
+    open_ = np.asarray(stitches) < 0.5
+    if not open_.any():
+        return 0.0, 0.0
+    best_run = max(max((len(r) for r in "".join("1" if o else "0" for o in row).split("0")), default=0) for row in open_)
+    rows_open = max(max((len(r) for r in "".join("1" if o else "0" for o in column).split("0")), default=0) for column in open_.T)
+    width = (best_run + 1) * p.stitch_width - 4.0 * p.yarn_radius
+    height = rows_open * p.row_height - 2.6 * p.yarn_radius
+    return width, height
+
+
+def fit(extraction, progress=lambda message: None, stitches=None, rows=None, wraps=None, rows_along_holes=None,
+        grid=None, refine=True) -> CrochetFit:
+    """The scan (a strand_equations.Extraction: its maps, frame and yarn) as crochet lace."""
+    if grid is not None:
+        grid = np.asarray(grid, dtype=float)
+        rows, stitches = grid.shape
+    maps = extraction.maps
+    support, height = maps["support"], maps["height"]
+    low = extraction.map_origin
+    progress("Finding the repeat from the openings")
+    lattice = lace_lattice.hole_lattice(support)
+    if lattice is None:
+        raise RuntimeError("no regular openings found - a filet repeat needs a few open cells in view")
+    hole_angle, repeat_u, repeat_v = lattice
+    cloth = lace_lattice.cloth_region(support)
+    bow = lace_lattice.bow_map(support, height)
+    radius = float(np.clip(extraction.summary()["median_radius_mm"] or 0.3, 0.15, 0.6))
+    holes = opening_mask(support)
+    measured = {}
+    best, tried = None, []
+    orientations = [(hole_angle, repeat_u, repeat_v), ((hole_angle + 90.0) % 180.0, repeat_v, repeat_u)]
+    if rows_along_holes is not None:
+        orientations = orientations[:1] if rows_along_holes else orientations[1:]
+    for angle, along, across in orientations:
+        progress(f"Folding the scan with the rows at {angle:.0f} deg")
+        u, v = lace_lattice._lattice_coords(support.shape, low, angle)
+        presence = 1.0 - lace_lattice.fold(holes.astype(float), cloth, u, v, along, across)
+        relief = lace_lattice.fold(height - bow, cloth & support, u, v, along, across)
+        measured[angle] = hole_size(holes, angle)
+        splits = [(r, p) for r in range(1, 13) if ROW_MM[0] <= across / r <= ROW_MM[1]
+                  for p in range(2, 30) if STITCH_MM[0] <= along / p <= STITCH_MM[1]]
+        if stitches is not None or rows is not None:
+            splits = [(r, s) for r, s in splits if (rows is None or r == rows) and (stitches is None or s == stitches)]
+            if not splits:
+                splits = [(rows or 3, stitches or 3)]
+        for n_rows, posts in splits:
+            if grid is not None:
+                cells = grid
+            else:
+                cells, _, _ = lace_lattice.bitmap_from_tile(presence, n_rows, posts, open_below=0.5)
+            for n_wraps in ((wraps,) if wraps is not None else (1, 2, 3)):
+                params = crochet_core.CrochetParams(stitch_width=along / posts, row_height=across / n_rows, wraps=n_wraps,
+                                                    yarn_radius=radius)
+                progress(f"Trying {n_rows} rows x {posts} stitches, {n_wraps} yarn-over{'s' if n_wraps > 1 else ''}, rows at {angle:.0f} deg")
+                curves = crochet_core.build(np.tile(cells, (1, 1)), params)
+                model_presence, model_height = _rasterise(curves, radius, along, across, presence.shape)
+                score, shift_rows, shift_cols = _match(model_presence, model_height, presence, relief)
+                if measured[angle] is not None:
+                    model_along, model_across = model_hole_size(cells, params)
+                    score -= HOLE_SIZE_WEIGHT * (abs(model_along - measured[angle][0]) + abs(model_across - measured[angle][1]))
+                description = f"rows at {angle:.0f} deg, {n_rows} rows x {posts} stitches per repeat, {n_wraps} yarn-over(s)"
+                tried.append((score, description))
+                if best is None or score > best[0]:
+                    shift = (shift_cols * GRID_MM, shift_rows * GRID_MM)
+                    best = (score, params, angle, cells, shift, presence, model_presence, (u, v, along, across), relief)
+    score, params, angle, cells, shift, presence, model_presence, (u, v, along, across), relief = best
+    if refine:
+        progress("Fitting the yarn's thickness, the posts' twist and lean")
+        params, score, shift, model_presence = refine_shape(cells, params, along, across, presence, relief)
+    result = CrochetFit(params, angle, cells, shift, score, sorted(tried, reverse=True), extraction.mm_per_unit, extraction.centre,
+                        extraction.axes, extraction.yarn_points_mm, presence, model_presence)
+    progress("Building the whole cloth from the repeat")
+    build_cloth(result, cloth, u, v, low, bow, along, across)
+    progress("Comparing it with the scan")
+    result.comparison = strand_equations.compare_tube(result.tube, result.yarn_points_mm)
+    return result
+
+
+def refine_shape(cells, params, along: float, across: float, presence, relief):
+    """The yarn's thickness, then the posts' twist, then their lean."""
+    best = None
+
+    def trial(**changes):
+        nonlocal best
+        trial_params = crochet_core.CrochetParams(**{**params.as_dict(), **changes})
+        curves = crochet_core.build(cells, trial_params)
+        model_presence, model_height = _rasterise(curves, trial_params.yarn_radius, along, across, presence.shape)
+        score, shift_rows, shift_cols = _match(model_presence, model_height, presence, relief)
+        if best is None or score > best[1]:
+            best = (trial_params, score, (shift_cols * GRID_MM, shift_rows * GRID_MM), model_presence)
+
+    for factor in RADIUS_STEPS:
+        trial(yarn_radius=float(np.clip(params.yarn_radius * factor, 0.08, 1.0)))
+    params = best[0]
+    for twist in TWIST_STEPS:
+        trial(yarn_radius=params.yarn_radius, twist=twist)
+    params = best[0]
+    for lean in LEAN_STEPS * params.stitch_width:
+        trial(yarn_radius=params.yarn_radius, twist=params.twist, lean=float(lean))
+    return best
+
+
+def build_cloth(result: CrochetFit, cloth, u, v, low, bow, along: float, across: float) -> None:
+    """The repeat laid over the whole cloth, on its bow, cut to it, as yarn tubes."""
+    inside_u, inside_v = u[cloth] - result.shift[0], v[cloth] - result.shift[1]
+    first_u, first_v = math.floor(inside_u.min() / along) - 1, math.floor(inside_v.min() / across) - 1
+    tiles_u = int(math.ceil(inside_u.max() / along)) - first_u + 1
+    tiles_v = int(math.ceil(inside_v.max() / across)) - first_v + 1
+    curves = crochet_core.build(np.tile(result.cells, (tiles_v, tiles_u)), result.params)
+    a = math.radians(result.angle_deg)
+    near_cloth = ndimage.binary_dilation(cloth, iterations=5)
+    tubes = []
+    for points, closed in curves:
+        lu = points[:, 0] + first_u * along + result.shift[0]
+        lv = points[:, 1] + first_v * across + result.shift[1]
+        x, y = lu * math.cos(a) - lv * math.sin(a), lu * math.sin(a) + lv * math.cos(a)
+        col = np.clip(((x - low[0]) / GRID_MM).astype(int), 0, cloth.shape[1] - 1)
+        row = np.clip(((y - low[1]) / GRID_MM).astype(int), 0, cloth.shape[0] - 1)
+        if not near_cloth[row, col].all():
+            continue
+        tubes.append((np.stack([x, y, bow[row, col] + points[:, 2]], axis=1), result.params.yarn_radius, closed))
+    result.tube = strand_equations.polyline_tubes(tubes)
+
+
+def find_models(root: Path = paths.ROBOT_SCANS_DIR) -> list[dict]:
+    """Every trained splat under robot_scans: its PLY (the cropped one when there is one), the training
+    run and dataset it came from (for the cameras), its scale and its held-out PSNR."""
+    models = []
+    for export in sorted(Path(root).glob("*/splat_output*/export")):
+        ply = export / "splat_clean.ply"
+        if not ply.is_file():
+            ply = export / "splat.ply"
+        if not ply.is_file():
+            continue
+        output, session = export.parent, export.parent.parent
+        runs = [p for p in output.glob("*/splatfacto/*")
+                if (p / "dataparser_transforms.json").is_file() and not p.name.endswith("_cloth")]
+        run = max(runs, key=lambda p: p.stat().st_mtime) if runs else None
+        dataset = session / run.parent.parent.name if run is not None else None
+        try:
+            psnr = float(json.loads((output / "eval.json").read_text(encoding="utf-8"))["results"]["psnr"])
+        except (OSError, ValueError, KeyError, TypeError):
+            psnr = None
+        models.append({
+            "name": f"{session.name} / {output.name}" + ("" if ply.name == "splat_clean.ply" else " (uncropped)"),
+            "ply": ply, "output": output, "run": run,
+            "dataset": dataset if dataset is not None and (dataset / "transforms.json").is_file() else None,
+            "mm_per_unit": strand_equations.load_scale(output), "psnr": psnr,
+        })
+    return models
+
 
 def prepare(model: dict, progress=lambda message: None) -> dict:
-    """`model` as gui_model.find_models lists it. Returns the laid-flat splat, its scale and its yarn map."""
+    """`model` as find_models lists it. Returns the laid-flat splat, its scale and its yarn map."""
     progress(f"Reading {model['ply'].name}")
     splat = gaussian_splatting.load_splat_ply(model["ply"])
     normal, mm_per_unit = None, model.get("mm_per_unit")
@@ -63,9 +316,9 @@ def fit_crochet(prepared: dict, grid: np.ndarray, wraps: int, read_openings: boo
     """Crochet's numbers for this scan with `grid`'s size as the repeat (rows x stitches), `wraps`
     yarn-overs; the openings read from the scan, or `grid`'s kept."""
     grid = np.asarray(grid, dtype=float)
-    return crochet_fit.fit(prepared["extraction"], progress=progress, stitches=int(grid.shape[1]), rows=int(grid.shape[0]),
-                           wraps=int(wraps), rows_along_holes=bool(rows_along_openings),
-                           grid=None if read_openings else grid, refine=True)
+    return fit(prepared["extraction"], progress=progress, stitches=int(grid.shape[1]), rows=int(grid.shape[0]),
+               wraps=int(wraps), rows_along_holes=bool(rows_along_openings),
+               grid=None if read_openings else grid, refine=True)
 
 
 def fit_knit(prepared: dict, bitmap: np.ndarray, progress=lambda message: None):
@@ -85,10 +338,6 @@ def scan_picture(prepared: dict, rows_angle_deg: float, size=(360, 300), zoom: f
     keep = splat["opacity"] >= 0.1
     frame = gaussian_splatting.orbit_frame(splat["positions"][keep])
     return gaussian_splatting.render_splat(splat, -90.0, 89.9, zoom, size=size, frame=frame)
-
-
-ROOT = Path(__file__).resolve().parent.parent
-GRID_MM = strand_equations.GRID_MM
 
 
 def load_stitch_model(path) -> tuple[dict, np.ndarray]:
@@ -121,7 +370,7 @@ class PhotoFit:
 
     def _run(self) -> None:
         try:
-            self._process = subprocess.Popen(["powershell", "-ExecutionPolicy", "Bypass", "-Command", self.command], cwd=ROOT,
+            self._process = subprocess.Popen(["powershell", "-ExecutionPolicy", "Bypass", "-Command", self.command], cwd=paths.PROJECT_ROOT,
                                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                                              creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
             for line in self._process.stdout:
@@ -191,6 +440,7 @@ def load_cameras(run, dataset):
         path = (dataset / frame["file_path"]).resolve()
         cameras.append({"viewmat": np.linalg.inv(c2w), "path": path, "name": path.stem})
     lens = {k: float(transforms[k]) for k in ("fl_x", "fl_y", "cx", "cy", "w", "h")}
+    lens["dist"] = np.array([transforms.get(k, 0.0) for k in ("k1", "k2", "p1", "p2")])
     count = len(cameras)
     train = set(np.linspace(0, count - 1, int(math.ceil(count * 0.9)), dtype=int).tolist())
     return cameras, lens, [i for i in range(count) if i in train], [i for i in range(count) if i not in train]

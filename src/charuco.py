@@ -41,7 +41,6 @@ from scipy.spatial.transform import Rotation
 
 import gaussian_splatting
 import hand_eye
-import lens
 from paths import CONFIG_DIR
 from persistence import write_json
 
@@ -278,71 +277,47 @@ def calibrate_lens(detections: list[dict], size) -> dict:
             "calibrated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
-def _matrix(params) -> np.ndarray:
-    out = np.eye(4)
-    out[:3, :3], out[:3, 3] = Rotation.from_rotvec(params[:3]).as_matrix(), params[3:6]
-    return out
-
-
-def _params(matrix: np.ndarray) -> np.ndarray:
-    return np.concatenate([Rotation.from_matrix(matrix[:3, :3]).as_rotvec(), matrix[:3, 3]])
-
-
 def _nearest_rotation(matrix: np.ndarray) -> np.ndarray:
     u, _, vt = np.linalg.svd(matrix)
     return u @ np.diag([1.0, 1.0, np.linalg.det(u @ vt)]) @ vt
 
 
-def _robot_world_closed_form(board_to_camera: list[np.ndarray], flange_from_base: list[np.ndarray]):
-    """Shah's closed form for A_i Y = X B_i (A board-to-camera, B base-to-flange; Y world-from-base,
-    X camera-from-flange): the rotations from the null space of the stacked linear equations, then the
-    translations by least squares. OpenCV 5 no longer ships calibrateRobotWorldHandEye."""
-    rows = []
-    for a, b in zip(board_to_camera, flange_from_base):
-        # vec(R_A R_Y) = (I kron R_A) vec(R_Y);  vec(R_X R_B) = (R_B^T kron I) vec(R_X)  (column-major vec)
-        rows.append(np.hstack([np.kron(np.eye(3), a[:3, :3]), -np.kron(b[:3, :3].T, np.eye(3))]))
+def fit_robot_world(views: list[dict], intrinsics: dict) -> dict:
+    """The robot base in the board's frame and the camera on the flange, from board views taken at
+    known arm poses. Each view: {'tcp': 4x4 base-to-flange, 'detection': ..., 'board_to_camera': 4x4}."""
+    import cv2
+
+    base_to_flange = [np.linalg.inv(v["tcp"]) for v in views]
+    board_to_camera = [v["board_to_camera"] for v in views]
+    rows = [np.hstack([np.kron(np.eye(3), a[:3, :3]), -np.kron(b[:3, :3].T, np.eye(3))])
+            for a, b in zip(board_to_camera, base_to_flange)]
     _, _, vt = np.linalg.svd(np.vstack(rows))
     solution = vt[-1]
     rotation_y = solution[:9].reshape(3, 3, order="F")
     rotation_x = solution[9:].reshape(3, 3, order="F")
     scale = np.cbrt(np.linalg.det(rotation_x)) or 1.0
     rotation_x, rotation_y = _nearest_rotation(rotation_x / scale), _nearest_rotation(rotation_y / scale)
-    # R_A t_Y + t_A = R_X t_B + t_X  ->  [R_A, -I] [t_Y; t_X] = R_X t_B - t_A
     lhs = np.vstack([np.hstack([a[:3, :3], -np.eye(3)]) for a in board_to_camera])
-    rhs = np.concatenate([rotation_x @ b[:3, 3] - a[:3, 3] for a, b in zip(board_to_camera, flange_from_base)])
+    rhs = np.concatenate([rotation_x @ b[:3, 3] - a[:3, 3] for a, b in zip(board_to_camera, base_to_flange)])
     translations = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
     world_from_base, camera_from_flange = np.eye(4), np.eye(4)
     world_from_base[:3, :3], world_from_base[:3, 3] = rotation_y, translations[:3]
     camera_from_flange[:3, :3], camera_from_flange[:3, 3] = rotation_x, translations[3:]
-    return world_from_base, camera_from_flange
-
-
-def fit_robot_world(views: list[dict], intrinsics: dict) -> dict:
-    """The robot base in the board's frame and the camera on the flange, from board views taken at
-    known arm poses. Each view: {'tcp': 4x4 base-to-flange, 'detection': ..., 'board_to_camera': 4x4}.
-
-    A closed form gives the start; Levenberg-Marquardt over every seen corner then minimises what
-    matters - how far the arm-placed corners land from where they were seen. With every view at the
-    same tool attitude (a straight-down grid) the mount's offset and the base's position trade off
-    against each other, but every camera of that attitude comes out the same either way."""
-    import cv2
-
-    base_to_flange = [np.linalg.inv(v["tcp"]) for v in views]
-    world_from_base, camera_from_flange = _robot_world_closed_form([v["board_to_camera"] for v in views], base_to_flange)
     matrix, distortion = camera_matrix(intrinsics)
 
     def residuals(params):
-        world_base, camera_flange = _matrix(params[:6]), _matrix(params[6:])
+        world_base = hand_eye.hand_eye_from_params(params[:3], params[3:6])
+        camera_flange = hand_eye.hand_eye_from_params(params[6:9], params[9:12])
         base_world = np.linalg.inv(world_base)
         out = []
         for view, flange_base in zip(views, base_to_flange):
-            board_to_camera = camera_flange @ flange_base @ base_world
-            rvec = cv2.Rodrigues(board_to_camera[:3, :3])[0]
-            projected, _ = cv2.projectPoints(view["detection"]["object"], rvec, board_to_camera[:3, 3], matrix, distortion)
+            b2c = camera_flange @ flange_base @ base_world
+            rvec = cv2.Rodrigues(b2c[:3, :3])[0]
+            projected, _ = cv2.projectPoints(view["detection"]["object"], rvec, b2c[:3, 3], matrix, distortion)
             out.append((projected.reshape(-1, 2) - view["detection"]["image"]).ravel())
         return np.concatenate(out)
 
-    start = np.concatenate([_params(world_from_base), _params(camera_from_flange)])
+    start = np.concatenate([hand_eye.params_from_matrix(world_from_base), hand_eye.params_from_matrix(camera_from_flange)])
     fitted = least_squares(residuals, start, method="lm", x_scale="jac")
     error = residuals(fitted.x).reshape(-1, 2)
     per_view, offset = [], 0
@@ -350,19 +325,14 @@ def fit_robot_world(views: list[dict], intrinsics: dict) -> dict:
         count = len(view["detection"]["image"])
         per_view.append(float(np.sqrt(np.mean(np.sum(error[offset:offset + count] ** 2, axis=1)))))
         offset += count
-    return {"world_from_base": _matrix(fitted.x[:6]), "camera_from_flange": _matrix(fitted.x[6:]),
+    return {"world_from_base": hand_eye.hand_eye_from_params(fitted.x[:3], fitted.x[3:6]),
+            "camera_from_flange": hand_eye.hand_eye_from_params(fitted.x[6:9], fitted.x[9:12]),
             "rms_px": float(np.sqrt(np.mean(np.sum(error ** 2, axis=1)))), "max_view_px": float(max(per_view)),
             "views": len(views)}
 
 
-def board_to_camera_from_arm(tcp: np.ndarray, mount: dict) -> np.ndarray:
-    return mount["camera_from_flange"] @ np.linalg.inv(tcp) @ np.linalg.inv(mount["world_from_base"])
-
-
 def arm_tcp(capture: dict) -> np.ndarray | None:
-    """The flange pose the session recorded for a picture - the reported one where there is one.
-    Whatever tool-centre setting it carries is the same for every picture of a session, and the
-    per-session mount fit absorbs it."""
+    """The flange pose the session recorded for a picture - the reported one where there is one."""
     pose = capture.get("actual_tcp_pose") or capture.get("target_position")
     if pose is None or len(pose) < 6:
         return None
@@ -373,10 +343,6 @@ def _read(path: Path):
     import cv2
 
     return cv2.imread(str(path), cv2.IMREAD_COLOR)
-
-
-def _session_of(capture: dict) -> str:
-    return str(capture.get("session_id") or capture.get("combined_from") or "")
 
 
 def write_coloured_seed(path: Path, frames: list[dict], images: dict, intrinsics: dict, spacing_m: float = 0.0004,
@@ -477,7 +443,7 @@ def export_dataset(captures, output_dir: str | Path, *, session_id: str = "", sp
         if (output_dir / stale).exists():
             (output_dir / stale).unlink()
 
-    sessions = sorted({_session_of(c) for c in captures})
+    sessions = sorted({str(c.get("session_id") or c.get("combined_from") or "") for c in captures})
     if len(sessions) > 1 and not allow_several_sessions:
         raise ValueError(f"these pictures come from {len(sessions)} scans ({', '.join(s or '?' for s in sessions)}); a splat needs "
                          "one scan of an untouched cloth - export one session")
@@ -515,17 +481,15 @@ def export_dataset(captures, output_dir: str | Path, *, session_id: str = "", sp
             warnings.append(f"the lens calibrated from the board views fits to {measured['reprojection_error_px']:.2f} px (want under 1): "
                             "was the board flat, and focus fixed?")
     else:
-        measured = measured_lens if measured_lens is not None else lens.load_intrinsics()
+        measured = measured_lens if measured_lens is not None else hand_eye.load_intrinsics()
         if measured is None:
             raise ValueError(f"the lens is not measured: only {len(lens_views)} pictures see {MIN_LENS_CORNERS}+ board corners "
                              f"(the scan can calibrate it itself from {MIN_LENS_VIEWS}), and there is no config/camera_intrinsics.json - "
                              "run scripts/calibrate_lens.py, or scan with more of the board in view")
         lens_source = "measured lens (config/camera_intrinsics.json)"
         if mirrored:
-            # Measured on unmirrored pictures: flipped left to right, the centre mirrors and the
-            # tangential term along x changes sign.
             measured = {**measured, "cx": float(measured["width"]) - float(measured["cx"]), "p2": -float(measured.get("p2", 0.0))}
-    intrinsics = lens.intrinsics_for(width, height, measured)
+    intrinsics = hand_eye.intrinsics_for(width, height, measured)
 
     placed: dict[int, dict] = {}
     rejected = 0
@@ -555,7 +519,10 @@ def export_dataset(captures, output_dir: str | Path, *, session_id: str = "", sp
                 if tcp is None:
                     warnings.append(f"no arm pose for {looked[index]['source'].name}; left out")
                     continue
-                placed[index] = {"board_to_camera": board_to_camera_from_arm(tcp, mount), "from": "arm"}
+                placed[index] = {
+                    "board_to_camera": mount["camera_from_flange"] @ np.linalg.inv(tcp) @ np.linalg.inv(mount["world_from_base"]),
+                    "from": "arm",
+                }
         else:
             warnings.append(f"{len(unplaced)} pictures without the board are left out: placing them through the arm needs the board "
                             f"in at least {MIN_MOUNT_VIEWS} pictures with an arm pose ({len(arm_views)} here)")

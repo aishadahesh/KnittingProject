@@ -634,15 +634,6 @@ def tilt_views(tool_pose, count, view_radius):
     return [Viewpoint(name, point, rotvec) for name, point, rotvec in zip(names, points, rotvecs)]
 
 
-def looking_down(follow_rotvec):
-    """A camera attitude with the lens straight down, rolled to keep the current camera's heading.
-
-    Keeping the heading is what holds wrist 3 still across a whole grid: every station has
-    the same attitude, so the arm only translates between them.
-    """
-    return looking_down_along(_heading_of(follow_rotvec))
-
-
 def looking_down_along(heading):
     """The lens straight down with the image's x edge along `heading` (a direction in the plane)."""
     from scipy.spatial.transform import Rotation

@@ -34,8 +34,8 @@ import numpy as np
 from PIL import Image
 
 import fabric_detector
+import fabric_scanner
 import free_capture
-import rgb_analysis
 import robot_camera
 import ur5_robot
 from persistence import write_json
@@ -288,7 +288,7 @@ class RealScanRunner:
         self.scan_targets = [
             index
             for index, name in enumerate(plan.view_names)
-            if _is_scan_view(name)
+            if fabric_scanner.is_scan_view(str(name))
         ]
 
         self._progress = ScanProgress(target_count=len(self.scan_targets))
@@ -575,7 +575,7 @@ class RealScanRunner:
         except Exception as exc:
             self._set(error=f"Could not save capture: {exc}")
 
-        stats = rgb_analysis.fabric_rgb_stats(frame.image)
+        stats = fabric_detector.fabric_rgb_stats(frame.image)
         actual_pose = [float(v) for v in self.robot.state.tcp_pose]
         record = {
             "row": int(row),
@@ -716,7 +716,7 @@ class RealScanRunner:
             try:
                 debug_path = debug_dir / f"{path.stem}_used_pixels.png" if save_outputs else None
                 with Image.open(path) as saved_image:
-                    stats = rgb_analysis.fabric_rgb_stats(saved_image, debug_path=debug_path)
+                    stats = fabric_detector.fabric_rgb_stats(saved_image, debug_path=debug_path)
             except Exception:
                 continue
             record["rgb"] = [float(v) for v in np.asarray(stats["rgb"], dtype=np.float32)]
@@ -727,7 +727,7 @@ class RealScanRunner:
                 record["analysis_used_image"] = str(stats["debug_path"])
 
         # A frame that is mostly table would average the table's colour into the cloth's.
-        result = rgb_analysis.summarize_capture_records(
+        result = fabric_detector.summarize_capture_records(
             [record for record in self.capture_records if not record.get("mostly_background")],
             self.estimated_cell_colors,
             pattern_signature=self.pattern_signature,
@@ -735,7 +735,7 @@ class RealScanRunner:
         result["robot_mode"] = ROBOT_MODE_REAL
         result["session_id"] = self.session_id
         result["robot_ip"] = str(self.robot.ip)
-        result["comparisons"] = rgb_analysis.compare_cell_colors(result["cells"])
+        result["comparisons"] = fabric_detector.compare_cell_colors(result["cells"])
 
         if save_outputs:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -769,11 +769,5 @@ class RealScanRunner:
                 Image.new("RGB", (swatch_w, swatch_h), angle_color).save(
                     self.output_dir / f"avg_rgb_row_{row + 1:02d}_col_{col + 1:02d}_{angle_name}.png"
                 )
-
-
-def _is_scan_view(view_name: str) -> bool:
-    import fabric_scanner as scanner
-
-    return scanner.is_scan_view(str(view_name))
 
 

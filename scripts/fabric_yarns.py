@@ -30,7 +30,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 import fabric_palette  # noqa: E402
 import gaussian_splatting  # noqa: E402
-import fit_yarns  # noqa: E402
 import strand_equations  # noqa: E402
 import yarn_tracks  # noqa: E402
 from persistence import write_json
@@ -68,19 +67,18 @@ def main() -> None:
         count, radii, parts = 0, [], []
         for path in fits:
             fit = json.loads(path.read_text(encoding="utf-8"))
-            prepared = fit_yarns.fit_frame(path)
+            prepared = yarn_tracks.fit_frame(path)
             if prepared is None:                       # saved before fits kept their frame: the whole cloth's
-                import gui_model
                 import scan_fit
 
-                model = next(m for m in gui_model.find_models() if m["output"].resolve() == args.run.resolve())
+                model = next(m for m in scan_fit.find_models() if m["output"].resolve() == args.run.resolve())
                 model["mm_per_unit"] = mm
                 prepared = scan_fit.prepare(model)
             mine = candidates.copy()
             if "region" in fit:
-                mine &= fit_yarns.region_members(splat["positions"], fabric["labels"], roles, fit["region"]["group"])
-            curves = fit_yarns.fitted_curves(path)
-            y, c, d = fit_yarns.yarn_of(splat["positions"], curves, prepared, mine)
+                mine &= yarn_tracks.region_members(splat["positions"], fabric["labels"], roles, fit["region"]["group"])
+            curves = yarn_tracks.fitted_curves(path)
+            y, c, d = yarn_tracks.yarn_of(splat["positions"], curves, prepared, mine)
             yarn[mine], curve[mine], distance_mm[mine] = y[mine] + count, c[mine] + sum(parts), d[mine]
             count = int(yarn.max()) + 1
             parts.append(len(curves))

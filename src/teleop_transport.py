@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -38,6 +39,21 @@ import ur5_robot
 
 DEFAULT_ADDRESS = "localhost:50052"
 DEFAULT_TARGET = "ur5"
+FRAME_CANDIDATES = {
+    "base_link": np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+    "base":      np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]),
+}
+FRAME_TOLERANCE = 0.01
+FABRIC_WIDTH = 0.40
+FABRIC_DROP = 0.25
+TABLE_MARGIN = 0.15
+TABLE_THICKNESS = 0.03
+LEG_SIDE = 0.04
+FABRIC_LIFT = 0.001
+TEXTURE_MAX_SIDE = 2048
+TABLE_COLOR = [0.45, 0.33, 0.22, 1.0]
+LEG_COLOR = [0.30, 0.30, 0.32, 1.0]
+PROP_PREFIX = "simcell "
 
 # TeleopApp's gRPC stubs are generated code, regenerated on import by that project's own
 # protostubs.py, so they are reached through its tree rather than vendored here. The
@@ -461,3 +477,91 @@ class TeleopCameraBackend(robot_camera.CameraBackend):
 
     def describe(self) -> str:
         return f"TeleopApp {self.camera_name} ({self.size[0]}x{self.size[1]}, simulated)"
+
+
+def frame_map(transport) -> np.ndarray:
+    """The plan-to-TeleopApp rotation, chosen by where TeleopApp says the tool point is right now."""
+    ours = geo.camera_position(transport.measured_joints(), transport.tool_offset)
+    theirs = np.asarray(transport.app_tool_point(), dtype=float)
+    misses = {name: float(np.linalg.norm(rotation @ ours - theirs)) for name, rotation in FRAME_CANDIDATES.items()}
+    name = min(misses, key=misses.get)
+    if misses[name] > FRAME_TOLERANCE:
+        raise RuntimeError("TeleopApp's world does not match this app's frame under any known mapping - its tool point is "
+                           + ", ".join(f"{miss * 1000:.0f} mm off as `{candidate}`" for candidate, miss in misses.items())
+                           + ". Check that its ur5 basePose is zero and its tool is the camera, then try again")
+    return FRAME_CANDIDATES[name]
+
+
+def fabric_layout(tool_offset: float, texture_size) -> dict:
+    """Where the fabric and table go in the plan frame: under Home's camera, sized to the texture."""
+    home = geo.camera_position(ur5_robot.DEFAULT_HOME_JOINTS, tool_offset)
+    width = FABRIC_WIDTH
+    depth = FABRIC_WIDTH * float(texture_size[1]) / float(texture_size[0])
+    centre = np.array([home[0], home[1], home[2] - FABRIC_DROP])
+    half = np.array([width / 2.0, depth / 2.0])
+    corners = [np.r_[centre[:2] + sign * half, centre[2]] for sign in (np.array([-1, -1]), np.array([1, -1]), np.array([1, 1]), np.array([-1, 1]))]
+    return {"centre": centre, "width": width, "depth": depth, "corners": corners}
+
+
+def write_fabric_mesh(texture: Image.Image, width: float, depth: float, folder: Path) -> Path:
+    """A flat, textured quad in TeleopApp's frame: Y up, the cloth spanning X and Z."""
+    folder.mkdir(parents=True, exist_ok=True)
+    image = texture.convert("RGB")
+    if max(image.size) > TEXTURE_MAX_SIDE:
+        scale = TEXTURE_MAX_SIDE / float(max(image.size))
+        image = image.resize((max(1, int(image.size[0] * scale)), max(1, int(image.size[1] * scale))), Image.LANCZOS)
+    image.save(folder / "fabric.png")
+
+    (folder / "fabric.mtl").write_text("newmtl knit\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nmap_Kd fabric.png\n")
+    x, z = width / 2.0, depth / 2.0
+    (folder / "fabric.obj").write_text(
+        "mtllib fabric.mtl\n"
+        f"v {-x} 0 {-z}\nv {-x} 0 {z}\nv {x} 0 {z}\nv {x} 0 {-z}\n"
+        "vt 0 1\nvt 0 0\nvt 1 0\nvt 1 1\n"
+        "vn 0 1 0\n"
+        "usemtl knit\n"
+        "f 1/1/1 2/2/1 3/3/1 4/4/1\n")
+    return folder / "fabric.obj"
+
+
+def props_for(layout: dict, rotation: np.ndarray, mesh: Path) -> dict:
+    """The props that make the cell, by name, as setProp specs in TeleopApp's world."""
+    def at(point):
+        return [float(value) for value in rotation @ np.asarray(point, dtype=float)]
+
+    centre = layout["centre"]
+    table_w, table_d = layout["width"] + 2.0 * TABLE_MARGIN, layout["depth"] + 2.0 * TABLE_MARGIN
+    top = centre[2] - FABRIC_LIFT
+    leg_height = max(top - TABLE_THICKNESS, 0.01)
+
+    props = {
+        f"{PROP_PREFIX}table": {"shape": "box", "position": at(centre - [0.0, 0.0, FABRIC_LIFT + TABLE_THICKNESS / 2.0]),
+                                "size": [table_w, TABLE_THICKNESS, table_d], "color": TABLE_COLOR},
+        f"{PROP_PREFIX}fabric": {"shape": "mesh", "file": str(mesh), "position": at(centre), "size": [1.0, 1.0, 1.0]},
+    }
+    for index, (sx, sy) in enumerate(((-1, -1), (1, -1), (1, 1), (-1, 1))):
+        foot = centre + [sx * (table_w / 2.0 - LEG_SIDE), sy * (table_d / 2.0 - LEG_SIDE), 0.0]
+        foot[2] = leg_height / 2.0
+        props[f"{PROP_PREFIX}leg {index + 1}"] = {"shape": "box", "position": at(foot),
+                                                   "size": [LEG_SIDE, leg_height, LEG_SIDE], "color": LEG_COLOR}
+    return props
+
+
+def build(transport, texture: Image.Image) -> list[list[float]]:
+    """Set the table and the knitted fabric into TeleopApp's scene; return the fabric's corners (plan frame)."""
+    rotation = frame_map(transport)
+    layout = fabric_layout(transport.tool_offset, texture.size)
+    mesh = write_fabric_mesh(texture, layout["width"], layout["depth"], paths.SIM_CELL_DIR / time.strftime("cell_%Y%m%d_%H%M%S"))
+
+    for name in [name for name in (transport.client.call("getProps") or {}) if name.startswith(PROP_PREFIX)]:
+        transport.client.call("removeProp", name)
+    for name, spec in props_for(layout, rotation, mesh).items():
+        transport.client.call("setProp", name, spec)
+    return [[float(value) for value in corner] for corner in layout["corners"]]
+
+
+def remove(transport) -> int:
+    names = [name for name in (transport.client.call("getProps") or {}) if name.startswith(PROP_PREFIX)]
+    for name in names:
+        transport.client.call("removeProp", name)
+    return len(names)

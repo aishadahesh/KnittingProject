@@ -27,8 +27,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from hand_eye import INTRINSICS_JSON  # noqa: E402
 from paths import CONFIG_DIR  # noqa: E402
-from lens import INTRINSICS_JSON  # noqa: E402
 from persistence import write_json
 
 

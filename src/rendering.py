@@ -592,16 +592,8 @@ class MeshRenderer:
             if len(verts) == 0:
                 continue
             stride = max(1, len(verts) // 400)
-            sample = verts[::stride]
-            world_pts = transform_points(sample, model_mat)
-            homo = np.column_stack((world_pts, np.ones(len(world_pts), dtype=np.float32)))
-            clip = homo @ view_proj.T
-            valid = clip[:, 3] > 1e-6
-            if not np.any(valid):
-                continue
-
-            ndc = np.zeros((len(world_pts), 3), dtype=np.float32)
-            ndc[valid] = clip[valid, :3] / clip[valid, 3:4]
+            world_pts = transform_points(verts[::stride], model_mat)
+            screen, valid, ndc = project_to_screen(world_pts, view_proj, vp_w, vp_h)
             in_view = (
                 valid
                 & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0)
@@ -610,10 +602,6 @@ class MeshRenderer:
             if not np.any(in_view):
                 continue
 
-            screen = np.column_stack((
-                (ndc[:, 0] * 0.5 + 0.5) * vp_w,
-                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * vp_h,
-            ))
             d2 = np.sum((screen - np.array([mouse_x, mouse_y], dtype=np.float32)) ** 2, axis=1)
             d2[~in_view] = np.inf
             local_best = float(np.min(d2))

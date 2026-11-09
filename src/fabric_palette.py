@@ -21,13 +21,12 @@ from pathlib import Path
 
 import numpy as np
 
-from paths import CONFIG_DIR
+from paths import CONFIG_DIR, PROJECT_ROOT, SCRIPTS_DIR
 from persistence import write_json
 
 PALETTES_DIR = CONFIG_DIR / "fabric_palettes"
 COLOURS_FILE, LABELS_FILE = "fabric_colours.json", "fabric_colours_labels.npy"
 MAX_GAIN = 8.0
-ROOT = Path(__file__).resolve().parent.parent
 
 
 def srgb_to_linear(rgb):
@@ -225,9 +224,9 @@ def recolour_all(colours: np.ndarray, labels: np.ndarray, groups: list[dict], ta
 def extract(output: Path, dataset: Path, colours: int = 0) -> subprocess.Popen:
     """Runs fabric_colours.py for a model (about a minute) as its own process - `colours` of them to find,
     0 for as many as differ - and returns it to be polled."""
-    return subprocess.Popen([sys.executable, str(ROOT / "scripts" / "fabric_colours.py"), str(output), str(dataset),
+    return subprocess.Popen([sys.executable, str(SCRIPTS_DIR / "fabric_colours.py"), str(output), str(dataset),
                              "--colours", str(int(colours))],
-                            cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 def save_colour(name: str, colour, source: str, folder: Path = PALETTES_DIR) -> Path:

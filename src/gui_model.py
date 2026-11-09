@@ -41,13 +41,14 @@ from imgui_bundle import imgui
 from PIL import Image
 
 import crochet_core
-import crochet_fit
 import drive_store
+import paths
+import scan_fit
+from scan_fit import find_models
 import fabric_palette
 import gaussian_splatting
 import yarn_tracks
 import lace_lattice
-import paths
 import splat_gl
 import strand_equations
 from rendering import draw_fitted_texture, upload_rgb_texture
@@ -68,34 +69,6 @@ COLOURINGS = ("Fabric colour", "Distance to scan (heat map)")
 SOURCES = ("Traced strands", "Knit repeating loops", "Crochet model")
 SELECTED_COLOUR = (1.0, 0.55, 0.10)
 CONTROLS_WIDTH = 410.0
-
-
-def find_models(root: Path = paths.ROBOT_SCANS_DIR) -> list[dict]:
-    """Every trained splat under robot_scans: its PLY (the cropped one when there is one), the training
-    run and dataset it came from (for the cameras), its scale and its held-out PSNR."""
-    models = []
-    for export in sorted(Path(root).glob("*/splat_output*/export")):
-        ply = export / "splat_clean.ply"
-        if not ply.is_file():
-            ply = export / "splat.ply"
-        if not ply.is_file():
-            continue
-        output, session = export.parent, export.parent.parent
-        runs = [p for p in output.glob("*/splatfacto/*")
-                if (p / "dataparser_transforms.json").is_file() and not p.name.endswith("_cloth")]
-        run = max(runs, key=lambda p: p.stat().st_mtime) if runs else None
-        dataset = session / run.parent.parent.name if run is not None else None
-        try:
-            psnr = float(json.loads((output / "eval.json").read_text(encoding="utf-8"))["results"]["psnr"])
-        except (OSError, ValueError, KeyError, TypeError):
-            psnr = None
-        models.append({
-            "name": f"{session.name} / {output.name}" + ("" if ply.name == "splat_clean.ply" else " (uncropped)"),
-            "ply": ply, "output": output, "run": run,
-            "dataset": dataset if dataset is not None and (dataset / "transforms.json").is_file() else None,
-            "mm_per_unit": strand_equations.load_scale(output), "psnr": psnr,
-        })
-    return models
 
 
 def _view(state) -> SimpleNamespace:
@@ -446,7 +419,7 @@ def _draw_yarns(view, model) -> None:
         return
     label = "from the fitted stitches" if fit_path.is_file() else "from the Gaussians' directions"
     if imgui.small_button(("Find the yarns again" if view.yarns is not None else "Find the yarns") + f" ({label})##yarns_find"):
-        view.yarns_job = subprocess.Popen([sys.executable, str(paths.PROJECT_ROOT / "scripts" / "fabric_yarns.py"), str(model["output"])],
+        view.yarns_job = subprocess.Popen([sys.executable, str(paths.SCRIPTS_DIR / "fabric_yarns.py"), str(model["output"])],
                                           cwd=str(paths.PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if imgui.is_item_hovered():
         imgui.set_tooltip("From the fitted stitches: each yarn Gaussian takes its nearest fitted curve; a row's curves are one yarn.\n"
@@ -671,7 +644,7 @@ def _start_crochet_fit(view) -> None:
 
     def run():
         try:
-            holder["result"] = crochet_fit.fit(extraction, progress=lambda message: setattr(view, "progress", message), **known)
+            holder["result"] = scan_fit.fit(extraction, progress=lambda message: setattr(view, "progress", message), **known)
         except Exception as exc:
             holder["error"] = str(exc)
 

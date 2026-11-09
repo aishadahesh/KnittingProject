@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import gaussian_splatting  # noqa: E402
+from fabric_palette import hex_of, linear_to_srgb, srgb_to_linear  # noqa: E402
 from persistence import write_json
 
 MAX_COLOURS = 8               # groups the k-means starts from, before merging
@@ -59,16 +60,6 @@ BLACK_REFLECTANCE = 0.04      # and its printed black (laser toner on matte pape
 
 # ----------------------------------------------------------------------------------------- colour maths
 
-def srgb_to_linear(rgb):
-    rgb = np.asarray(rgb, dtype=np.float64)
-    return np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-
-
-def linear_to_srgb(lin):
-    lin = np.clip(np.asarray(lin, dtype=np.float64), 0.0, 1.0)
-    return np.where(lin <= 0.0031308, lin * 12.92, 1.055 * lin ** (1 / 2.4) - 0.055)
-
-
 _RGB_TO_XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
                         [0.2126729, 0.7151522, 0.0721750],
                         [0.0193339, 0.1191920, 0.9503041]])
@@ -79,10 +70,6 @@ def srgb_to_lab(rgb):
     xyz = srgb_to_linear(rgb) @ _RGB_TO_XYZ.T / _WHITE_D65
     f = np.where(xyz > (6 / 29) ** 3, np.cbrt(xyz), xyz / (3 * (6 / 29) ** 2) + 4 / 29)
     return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis=-1)
-
-
-def hex_of(rgb) -> str:
-    return "#" + "".join(f"{int(round(float(np.clip(v, 0, 1)) * 255)):02x}" for v in rgb)
 
 
 def describe(lab) -> str:

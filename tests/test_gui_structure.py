@@ -12,11 +12,12 @@ MODE_MODULES = ("gui_database", "gui_ur5", "gui_model")
 # Modules that must stay usable without a UI: they are imported by headless
 # callers (tests, scripts, the scan runner) where imgui does not exist.
 IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core", "embedded_scanner",
-                      "rgb_analysis", "robot_camera", "ur5_robot", "ur5_scan",
+                      "fabric_detector", "robot_camera", "ur5_robot", "ur5_scan",
                       "gaussian_splatting", "free_capture", "paths", "strand_equations",
-                      "lace_lattice", "crochet_core", "crochet_fit", "scan_fit", "crochet_stitches",
-                      "splat_gl", "fabric_palette", "yarn_tracks", "fit_yarns", "drive_store",
-                      "knitting_core", "persistence")
+                      "lace_lattice", "crochet_core", "scan_fit", "hand_eye", "charuco",
+                      "splat_gl", "fabric_palette", "yarn_tracks", "drive_store",
+                      "knitting_core", "persistence", "teleop_transport", "scan_geometry",
+                      "yarn_simulation", "scanner_storage")
 
 
 def _parse(path: Path) -> ast.Module:

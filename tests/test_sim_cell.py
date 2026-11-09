@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-import sim_cell
+import teleop_transport as sim_cell
 import ur5_robot
 
 

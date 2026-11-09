@@ -40,7 +40,7 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-import lens
+from hand_eye import hand_eye_from_params, intrinsics_for, load_intrinsics, tcp_matrix
 from persistence import write_json
 
 
@@ -69,35 +69,15 @@ class SplatDataset:
     offered: int = 0
 
 def hand_eye_matrix(offset_m: float = DEFAULT_CAMERA_OFFSET_M, rotation_rotvec=None) -> np.ndarray:
-    """Tool-flange to camera transform.
-
-    Defaults to a pure translation along the tool's +Z, which is where a
-    gripper-mounted camera looking at the work usually sits.
-    """
-    matrix = np.eye(4, dtype=float)
-    if rotation_rotvec is not None:
-        matrix[:3, :3] = Rotation.from_rotvec(np.asarray(rotation_rotvec, dtype=float)).as_matrix()
-    matrix[:3, 3] = [0.0, 0.0, float(offset_m)]
-    return matrix
-
-
-def pose_to_matrix(pose) -> np.ndarray:
-    """UR pose ``[x, y, z, rx, ry, rz]`` to a 4x4 base-to-tool transform.
-
-    The rotation part is an axis-angle (rotation vector), which is how UR
-    controllers report and accept orientation.
-    """
-    pose = np.asarray(pose, dtype=float).reshape(-1)[:6]
-    matrix = np.eye(4, dtype=float)
-    matrix[:3, :3] = Rotation.from_rotvec(pose[3:6]).as_matrix()
-    matrix[:3, 3] = pose[:3]
-    return matrix
+    """Tool-flange to camera transform (defaults to pure translation along tool +Z)."""
+    rotvec = [0.0, 0.0, 0.0] if rotation_rotvec is None else rotation_rotvec
+    return hand_eye_from_params(rotvec, [0.0, 0.0, float(offset_m)])
 
 
 def camera_to_world(pose, hand_eye: np.ndarray | None = None) -> np.ndarray:
     """Camera pose in the robot base frame, in OpenCV axes (x right, y down, z forward)."""
     hand_eye = hand_eye_matrix() if hand_eye is None else np.asarray(hand_eye, dtype=float)
-    return pose_to_matrix(pose) @ hand_eye
+    return tcp_matrix(pose) @ hand_eye
 
 
 # OpenCV camera axes to OpenGL/NeRF axes: flip Y and Z. transforms.json is a
@@ -722,10 +702,8 @@ def export_dataset(
         warnings.append("no usable captures; nothing was exported")
         width, height = max(width, 1), max(height, 1)
 
-    # A measured lens (scripts/calibrate_lens.py) beats any field-of-view guess: its focal length,
-    # centre and distortion go in, and nerfstudio undistorts the pictures itself.
-    measured = lens.load_intrinsics() if calibration is not None and calibration.get("lens", "").startswith("measured") else None
-    intrinsics = lens.intrinsics_for(width or 1, height or 1, measured) if measured else intrinsics_from_fov(width or 1, height or 1, fov_degrees)
+    measured = load_intrinsics() if calibration is not None and calibration.get("lens", "").startswith("measured") else None
+    intrinsics = intrinsics_for(width or 1, height or 1, measured) if measured else intrinsics_from_fov(width or 1, height or 1, fov_degrees)
     if not frames:
         seed = 0
     elif registered is not None:

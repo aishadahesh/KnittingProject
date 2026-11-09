@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import fabric_detector
 import gaussian_splatting
-import rgb_analysis
 import robot_camera
 import ur5_robot
 import ur5_scan
@@ -341,7 +341,7 @@ def test_analysis_ignores_background_and_measures_the_fabric():
     """A coloured patch on a dark ground must read as the patch's colour."""
     image = Image.new("RGB", (120, 120), (12, 12, 14))
     image.paste(Image.new("RGB", (60, 60), (200, 80, 60)), (30, 30))
-    stats = rgb_analysis.fabric_rgb_stats(image)
+    stats = fabric_detector.fabric_rgb_stats(image)
     assert stats["rgb"][0] > stats["rgb"][1] > stats["rgb"][2]
     assert stats["rgb"][0] == pytest.approx(200, abs=12)
     assert stats["pixel_count"] < stats["total_pixels"]
@@ -353,7 +353,7 @@ def test_analysis_is_the_same_function_the_simulation_uses():
 
     image = Image.new("RGB", (80, 80), (90, 140, 70))
     assert gui.EmbeddedMujocoScanner._fabric_rgb_stats(image)["rgb"] == pytest.approx(
-        rgb_analysis.fabric_rgb_stats(image)["rgb"]
+        fabric_detector.fabric_rgb_stats(image)["rgb"]
     )
 
 
@@ -363,7 +363,7 @@ def test_comparison_ranks_most_different_colours_first():
         {"row": 0, "col": 1, "overall_rgb": [12.0, 11.0, 10.0]},
         {"row": 1, "col": 0, "overall_rgb": [240.0, 230.0, 220.0]},
     ]
-    comparisons = rgb_analysis.compare_cell_colors(cells)
+    comparisons = fabric_detector.compare_cell_colors(cells)
     assert len(comparisons) == 3
     assert comparisons[0]["delta_rgb"] > comparisons[-1]["delta_rgb"]
 

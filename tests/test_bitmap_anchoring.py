@@ -23,7 +23,6 @@ import pytest
 from app_state import AppState  # noqa: E402
 from knitting_core import (  # noqa: E402
     anchor_bitmap,
-    bitmap_is_anchored,
     compute_bitmap_scale_factors,
     unanchored_columns,
 )
@@ -88,8 +87,6 @@ def test_unanchored_columns_finds_the_cleared_bottom_cells():
     bitmap = np.array([[1, 0, 1], [0, 1, 0]], dtype=np.float32)
     assert unanchored_columns(bitmap).tolist() == [1]
     assert unanchored_columns(np.ones((3, 4), dtype=np.float32)).tolist() == []
-    assert bitmap_is_anchored(np.ones((3, 4), dtype=np.float32))
-    assert not bitmap_is_anchored(bitmap)
 
 
 def test_anchor_bitmap_leaves_its_input_alone():

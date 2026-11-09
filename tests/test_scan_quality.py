@@ -54,7 +54,7 @@ def test_a_frame_over_the_middle_is_inside_and_over_a_corner_is_not():
     import scan_geometry
 
     region = scan_geometry.FabricRegion(square_cloth())
-    down = scan_geometry.looking_down(np.array([math.pi, 0.0, 0.0]))
+    down = scan_geometry.looking_down_along([1.0, 0.0])
     middle = scan_geometry.footprint(region.centre + [0.0, 0.0, 0.09], down, region.z, 55.0)
     corner = scan_geometry.footprint(np.r_[square_cloth()[0, :2], region.z + 0.09], down, region.z, 55.0)
 
@@ -538,7 +538,7 @@ def test_capture_metadata_says_how_high_how_tilted_and_at_what_detail():
     pytest.importorskip("scipy")
     import scan_geometry
 
-    down = scan_geometry.looking_down(np.array([math.pi, 0.0, 0.0]))
+    down = scan_geometry.looking_down_along([1.0, 0.0])
     point = scan_geometry.Viewpoint("over", np.array([0.0, 0.5, 0.31]), down)
     plan = scan_geometry.CapturePlan(poses=np.zeros((1, 6)), view_names=["over"], station_ids=[0], station_cells=[(0, 0)],
                                      viewpoints=[point], subject=np.array([0.0, 0.5, 0.24]), pattern="grid", fabric_z=0.24)

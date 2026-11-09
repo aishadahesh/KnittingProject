@@ -161,17 +161,14 @@ def test_a_splat_still_being_written_is_not_read_as_a_small_one(tmp_path):
 
 
 def test_a_measured_lens_is_used_as_it_is_and_scales_with_the_picture():
-    import lens
-
     measured = {"fx": 1200.0, "fy": 1180.0, "cx": 330.0, "cy": 250.0, "k1": -0.1, "width": 640, "height": 480}
-    full = lens.intrinsics_for(640, 480, measured)
+    full = hand_eye.intrinsics_for(640, 480, measured)
     assert full["fl_x"] == 1200.0 and full["cx"] == 330.0 and full["camera_model"] == "OPENCV" and full["k1"] == -0.1
-    half = lens.intrinsics_for(320, 240, measured)
+    half = hand_eye.intrinsics_for(320, 240, measured)
     assert half["fl_x"] == 600.0 and half["fl_y"] == 590.0 and half["cx"] == 165.0
-    # On the axis, distortion does nothing; off it, k1 < 0 pulls points inwards.
-    on_axis = lens.project(np.array([[0.0, 0.0, 1.0]]), full)
+    on_axis = hand_eye.project(np.array([[0.0, 0.0, 1.0]]), full)
     assert np.allclose(on_axis, [[330.0, 250.0]])
-    off_axis = lens.project(np.array([[0.2, 0.0, 1.0]]), full)
+    off_axis = hand_eye.project(np.array([[0.2, 0.0, 1.0]]), full)
     assert 330.0 < off_axis[0, 0] < 330.0 + 0.2 * 1200.0
 
 
