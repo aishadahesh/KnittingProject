@@ -102,6 +102,30 @@ def test_load_rebuilds_dimensions_and_preserves_active_mode(state):
     assert state.app_mode == 'database'
 
 
+@pytest.mark.parametrize('shape', [(7, 3), (2, 4)])
+@pytest.mark.parametrize('saved_size', [None, [99, 99]])
+def test_loading_a_different_bitmap_size_restores_all_row_state(state, shape, saved_size):
+    state.on_bitmap_resize(*shape)
+    state.save_params(state.save_path)
+    source = Path(state.save_path)
+    data = json.loads(source.read_text())
+    data['gui_state']['row_visible'] = [False, True, False]
+    if saved_size is not None:
+        data['gui_state']['bitmap_size'] = saved_size
+    source.write_text(json.dumps(data))
+    state.on_bitmap_resize(3, 5)
+
+    assert state.load_params(source), state.status_msg
+
+    np.testing.assert_array_equal(state.bitmap_size, shape)
+    assert len(state.ctrl_rows) == len(state.row_colors) == len(state.row_visible) == shape[0]
+    assert state.loop_heights.shape == state.loop_height_overrides.shape == shape
+    np.testing.assert_array_equal(state.row_visible[:min(3, shape[0])], [False, True, False][:shape[0]])
+    assert state.row_visible[3:].all()
+    for actual, saved in zip(state.ctrl_rows, data['spline_control_rows']):
+        np.testing.assert_allclose(actual, saved, rtol=1e-7, atol=1e-7)
+
+
 def test_reading_display_periods_does_not_replace_radius_state(state):
     radii = state.spline_radius_rows
     before = json_ready(state.snapshot_state())

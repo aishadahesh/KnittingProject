@@ -1622,6 +1622,7 @@ class AppState:
                     raise ValueError('bitmap must be a finite, nonempty 2D array')
                 if not np.isfinite(self.params).all():
                     raise ValueError('parameters must be finite')
+                self.bitmap_size = np.array(self.bitmap.shape, dtype=np.int32)
                 pre_anchor_bitmap = self.bitmap.copy()
                 anchored_columns = self._anchor_bitmap()
                 gui_state = data['gui_state']
