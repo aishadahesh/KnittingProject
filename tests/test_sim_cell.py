@@ -65,12 +65,10 @@ class FakeTransport:
 
 @pytest.mark.parametrize("name", sorted(sim_cell.FRAME_CANDIDATES))
 def test_the_frame_map_is_the_one_teleop_s_tool_point_agrees_with(name):
-    pytest.importorskip("mujoco")
     assert sim_cell.frame_map(FakeTransport(sim_cell.FRAME_CANDIDATES[name])) is sim_cell.FRAME_CANDIDATES[name]
 
 
 def test_a_frame_no_candidate_explains_is_refused_before_anything_is_placed():
-    pytest.importorskip("mujoco")
     transport = FakeTransport(np.eye(3))
     with pytest.raises(RuntimeError, match="does not match"):
         sim_cell.build(transport, Image.new("RGB", (400, 300)))
@@ -128,7 +126,6 @@ def test_the_fabric_mesh_is_a_textured_quad_facing_up(tmp_path):
 
 
 def test_building_replaces_its_own_props_and_leaves_the_rest_and_returns_the_corners(tmp_path, monkeypatch):
-    pytest.importorskip("mujoco")
     import paths
 
     monkeypatch.setattr(paths, "SIM_CELL_DIR", tmp_path)

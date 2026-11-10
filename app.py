@@ -1,5 +1,6 @@
 """Knitted and crocheted geometry editor, scanner, and reconstruction viewer."""
 
+import argparse
 import os
 import sys
 import logging
@@ -40,7 +41,7 @@ from gui import (
 
 # %% MAIN ─────────────────────────────────────────────────────────────────────
 
-def main():
+def main(robot="sim", camera_source="sim"):
     with ExitStack() as resources:
         with open(paths.CONFIG_JSON, encoding="utf-8") as handle:
             config = json.load(handle)
@@ -117,20 +118,17 @@ def main():
         resources.callback(glfw.make_context_current, window)
 
         def close_controllers():
-            for key in ('embedded_scanner', 'ur5_controller'):
-                controller = state.get(key)
-                if controller is not None:
-                    try:
-                        controller.close()
-                        state[key] = None
-                    except Exception:
-                        logging.exception("Closing %s", key)
+            controller = state.get('ur5_controller')
+            if controller is not None:
+                try:
+                    controller.close()
+                    state['ur5_controller'] = None
+                except Exception:
+                    logging.exception("Closing ur5_controller")
 
         resources.callback(close_controllers)
         state.reference_image_pixels = np.asarray(ref_pil, dtype=np.float32) / 255.0
 
-        # initial_params.json is the frozen reset baseline.
-        # params.json is the working autosave and is loaded for normal resume.
         work_params_path = state.load_path
         initial_params_path = str(paths.INITIAL_PARAMS_JSON)
 
@@ -146,6 +144,10 @@ def main():
                 state.restore_snapshot(state._initial_snapshot)
         state.load_path = work_params_path
         state.save_path = work_params_path
+        state.ur5_transport = str(robot)
+        state.scanner_execution_mode = "simulation" if str(robot) == "sim" else "robot"
+        if str(camera_source).isdigit():
+            state.ur5_camera_device = int(camera_source)
         scanner_storage = ScannerStorage(paths.PROJECT_ROOT)
         object.__setattr__(state, "scanner_storage", scanner_storage)
         if scanner_storage.restore_scanner_state(state):
@@ -264,12 +266,8 @@ def main():
         IDLE_FRAME_SECONDS = 1.0 / 15.0
 
         def animating(state):
-            embedded = state.get('embedded_scanner')
-            scanning = embedded is not None and (
-                bool(getattr(embedded, 'running', False))
-                or bool(getattr(embedded, 'single_target_active', False))
-                or getattr(embedded, '_capture_job', None) is not None
-            )
+            controller = state.get('ur5_controller')
+            scanning = controller is not None and controller.runner is not None and bool(controller.runner.running)
             model_view = state.get('model_view')
             spinning = model_view is not None and (bool(getattr(model_view, 'spin', False))
                                                    or bool(getattr(model_view, 'wiggle', False)))
@@ -353,6 +351,10 @@ def main():
             glfw.swap_buffers(window)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Knitting Guided Workflow")
+    parser.add_argument("--robot", choices=("sim", "teleop", "rtde"), default="sim")
+    parser.add_argument("--camera", default="sim")
+    cli_args = parser.parse_args()
+    main(robot=cli_args.robot, camera_source=cli_args.camera)
 
 # %%

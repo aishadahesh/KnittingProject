@@ -251,8 +251,7 @@ class TeleopAppTransport(ur5_robot.UR5Transport):
 
         from scipy.spatial.transform import Rotation
 
-        mj, model, data, site_id = self._model
-        flange = geo.seed_from(mj, model, data, site_id, self.measured_joints())
+        flange = geo.flange_pose(self.measured_joints())
         rotvec = np.asarray(flange[3:6], dtype=float)
         position = np.asarray(flange[:3], dtype=float) + Rotation.from_rotvec(rotvec).apply([0.0, 0.0, self.tool_offset])
         return np.r_[position, rotvec]
@@ -293,12 +292,10 @@ class TeleopAppTransport(ur5_robot.UR5Transport):
         a flange target instead parks the tool one tool-length beyond the pose asked for, and
         arrival then never registers.
         """
-        mj, model, data, site_id = self._model
         asked = np.asarray(pose, dtype=float).reshape(-1)[:6]
         flange = geo.flange_for_grasp(asked[:3], asked[3:6], self.tool_offset)
 
-        geo.seed_from(mj, model, data, site_id, self.measured_joints())
-        config, _, _ = geo.solve_ik(mj, model, data, site_id, np.r_[flange, asked[3:6]], "pose")
+        config, _, _ = geo.solve_ik(self.measured_joints(), np.r_[flange, asked[3:6]], "pose")
         self.move_to_joints(config, speed, acceleration)
 
     def rehearsable(self) -> bool:
@@ -396,16 +393,14 @@ class TeleopAppTransport(ur5_robot.UR5Transport):
         """Reachable and clear of self-collision, checked against the model rather than tried."""
         if self._model is None:
             return True
-        mj, model, data, site_id = self._model
         asked = np.asarray(pose, dtype=float).reshape(-1)[:6]
         flange = geo.flange_for_grasp(asked[:3], asked[3:6], self.tool_offset)
 
-        geo.seed_from(mj, model, data, site_id, self.measured_joints())
         try:
-            config, _, _ = geo.solve_ik(mj, model, data, site_id, np.r_[flange, asked[3:6]], "pose")
+            config, _, _ = geo.solve_ik(self.measured_joints(), np.r_[flange, asked[3:6]], "pose")
         except geo.Unreachable:
             return False
-        return geo.contacts_at(mj, model, data, config) == 0
+        return geo.contacts_at(config) == 0
 
     # -- helpers the panel and the runner use ------------------------------
 

@@ -178,6 +178,7 @@ class AppState:
 
         # 6. Direct assignments for types that _coerce would get wrong
         state_defaults['_row_starts'] = [0]
+        state_defaults['swatch_cells'] = {}
 
         super().__setattr__('_state_defaults', state_defaults)
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}
@@ -413,7 +414,79 @@ class AppState:
             int(np.clip(cols, 2, self.SCANNER_PATTERN_MAX_COLS)),
         )
 
+    SWATCH_STATE_KEYS = (
+        'bitmap',
+        'bitmap_size',
+        'params',
+        'loop_heights',
+        'loop_height_overrides',
+        'ctrl_rows',
+        'spline_radius_rows',
+        'row_colors',
+        'use_row_colors',
+        'fabric_type',
+        'crochet_params',
+        'crochet_stitches',
+    )
+
+    def _swatch_key(self, row: int, col: int) -> str:
+        return f"{int(row)},{int(col)}"
+
+    def _cell_index_to_row_col(self, cell_index: int) -> tuple[int, int]:
+        cols = max(1, int(self.get('scanner_preview_cols', self.get('scanner_cols', 1))))
+        idx = max(0, int(cell_index))
+        return idx // cols, idx % cols
+
+    def save_active_swatch(self) -> None:
+        cells = self._data.setdefault('swatch_cells', {})
+        row = int(self.get('scanner_selected_row', 0))
+        col = int(self.get('scanner_selected_col', 0))
+        key = self._swatch_key(row, col)
+        entry = {}
+        for k in self.SWATCH_STATE_KEYS:
+            if k in self._data:
+                entry[k] = self._clone(self._data[k])
+        cells[key] = entry
+
+    def select_swatch(self, row: int, col: int, rebuild: bool = True) -> None:
+        cells = self._data.setdefault('swatch_cells', {})
+        cur_row = int(self.get('scanner_selected_row', 0))
+        cur_col = int(self.get('scanner_selected_col', 0))
+        if (cur_row, cur_col) != (int(row), int(col)) or self._swatch_key(cur_row, cur_col) in cells:
+            self.save_active_swatch()
+        self.scanner_selected_row = int(row)
+        self.scanner_selected_col = int(col)
+        key = self._swatch_key(row, col)
+        if key in cells:
+            entry = cells[key]
+            for k, v in entry.items():
+                self._data[k] = self._clone(v)
+        else:
+            cols = max(1, int(self.get('scanner_cols', 1)))
+            cell_index = int(row) * cols + int(col)
+            pattern_bitmap = self._scanner_random_bitmap(cell_index)
+            loop_heights = self._scanner_loop_heights_for_bitmap(pattern_bitmap)
+            params = self._scanner_template_params()
+            self.bitmap = pattern_bitmap.copy()
+            self.bitmap_size = np.array(pattern_bitmap.shape, dtype=np.int32)
+            self.params = [float(v) for v in params]
+            self.loop_heights = loop_heights.copy()
+            self.loop_height_overrides = np.ones_like(pattern_bitmap, dtype=bool)
+            self._sync_row_colors(int(pattern_bitmap.shape[0]))
+            self._sync_row_visibility(int(pattern_bitmap.shape[0]))
+            self.rebuild_spline_from_params(rebuild_mesh=False)
+            self.save_active_swatch()
+        if rebuild:
+            self.rebuild_spline_mesh(preserve_model_placement=True)
+
     def _scanner_random_bitmap(self, cell_index):
+        r, c = self._cell_index_to_row_col(cell_index)
+        cells = self.get('swatch_cells') or {}
+        entry = cells.get(self._swatch_key(r, c))
+        if isinstance(entry, dict) and 'bitmap' in entry:
+            bm = np.asarray(entry['bitmap'], dtype=np.float32)
+            if bm.ndim == 2 and bm.size:
+                return bm.copy()
         pattern_rows, pattern_cols = self._scanner_pattern_size()
         density = float(np.clip(float(self.get('scanner_pattern_density', 0.62)), 0.05, 0.95))
         seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
@@ -467,6 +540,44 @@ class AppState:
         return fitted
 
     def _scanner_pattern_meshes(self, cell_index, target_bounds):
+        r, c = self._cell_index_to_row_col(cell_index)
+        cells = self.get('swatch_cells') or {}
+        entry = cells.get(self._swatch_key(r, c))
+        if isinstance(entry, dict) and entry.get('ctrl_rows'):
+            ctrl_rows = [np.asarray(row, dtype=np.float32) for row in entry['ctrl_rows'] if len(row) > 1]
+            params = np.asarray(entry.get('params', self._scanner_template_params()), dtype=np.float32)
+            bm = np.asarray(entry.get('bitmap', self._scanner_random_bitmap(cell_index)), dtype=np.float32)
+            stitch_width = float(params[self._pidx['stitch_width']])
+            period_offset_x = np.array(
+                [float(bm.shape[1]) * stitch_width, 0.0, 0.0], dtype=np.float32
+            )
+            radius = max(float(params[self._pidx['radius']]), 1e-6)
+            saved_radii = entry.get('spline_radius_rows') or []
+            if len(saved_radii) == len(ctrl_rows):
+                radius_profiles = [np.asarray(row, dtype=np.float32) for row in saved_radii]
+            else:
+                radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
+            vl = build_spline_mesh(
+                ctrl_rows,
+                params,
+                self.config,
+                self._pidx,
+                period_offset_x,
+                radius_ctrl_rows=radius_profiles,
+            )
+            vl, meta = build_surface_fiber_meshes(
+                vl,
+                segments=int(self.config['knit_parameters']['segments']),
+                enabled=self.fiber_geometry_enabled,
+                count=max(1, int(round(float(self.fiber_geometry_count)))),
+                radius=radius,
+                radius_scale=float(self.fiber_geometry_radius_scale),
+                lift=float(self.fiber_geometry_lift),
+                surface_arc=float(self.fiber_geometry_surface_arc),
+                randomness=float(self.fiber_geometry_randomness),
+                twist=float(self.fiber_geometry_twist),
+            )
+            return self._fit_vl_to_bounds(vl, target_bounds), meta
         pattern_bitmap = self._scanner_random_bitmap(cell_index)
         loop_heights = self._scanner_loop_heights_for_bitmap(pattern_bitmap)
         params = self._scanner_template_params()
@@ -1227,7 +1338,7 @@ class AppState:
     # a live robot connection mid-scan, leaving nothing able to stop the arm.
     _SNAPSHOT_EXCLUDE = frozenset({
         'render_tex', 'render_result', 'undo_stack',
-        'ur5_controller', 'embedded_scanner', 'scanner_storage', 'scanner_process',
+        'ur5_controller', 'scanner_storage', 'scanner_process',
         # Mode workspaces are containers for snapshots, not model fields. They
         # must never be copied into the snapshots they contain.
         'puzzle_model_snapshot', 'puzzle_initial_snapshot', 'puzzle_undo_stack',

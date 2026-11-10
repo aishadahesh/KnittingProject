@@ -11,7 +11,6 @@ Module layout (dependencies point one way, no cycles):
 draw_orbit_viewport from here. Names moved into scanner_core kept their original
 spelling and are re-imported below, so call sites in this file are unchanged.
 """
-import logging
 import os
 import json
 import numpy as np
@@ -29,21 +28,16 @@ from rendering import (draw_fitted_texture, project_to_screen, transform_points,
                        upload_rgb_texture)
 from fabric_scanner import clamp_capture_size
 import paths
-from embedded_scanner import EmbeddedMujocoScanner
 from gui_database import _draw_database_summary_page, draw_database_viewport
-# Moved to scanner_core (see its docstring). Re-imported under their original
-# names so every call site in this file is unchanged.
 from scanner_core import (
     _clamp_scanner_selected_cell, _ensure_scanner_shared_colors,
     _maybe_persist_scanner_state,
-    _puzzle_apply_geometry_copies,
-    _puzzle_build_seamless_tile, _puzzle_capture_geometry_image, _puzzle_capture_rect,
-    _puzzle_detect_colors, _puzzle_target_copies,
+    _puzzle_capture_rect,
     _refresh_embedded_scanner_display_colors, _scanner_batch_texture_size, _scanner_capture_image_size,
     _scanner_display_batch_colors, _scanner_estimated_cell_colors,
-    _scanner_generate_tiled_layout, _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
-    _scanner_storage, _set_puzzle_capture_rect,
-    _set_scanner_estimated_batch_color, _upload_puzzle_texture, build_scanner_plan_args,
+    _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
+    _scanner_storage,
+    _set_scanner_estimated_batch_color, _upload_puzzle_texture,
 )
 
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
@@ -406,13 +400,14 @@ def _open_model_in_edit(state, request):
     _set_app_mode(state, 'edit')
     state.push_undo("Pattern from scanned model")
     if request.get('fabric') == 'crochet':
-        # Crochet: Edit Mode's crochet fabric takes the fitted stitch numbers and grid as they are.
         state.fabric_type = 'crochet'
         state.crochet_params = dict(request['parameters'])
         state.crochet_stitches = np.asarray(request['stitches'], dtype=np.float32).copy()
         state.display_copies = np.array([1, 1], dtype=np.int32)
         state.rebuild_spline_mesh(preserve_model_placement=False)
         state.center_model_on_view()
+        if state.get('swatch_cells'):
+            state.save_active_swatch()
         rows, stitches = state.crochet_stitches.shape
         state.status_msg = f"Crochet from the scan: {rows} rows x {stitches} stitches"
         return
@@ -421,94 +416,75 @@ def _open_model_in_edit(state, request):
     state.display_copies = np.array([1, 1], dtype=np.int32)
     state.rebuild_spline_mesh(preserve_model_placement=False)
     state.center_model_on_view()
+    if state.get('swatch_cells'):
+        state.save_active_swatch()
     state.status_msg = f"Pattern from the scan: {state.bitmap.shape[0]} rows x {state.bitmap.shape[1]} stitches"
 
 
+def _normalize_app_mode(mode, state=None):
+    m = str(mode or 'edit')
+    if state is not None:
+        prev_raw = state.get('_last_raw_app_mode')
+        if m != prev_raw:
+            state._last_raw_app_mode = m
+            if m == 'database':
+                state._scan_subview = 'database'
+            elif m == 'scan':
+                state._scan_subview = 'scan'
+    if m in ('splat', 'splatting'):
+        return 'model'
+    if m == 'ur5':
+        return 'capture'
+    if m == 'database':
+        return 'scan'
+    if m == 'puzzle':
+        return 'edit'
+    return m if m in ('scan', 'capture', 'model', 'edit') else 'edit'
+
+
 def _set_app_mode(state, mode):
-    if mode in ('splat', 'splatting'):
-        mode = 'model'
-    mode = mode if mode in ('edit', 'scan', 'puzzle', 'database', 'ur5', 'model') else 'edit'
-    current_mode = str(state.get('app_mode', 'edit'))
-    if current_mode == mode:
+    raw_mode = str(mode or 'edit')
+    if raw_mode == 'database':
+        state._scan_subview = 'database'
+    elif raw_mode == 'scan':
+        state._scan_subview = 'scan'
+    mode = _normalize_app_mode(raw_mode, state)
+    current_mode = _normalize_app_mode(state.get('app_mode', 'edit'))
+    if current_mode == mode and mode != 'scan':
         return
-    # Invalidates every temporary Scan snapshot made in the mode being left.
-    # A delayed cleanup must not restore that old model over the new workspace.
     state.mode_epoch = int(state.get('mode_epoch', 0)) + 1
-    # Leaving UR5 Robot Mode stops the run, releases the arm and closes the
-    # camera. Left connected, a background scan thread would keep moving real
-    # hardware while the user is in a mode that shows none of it.
-    if current_mode == 'ur5':
+    if current_mode == 'edit' and state.get('swatch_cells'):
+        state.save_active_swatch()
+    if mode not in ('scan', 'capture'):
         controller = state.get('ur5_controller')
-        if controller is not None:
-            try:
-                controller.close()
-            except Exception as exc:
-                logging.warning("gui._set_app_mode: %s", exc)
-            state.ur5_controller = None
+        if controller is not None and controller.runner is not None and controller.runner.running and controller.robot.is_real:
+            controller.runner.stop()
     if mode != 'edit' and bool(state.get('sim_active', False)):
-        # Stop the solver before handing the model to Scan/Puzzle/Database.
-        # Those snapshot ctrl_rows and swap in their own geometry, so a solver
-        # still writing to it would fight them. Taken under sim_lock so a step
-        # already in flight finishes and sees sim_active False on write-back.
         with state.sim_lock:
             state.sim_active = False
     scanner_idx = next((i for i, item in enumerate(state.workflow_stages) if item[0] == 'Scanner'), 0)
-    embedded = state.get('embedded_scanner')
-    if embedded is not None:
-        try:
-            embedded.close()
-        except Exception as exc:
-            logging.warning("gui._set_app_mode: %s", exc)
-        state.embedded_scanner = None
-    # Puzzle owns its model, pattern and undo history. Swap workspaces only
-    # after the scanner has closed, so an in-flight temporary scan render has
-    # finished restoring the non-Puzzle model before it is snapshotted.
-    if current_mode == 'puzzle':
-        state.leave_puzzle_workspace()
     state.app_mode = mode
-    if mode == 'puzzle':
-        # Select Puzzle before restoring its workspace so restore_snapshot
-        # cannot infer the previous Scan renderer from the old mode.
-        state.enter_puzzle_workspace()
-    if mode == 'scan':
+    state._last_raw_app_mode = mode
+    if mode in ('scan', 'capture'):
         state.workflow_step = scanner_idx
-        state.scanner_preview_grid_enabled = True
+        state.scanner_preview_grid_enabled = not (mode == 'scan' and str(state.get('_scan_subview', 'scan')) == 'database')
         state.scanner_preview_rows = max(1, int(state.scanner_rows))
         state.scanner_preview_cols = max(1, int(state.scanner_cols))
         _clamp_scanner_selected_cell(state)
-    elif mode == 'puzzle':
-        state.workflow_step = scanner_idx
-        state.scanner_preview_grid_enabled = False
-        # enter_puzzle_workspace restored Puzzle's own placement. Its copy grid
-        # is symmetric about the base model, so rebuilding it must preserve that
-        # placement; recentering here made a prior Scan scene appear to transform
-        # into Puzzle rather than returning to Puzzle's saved scene.
-        _puzzle_apply_geometry_copies(state, preserve=True)
-    elif mode == 'database':
-        state.scanner_preview_grid_enabled = False
-        state.display_copies = np.array([0, 0], dtype=np.int32)
-        state.database_view_mode = "results"
     elif mode == 'model':
-        # Model Mode draws its own pictures of a trained splat; the knit preview is not shown.
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
-    elif mode == 'ur5':
-        # Shows the same fabric grid preview Scan Mode does, since the real
-        # robot scans that same layout -- the 3D View is the plan being sent to
-        # the arm, so the two modes must not disagree about it.
-        state.workflow_step = scanner_idx
-        state.scanner_preview_grid_enabled = True
-        state.scanner_preview_rows = max(1, int(state.scanner_rows))
-        state.scanner_preview_cols = max(1, int(state.scanner_cols))
-        _clamp_scanner_selected_cell(state)
     else:
         state.workflow_step = 0
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
-    # Puzzle already rebuilt its copies above. A second non-preserving rebuild
-    # discarded the independent transform that was just restored.
-    if mode != 'puzzle':
-        state.rebuild_spline_mesh(preserve_model_placement=False)
+        if bool(state.get('_swatch_selection_dirty', False)):
+            state._swatch_selection_dirty = False
+            sel = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
+            r = int(sel[0]) if sel.size > 0 else 0
+            c = int(sel[1]) if sel.size > 1 else 0
+            state.select_swatch(r, c, rebuild=False)
+    state.rebuild_spline_mesh(preserve_model_placement=False)
 
 
 def _scan_duplicate_runs(state):
@@ -1024,13 +1000,39 @@ def _draw_bitmap_editor(state, id_suffix=""):
 
 
 MODE_SPECS = (
-    ('edit', "Edit", "Edit knitted and crocheted geometry, material, and simulation"),
-    ('scan', "Scan", "Simulate multi-angle UR5e fabric scanning in MuJoCo"),
-    ('puzzle', "Puzzle", "Test seamless tile repeat and landmark extraction"),
-    ('database', "Database", "Browse captured images, metadata, and RGB analyses"),
-    ('model', "Splatting", "Inspect 3D Gaussian splats and fit yarn/stitch equations"),
-    ('ur5', "UR5 Robot", "Connect to physical UR5e or TeleopApp, capture, and reconstruct"),
+    ('scan', "Scan", "Global 3D cell, swatch grid, batch/single scans, and capture database"),
+    ('capture', "Capture", "Robot & camera source (Sim/Real), calibration, focus, and capture path"),
+    ('model', "Splatting", "Dataset export, pose solving, 3DGS training, and strand/stitch fitting"),
+    ('edit', "Edit", "Direct 3D geometry editing, appearance, and yarn simulation"),
 )
+
+
+def _draw_active_swatch_bar(state):
+    rows = max(1, int(state.get('scanner_rows', 1)))
+    cols = max(1, int(state.get('scanner_cols', 1)))
+    sel = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
+    r = int(np.clip(sel[0] if sel.size > 0 else int(state.get('scanner_selected_row', 0)), 0, rows - 1))
+    c = int(np.clip(sel[1] if sel.size > 1 else int(state.get('scanner_selected_col', 0)), 0, cols - 1))
+    state.scanner_selected_cell = [r, c]
+    state.scanner_selected_row = r
+    state.scanner_selected_col = c
+    total = rows * cols
+    cur_idx = r * cols + c
+    imgui.text(f"Swatch R{r + 1} C{c + 1} ({cur_idx + 1}/{total})")
+    if total > 1:
+        imgui.same_line()
+        if imgui.small_button("<##swatch_prev"):
+            prev_idx = (cur_idx - 1) % total
+            nr, nc = prev_idx // cols, prev_idx % cols
+            state.scanner_selected_cell = [nr, nc]
+            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) == 'edit'))
+        imgui.same_line()
+        if imgui.small_button(">##swatch_next"):
+            next_idx = (cur_idx + 1) % total
+            nr, nc = next_idx // cols, next_idx % cols
+            state.scanner_selected_cell = [nr, nc]
+            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) == 'edit'))
+    imgui.separator()
 
 GEOMETRY_PARAM_LABELS = {
     'stitch_bulge': "Stitch bulge",
@@ -1194,7 +1196,7 @@ def _draw_appearance_controls(state, rebuild_current_mesh, is_knit=True):
 
 def draw_sidebar(state, renderer, window=None):
     _apply_ui_theme(state)
-    current_mode = str(state.get('app_mode', 'edit'))
+    current_mode = _normalize_app_mode(state.get('app_mode', 'edit'), state)
     reset = bool(state.get('_layout_reset_pending', False)) or not bool(state.get('_sidebar_sized_once', False))
     cond = imgui.Cond_.always if reset else imgui.Cond_.first_use_ever
     imgui.set_next_window_pos((20, 20), cond=cond)
@@ -1208,65 +1210,26 @@ def draw_sidebar(state, renderer, window=None):
     def rebuild_current_mesh(preserve=True):
         state.rebuild_spline_mesh(preserve_model_placement=preserve)
 
-    def ensure_embedded_robot_viewer(auto_start=False, single_capture=False):
-        if not auto_start and not single_capture and bool(state.get('_embedded_scanner_viewer_failed', False)):
-            return None
-        _clamp_scanner_selected_cell(state)
-        state.save_params(state.save_path, silent=True)
-        embedded = state.get('embedded_scanner')
-        if embedded is not None:
-            if auto_start and not getattr(embedded, 'running', False):
-                try:
-                    embedded.close()
-                except Exception as exc:
-                    logging.warning("gui.ensure_embedded_robot_viewer: %s", exc)
-                state.embedded_scanner = None
-            else:
-                if single_capture:
-                    embedded.running = False
-                    embedded.paused = True
-                    embedded.args.capture_mode = str(state.get('scanner_capture_mode', 'natural'))
-                    embedded.args.camera_zoom = float(state.get('scanner_camera_zoom', 1.0))
-                return embedded
-        try:
-            tiled_full_image, tiled_per_cell = _scanner_generate_tiled_layout(state, renderer)
-            embedded = EmbeddedMujocoScanner(
-                state,
-                renderer.ctx,
-                window,
-                preview_image=tiled_full_image,
-                per_cell_images=tiled_per_cell,
-                auto_start=auto_start,
-            )
-            state.embedded_scanner = embedded
-            state._embedded_scanner_viewer_failed = False
-            if single_capture:
-                embedded.running = False
-                embedded.paused = True
-                embedded.args.capture_mode = str(state.get('scanner_capture_mode', 'natural'))
-                embedded.args.camera_zoom = float(state.get('scanner_camera_zoom', 1.0))
-            elif not auto_start:
-                state.scanner_status = embedded.status
-            return embedded
-        except Exception as exc:
-            state.embedded_scanner = None
-            if not single_capture:
-                state._embedded_scanner_viewer_failed = True
-            label = "single capture preview" if single_capture else ("embedded MuJoCo scanner" if auto_start else "embedded MuJoCo Robot Viewer")
-            state.scanner_status = f"Could not start {label}: {exc}"
-            return None
+    def ensure_ur5_controller(auto_connect_sim=False):
+        controller = state.get('ur5_controller')
+        if controller is None:
+            controller = gui_ur5.UR5ModeController(state, renderer.ctx, window)
+            state.ur5_controller = controller
+        if auto_connect_sim and not controller.robot.connected:
+            controller.connect_sim()
+        return controller
 
     def start_scanner_process(force=False):
         mode = str(state.scanner_execution_mode)
-        embedded = state.get('embedded_scanner')
-        if embedded is not None and mode == "simulation":
-            if getattr(embedded, 'paused', False) and not getattr(embedded, 'single_capture_mode', False):
-                embedded.resume()
-                state.scanner_status = "Embedded MuJoCo scanner continued"
-                return
-            if getattr(embedded, 'running', False):
+        controller = ensure_ur5_controller(auto_connect_sim=(mode == "simulation"))
+        runner = controller.runner
+        if runner is not None and runner.running:
+            if runner.paused:
+                runner.resume()
+                state.scanner_status = "Scanner continued"
+            else:
                 state.scanner_status = "Scanner already running"
-                return
+            return
 
         if not force:
             existing = _scan_duplicate_runs(state)
@@ -1276,63 +1239,42 @@ def draw_sidebar(state, renderer, window=None):
                 return
         state._scan_duplicate_prompt = None
 
-        if embedded is not None:
-            try:
-                embedded.close()
-            except Exception as exc:
-                logging.warning("gui.start_scanner_process: %s", exc)
-            state.embedded_scanner = None
         _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
-        if mode == "simulation":
-            embedded = ensure_embedded_robot_viewer(auto_start=True)
-            if embedded is not None:
-                state.scanner_status = "Embedded MuJoCo scanner running"
-            return
-
-        try:
-            import fabric_scanner as scanner
-
-            args = build_scanner_plan_args(
-                state,
-                model_curves=None,
-                robot_ip=str(state.scanner_robot_ip),
-                robot_port=int(state.scanner_robot_port),
-                robot_vel=0.015,
-                robot_acc=0.08,
-                robot_dwell=0.20,
-            )
-            plan = scanner.build_plan(args)
-            plan = scanner.densify_plan_for_robot(plan)
-            safe, issues = scanner.assess_plan_safety(plan.mapped_points, max_step=0.08)
-            if not safe:
-                state.scanner_status = "Real UR5 path blocked: " + "; ".join(issues)
+        if not controller.robot.connected:
+            if mode == "simulation":
+                controller.connect_sim()
+            else:
+                state.scanner_status = "Connect the real robot and camera in Capture mode first."
                 return
-            scanner.run_robot_motion(plan, args)
-            state.scanner_status = "Real UR5 command sent from selected GUI settings"
+        if controller.camera is None or not controller.camera.running:
+            controller.connect_sim(connect_robot=False, start_cam=True)
+        try:
+            plan = gui_ur5.build_scan_plan(state)
+            controller.plan = plan
+            controller.runner = gui_ur5._make_runner(state, controller, plan)
+            controller.runner.start()
+            state.scanner_status = "Scanner running"
         except Exception as exc:
-            state.scanner_process = None
             state.scanner_status = f"Could not start scanner: {exc}"
 
     def stop_scanner_process():
-        embedded = state.get('embedded_scanner')
-        if embedded is not None:
-            embedded.pause()
-            state.scanner_status = embedded.status
+        controller = state.get('ur5_controller')
+        if controller is not None and controller.runner is not None and controller.runner.running:
+            controller.runner.pause()
+            state.scanner_status = "Scanner paused"
             return
         state.scanner_status = "Scanner idle"
 
     edit_active = current_mode == 'edit'
     scan_active = current_mode == 'scan'
-    puzzle_active = current_mode == 'puzzle'
-    database_active = current_mode == 'database'
-    ur5_active = current_mode == 'ur5'
+    capture_active = current_mode == 'capture'
     model_active = current_mode == 'model'
 
-    cols_per_row = 3
+    cols_per_row = 4
     spacing_x = imgui.get_style().item_spacing.x
     avail_w = imgui.get_content_region_avail().x
-    mode_btn_w = max(72.0, (avail_w - spacing_x * (cols_per_row - 1)) / cols_per_row)
+    mode_btn_w = max(68.0, (avail_w - spacing_x * (cols_per_row - 1)) / cols_per_row)
     is_light = str(state.get('ui_theme', 'dark')) == 'light'
     inactive_bg = (0.82, 0.84, 0.88, 1.0) if is_light else (0.22, 0.24, 0.28, 1.0)
     inactive_ur5 = (0.92, 0.82, 0.72, 1.0) if is_light else (0.30, 0.22, 0.16, 1.0)
@@ -1340,7 +1282,7 @@ def draw_sidebar(state, renderer, window=None):
         if idx % cols_per_row != 0:
             imgui.same_line()
         active = current_mode == mode_id
-        if mode_id == 'ur5':
+        if mode_id == 'capture':
             bg = (0.78, 0.44, 0.14, 1.0) if active else inactive_ur5
             hov = (0.88, 0.52, 0.20, 1.0)
         else:
@@ -1358,8 +1300,9 @@ def draw_sidebar(state, renderer, window=None):
         if imgui.is_item_hovered():
             imgui.set_tooltip(mode_tip)
     imgui.separator()
+    _draw_active_swatch_bar(state)
 
-    if edit_active or puzzle_active:
+    if edit_active:
         quarter_w = max(64.0, (imgui.get_content_region_avail().x - spacing_x * 3.0) / 4.0)
         undo_disabled = not state.undo_stack
         if undo_disabled:
@@ -1369,12 +1312,8 @@ def draw_sidebar(state, renderer, window=None):
         if undo_disabled:
             imgui.end_disabled()
         imgui.same_line()
-        if not edit_active:
-            imgui.begin_disabled()
         if imgui.button("Reset##reset_saved_initial_global", (quarter_w, 0)):
             state.reset_to_initial()
-        if not edit_active:
-            imgui.end_disabled()
         imgui.same_line()
         if imgui.button("Save...##save_params", (quarter_w, 0)):
             path = _pick_file('save', state.save_path)
@@ -1387,13 +1326,9 @@ def draw_sidebar(state, renderer, window=None):
                 state.load_params(path)
         imgui.separator()
 
-    if database_active:
-        _draw_database_summary_page(state, renderer)
-        state.maybe_autosave()
-        imgui.end()
-        return
-
     if model_active:
+        gui_ur5.draw_splatting_workflow_section(state, renderer, window)
+        imgui.separator()
         gui_model.draw_model_panel(state, renderer)
         request = state.get('model_to_edit')
         if request is not None:
@@ -1405,7 +1340,7 @@ def draw_sidebar(state, renderer, window=None):
         imgui.end()
         return
 
-    if ur5_active:
+    if capture_active:
         gui_ur5.draw_ur5_panel(state, renderer, window)
         state.maybe_autosave()
         imgui.end()
@@ -1571,16 +1506,34 @@ def draw_sidebar(state, renderer, window=None):
             return
 
     elif scan_active:
-        embedded = state.get('embedded_scanner')
-        embedded_running = embedded is not None and getattr(embedded, 'running', False) and not getattr(embedded, 'paused', False)
-        embedded_paused = embedded is not None and getattr(embedded, 'paused', False)
-        running = embedded_running
+        scan_subview = str(state.get('_scan_subview', 'scan'))
+        if imgui.radio_button("Swatch Grid & Scan##scan_sub_grid", scan_subview != 'database'):
+            state._scan_subview = 'scan'
+            state.scanner_preview_grid_enabled = True
+            state.rebuild_spline_mesh(preserve_model_placement=False)
+            scan_subview = 'scan'
+        imgui.same_line()
+        if imgui.radio_button("Database & History##scan_sub_db", scan_subview == 'database'):
+            state._scan_subview = 'database'
+            state.scanner_preview_grid_enabled = False
+            scan_subview = 'database'
+        imgui.separator()
+        if scan_subview == 'database':
+            _draw_database_summary_page(state, renderer)
+            state.maybe_autosave()
+            imgui.end()
+            return
+
+        controller = state.get('ur5_controller')
+        runner = controller.runner if controller is not None else None
+        running = runner is not None and bool(runner.running) and not bool(runner.paused)
+        runner_paused = runner is not None and bool(runner.running) and bool(runner.paused)
         single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
         path_workflow = not single_workflow
 
         if running:
             imgui.text_colored((0.15, 0.85, 0.35, 1.0), "Scanner is running")
-        elif embedded_paused:
+        elif runner_paused:
             imgui.text_colored((0.95, 0.75, 0.20, 1.0), "Scanner is paused")
         if state.scanner_status:
             imgui.text_wrapped(str(state.scanner_status))
@@ -1617,16 +1570,16 @@ def draw_sidebar(state, renderer, window=None):
             if not path_workflow:
                 imgui.end_disabled()
             imgui.same_line()
-            if not (running or embedded_paused):
+            if not (running or runner_paused):
                 imgui.begin_disabled()
             if imgui.button("Stop Scanner##scanner_stop", (half_btn, 0)):
                 stop_scanner_process()
-            if not (running or embedded_paused):
+            if not (running or runner_paused):
                 imgui.end_disabled()
-            if embedded_paused and path_workflow:
+            if runner_paused and path_workflow:
                 if imgui.button("Continue Scanner##scanner_continue", (-1, 0)):
-                    embedded.resume()
-                    state.scanner_status = "Embedded MuJoCo scanner continued"
+                    runner.resume()
+                    state.scanner_status = "Scanner continued"
 
         imgui.separator()
         if imgui.collapsing_header("Scan Layout & Capture##scan_layout_section", imgui.TreeNodeFlags_.default_open):
@@ -1645,14 +1598,7 @@ def draw_sidebar(state, renderer, window=None):
             if changed_layout:
                 state.scanner_preview_rows = max(1, int(state.scanner_rows))
                 state.scanner_preview_cols = max(1, int(state.scanner_cols))
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception as exc:
-                        logging.warning("gui.draw_sidebar: %s", exc)
-                    state.embedded_scanner = None
-                    state.scanner_status = "Scanner layout changed; press Start Scanner to generate new random patterns"
+                state.scanner_status = "Scanner layout updated"
                 state.rebuild_spline_mesh(preserve_model_placement=False)
             grid_active = str(state.get('scanner_layout_pattern', 'grid')) == 'grid'
             if imgui.radio_button("Grid##scan_layout_grid", grid_active):
@@ -1692,15 +1638,9 @@ def draw_sidebar(state, renderer, window=None):
             if imgui.radio_button("Single-batch focused##scanner_capture_focused", focused and not single_workflow):
                 state.scanner_camera_workflow = 'path'
                 state.scanner_capture_mode = "focused"
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.args.capture_mode = "focused"
             if imgui.radio_button("Natural robot camera##scanner_capture_natural", not focused and not single_workflow):
                 state.scanner_camera_workflow = 'path'
                 state.scanner_capture_mode = "natural"
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    embedded.args.capture_mode = "natural"
             if imgui.radio_button("Single image capture##scanner_capture_single", single_workflow):
                 state.scanner_camera_workflow = 'single'
                 state.scanner_status = "Single image capture: click a mini-fabric in the 3D view"
@@ -1723,9 +1663,7 @@ def draw_sidebar(state, renderer, window=None):
                     scan_capture_width, scan_capture_height = clamp_capture_size(scan_capture_width)
                     if changed_scan_res:
                         state.scanner_capture_width = scan_capture_width
-                        embedded = state.get('embedded_scanner')
-                        if embedded is not None:
-                            embedded.set_capture_resolution(scan_capture_width)
+                        state.ur5_capture_width = scan_capture_width
                     imgui.text_disabled(f"Full scanner output: {scan_capture_width} x {scan_capture_height}")
             if single_workflow:
                 imgui.text_disabled("Click the fabric, adjust angle/zoom, then capture one image.")
@@ -1746,14 +1684,6 @@ def draw_sidebar(state, renderer, window=None):
                 )
                 if changed_single_angle:
                     state.scanner_single_angle = int(single_angle)
-                    embedded = state.get('embedded_scanner')
-                    if embedded is not None:
-                        embedded.preview_single_target(
-                            int(state.get('scanner_single_row', 1)) - 1,
-                            int(state.get('scanner_single_col', 1)) - 1,
-                            int(state.get('scanner_single_angle', 1)) - 1,
-                            float(state.get('scanner_camera_zoom', 1.0)),
-                        )
                 changed_camera_zoom, camera_zoom = imgui.slider_float(
                     "Robot camera zoom##single_capture_zoom",
                     float(np.clip(float(state.get('scanner_camera_zoom', 1.0)), 0.25, 5.0)),
@@ -1763,36 +1693,11 @@ def draw_sidebar(state, renderer, window=None):
                 )
                 if changed_camera_zoom:
                     state.scanner_camera_zoom = float(camera_zoom)
-                    embedded = state.get('embedded_scanner')
-                    if embedded is not None:
-                        embedded.args.camera_zoom = float(camera_zoom)
-                        embedded.preview_single_target(
-                            int(state.get('scanner_single_row', 1)) - 1,
-                            int(state.get('scanner_single_col', 1)) - 1,
-                            int(state.get('scanner_single_angle', 1)) - 1,
-                            float(state.get('scanner_camera_zoom', 1.0)),
-                        )
                 if imgui.small_button("Zoom in##single_capture_zoom_in"):
                     state.scanner_camera_zoom = float(min(5.0, float(state.get('scanner_camera_zoom', 1.0)) * 1.15))
-                    embedded = state.get('embedded_scanner')
-                    if embedded is not None:
-                        embedded.preview_single_target(
-                            int(state.get('scanner_single_row', 1)) - 1,
-                            int(state.get('scanner_single_col', 1)) - 1,
-                            int(state.get('scanner_single_angle', 1)) - 1,
-                            float(state.get('scanner_camera_zoom', 1.0)),
-                        )
                 imgui.same_line()
                 if imgui.small_button("Zoom out##single_capture_zoom_out"):
                     state.scanner_camera_zoom = float(max(0.25, float(state.get('scanner_camera_zoom', 1.0)) / 1.15))
-                    embedded = state.get('embedded_scanner')
-                    if embedded is not None:
-                        embedded.preview_single_target(
-                            int(state.get('scanner_single_row', 1)) - 1,
-                            int(state.get('scanner_single_col', 1)) - 1,
-                            int(state.get('scanner_single_angle', 1)) - 1,
-                            float(state.get('scanner_camera_zoom', 1.0)),
-                        )
                 current_capture_width, _current_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
                 current_capture_width = int(np.clip(current_capture_width, 320, 4096))
                 changed_capture_res, capture_width = imgui.slider_int(
@@ -1805,56 +1710,24 @@ def draw_sidebar(state, renderer, window=None):
                 capture_width, capture_height = clamp_capture_size(capture_width)
                 if changed_capture_res:
                     state.scanner_single_capture_width = capture_width
-                    embedded = state.get('embedded_scanner')
-                    if embedded is not None:
-                        embedded.set_single_capture_resolution(capture_width)
                 imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
                 if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
-                    embedded = ensure_embedded_robot_viewer(single_capture=True)
-                    if embedded is not None:
-                        embedded.set_single_capture_resolution(capture_width)
-                        embedded.preview_single_target(
-                            int(state.get('scanner_single_row', 1)) - 1,
-                            int(state.get('scanner_single_col', 1)) - 1,
-                            int(state.get('scanner_single_angle', 1)) - 1,
-                            float(state.get('scanner_camera_zoom', 1.0)),
-                        )
-                        state.scanner_status = embedded.status
-                single_job = state.get('single_capture_job') or {}
-                single_job_busy = str(single_job.get('status', '')) in {
-                    'positioning', 'preparing', 'rendering', 'saving', 'cancelling',
-                }
-                capture_label = "Capture in progress...##single_capture_save" if single_job_busy else "Capture Image##single_capture_save"
-                if imgui.button(capture_label, (-1, 0)) and not single_job_busy:
-                    embedded = ensure_embedded_robot_viewer(single_capture=True)
-                    if embedded is not None:
-                        embedded.set_single_capture_resolution(capture_width)
-                        embedded.start_single_capture(
-                            int(state.get('scanner_single_row', 1)) - 1,
-                            int(state.get('scanner_single_col', 1)) - 1,
-                            int(state.get('scanner_single_angle', 1)) - 1,
-                            float(state.get('scanner_camera_zoom', 1.0)),
-                        )
-                        state.scanner_status = embedded.status
-                if single_job:
-                    progress = float(np.clip(single_job.get('progress', 0.0), 0.0, 1.0))
-                    imgui.text_disabled(f"Capture progress: {progress * 100.0:.0f}%")
-                    message = str(single_job.get('message', '')).strip()
-                    if message:
-                        imgui.text_wrapped(message)
-                    if single_job_busy and str(single_job.get('status')) != 'saving':
-                        if imgui.button("Cancel Capture##single_capture_cancel", (-1, 0)):
-                            embedded = state.get('embedded_scanner')
-                            if embedded is not None:
-                                embedded.cancel_single_capture()
-                                state.scanner_status = embedded.status
-            if not single_workflow and str(state.scanner_execution_mode) == "robot":
-                changed_ip, ip = imgui.input_text("Robot IP##scanner_robot_ip", str(state.scanner_robot_ip))
-                changed_port, port = imgui.input_int("Robot port##scanner_robot_port", int(state.scanner_robot_port))
-                if changed_ip:
-                    state.scanner_robot_ip = ip
-                if changed_port:
-                    state.scanner_robot_port = int(port)
+                    ctrl = ensure_ur5_controller(auto_connect_sim=True)
+                    ctrl.update_preview(renderer)
+                    state.scanner_status = f"Previewing R{int(state.scanner_single_row)} C{int(state.scanner_single_col)}"
+                if imgui.button("Capture Image##single_capture_save", (-1, 0)):
+                    ctrl = ensure_ur5_controller(auto_connect_sim=True)
+                    ctrl.update_preview(renderer)
+                    frame = ctrl.camera.latest_frame() if ctrl.camera is not None else None
+                    if frame is not None:
+                        out_dir = Path(state.project_root) / "scanner_data" / "single_captures"
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        r_idx = int(state.get('scanner_single_row', 1))
+                        c_idx = int(state.get('scanner_single_col', 1))
+                        a_idx = int(state.get('scanner_single_angle', 1))
+                        out_path = out_dir / f"swatch_r{r_idx}_c{c_idx}_a{a_idx}_{int(time.time())}.png"
+                        frame.image.save(out_path)
+                        state.scanner_status = f"Saved {out_path.name}"
 
         if imgui.collapsing_header("Random Pattern & Shared Colors##scan_pattern_section"):
             pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
@@ -1933,14 +1806,9 @@ def draw_sidebar(state, renderer, window=None):
                         f"Pattern is {pattern_rows_now}x{pattern_cols_now}; saved template is {tpl_rows}x{tpl_cols}.",
                     )
             if random_changed:
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception as exc:
-                        logging.warning("gui.draw_sidebar: %s", exc)
-                    state.embedded_scanner = None
-                state.scanner_status = "Random pattern settings changed; press Start Scanner to rebuild"
+                state.swatch_cells = {}
+                state.rebuild_spline_mesh(preserve_model_placement=False)
+                state.scanner_status = "Random pattern settings updated"
             imgui.text("Preview mode")
             if not state.get('scanner_color_mode'):
                 state.scanner_color_mode = 'realistic'
@@ -1985,14 +1853,8 @@ def draw_sidebar(state, renderer, window=None):
                     palette_changed = True
             if palette_changed:
                 state.scanner_estimated_color_overrides = []
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception as exc:
-                        logging.warning("gui.draw_sidebar: %s", exc)
-                    state.embedded_scanner = None
-                state.scanner_status = "Shared scanner colors changed; press Start Scanner to rebuild"
+                state.swatch_cells = {}
+                state.scanner_status = "Shared scanner colors updated"
                 state.rebuild_spline_mesh(preserve_model_placement=False)
             if estimate_mode:
                 _draw_scanner_batch_color_grid(state)
@@ -2101,22 +1963,17 @@ def draw_sidebar(state, renderer, window=None):
             if not lighting_enabled:
                 imgui.end_disabled()
             if lighting_changed:
-                embedded = state.get('embedded_scanner')
-                if embedded is not None:
-                    try:
-                        embedded.close()
-                    except Exception as exc:
-                        logging.warning("gui.draw_sidebar: %s", exc)
-                state.embedded_scanner = None
-                state.scanner_status = "Scanner lighting changed; press Start Scanner to rebuild"
+                state.scanner_status = "Scanner lighting updated"
 
         if imgui.collapsing_header("Per-Sample RGB Analysis##scan_rgb_section", imgui.TreeNodeFlags_.default_open):
-            analysis_ready = embedded is not None and bool(getattr(embedded, "capture_records", []))
+            records = list(getattr(runner, "capture_records", [])) if runner is not None else []
+            analysis_ready = bool(records)
             if not analysis_ready:
                 imgui.text_disabled("Capture scanner images first.")
                 imgui.begin_disabled()
             if imgui.button("Analyze captured RGB##scanner_analyze_rgb", (-1, 0)):
-                result = embedded.analyze_captures(save_outputs=True)
+                result = gui_ur5.ur5_scan.analyze_run_captures(records, state) if hasattr(gui_ur5.ur5_scan, "analyze_run_captures") else {}
+                state.scanner_analysis_results = result
                 _refresh_embedded_scanner_display_colors(state)
                 if result.get("cells"):
                     state.scanner_status = f"RGB analysis saved for {len(result['cells'])} mini-squares"
@@ -2124,7 +1981,7 @@ def draw_sidebar(state, renderer, window=None):
                     state.scanner_status = result.get("summary", "No RGB analysis results")
             if not analysis_ready:
                 imgui.end_disabled()
-            result = getattr(embedded, "analysis_results", None) if embedded is not None else None
+            result = state.get("scanner_analysis_results")
             has_analysis = bool(result and result.get("cells"))
 
             rows = max(1, int(state.scanner_rows))
@@ -2274,162 +2131,9 @@ def draw_sidebar(state, renderer, window=None):
                         )
         _maybe_persist_scanner_state(state)
 
-    elif puzzle_active:
-        imgui.text_disabled("Tile real geometry, capture a region, and verify seamless repeat edges.")
-        if imgui.collapsing_header("1. Stitch Pattern & Copies##puzzle_pattern", imgui.TreeNodeFlags_.default_open):
-            _draw_bitmap_editor(state, id_suffix="_puzzle")
-            imgui.separator()
-            copies_x, copies_y = _puzzle_target_copies(state)
-            changed_px, new_px = imgui.slider_int("Copies X##puzzle_copies_x", copies_x, 1, 9)
-            released_px = imgui.is_item_deactivated_after_edit()
-            changed_py, new_py = imgui.slider_int("Copies Y##puzzle_copies_y", copies_y, 1, 9)
-            released_py = imgui.is_item_deactivated_after_edit()
-            if changed_px:
-                if int(new_px) % 2 == 0:
-                    new_px += 1
-                state.puzzle_copies_x = int(np.clip(new_px, 1, 9))
-            if changed_py:
-                if int(new_py) % 2 == 0:
-                    new_py += 1
-                state.puzzle_copies_y = int(np.clip(new_py, 1, 9))
-            if changed_px or changed_py:
-                state.status_msg = (
-                    f"Release to apply {int(state.puzzle_copies_x)} x "
-                    f"{int(state.puzzle_copies_y)} geometry"
-                )
-            if released_px or released_py:
-                _puzzle_apply_geometry_copies(state, preserve=True)
-                state.status_msg = f"Puzzle geometry set to {int(state.puzzle_copies_x)} x {int(state.puzzle_copies_y)}"
-            half_p = max(80.0, (imgui.get_content_region_avail().x - imgui.get_style().item_spacing.x) * 0.5)
-            if imgui.button("Apply 5 x 5##puzzle_apply_5x5", (half_p, 0)):
-                state.puzzle_copies_x = 5
-                state.puzzle_copies_y = 5
-                _puzzle_apply_geometry_copies(state, preserve=True)
-                state.status_msg = "Puzzle geometry set to 5 x 5"
-            imgui.same_line()
-            if imgui.button("Apply Copies##puzzle_apply", (half_p, 0)):
-                _puzzle_apply_geometry_copies(state, preserve=True)
-                state.status_msg = "Puzzle geometry copies applied"
-
-        if imgui.collapsing_header("2. Capture Frame & Landmarks##puzzle_capture_section", imgui.TreeNodeFlags_.default_open):
-            rx, ry, rw, rh = _puzzle_capture_rect(state)
-            changed_rx, rx = imgui.slider_float("Frame X##puzzle_capture_rect_x", rx, 0.0, 0.95, "%.2f")
-            changed_ry, ry = imgui.slider_float("Frame Y##puzzle_capture_rect_y", ry, 0.0, 0.95, "%.2f")
-            changed_rw, rw = imgui.slider_float("Frame width##puzzle_capture_rect_w", rw, 0.05, 1.0, "%.2f")
-            changed_rh, rh = imgui.slider_float("Frame height##puzzle_capture_rect_h", rh, 0.05, 1.0, "%.2f")
-            if changed_rx or changed_ry or changed_rw or changed_rh:
-                _set_puzzle_capture_rect(state, [rx, ry, rw, rh])
-            changed_count, new_count = imgui.slider_int("Detected colors##puzzle_detect_color_count", int(state.get('puzzle_detect_color_count', 6)), 1, 12)
-            if changed_count:
-                state.puzzle_detect_color_count = int(new_count)
-            if imgui.button("Capture geometry preview##puzzle_capture", (-1, 0)):
-                image, points, landmarks = _puzzle_capture_geometry_image(state, renderer)
-                state.puzzle_capture_image = image
-                state.puzzle_projected_points = points
-                state.puzzle_edge_landmarks = landmarks
-                state.puzzle_detected_colors = _puzzle_detect_colors(image, int(state.get('puzzle_detect_color_count', 6))) if image is not None else []
-                state.puzzle_capture_texture_key = None
-                if image is not None:
-                    state.status_msg = f"Puzzle capture: {len(points)} control points, {len(landmarks)} edge landmarks"
-                else:
-                    state.status_msg = "Puzzle capture failed: 3D viewport has not rendered yet"
-            image = state.get('puzzle_capture_image', None)
-            if image is not None:
-                if imgui.button("Save puzzle capture##puzzle_save_capture", (-1, 0)):
-                    output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    output_path = output_dir / f"puzzle_capture_{int(time.time())}.png"
-                    image.save(output_path)
-                    state.status_msg = f"Saved {output_path.name}"
-                imgui.text(f"Captured image: {image.size[0]} x {image.size[1]} | pts: {len(state.get('puzzle_projected_points', []))} | landmarks: {len(state.get('puzzle_edge_landmarks', []))}")
-                colors = state.get('puzzle_detected_colors', [])
-                if colors:
-                    for idx, item in enumerate(colors):
-                        rgb = item.get("rgb", [0, 0, 0])
-                        imgui.color_button(
-                            f"##puzzle_color_{idx}",
-                            (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
-                            imgui.ColorEditFlags_.no_tooltip,
-                            imgui.ImVec2(28, 18),
-                        )
-                        imgui.same_line()
-                        imgui.text(f"{rgb[0]}, {rgb[1]}, {rgb[2]} ({int(item.get('count', 0))} px)")
-
-        if imgui.collapsing_header("3. Seamless Tile & Glue Preview##puzzle_glue_section", imgui.TreeNodeFlags_.default_open):
-            glue_cols = int(state.get('puzzle_glue_cols', 3))
-            glue_rows = int(state.get('puzzle_glue_rows', 3))
-            changed_gc, new_gc = imgui.slider_int("Glue copies X##puzzle_glue_cols", glue_cols, 1, 100)
-            changed_gr, new_gr = imgui.slider_int("Glue copies Y##puzzle_glue_rows", glue_rows, 1, 100)
-            if changed_gc:
-                state.puzzle_glue_cols = int(new_gc)
-            if changed_gr:
-                state.puzzle_glue_rows = int(new_gr)
-            changed_hl, new_hl = imgui.checkbox("Highlight tile edges##puzzle_glue_highlight", bool(state.get('puzzle_glue_highlight_edges', False)))
-            if changed_hl:
-                state.puzzle_glue_highlight_edges = bool(new_hl)
-            if imgui.button("Build seamless tile##puzzle_build_glue", (-1, 0)):
-                tile, glued, info = _puzzle_build_seamless_tile(
-                    state, renderer,
-                    int(state.get('puzzle_glue_cols', 3)),
-                    int(state.get('puzzle_glue_rows', 3)),
-                )
-                state.puzzle_tile_image = tile
-                state.puzzle_glued_image = glued
-                state.puzzle_glue_info = info
-                state.puzzle_glued_texture_key = None
-                if glued is not None:
-                    state.status_msg = (
-                        f"Glued {info.get('cols', 0)} x {info.get('rows', 0)} "
-                        f"tiles ({info.get('tile_w', 0)} x {info.get('tile_h', 0)} px each)"
-                    )
-                else:
-                    state.status_msg = "Seamless tile build failed: capture the 3D viewport first"
-            glued_image = state.get('puzzle_glued_image', None)
-            info = state.get('puzzle_glue_info', {}) or {}
-            if glued_image is not None:
-                skew_x = float(info.get('skew_x_px', 0.0))
-                skew_y = float(info.get('skew_y_px', 0.0))
-                imgui.text(f"Tile: {info.get('tile_w', 0)} x {info.get('tile_h', 0)} px | Period: {info.get('x_period_world', 0.0):.2f} / {info.get('y_period_world', 0.0):.2f}")
-                skew_color = (1.0, 0.55, 0.2, 1.0) if (abs(skew_x) > 1.5 or abs(skew_y) > 1.5) else (0.6, 0.9, 0.6, 1.0)
-                imgui.text_colored(skew_color, f"Seam skew: x={skew_x:.2f}px, y={skew_y:.2f}px")
-                if imgui.button("Save seamless tile##puzzle_save_glue", (-1, 0)):
-                    output_dir = Path(state.project_root) / "scanner_data" / "puzzle_mode"
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    stamp = int(time.time())
-                    tile_image = state.get('puzzle_tile_image', None)
-                    if tile_image is not None:
-                        tile_image.save(output_dir / f"puzzle_tile_{stamp}.png")
-                    glued_image.save(output_dir / f"puzzle_glued_{stamp}.png")
-                    state.status_msg = f"Saved puzzle_tile_{stamp}.png and puzzle_glued_{stamp}.png"
-
-    if (
-        str(state.get('app_mode', 'edit')) == 'scan'
-        and str(state.get('scanner_execution_mode', 'simulation')) == 'simulation'
-        and state.get('embedded_scanner') is None
-    ):
-        ensure_embedded_robot_viewer(auto_start=False)
-
-    embedded = state.get('embedded_scanner')
-    if str(state.get('app_mode', 'edit')) == 'scan' and embedded is not None:
-        scan_vp = str(state.get('_scan_vp_mode', 'split'))
-        embedded.preview_visible = scan_vp in ('split', 'camera')
-        try:
-            needs_update = (
-                getattr(embedded, 'running', False)
-                or getattr(embedded, 'paused', False)
-                or getattr(embedded, 'single_target_active', False)
-                or embedded.texture is None
-            )
-            if needs_update:
-                embedded.update()
-                state.scanner_status = embedded.status
-        except Exception as exc:
-            state.scanner_status = f"Embedded scanner error: {exc}"
-            try:
-                embedded.close()
-            except Exception as cleanup_error:
-                logging.warning("Scanner cleanup: %s", cleanup_error)
-            state.embedded_scanner = None
+    controller = state.get('ur5_controller')
+    if controller is not None and controller.runner is not None and controller.runner.running:
+        state.scanner_status = controller.runner.progress.message
 
     if state.status_msg:
         imgui.separator()
@@ -2438,88 +2142,72 @@ def draw_sidebar(state, renderer, window=None):
     imgui.end()
 
 
-def _draw_scan_simulator_canvas(state, embedded, window, height=0):
-    if embedded is None:
-        imgui.text_disabled("Simulator not initialized. Press Start Scan in Knitting Control.")
-        return
-    if embedded.texture is None:
-        imgui.text_disabled("Waiting for simulator frame...")
-        return
-    view_changed = False
-    imgui.text("UR5 Robot Simulator")
-    imgui.same_line()
-    imgui.set_next_item_width(90)
-    changed_zoom, zoom = imgui.slider_float("##scanner_view_zoom", float(embedded.view_zoom), 0.45, 2.50, "%.2fx")
-    if changed_zoom:
-        embedded.set_zoom(zoom)
-        view_changed = True
-    imgui.same_line()
-    if imgui.small_button("Reset##scanner_view"):
-        embedded.reset_view()
-        view_changed = True
-    imgui.same_line()
-    if imgui.small_button("Rot L##scanner_view"):
-        embedded.rotate_view(delta_azimuth=-12.0)
-        view_changed = True
-    imgui.same_line()
-    if imgui.small_button("Rot R##scanner_view"):
-        embedded.rotate_view(delta_azimuth=12.0)
-        view_changed = True
-    imgui.same_line()
-    if imgui.small_button("Tilt +##scanner_view"):
-        embedded.rotate_view(delta_elevation=8.0)
-        view_changed = True
-    imgui.same_line()
-    if imgui.small_button("Tilt -##scanner_view"):
-        embedded.rotate_view(delta_elevation=-8.0)
-        view_changed = True
-    avail = imgui.get_content_region_avail()
-    main_w = max(1, int(avail.x))
-    main_h = max(1, int(height if height > 0 else avail.y - 24))
-    rect = draw_fitted_texture(embedded.texture.glo, embedded.width, embedded.height, main_w, main_h, flip_y=True)
-    if rect is not None:
-        x, y, w, h = rect
-        io = imgui.get_io()
-        mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
-        image_hovered = (x <= mx <= x + w and y <= my <= y + h and imgui.is_window_hovered())
-        if image_hovered:
-            if float(io.mouse_wheel) != 0.0:
-                embedded.set_zoom(embedded.view_zoom * float(np.exp(float(io.mouse_wheel) * 0.16)))
-                view_changed = True
-            if window is not None:
-                lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
-                rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-                mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
-                dx, dy = float(io.mouse_delta.x), float(io.mouse_delta.y)
-                if (abs(dx) > 0.0 or abs(dy) > 0.0) and lmb:
-                    embedded.orbit_view(dx, dy)
-                    view_changed = True
-                elif (abs(dx) > 0.0 or abs(dy) > 0.0) and (rmb or mmb):
-                    embedded.pan_view(dx, dy)
-                    view_changed = True
-        imgui.text_disabled("Wheel: zoom | LMB drag: rotate | RMB/MMB drag: pan")
-    if view_changed:
-        embedded._render_frame()
+def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True):
+    controller = state.get('ur5_controller')
+    joints = None
+    if controller is not None and controller.robot is not None and controller.robot.connected:
+        st = controller.robot.refresh()
+        if len(st.joints) >= 6:
+            joints = list(st.joints[:6])
+    if joints is None:
+        joints = list(state.get('ur5_home_joints') or gui_ur5.ur5_robot.DEFAULT_HOME_JOINTS)
+    tool_offset = float(state.get('teleop_tool_offset', 0.0306))
+    cam_pos, cam_rotvec = gui_ur5.scan_geometry.camera_pose(joints, tool_offset)
+    cam_pose = [*cam_pos, *cam_rotvec]
+    plan_poses = []
+    if show_frusta and bool(state.get('scanner_add_camera', True)):
+        if controller is not None and controller.plan is not None:
+            plan_poses = controller.plan.poses
+        else:
+            tool_pose = gui_ur5.scan_geometry.flange_pose(joints)
+            views, _ = gui_ur5.scan_geometry.grid_views(
+                tool_pose,
+                max(1, int(state.get('scanner_rows', 1))),
+                max(1, int(state.get('scanner_cols', 1))),
+                float(state.get('teleop_camera_height', 0.07)),
+                0.0,
+                float(state.get('teleop_subject_distance', 0.20)),
+                tool_offset,
+                None,
+                float(state.get('ur5_splat_fov', 55.0)),
+                float(state.get('teleop_grid_overlap', 0.3)),
+                gui_ur5.scan_geometry.IDENTITY_TURN,
+                max(1, int(state.get('scanner_angles', 1))),
+                float(state.get('teleop_max_tilt', 35.0)),
+                True,
+            )
+            plan_poses = [np.r_[v.position, v.rotvec] for v in views]
+    return {
+        'show_board': bool(show_board),
+        'show_robot': bool(show_robot),
+        'show_frusta': bool(show_frusta and bool(state.get('scanner_add_camera', True))),
+        'robot_joints': joints,
+        'camera_pose': cam_pose,
+        'capture_plan_poses': plan_poses,
+        'fabric_center': (-0.45, -0.08, 0.0),
+        'phys_span': 0.18,
+    }
 
 
-def _draw_scan_gripper_camera_canvas(embedded, height=0):
-    imgui.text("Live Gripper Camera")
+def _draw_scan_gripper_camera_canvas(state, renderer, height=0):
+    imgui.text("Live Wrist Camera")
     imgui.same_line()
     imgui.text_disabled("(UR5 wrist camera feed)")
     avail = imgui.get_content_region_avail()
     preview_w = max(120, int(avail.x))
     preview_h = max(90, int(height if height > 0 else avail.y - 8))
-    if embedded is None:
+    controller = state.get('ur5_controller')
+    if controller is not None and controller.camera is not None and controller.camera.running:
+        controller.update_preview(renderer)
+    if controller is None or controller.preview_texture is None:
         imgui.dummy((preview_w, preview_h))
-        imgui.text_disabled("Camera preview waiting for scan. Press Start Scan.")
-    elif embedded.camera_texture is None:
-        imgui.dummy((preview_w, preview_h))
-        imgui.text_disabled("Camera preview waiting for the first scanner frame.")
+        imgui.text_disabled("Camera preview waiting for scan or camera connection.")
     else:
+        w, h = controller._preview_size
         draw_fitted_texture(
-            embedded.camera_texture.glo,
-            embedded.camera_preview_width,
-            embedded.camera_preview_height,
+            controller.preview_texture.glo,
+            w,
+            h,
             preview_w,
             preview_h,
             flip_y=True,
@@ -2631,8 +2319,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         state._layout_reset_viewport = False
     imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
 
-    current_mode = str(state.get('app_mode', 'edit'))
-    if current_mode == 'database':
+    current_mode = _normalize_app_mode(state.get('app_mode', 'edit'), state)
+    if current_mode == 'scan' and str(state.get('_scan_subview', 'scan')) == 'database':
         draw_database_viewport(state, renderer)
         imgui.end()
         return
@@ -2642,15 +2330,15 @@ def draw_viewport(state, renderer, ref_tex, window):
         imgui.end()
         return
 
-    if current_mode == 'ur5':
+    if current_mode == 'capture':
         show_scene = bool(state.get('ur5_show_scene', False))
-        imgui.text("UR5 Workspace:")
+        imgui.text("Capture Workspace:")
         imgui.same_line()
         if imgui.radio_button("Camera & Capture Path##ur5_vp_cam", not show_scene):
             state.ur5_show_scene = False
             show_scene = False
         imgui.same_line()
-        if imgui.radio_button("3D Knit Layout##ur5_vp_scene", show_scene):
+        if imgui.radio_button("3D World & Robot Cell##ur5_vp_scene", show_scene):
             state.ur5_show_scene = True
             show_scene = True
         imgui.separator()
@@ -2677,64 +2365,27 @@ def draw_viewport(state, renderer, ref_tex, window):
             split_right_mode = 'edit_orbit'
     elif current_mode == 'scan':
         scan_vp = str(state.get('_scan_vp_mode', 'split'))
+        if scan_vp == 'simulator':
+            scan_vp = 'fabric'
         imgui.text("Scan View:")
         for key, label in (
-            ('split', "Split: Fabric + Robot"),
-            ('fabric', "3D Fabric Grid"),
-            ('simulator', "UR5 Robot Simulator"),
-            ('camera', "Gripper Camera"),
+            ('split', "Split: 3D World + Wrist Camera"),
+            ('fabric', "3D World Only"),
+            ('camera', "Wrist Camera Only"),
         ):
             imgui.same_line()
             if imgui.radio_button(f"{label}##scan_vp_{key}", scan_vp == key):
                 state._scan_vp_mode = key
                 scan_vp = key
-        embedded = state.get('embedded_scanner')
-        if embedded is not None:
-            embedded.preview_visible = scan_vp in ('split', 'camera')
-        if scan_vp == 'simulator':
-            imgui.separator()
-            _draw_scan_simulator_canvas(state, embedded, window)
-            imgui.end()
-            return
         if scan_vp == 'camera':
             imgui.separator()
-            _draw_scan_gripper_camera_canvas(embedded)
+            _draw_scan_gripper_camera_canvas(state, renderer)
             imgui.end()
             return
         if scan_vp == 'split':
             split_right_mode = 'scan_robot'
-    elif current_mode == 'puzzle':
-        renderer = state.puzzle_renderer
-        puzzle_vp = str(state.get('_puzzle_vp_mode', 'split'))
-        imgui.text("Puzzle View:")
-        for key, label in (
-            ('split', "Split: 3D + Previews"),
-            ('3d', "3D Puzzle Only"),
-            ('capture', "Captured Frame & Landmarks"),
-            ('glue', "Seamless Glued Tile"),
-        ):
-            imgui.same_line()
-            if imgui.radio_button(f"{label}##puzzle_vp_{key}", puzzle_vp == key):
-                state._puzzle_vp_mode = key
-                puzzle_vp = key
-        if puzzle_vp == 'capture':
-            imgui.separator()
-            _draw_puzzle_inspector_canvas(state, renderer)
-            imgui.end()
-            return
-        if puzzle_vp == 'glue':
-            imgui.separator()
-            _draw_puzzle_glue_canvas(state, renderer)
-            imgui.end()
-            return
-        if puzzle_vp == 'split':
-            split_right_mode = 'puzzle_previews'
 
-    imgui.text(
-        "3D Puzzle Viewport"
-        if current_mode == 'puzzle'
-        else "3D Viewport"
-    )
+    imgui.text("3D World Viewport")
     imgui.same_line()
     if imgui.small_button("Center##vp_center"):
         state.center_model_in_viewport()
@@ -2775,7 +2426,7 @@ def draw_viewport(state, renderer, ref_tex, window):
     # flag keeps the two previews identical and, just as importantly, keeps the
     # model-editing handles off -- editing the fabric mid-scan would leave the
     # plan the arm is executing describing geometry that no longer exists.
-    scanner_stage_active = str(state.get('app_mode', 'edit')) in ('scan', 'ur5')
+    scanner_stage_active = current_mode in ('scan', 'capture')
     scanner_estimate_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
     edit_controls_active = not scanner_stage_active
     if scanner_stage_active:
@@ -2879,7 +2530,14 @@ def draw_viewport(state, renderer, ref_tex, window):
         bg_alpha    = state.ref_bg_alpha if _reference_overlay_active(state) else 0.0,
         bg_uniforms = bg_uniforms,
         camera      = state.camera,
-        n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx])
+        n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx]),
+        model_mat   = model_mat,
+        world_scene = _build_world_scene_dict(
+            state,
+            show_robot=scanner_stage_active,
+            show_frusta=scanner_stage_active,
+            show_board=True,
+        ),
     )
 
     # Display FBO
@@ -3268,19 +2926,13 @@ def draw_viewport(state, renderer, ref_tex, window):
                     cell_r = cell_index // cols
                     cell_c = cell_index % cols
                     state.scanner_selected_cell = [cell_r, cell_c]
+                    state.scanner_selected_row = int(cell_r)
+                    state.scanner_selected_col = int(cell_c)
+                    state._swatch_selection_dirty = True
                     if str(state.get('scanner_camera_workflow', 'path')) == 'single':
                         state.scanner_single_row = int(cell_r + 1)
                         state.scanner_single_col = int(cell_c + 1)
                         state.scanner_status = f"Single capture target: row {cell_r + 1}, col {cell_c + 1}"
-                        embedded = state.get('embedded_scanner')
-                        if embedded is not None:
-                            embedded.preview_single_target(
-                                cell_r,
-                                cell_c,
-                                int(state.get('scanner_single_angle', 1)) - 1,
-                                float(state.get('scanner_camera_zoom', 1.0)),
-                            )
-                            state.scanner_status = embedded.status
                     else:
                         state.scanner_status = f"Selected mini-fabric R{cell_r + 1} C{cell_c + 1}"
                     suppress_mesh_click = True
@@ -3655,18 +3307,7 @@ def draw_viewport(state, renderer, ref_tex, window):
             if split_right_mode == 'edit_orbit':
                 _draw_orbit_canvas(state, window)
             elif split_right_mode == 'scan_robot':
-                embedded = state.get('embedded_scanner')
-                top_h = max(140.0, (avail_y - 90.0) * 0.56)
-                _draw_scan_simulator_canvas(state, embedded, window, height=top_h)
-                imgui.separator()
-                bot_h = max(100.0, imgui.get_content_region_avail().y - 36.0)
-                _draw_scan_gripper_camera_canvas(embedded, height=bot_h)
-            elif split_right_mode == 'puzzle_previews':
-                top_h = max(140.0, (avail_y - 90.0) * 0.50)
-                _draw_puzzle_inspector_canvas(state, renderer, height=top_h)
-                imgui.separator()
-                bot_h = max(120.0, imgui.get_content_region_avail().y - 32.0)
-                _draw_puzzle_glue_canvas(state, renderer, height=bot_h)
+                _draw_scan_gripper_camera_canvas(state, renderer)
         imgui.end_child()
 
     imgui.end()

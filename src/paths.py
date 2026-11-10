@@ -43,6 +43,8 @@ TAUGHT_VIEWS_DIR = CONFIG_DIR / "taught_views"
 # check's segmentation model (scripts/fetch_mobilesam.py).
 MODELS_DIR = PROJECT_ROOT / "models"
 MOBILESAM_DIR = MODELS_DIR / "mobilesam"
+UR5E_URDF = ASSETS_DIR / "ur5e" / "robot.urdf"
+UR5E_MESHES_DIR = ASSETS_DIR / "ur5e" / "meshes"
 
 # Dear ImGui's window layout. Written by the UI at runtime rather than being
 # configuration anyone edits, so it stays out of config/.

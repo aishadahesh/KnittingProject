@@ -158,7 +158,6 @@ def test_a_new_capture_height_is_clamped_and_replans_the_points(controller, monk
 
 def test_a_jog_down_asks_for_the_same_spot_one_step_lower(controller, monkeypatch):
     """The jog pad moves the camera from the panel, through the same solve and check as a capture."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     flown = []
@@ -175,7 +174,6 @@ def test_a_jog_down_asks_for_the_same_spot_one_step_lower(controller, monkeypatc
 
 
 def test_a_sideways_jog_keeps_the_height_and_moves_one_step(controller, monkeypatch):
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     flown = []
@@ -190,7 +188,6 @@ def test_a_sideways_jog_keeps_the_height_and_moves_one_step(controller, monkeypa
 
 
 def test_a_corner_under_the_crosshair_lies_on_the_fabric_plane(controller, monkeypatch):
-    pytest.importorskip("mujoco")
     import gui_ur5
 
     monkeypatch.setattr(controller, "check_in_background", lambda: None)
@@ -241,25 +238,22 @@ def test_grid_stations_spread_with_the_capture_height():
 
 def test_a_pose_the_arm_reaches_is_solved_even_from_a_start_facing_away():
     """The solve may swing the base and refold the arm, rather than stall on the branch it started on."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id = scan_geometry.load_model()
-    fabric_z = scan_geometry.fabric_height(mj, model, data, site_id, 0.20)
+    fabric_z = scan_geometry.fabric_height(0.20)
     camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
     view = scan_geometry.Viewpoint("below", np.r_[camera[:2], fabric_z + 0.06],
                                    scan_geometry.looking_down_along([1.0, 0.0]), elevation_deg=90.0)
     facing_away = np.array(HOME_JOINTS) + np.radians([120.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    solver = (mj, model, data, site_id, fabric_z, 0.0306, None)
+    solver = (fabric_z, 0.0306, None)
 
     solved = scan_geometry._solve(solver, view, facing_away, leaving=True)
-    reached = scan_geometry.camera_point(scan_geometry.seed_from(mj, model, data, site_id, solved.config), 0.0306)
+    reached = scan_geometry.camera_point(scan_geometry.flange_pose(solved.config), 0.0306)
     assert reached == pytest.approx(view.position, abs=scan_geometry.UNREACHED_POS)
 
 
 def test_a_ruler_gap_moves_the_unmarked_fabric_to_where_it_is(controller, monkeypatch):
     """A guessed plane above the real cloth refuses moves into room that is there; a measured gap fixes it."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     monkeypatch.setattr(controller, "check_in_background", lambda: None)
@@ -281,7 +275,6 @@ def test_a_ruler_gap_moves_the_unmarked_fabric_to_where_it_is(controller, monkey
 
 def test_a_jog_down_past_the_floor_stops_at_the_floor(controller, monkeypatch):
     """A step that would take the camera under the lowest allowed height goes as low as allowed instead of nowhere."""
-    pytest.importorskip("mujoco")
     import gui_ur5
     import scan_geometry
 
@@ -304,7 +297,6 @@ def test_a_jog_down_past_the_floor_stops_at_the_floor(controller, monkeypatch):
 def test_capturing_from_here_unmarked_takes_this_exact_pose_at_the_typed_gap(controller, monkeypatch):
     """Unmarked, the guessed plane can say 3.5 cm where the ruler says 30; the typed gap wins, and the
     capture height is then exactly where the camera stands."""
-    pytest.importorskip("mujoco")
 
     checks = []
     monkeypatch.setattr(controller, "check_in_background", lambda: checks.append(True))
@@ -320,7 +312,6 @@ def test_capturing_from_here_unmarked_takes_this_exact_pose_at_the_typed_gap(con
 def test_a_taught_view_below_the_guessed_plane_becomes_the_capture_height(controller, monkeypatch):
     """The view recorded in the session that found this: 37 cm under Home, so 20 cm under the plane
     guessed from Home - every move toward it was refused as going through the cloth."""
-    pytest.importorskip("mujoco")
 
     monkeypatch.setattr(controller, "check_in_background", lambda: None)
     taught = list(np.radians([-92.6, -62.3, 109.8, -135.6, -82.4, 0.7]))
@@ -342,7 +333,6 @@ def test_capturing_from_here_unmarked_asks_for_the_gap_first(controller):
 
 def test_setting_the_height_moves_corners_marked_over_a_guess_onto_it(controller, monkeypatch):
     """Corners marked under the crosshair while the height was a guess lie on the guess; they must not keep holding it."""
-    pytest.importorskip("mujoco")
     import gui_ur5
     import scan_geometry
 
@@ -365,7 +355,6 @@ def test_a_corner_under_the_crosshair_waits_for_the_fabric_height(controller):
 
 def test_measuring_by_parallax_finds_the_fabric_height(controller, monkeypatch):
     """A slide of d moves the picture f*d/h pixels; the measure reads h back from that, with no ruler."""
-    pytest.importorskip("mujoco")
     import gaussian_splatting
     import gui_ur5
     import robot_camera
@@ -399,7 +388,6 @@ def test_the_capture_height_reaches_the_grid_and_centred_plans(controller, monke
 
 
 def test_capturing_from_here_takes_the_height_the_camera_stands_at(controller, monkeypatch):
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     monkeypatch.setattr(controller, "check_in_background", lambda: None)
@@ -414,7 +402,6 @@ def test_capturing_from_here_takes_the_height_the_camera_stands_at(controller, m
 
 
 def test_teaching_z_refuses_a_camera_outside_the_offered_range(controller):
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     camera = scan_geometry.camera_position(HOME_JOINTS, float(controller.state.get("teleop_tool_offset", 0.0306)))
@@ -438,7 +425,6 @@ def test_teacher_settings_persist_with_the_other_ur5_settings():
 
 
 def test_teleop_free_drive_and_hold_are_its_tracking_modes():
-    pytest.importorskip("mujoco")
     import teleop_transport
     from test_ur5_mode import FakeTeleop
 
@@ -457,12 +443,10 @@ def test_teleop_free_drive_and_hold_are_its_tracking_modes():
 # ============================================================================
 
 def test_the_grid_looks_straight_down_from_the_asked_height():
-    pytest.importorskip("mujoco")
     import scan_geometry
     from scipy.spatial.transform import Rotation
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=3, camera_height=0.09, fabric_z=0.20)
-    mj, model, data, site_id = scan_geometry.load_model()
     fabric_z = plan.fabric_z
 
     assert len(plan.viewpoints) + len(plan.skipped) == 6
@@ -472,12 +456,11 @@ def test_the_grid_looks_straight_down_from_the_asked_height():
             assert point.position[2] - fabric_z == pytest.approx(0.09, abs=1e-6)
         assert Rotation.from_rotvec(point.rotvec).apply([0.0, 0.0, 1.0]) == pytest.approx([0.0, 0.0, -1.0], abs=1e-6)
 
-    flown = [scan_geometry.camera_point(scan_geometry.seed_from(mj, model, data, site_id, q), 0.0306) for q in plan.configs]
+    flown = [scan_geometry.camera_point(scan_geometry.flange_pose(q), 0.0306) for q in plan.configs]
     assert np.max(np.abs(np.array(flown) - plan.poses[:, :3])) < scan_geometry.UNREACHED_POS
 
 
 def test_every_grid_cell_is_its_own_station():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=2, fabric_z=0.20)
@@ -487,7 +470,6 @@ def test_every_grid_cell_is_its_own_station():
 
 
 def test_a_grid_move_is_one_frame_less_the_overlap_not_a_reconfiguration():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=2, grid_cols=3, camera_height=0.05, grid_overlap=0.3, fabric_z=0.20)
@@ -498,7 +480,6 @@ def test_a_grid_move_is_one_frame_less_the_overlap_not_a_reconfiguration():
 
 
 def test_a_sweep_is_the_grid_with_its_stations_closer_together_each_with_a_planned_camera_pose():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="sweep", grid_rows=2, grid_cols=3, camera_height=0.05, sweep_overlap=0.65, fabric_z=0.20)
@@ -511,7 +492,6 @@ def test_a_sweep_is_the_grid_with_its_stations_closer_together_each_with_a_plann
 
 
 def test_a_taught_plan_flies_the_recorded_joints_in_order():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     taught = [{"name": "near", "joints": HOME_JOINTS},
@@ -524,7 +504,6 @@ def test_a_taught_plan_flies_the_recorded_joints_in_order():
 
 
 def test_a_taught_plan_with_nothing_taught_refuses():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     with pytest.raises(RuntimeError, match="No taught views"):
@@ -536,10 +515,9 @@ def test_a_taught_plan_with_nothing_taught_refuses():
 # ============================================================================
 
 def test_a_measured_fabric_plane_overrides_the_estimate():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    assert scan_geometry.fabric_height(None, None, None, None, 0.20, measured=0.123) == 0.123
+    assert scan_geometry.fabric_height(0.20, measured=0.123) == 0.123
 
 
 def test_mark_corner_records_the_camera_point_and_drops_the_plan(controller, monkeypatch):
@@ -565,40 +543,38 @@ def _below_home(drop):
     """The arm with its camera `drop` metres straight below where it is at Home, attitude kept."""
     import scan_geometry
 
-    mj, model, data, site_id = scan_geometry.load_model()
-    flange = scan_geometry.seed_from(mj, model, data, site_id, HOME_JOINTS)
+    flange = scan_geometry.flange_pose(HOME_JOINTS)
     target = np.r_[flange[:3] - [0.0, 0.0, drop], flange[3:6]]
-    config, _, _ = scan_geometry.solve_ik(mj, model, data, site_id, target, f"{drop:.2f} below Home")
-    return mj, model, data, site_id, config
+    config, _, _ = scan_geometry.solve_ik(HOME_JOINTS, target, f"{drop:.2f} below Home")
+    return config
 
 
 def test_only_the_move_out_of_where_the_arm_stands_may_start_on_the_fabric():
     """The camera rests on the fabric after Measure fabric. It may lift off - but not stay, and not dig in."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id, low = _below_home(0.30)
-    resting = scan_geometry.lowest_point(mj, model, data, site_id, low, 0.0306)
-    assert resting < scan_geometry.lowest_point(mj, model, data, site_id, HOME_JOINTS, 0.0306) - 0.10
+    low = _below_home(0.30)
+    resting = scan_geometry.lowest_point(low, 0.0306)
+    assert resting < scan_geometry.lowest_point(HOME_JOINTS, 0.0306) - 0.10
 
-    _, _, _, _, lifted = _below_home(0.10)
+    lifted = _below_home(0.10)
     lift = scan_geometry.Viewpoint("lift", np.zeros(3), np.zeros(3), config=lifted)
-    scan_geometry.check_move(mj, model, data, site_id, lift, low, resting, 0.0306, leaving=True)
+    scan_geometry.check_move(lift, low, resting, 0.0306, leaving=True)
     assert lift.floor < scan_geometry.FABRIC_CLEARANCE
     assert lift.clear, lift.problems
 
     planned = scan_geometry.Viewpoint("lift", np.zeros(3), np.zeros(3), config=lifted)
-    scan_geometry.check_move(mj, model, data, site_id, planned, low, resting, 0.0306)
+    scan_geometry.check_move(planned, low, resting, 0.0306)
     assert planned.floor == scan_geometry.FABRIC_CLEARANCE
     assert not planned.clear
 
     stay = scan_geometry.Viewpoint("stay", np.zeros(3), np.zeros(3), config=low.copy())
-    scan_geometry.check_move(mj, model, data, site_id, stay, low, resting, 0.0306, leaving=True)
+    scan_geometry.check_move(stay, low, resting, 0.0306, leaving=True)
     assert not stay.clear
     assert "stands" in "; ".join(stay.problems)
 
     descent = scan_geometry.Viewpoint("down onto it", np.zeros(3), np.zeros(3), config=low.copy())
-    scan_geometry.check_move(mj, model, data, site_id, descent, np.asarray(HOME_JOINTS), resting + 0.01, 0.0306, leaving=True)
+    scan_geometry.check_move(descent, np.asarray(HOME_JOINTS), resting + 0.01, 0.0306, leaving=True)
     assert descent.floor == scan_geometry.FABRIC_CLEARANCE
     assert not descent.clear
     assert "BELOW the fabric plane" in "; ".join(descent.problems)
@@ -606,10 +582,9 @@ def test_only_the_move_out_of_where_the_arm_stands_may_start_on_the_fabric():
 
 def test_no_planned_viewpoint_is_judged_by_where_the_one_before_it_stood():
     """The ratchet: a low view must not lower the bar for the view after it."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    _, _, _, _, low = _below_home(0.30)
+    low = _below_home(0.30)
     plan = scan_geometry.build_capture_plan(low, pattern="orbit", count=5, rings=3, fabric_z=0.20)
     assert all(point.floor == scan_geometry.FABRIC_CLEARANCE for point in plan.viewpoints[1:])
     for point in plan.viewpoints:
@@ -621,11 +596,10 @@ def test_no_planned_viewpoint_is_judged_by_where_the_one_before_it_stood():
 
 
 def test_an_orbit_circles_the_fabric_under_the_camera_not_a_point_inside_the_table():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id, low = _below_home(0.30)
-    fabric_z = scan_geometry.lowest_point(mj, model, data, site_id, low, 0.0306) - 0.01
+    low = _below_home(0.30)
+    fabric_z = scan_geometry.lowest_point(low, 0.0306) - 0.01
     plan = scan_geometry.build_capture_plan(low, pattern="orbit", count=3, rings=1, fabric_z=fabric_z)
 
     assert plan.subject[2] == pytest.approx(fabric_z)
@@ -634,7 +608,6 @@ def test_an_orbit_circles_the_fabric_under_the_camera_not_a_point_inside_the_tab
 
 def test_a_full_orbit_looks_from_every_bearing_around_the_circle():
     """Staggered rings: 3 rings of 6 cover 18 bearings, 20 degrees apart, not 6 bearings three times."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     pose = np.array([-0.45, -0.10, 0.40, np.pi, 0.0, 0.0])
@@ -651,7 +624,6 @@ def test_a_full_orbit_looks_from_every_bearing_around_the_circle():
 
 def test_an_unreachable_view_is_replaced_by_the_nearest_safe_one_or_skipped():
     """One bad view no longer sinks the path: it is moved to the nearest safe spot, or dropped with a reason."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=6, rings=3, fabric_z=0.20)
@@ -663,7 +635,6 @@ def test_an_unreachable_view_is_replaced_by_the_nearest_safe_one_or_skipped():
 
 
 def test_grid_views_out_of_reach_move_up_or_inward_never_down():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=3, grid_cols=3, grid_overlap=0.0, camera_height=0.09, fabric_z=0.20)
@@ -673,13 +644,11 @@ def test_grid_views_out_of_reach_move_up_or_inward_never_down():
 
 
 def test_a_taught_view_is_never_moved_only_kept_or_skipped():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    _, _, _, _, low = _below_home(0.30)
+    low = _below_home(0.30)
     taught = [{"name": "good", "joints": HOME_JOINTS}, {"name": "on the cloth", "joints": list(low)}]
-    mj, model, data, site_id = scan_geometry.load_model()
-    fabric_z = scan_geometry.lowest_point(mj, model, data, site_id, low, 0.0306) - 0.005
+    fabric_z = scan_geometry.lowest_point(low, 0.0306) - 0.005
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="taught", taught=taught, fabric_z=fabric_z)
     assert plan.view_names == ["good"]
@@ -850,7 +819,6 @@ def test_a_busy_controller_names_its_program_and_the_panel_offers_to_stop_it(con
 
 def test_teleop_with_its_arm_down_is_linked_says_why_and_can_still_be_planned_from():
     """Connect to TeleopApp succeeds while its UR5e is down: Check must plan, Run must wait, and both must say why."""
-    pytest.importorskip("mujoco")
     import teleop_transport
     from test_ur5_mode import FakeTeleop
 

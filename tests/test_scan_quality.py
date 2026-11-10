@@ -92,11 +92,9 @@ def test_the_fitted_grid_fills_the_cloth_with_every_frame_on_it():
 
 
 def test_an_outlined_grid_plan_keeps_every_frame_on_the_cloth():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id = scan_geometry.load_model()
-    home_camera = scan_geometry.camera_point(scan_geometry.seed_from(mj, model, data, site_id, HOME_JOINTS), 0.0306)
+    home_camera = scan_geometry.camera_point(scan_geometry.flange_pose(HOME_JOINTS), 0.0306)
     fabric_z = home_camera[2] - 0.25
     rim = np.array([[-0.15, -0.10], [0.15, -0.10], [0.15, 0.10], [-0.15, 0.10]]) + home_camera[:2]
     corners = np.c_[rim, np.full(4, fabric_z)]
@@ -446,7 +444,6 @@ def test_a_dropped_state_stream_is_reopened_and_a_dropped_control_session_blocks
 
 def test_the_orbit_radius_no_longer_moves_the_estimated_fabric():
     """Subject distance estimates the fabric; the orbit's own radius must not shift it."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     near = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, orbit_radius=0.10, subject_distance=0.30)
@@ -460,11 +457,9 @@ def test_the_orbit_radius_no_longer_moves_the_estimated_fabric():
 
 def test_an_outlined_orbit_circles_the_fabric_s_middle_not_where_the_camera_looks():
     """The emulator's arm need not stand over the cloth; the orbit must still circle the cloth."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id = scan_geometry.load_model()
-    home_camera = scan_geometry.camera_point(scan_geometry.seed_from(mj, model, data, site_id, HOME_JOINTS), 0.0306)
+    home_camera = scan_geometry.camera_point(scan_geometry.flange_pose(HOME_JOINTS), 0.0306)
     fabric_z = home_camera[2] - 0.25
     rim = np.array([[-0.20, -0.15], [0.20, -0.15], [0.20, 0.15], [-0.20, 0.15]]) + home_camera[:2] + [0.08, -0.05]
     corners = np.c_[rim, np.full(4, fabric_z)]
@@ -511,11 +506,9 @@ def test_centred_views_tilt_less_where_the_cloth_is_narrow():
 
 
 def test_an_outlined_centred_plan_is_flown_centred_and_on_the_cloth():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
-    mj, model, data, site_id = scan_geometry.load_model()
-    home_camera = scan_geometry.camera_point(scan_geometry.seed_from(mj, model, data, site_id, HOME_JOINTS), 0.0306)
+    home_camera = scan_geometry.camera_point(scan_geometry.flange_pose(HOME_JOINTS), 0.0306)
     fabric_z = home_camera[2] - 0.25
     corners = np.c_[np.array([[-0.2, -0.15], [0.2, -0.15], [0.2, 0.15], [-0.2, 0.15]]) + home_camera[:2], np.full(4, fabric_z)]
 

@@ -259,29 +259,3 @@ def test_natural_capture_fills_the_frame_with_the_cell_it_is_at():
     ys, xs = np.where(is_target)
     assert abs(float(xs.mean()) - width / 2) < width * 0.05
     assert abs(float(ys.mean()) - height / 2) < height * 0.05
-
-
-def test_single_capture_targets_the_cell_the_user_picked():
-    """Row/col must survive the robot's serpentine station order.
-
-    Stations run along the scan path, so odd rows are laid out right to left.
-    Indexing them row-major sent a request for row 2, col 1 of a five-wide grid
-    to row 2, col 5 -- and the capture labelled itself with the cell it went
-    to, so nothing looked wrong about the wrong square.
-    """
-    from embedded_scanner import EmbeddedMujocoScanner
-
-    plan = _plan()
-    # Serpentine really is the layout, otherwise this test proves nothing.
-    assert tuple(plan.station_cells[plan.grid_cols]) != (1, 0)
-
-    scanner = EmbeddedMujocoScanner.__new__(EmbeddedMujocoScanner)
-    scanner.plan = plan
-    scanner.scanner = fs
-    scanner.target_index = 0
-
-    for row in range(plan.grid_rows):
-        for col in range(plan.grid_cols):
-            target_index, station_id = scanner._single_target_index(row, col, 0)
-            assert tuple(int(v) for v in plan.station_cells[station_id]) == (row, col)
-            assert int(plan.station_ids[target_index]) == station_id

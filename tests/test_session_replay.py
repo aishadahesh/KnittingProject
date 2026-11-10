@@ -44,7 +44,6 @@ def test_the_flange_stands_one_tool_offset_back_along_its_axis():
 
 
 def test_the_joints_solved_back_put_the_camera_where_it_was_recorded():
-    pytest.importorskip("mujoco")
     import scan_geometry
     import ur5_robot
 

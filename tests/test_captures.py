@@ -50,14 +50,12 @@ def test_a_grid_is_photographed_square_to_the_cloth():
 
 
 def test_straight_home_keeps_home_s_camera_and_points_it_exactly_down():
-    pytest.importorskip("mujoco")
     import scan_geometry
     from scipy.spatial.transform import Rotation
 
     joints = scan_geometry.straight_home(HOME_JOINTS, 0.0306)
-    mj, model, data, site_id = scan_geometry.load_model()
-    before = scan_geometry.camera_point(scan_geometry.seed_from(mj, model, data, site_id, HOME_JOINTS), 0.0306)
-    flange = scan_geometry.seed_from(mj, model, data, site_id, joints)
+    before = scan_geometry.camera_point(scan_geometry.flange_pose(HOME_JOINTS), 0.0306)
+    flange = scan_geometry.flange_pose(joints)
     after = scan_geometry.camera_point(flange, 0.0306)
 
     assert after == pytest.approx(before, abs=scan_geometry.UNREACHED_POS)
@@ -316,22 +314,17 @@ def test_the_image_turn_is_recovered_from_two_small_probes(angle, mirror):
 # ============================================================================
 
 def test_an_unreachable_pose_is_given_up_on_soon_not_after_every_step(monkeypatch):
-    pytest.importorskip("mujoco")
-    import fabric_scanner
     import scan_geometry
 
     steps = {"count": 0}
-    real_step = fabric_scanner.step_ik
-    monkeypatch.setattr(fabric_scanner, "step_ik", lambda *args: (steps.__setitem__("count", steps["count"] + 1), real_step(*args))[1])
-    mj, model, data, site_id = scan_geometry.load_model()
-    scan_geometry.seed_from(mj, model, data, site_id, HOME_JOINTS)
+    real_fk = scan_geometry.forward_kinematics
+    monkeypatch.setattr(scan_geometry, "forward_kinematics", lambda *args: (steps.__setitem__("count", steps["count"] + 1), real_fk(*args))[1])
     with pytest.raises(scan_geometry.Unreachable):
-        scan_geometry.solve_ik(mj, model, data, site_id, np.array([2.0, 2.0, 2.0, math.pi, 0.0, 0.0]), "far away")
+        scan_geometry.solve_ik(HOME_JOINTS, np.array([2.0, 2.0, 2.0, math.pi, 0.0, 0.0]), "far away")
     assert steps["count"] < scan_geometry.MAX_IK_ITERS // 2
 
 
-def test_each_thread_keeps_its_own_model_and_reuses_it():
-    pytest.importorskip("mujoco")
+def test_load_model_reuses_cached_urdf_kinematics_across_threads():
     import threading
     import scan_geometry
 
@@ -341,8 +334,7 @@ def test_each_thread_keeps_its_own_model_and_reuses_it():
     worker = threading.Thread(target=lambda: theirs.setdefault("model", scan_geometry.load_model()))
     worker.start()
     worker.join()
-    assert theirs["model"] is not mine
-    assert theirs["model"][2] is not mine[2]
+    assert theirs["model"] is mine
 
 
 def test_a_huge_splat_is_sampled_down_for_the_viewer_but_keeps_its_count(tmp_path, monkeypatch):

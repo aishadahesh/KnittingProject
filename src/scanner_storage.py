@@ -96,7 +96,7 @@ def database_path(project_root: str | Path) -> Path:
 
 def _scanner_state_fields(data):
     return {key: value for key, value in data.items()
-            if key not in {'scanner_storage', 'scanner_process', 'embedded_scanner'}
+            if key not in {'scanner_storage', 'scanner_process'}
             and (key.startswith('scanner_') or key in {'app_mode', 'ui_theme'})}
 
 

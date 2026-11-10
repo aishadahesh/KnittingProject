@@ -1,0 +1,179 @@
+<?xml version="1.0"?>
+<robot name="ur5e">
+  <link name="base">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/base_0.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/base_1.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="shoulder_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/shoulder_0.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/shoulder_1.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/shoulder_2.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="upper_arm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/upperarm_0.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/upperarm_1.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/upperarm_2.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/upperarm_3.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="forearm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/forearm_0.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/forearm_1.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/forearm_2.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/forearm_3.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="wrist_1_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist1_0.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist1_1.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist1_2.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="wrist_2_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist2_0.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist2_1.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist2_2.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="wrist_3_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/wrist3.obj" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="shoulder_pan_joint" type="revolute">
+    <parent link="base"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0.163" rpy="0 -0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28319" upper="6.28319" effort="150" velocity="3.14"/>
+  </joint>
+  <joint name="shoulder_lift_joint" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <origin xyz="0 0.138 0" rpy="-0 1.5707963267948966 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28319" upper="6.28319" effort="150" velocity="3.14"/>
+  </joint>
+  <joint name="elbow_joint" type="revolute">
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <origin xyz="0 -0.131 0.425" rpy="0 -0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.1415" upper="3.1415" effort="150" velocity="3.14"/>
+  </joint>
+  <joint name="wrist_1_joint" type="revolute">
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+    <origin xyz="0 0 0.392" rpy="-0 1.5707963267948966 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28319" upper="6.28319" effort="28" velocity="3.14"/>
+  </joint>
+  <joint name="wrist_2_joint" type="revolute">
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+    <origin xyz="0 0.127 0" rpy="0 -0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28319" upper="6.28319" effort="28" velocity="3.14"/>
+  </joint>
+  <joint name="wrist_3_joint" type="revolute">
+    <parent link="wrist_2_link"/>
+    <child link="wrist_3_link"/>
+    <origin xyz="0 0 0.1" rpy="0 -0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28319" upper="6.28319" effort="28" velocity="3.14"/>
+  </joint>
+</robot>

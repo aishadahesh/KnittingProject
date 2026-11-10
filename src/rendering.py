@@ -1,8 +1,12 @@
 import logging
+import math
 import numpy as np
 import moderngl
 from PIL import Image
 from imgui_bundle import imgui
+
+import paths
+import scan_geometry
 
 # %% GLSL SHADERS ─────────────────────────────────────────────────────────────
 
@@ -330,6 +334,17 @@ def orthographic(left, right, bottom, top, near=-1000.0, far=1000.0):
         [0, 0, 0, 1.0],
     ], dtype=np.float32)
 
+def perspective(vfov_deg, aspect, near=0.05, far=500.0):
+    f = 1.0 / math.tan(math.radians(max(5.0, min(170.0, float(vfov_deg)))) * 0.5)
+    a = max(float(aspect), 1e-4)
+    nf = 1.0 / max(float(near) - float(far), -1e6 if near < far else 1e-4)
+    return np.array([
+        [f / a, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, (far + near) * nf, 2.0 * far * near * nf],
+        [0.0, 0.0, -1.0, 0.0],
+    ], dtype=np.float32)
+
 def compute_normals(verts, tris):
     # Area-weighted vertex normals: each triangle adds its unnormalised face
     # normal to all three of its corners.
@@ -419,6 +434,133 @@ def transform_points(points, matrix):
     res = homo @ matrix.T
     return res[:, :3] / res[:, 3:4]
 
+
+WORLD_VERT = """
+#version 330
+in vec3 in_pos;
+in vec3 in_norm;
+uniform mat4 mvp;
+uniform mat4 model;
+out vec3 v_world_pos;
+out vec3 v_world_norm;
+void main() {
+    vec4 wp = model * vec4(in_pos, 1.0);
+    v_world_pos = wp.xyz;
+    v_world_norm = normalize(mat3(model) * in_norm);
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+WORLD_FRAG = """
+#version 330
+in vec3 v_world_pos;
+in vec3 v_world_norm;
+uniform vec3 base_color;
+uniform int surface_mode;
+uniform vec3 board_center;
+uniform float board_half;
+out vec4 frag_color;
+void main() {
+    vec3 col = base_color;
+    if (surface_mode == 1) {
+        vec2 d = v_world_pos.xy - board_center.xy;
+        if (abs(d.x) <= board_half && abs(d.y) <= board_half) {
+            float cell = max(board_half * 0.125, 1e-4);
+            int cx = int(floor(d.x / cell));
+            int cy = int(floor(d.y / cell));
+            int parity = (cx + cy) & 1;
+            col = parity == 0 ? vec3(0.90, 0.90, 0.92) : vec3(0.16, 0.16, 0.18);
+        }
+    }
+    vec3 n = normalize(v_world_norm);
+    vec3 l1 = normalize(vec3(0.35, -0.45, 0.82));
+    vec3 l2 = normalize(vec3(-0.40, 0.55, 0.45));
+    float diff = max(dot(n, l1), 0.0) * 0.65 + max(dot(n, l2), 0.0) * 0.25 + 0.25;
+    frag_color = vec4(clamp(col * diff, 0.0, 1.0), 1.0);
+}
+"""
+
+LINE_VERT = """
+#version 330
+in vec3 in_pos;
+in vec3 in_color;
+uniform mat4 mvp;
+out vec3 v_color;
+void main() {
+    v_color = in_color;
+    gl_Position = mvp * vec4(in_pos, 1.0);
+}
+"""
+
+LINE_FRAG = """
+#version 330
+in vec3 v_color;
+out vec4 frag_color;
+void main() {
+    frag_color = vec4(v_color, 1.0);
+}
+"""
+
+_UR5E_LINK_FILES = (
+    ("base", ("base_0.obj", "base_1.obj")),
+    ("shoulder_link", ("shoulder_0.obj", "shoulder_1.obj", "shoulder_2.obj")),
+    ("upper_arm_link", ("upperarm_0.obj", "upperarm_1.obj", "upperarm_2.obj", "upperarm_3.obj")),
+    ("forearm_link", ("forearm_0.obj", "forearm_1.obj", "forearm_2.obj", "forearm_3.obj")),
+    ("wrist_1_link", ("wrist1_0.obj", "wrist1_1.obj", "wrist1_2.obj")),
+    ("wrist_2_link", ("wrist2_0.obj", "wrist2_1.obj", "wrist2_2.obj")),
+    ("wrist_3_link", ("wrist3.obj",)),
+)
+_UR5E_VISUAL_CACHE = None
+
+
+def _parse_obj_mesh(path):
+    verts = []
+    faces = []
+    mtl = ""
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("usemtl "):
+                mtl = line.split(None, 1)[1].strip()
+            elif line.startswith("v "):
+                parts = line.split()
+                verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                parts = line.split()[1:]
+                idx = [int(p.split("/")[0]) - 1 for p in parts]
+                for k in range(1, len(idx) - 1):
+                    faces.append((idx[0], idx[k], idx[k + 1]))
+    if not verts or not faces:
+        return None
+    v_arr = np.asarray(verts, dtype=np.float32)
+    t_arr = np.asarray(faces, dtype=np.int32)
+    n_arr = compute_normals(v_arr, t_arr).astype(np.float32)
+    mtl_low = mtl.lower()
+    if "blue" in mtl_low:
+        color = (0.34, 0.64, 0.86)
+    elif "black" in mtl_low or "dark" in mtl_low:
+        color = (0.18, 0.19, 0.22)
+    else:
+        color = (0.76, 0.78, 0.81)
+    return v_arr.tobytes(), n_arr.tobytes(), t_arr.tobytes(), int(len(t_arr) * 3), color
+
+
+def _load_ur5e_visual_meshes():
+    global _UR5E_VISUAL_CACHE
+    if _UR5E_VISUAL_CACHE is not None:
+        return _UR5E_VISUAL_CACHE
+    meshes = []
+    mesh_dir = paths.UR5E_MESHES_DIR
+    for link_idx, filenames in _UR5E_LINK_FILES:
+        for fname in filenames:
+            fpath = mesh_dir / fname
+            if not fpath.is_file():
+                continue
+            parsed = _parse_obj_mesh(fpath)
+            if parsed is not None:
+                meshes.append((link_idx, *parsed))
+    _UR5E_VISUAL_CACHE = meshes
+    return meshes
+
 # %% MESH RENDERER ────────────────────────────────────────────────────────────
 
 class MeshRenderer:
@@ -454,6 +596,16 @@ class MeshRenderer:
             [(self.grid_vbo, '3f', 'in_pos')],
             self.grid_ibo,
         )
+        self.world_prog = ctx.program(vertex_shader=WORLD_VERT, fragment_shader=WORLD_FRAG)
+        self.line_prog = ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
+        self.robot_vaos = []
+        self.robot_buffers = []
+        self.board_vao = None
+        self.board_buffers = []
+        self.wrist_fbo = None
+        self.wrist_color_tex = None
+        self.wrist_depth_tex = None
+        self.wrist_size = (0, 0)
 
         self.vp_w    = 1
         self.vp_h    = 1
@@ -479,10 +631,24 @@ class MeshRenderer:
     def close(self):
         self.set_meshes([], [])
         self.set_ctrl_pts([])
-        for name in ('bg_vao', 'grid_vao', 'bg_vbo', 'grid_vbo', 'grid_ibo',
+        for vao, _, _ in self.robot_vaos:
+            vao.release()
+        self.robot_vaos.clear()
+        for buf in self.robot_buffers:
+            buf.release()
+        self.robot_buffers.clear()
+        if self.board_vao is not None:
+            self.board_vao.release()
+            self.board_vao = None
+        for buf in self.board_buffers:
+            buf.release()
+        self.board_buffers.clear()
+        for name in ('wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex',
+                     'bg_vao', 'grid_vao', 'bg_vbo', 'grid_vbo', 'grid_ibo',
                      'fbo', 'color_tex', 'depth_tex', 'prog', 'outline_prog',
-                     'pt_prog', 'bg_prog', 'depth_prog', 'grid_prog'):
-            resource = getattr(self, name)
+                     'pt_prog', 'bg_prog', 'depth_prog', 'grid_prog',
+                     'world_prog', 'line_prog'):
+            resource = getattr(self, name, None)
             if resource is not None:
                 resource.release()
                 setattr(self, name, None)
@@ -656,7 +822,8 @@ class MeshRenderer:
                hover_mesh_idx=-1, selected_mesh_idx=-1,
                visible_rows=None,
                bg_tex=None, bg_alpha=0.5, bg_uniforms=None,
-               camera=None, n_real_pts=-1, model_mat=None, show_grid=False):
+               camera=None, n_real_pts=-1, model_mat=None, show_grid=False,
+               world_scene=None):
         self.fbo.use()
         self.ctx.viewport = (0, 0, self.vp_w, self.vp_h)
         
@@ -788,6 +955,10 @@ class MeshRenderer:
             self.fbo.depth_mask = True
             self.ctx.disable(moderngl.BLEND)
 
+        if world_scene is not None and camera is not None:
+            view_proj = camera.proj(self.vp_w, self.vp_h) @ camera.view()
+            self._draw_world_scene(view_proj, model_mat, world_scene)
+
         if self.pt_vao:
             self.ctx.disable(moderngl.DEPTH_TEST)
             self.ctx.disable(moderngl.CULL_FACE)
@@ -800,6 +971,248 @@ class MeshRenderer:
             self.pt_vao.render(moderngl.POINTS, vertices=self.n_pts)
 
         self.ctx.screen.use()
+
+    def _ensure_world_vaos(self):
+        if self.board_vao is None:
+            quad_pos = np.array([
+                [-0.5, -0.5, 0.0],
+                [ 0.5, -0.5, 0.0],
+                [ 0.5,  0.5, 0.0],
+                [-0.5,  0.5, 0.0],
+            ], dtype=np.float32)
+            quad_norm = np.array([
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float32)
+            quad_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
+            p_buf = self.ctx.buffer(quad_pos.tobytes())
+            n_buf = self.ctx.buffer(quad_norm.tobytes())
+            i_buf = self.ctx.buffer(quad_idx.tobytes())
+            self.board_buffers = [p_buf, n_buf, i_buf]
+            self.board_vao = self.ctx.vertex_array(
+                self.world_prog,
+                [(p_buf, '3f', 'in_pos'), (n_buf, '3f', 'in_norm')],
+                i_buf,
+            )
+        if not self.robot_vaos:
+            for link_idx, pos_b, norm_b, tri_b, n_idx, color in _load_ur5e_visual_meshes():
+                p_buf = self.ctx.buffer(pos_b)
+                n_buf = self.ctx.buffer(norm_b)
+                i_buf = self.ctx.buffer(tri_b)
+                self.robot_buffers.extend((p_buf, n_buf, i_buf))
+                vao = self.ctx.vertex_array(
+                    self.world_prog,
+                    [(p_buf, '3f', 'in_pos'), (n_buf, '3f', 'in_norm')],
+                    i_buf,
+                )
+                self.robot_vaos.append((vao, link_idx, color))
+
+    def _scene_world_mapping(self, model_mat, fabric_center, phys_span):
+        if self.mesh_pick_data and model_mat is not None:
+            pts = np.vstack([v[::max(1, len(v) // 80)] for v, _ in self.mesh_pick_data if len(v)])
+            world_pts = transform_points(pts, model_mat)
+            min_v = world_pts.min(axis=0)
+            max_v = world_pts.max(axis=0)
+            center = np.array(
+                [(min_v[0] + max_v[0]) * 0.5, (min_v[1] + max_v[1]) * 0.5, float(min_v[2])],
+                dtype=np.float32,
+            )
+            span = max(float(max_v[0] - min_v[0]), float(max_v[1] - min_v[1]), 2.0)
+        else:
+            center = np.zeros(3, dtype=np.float32)
+            span = 16.0
+        units_per_meter = span / max(float(phys_span), 0.05)
+        fc = np.asarray(fabric_center, dtype=np.float32).reshape(-1)[:3]
+        return center, fc, float(units_per_meter)
+
+    def _ur_to_gl_matrix(self, ur_mat4, scene_center, fabric_center, units_per_meter):
+        m = np.eye(4, dtype=np.float32)
+        m[:3, :3] = np.asarray(ur_mat4[:3, :3], dtype=np.float32) * float(units_per_meter)
+        ur_pos = np.asarray(ur_mat4[:3, 3], dtype=np.float32)
+        m[:3, 3] = scene_center + (ur_pos - fabric_center) * float(units_per_meter)
+        return m
+
+    def _draw_world_scene(self, view_proj, model_mat, world_scene, draw_robot=True, draw_frusta=True):
+        self._ensure_world_vaos()
+        fabric_center = world_scene.get("fabric_center", (-0.45, -0.08, 0.0))
+        phys_span = float(world_scene.get("phys_span", 0.18))
+        scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span)
+
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.CULL_FACE)
+        self.fbo.depth_mask = True
+
+        if self.board_vao is not None and world_scene.get("show_board", True):
+            board_span_m = max(phys_span * 1.45, 0.24)
+            board_half = 0.5 * board_span_m * units_per_m
+            board_mat = np.eye(4, dtype=np.float32)
+            board_mat[0, 0] = board_span_m * units_per_m * 2.2
+            board_mat[1, 1] = board_span_m * units_per_m * 2.2
+            board_mat[:3, 3] = scene_center + np.array([0.0, 0.0, -0.003 * units_per_m], dtype=np.float32)
+            mvp_board = (view_proj @ board_mat).astype(np.float32)
+            self.world_prog['mvp'].write(mvp_board.T.tobytes())
+            self.world_prog['model'].write(board_mat.T.tobytes())
+            self.world_prog['base_color'].value = (0.24, 0.25, 0.27)
+            self.world_prog['surface_mode'].value = 1
+            self.world_prog['board_center'].value = tuple(float(v) for v in scene_center)
+            self.world_prog['board_half'].value = float(board_half)
+            self.board_vao.render(moderngl.TRIANGLES)
+
+        joints = world_scene.get("robot_joints")
+        if draw_robot and world_scene.get("show_robot", True) and joints is not None and self.robot_vaos:
+            link_mats = scan_geometry.link_world_transforms(joints)
+            self.world_prog['surface_mode'].value = 0
+            for vao, link_name, color in self.robot_vaos:
+                link_mat = link_mats.get(link_name)
+                if link_mat is None:
+                    continue
+                gl_model = self._ur_to_gl_matrix(link_mat, scene_center, fc, units_per_m)
+                mvp_link = (view_proj @ gl_model).astype(np.float32)
+                self.world_prog['mvp'].write(mvp_link.T.tobytes())
+                self.world_prog['model'].write(gl_model.T.tobytes())
+                self.world_prog['base_color'].value = color
+                vao.render(moderngl.TRIANGLES)
+
+        if draw_frusta and world_scene.get("show_frusta", True):
+            line_verts = []
+            plan_poses = world_scene.get("capture_plan_poses") or []
+            prev_pt = None
+            for p in plan_poses:
+                pose_arr = np.asarray(p, dtype=np.float32).reshape(-1)
+                if pose_arr.size < 6:
+                    continue
+                pos_gl = scene_center + (pose_arr[:3] - fc) * units_per_m
+                if prev_pt is not None:
+                    line_verts.extend((*prev_pt, 0.30, 0.78, 0.95, *pos_gl, 0.30, 0.78, 0.95))
+                prev_pt = pos_gl
+                self._append_frustum_lines(line_verts, pose_arr, scene_center, fc, units_per_m, 0.028, (0.35, 0.75, 0.95))
+            cam_pose = world_scene.get("camera_pose")
+            if cam_pose is not None:
+                pose_arr = np.asarray(cam_pose, dtype=np.float32).reshape(-1)
+                if pose_arr.size >= 6:
+                    self._append_frustum_lines(line_verts, pose_arr, scene_center, fc, units_per_m, 0.055, (1.0, 0.82, 0.22))
+            if line_verts:
+                arr = np.asarray(line_verts, dtype=np.float32)
+                vbo = self.ctx.buffer(arr.tobytes())
+                vao = self.ctx.vertex_array(self.line_prog, [(vbo, '3f 3f', 'in_pos', 'in_color')])
+                self.line_prog['mvp'].write(view_proj.astype(np.float32).T.tobytes())
+                vao.render(moderngl.LINES)
+                vao.release()
+                vbo.release()
+
+    @staticmethod
+    def _append_frustum_lines(out, pose_arr, scene_center, fc, units_per_m, depth_m, color):
+        origin = scene_center + (pose_arr[:3] - fc) * units_per_m
+        rot = scan_geometry.rotvec_to_matrix(pose_arr[3:6]).astype(np.float32)
+        d = float(depth_m) * units_per_m
+        hw = d * 0.52
+        hh = d * 0.36
+        corners_cam = np.array([
+            [-hw, -hh, d],
+            [ hw, -hh, d],
+            [ hw,  hh, d],
+            [-hw,  hh, d],
+        ], dtype=np.float32)
+        corners = origin + corners_cam @ rot.T
+        r, g, b = color
+        for c in corners:
+            out.extend((*origin, r, g, b, *c, r, g, b))
+        for i in range(4):
+            c0, c1 = corners[i], corners[(i + 1) % 4]
+            out.extend((*c0, r, g, b, *c1, r, g, b))
+
+    def render_wrist_camera(
+        self,
+        world_pose,
+        hfov_deg,
+        fabric_center,
+        phys_span,
+        out_w,
+        out_h,
+        material_uniforms,
+        visible_rows=None,
+        model_mat=None,
+    ):
+        out_w = max(16, int(out_w))
+        out_h = max(16, int(out_h))
+        if self.wrist_fbo is None or self.wrist_size != (out_w, out_h):
+            for name in ('wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex'):
+                res = getattr(self, name, None)
+                if res is not None:
+                    res.release()
+            self.wrist_color_tex = self.ctx.texture((out_w, out_h), 3)
+            self.wrist_depth_tex = self.ctx.depth_texture((out_w, out_h))
+            self.wrist_fbo = self.ctx.framebuffer(
+                color_attachments=[self.wrist_color_tex],
+                depth_attachment=self.wrist_depth_tex,
+            )
+            self.wrist_size = (out_w, out_h)
+
+        if model_mat is None:
+            model_mat = np.eye(4, dtype=np.float32)
+        scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span)
+        pose_arr = np.asarray(world_pose, dtype=np.float32).reshape(-1)[:6]
+        eye_gl = scene_center + (pose_arr[:3] - fc) * units_per_m
+        rot_wc = scan_geometry.rotvec_to_matrix(pose_arr[3:6]).astype(np.float32)
+        right = rot_wc[:, 0]
+        up = -rot_wc[:, 1]
+        forward = rot_wc[:, 2]
+        view = np.eye(4, dtype=np.float32)
+        view[0, :3] = right
+        view[1, :3] = up
+        view[2, :3] = -forward
+        view[0, 3] = -float(np.dot(right, eye_gl))
+        view[1, 3] = -float(np.dot(up, eye_gl))
+        view[2, 3] = float(np.dot(forward, eye_gl))
+
+        aspect = float(out_w) / float(out_h)
+        half_w_tan = math.tan(math.radians(max(10.0, min(120.0, float(hfov_deg)))) * 0.5)
+        vfov_rad = 2.0 * math.atan(half_w_tan / max(aspect, 1e-4))
+        proj = perspective(math.degrees(vfov_rad), aspect, 0.05, 500.0)
+        view_proj = proj @ view
+        mvp = (view_proj @ model_mat).astype(np.float32)
+        mv = (view @ model_mat).astype(np.float32)
+
+        self.wrist_fbo.use()
+        self.ctx.viewport = (0, 0, out_w, out_h)
+        self.wrist_fbo.depth_mask = True
+        self.ctx.clear(0.18, 0.19, 0.22, 1.0)
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.depth_func = '<'
+
+        self._draw_world_scene(
+            view_proj,
+            model_mat,
+            {"fabric_center": fabric_center, "phys_span": phys_span, "show_board": True},
+            draw_robot=False,
+            draw_frusta=False,
+        )
+
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.wrist_depth_tex.use(location=1)
+        if 'depth_tex' in self.prog:
+            self.prog['depth_tex'].value = 1
+        if 'viewport_size' in self.prog:
+            self.prog['viewport_size'].value = (float(out_w), float(out_h))
+        if 'ao_uv_scale' in self.prog:
+            self.prog['ao_uv_scale'].value = (0.01, 0.01)
+        self.prog['mvp'].write(mvp.T.tobytes())
+        self.prog['mv'].write(mv.T.tobytes())
+        if 'light_dir' in self.prog and 'light_dir' not in material_uniforms:
+            self.prog['light_dir'].value = (0.5, 1.0, 0.8)
+        self._set_program_uniforms(self.prog, material_uniforms)
+        for vao, _, _, _, color, row_idx in self.meshes:
+            if not self._row_visible(row_idx, visible_rows):
+                continue
+            self.prog['color'].value = tuple(float(c) for c in np.asarray(color, dtype=np.float32))
+            vao.render(moderngl.TRIANGLES)
+
+        raw = self.wrist_fbo.read(components=3, dtype='f1')
+        self.ctx.screen.use()
+        img = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3))
+        return np.ascontiguousarray(np.flipud(img))
 
 # %% IMAGE TEXTURE HELPER ─────────────────────────────────────────────────────
 

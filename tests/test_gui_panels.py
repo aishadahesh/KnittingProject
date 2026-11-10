@@ -26,7 +26,7 @@ imgui_bundle = pytest.importorskip("imgui_bundle")
 glfw = pytest.importorskip("glfw")
 from imgui_bundle import imgui  # noqa: E402
 
-MODES = ("edit", "scan", "puzzle", "database", "ur5", "model")
+MODES = ("scan", "capture", "model", "edit")
 
 
 def _make_hidden_window():
@@ -134,10 +134,9 @@ def state(gl_context, tmp_path):
     app_state.rebuild_spline_from_params()
     assert renderer.mesh_pick_data, "fixture must produce pick data for the viewport paths"
     yield app_state, renderer
-    for key in ('embedded_scanner', 'ur5_controller'):
-        controller = app_state.get(key)
-        if controller is not None:
-            controller.close()
+    controller = app_state.get('ur5_controller')
+    if controller is not None:
+        controller.close()
     glfw.make_context_current(gl_context.window)
     renderer.close()
     puzzle_renderer.close()
@@ -199,26 +198,18 @@ def test_every_mode_is_reachable_from_every_other(imgui_context, state, gl_conte
             _draw_one_frame(gui, app_state, renderer, second, gl.window, ref_tex)
 
 
-def test_scan_mode_draws_without_the_mujoco_runtime(imgui_context, state, gl_context, ref_tex, monkeypatch):
-    """Scan Mode's UI must not depend on the scan runtime starting.
-
-    Keeps MuJoCo out of the test run, and asserts the separation the split
-    relies on: the panel is drawable even when the scanner cannot be built.
-    """
+def test_scan_mode_draws_without_the_mujoco_runtime(imgui_context, state, gl_context, ref_tex):
     import gui
 
-    def _refuse(*args, **kwargs):
-        raise RuntimeError("EmbeddedMujocoScanner is stubbed out in tests")
-
-    monkeypatch.setattr(gui, "EmbeddedMujocoScanner", _refuse)
     app_state, renderer = state
     gl = gl_context
     assert _draw_one_frame(gui, app_state, renderer, "scan", gl.window, ref_tex) > 0
-    assert app_state.get("embedded_scanner") is None
+    controller = app_state.get("ur5_controller")
+    assert controller is None or controller.robot.connected is False
 
 
 def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_context, ref_tex, monkeypatch):
-    """Drawing the UR5 panel must not connect to a robot or open a camera."""
+    """Drawing the Capture panel must not connect to a robot or open a camera."""
     import gui
     import robot_camera
 
@@ -229,7 +220,7 @@ def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_co
 
     app_state, renderer = state
     gl = gl_context
-    _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex)
+    _draw_one_frame(gui, app_state, renderer, "capture", gl.window, ref_tex)
     controller = app_state.get("ur5_controller")
     assert controller is not None
     assert controller.robot.connected is False
@@ -255,18 +246,17 @@ def test_capture_path_draws_a_checked_plan(imgui_context, state, gl_context, ref
     Everything the preview reads -- positions, the subject, per-viewpoint verdicts -- comes
     from the solve, so drawing it with no plan present covers none of it.
     """
-    pytest.importorskip("mujoco")
     import gui
     import scan_geometry
     import ur5_robot
 
     app_state, renderer = state
     gl = gl_context
-    _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex)
+    _draw_one_frame(gui, app_state, renderer, "capture", gl.window, ref_tex)
     controller = app_state.get("ur5_controller")
     controller.plan = scan_geometry.build_capture_plan(ur5_robot.DEFAULT_HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
 
-    assert _draw_one_frame(gui, app_state, renderer, "ur5", gl.window, ref_tex) > 0
+    assert _draw_one_frame(gui, app_state, renderer, "capture", gl.window, ref_tex) > 0
     assert controller.robot.connected is False
 
 

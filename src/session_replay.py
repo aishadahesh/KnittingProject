@@ -105,22 +105,14 @@ def solve_joints(views: list[View], offset: float, progress=None) -> list[tuple[
     import scan_geometry
     import ur5_robot
 
-    mj, model, data, site_id = scan_geometry.load_model()
-    held = np.array(data.qpos, dtype=float)       # the model is shared on this thread: hand it back as found
-    data.qpos[:6] = ur5_robot.DEFAULT_HOME_JOINTS
-    mj.mj_forward(model, data)
     q = np.array(ur5_robot.DEFAULT_HOME_JOINTS, dtype=float)
     solved = []
     for index, view in enumerate(views):
         try:
-            q, _, _ = scan_geometry.solve_ik(mj, model, data, site_id, flange_pose(view, offset), view.label)
+            q, _, _ = scan_geometry.solve_ik(q, flange_pose(view, offset), view.label)
             solved.append((np.array(q, dtype=float), None))
         except scan_geometry.Unreachable as exc:
-            data.qpos[:6] = q
-            mj.mj_forward(model, data)
             solved.append((np.array(q, dtype=float), str(exc)))
         if progress is not None:
             progress(index + 1, len(views))
-    data.qpos[:] = held
-    mj.mj_forward(model, data)
     return solved

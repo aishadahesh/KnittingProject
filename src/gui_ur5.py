@@ -144,6 +144,8 @@ Transport = namedtuple("Transport", "label explain build available")
 # while the arm stays still, which shows the motion a run will make - a stand-in that only
 # reported arriving showed nothing, and planned from a pose the arm was never in.
 TRANSPORTS = {
+    "sim":     Transport("Simulated UR5e", "In-process 3D UR5e in the shared world. Moves smoothly at the configured joint speed.",
+                         ur5_robot.SimUR5Transport, lambda: True),
     "teleop":  Transport("Via TeleopApp", "TeleopApp holds the controller and this app asks it to move. "
                                           "To simulate, leave TeleopApp not following the arm (or on its emulator), "
                                           "then Check and Rehearse: its 3D arm flies the path and the real one stays still.",
@@ -255,7 +257,12 @@ class UR5ModeController:
         self.video_extract: threading.Thread | None = None
         self.video_extract_result = ""
         self.status = "UR5 Robot Mode ready"
-        self.devices: list[dict] = []
+        self.devices: list[dict] = [{
+            "backend": "sim",
+            "index": -1,
+            "label": "Simulated wrist camera (3D world)",
+            "is_real": False,
+        }]
         # Names which run was asked for and is awaiting confirmation - "scan", "capture",
         # or "" for none. The arm does not move while one is pending.
         self.pending_start = ""
@@ -284,13 +291,52 @@ class UR5ModeController:
 
     # -- camera preview ----------------------------------------------------
 
-    def update_preview(self) -> None:
+    def _sim_camera_pose_provider(self):
+        joints = self.robot.refresh().joints
+        tool_offset = float(self.state.get("teleop_tool_offset", 0.0306))
+        pos, rotvec = scan_geometry.camera_pose(joints, tool_offset)
+        pose = [*pos, *rotvec]
+        fov = float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES))
+        fz = _settings_fabric_z(self.state, None)
+        return pose, fov, (-0.45, -0.08, float(fz))
+
+    def connect_sim(self, connect_robot: bool = True, start_cam: bool = True) -> None:
+        if connect_robot:
+            self.state.ur5_transport = "sim"
+            self.connect("sim", "sim")
+        if start_cam:
+            spec = {"backend": "sim", "index": -1, "label": "Simulated wrist camera (3D world)", "is_real": False}
+            self.start_camera(spec, clamp_capture_size(self.state.get("ur5_capture_width", 1280)))
+
+    def update_preview(self, renderer=None) -> None:
         """Refreshes the live camera texture, rate limited to the UI's needs."""
         if self.camera is None or not self.camera.running:
             return
         now = time.monotonic()
         if now - self._last_preview_time < PREVIEW_INTERVAL:
             return
+        if (
+            isinstance(self.camera.backend, robot_camera.SimCameraBackend)
+            and renderer is not None
+            and hasattr(renderer, "render_wrist_camera")
+        ):
+            pose, fov, target = self._sim_camera_pose_provider()
+            w, h = self.camera.backend.size
+            try:
+                gl_rgb = renderer.render_wrist_camera(
+                    pose,
+                    fov,
+                    target,
+                    0.18,
+                    w,
+                    h,
+                    self.state.get_material_uniforms(),
+                    visible_rows=self.state.row_visible,
+                    model_mat=self.state.current_model_matrix(),
+                )
+                self.camera.backend.update_gl_frame(gl_rgb, pose)
+            except Exception as exc:
+                logging.warning("gui_ur5.update_preview: %s", exc)
         self._last_preview_time = now
         latest = self.camera.latest_frame()
         if latest is None or latest.index == self._previewed_index:
@@ -344,8 +390,11 @@ class UR5ModeController:
 
     def start_camera(self, spec: dict, size) -> bool:
         self.stop_camera()
-        backend = (teleop_transport.TeleopCameraBackend(self.robot.transport, spec["camera"], size)
-                   if spec.get("backend") == "teleop" else robot_camera.make_backend(spec, size=size))
+        backend = (
+            teleop_transport.TeleopCameraBackend(self.robot.transport, spec["camera"], size)
+            if spec.get("backend") == "teleop"
+            else robot_camera.make_backend(spec, size=size, pose_provider=self._sim_camera_pose_provider)
+        )
         self.camera = robot_camera.RobotCamera(backend)
         self._previewed_index = -1
         if not self.camera.start():
@@ -1214,16 +1263,21 @@ def taught_set_names() -> list[str]:
 
 
 def build_scan_plan(state):
-    """Builds the same fabric scan plan Scan Mode uses, for the real arm.
-
-    Both modes go through ``fabric_scanner.build_plan`` with the same settings,
-    which is what makes a real dataset comparable to a simulated one: same grid,
-    same stations, same camera angles.
-    """
-    import fabric_scanner as scanner
-
-    center = [float(v) for v in state.get("ur5_workspace_center", [-0.45, -0.08, 0.30])]
-    return scanner.build_plan(scanner_core.build_scanner_plan_args(state, center=center, model_curves=None))
+    """Builds the grid CapturePlan from the scanner grid settings."""
+    controller = state.get("ur5_controller")
+    joints = (
+        controller.robot.refresh().joints
+        if controller is not None and controller.robot.connected
+        else list(state.get("ur5_home_joints") or ur5_robot.DEFAULT_HOME_JOINTS)
+    )
+    settings = {
+        **_capture_settings(state),
+        "pattern": "grid",
+        "grid_rows": max(1, int(state.get("scanner_rows", 1))),
+        "grid_cols": max(1, int(state.get("scanner_cols", 1))),
+        "grid_views_per_station": max(1, int(state.get("scanner_angles", 3))),
+    }
+    return scan_geometry.build_capture_plan(joints, **settings)
 
 
 def _make_runner(state, controller, plan):
@@ -1315,8 +1369,21 @@ def draw_ur5_panel(state, renderer, window=None):
         controller = UR5ModeController(state, renderer.ctx, window)
         state.ur5_controller = controller
 
-    controller.update_preview()
+    controller.update_preview(renderer)
     _draw_ur5_controls_column(state, controller, renderer)
+
+
+def draw_splatting_workflow_section(state, renderer, window=None):
+    """3DGS dataset export, pose solver, and training workflow for Splatting mode."""
+    controller = state.get("ur5_controller")
+    if controller is None:
+        controller = UR5ModeController(state, renderer.ctx, window)
+        state.ur5_controller = controller
+    imgui.push_id("splat_workflow_panel")
+    if imgui.collapsing_header("Dataset, Poses & 3DGS Training##splat_workflow_hdr", imgui.TreeNodeFlags_.default_open):
+        gui_captures.draw_captures_section(state, controller, "Captured Scan Sessions")
+        _draw_splatting_body(state, controller)
+    imgui.pop_id()
 
 
 def draw_ur5_viewport(state, renderer, window=None):
@@ -1537,24 +1604,26 @@ def _draw_connection(state, controller):
 
     kind = _draw_transport_choice(state, connected)
     address_key = "teleop_address" if kind == "teleop" else "ur5_robot_ip"
-    label = "TeleopApp address" if kind == "teleop" else "Robot IP"
-    changed_address, address = imgui.input_text(f"{label}##ur5_address_{kind}", str(state.get(address_key, "")))
-    if changed_address:
-        state[address_key] = address
+    if kind != "sim":
+        label = "TeleopApp address" if kind == "teleop" else "Robot IP"
+        changed_address, address = imgui.input_text(f"{label}##ur5_address_{kind}", str(state.get(address_key, "")))
+        if changed_address:
+            state[address_key] = address
 
     if connected:
         if imgui.button("Disconnect##ur5_disconnect", (-1, 0)):
             controller.disconnect()
     else:
+        target_addr = "sim" if kind == "sim" else str(state.get(address_key, ""))
         if imgui.button("Connect##ur5_connect", (-1, 0)):
-            controller.connect(str(state.get(address_key, "")), kind)
+            controller.connect(target_addr, kind)
         blocking = controller.blocking_program
         if blocking is not None:
             imgui.text_colored(COLOR_WARN, blocking.describe()[0].upper() + blocking.describe()[1:])
             imgui.text_wrapped("Make sure TeleopApp is really closed first (check Task Manager for TeleopApp.exe) - "
                                "a hidden one would lose the arm mid-command. Stopping brings the arm to rest.")
             if imgui.button("Stop that program, then connect##ur5_stop_and_connect", (-1, 0)):
-                controller.stop_program_and_connect(str(state.get(address_key, "")), kind)
+                controller.stop_program_and_connect(target_addr, kind)
 
     state_now = robot.refresh()
     imgui.text("Status:")
@@ -1754,8 +1823,7 @@ def _settings_fabric_z(state, view):
     known = _measured_fabric_z(state)
     if known is not None:
         return known
-    mj, model, data, site_id = scan_geometry.load_model()
-    return scan_geometry.fabric_height(mj, model, data, site_id, float(state.get("teleop_subject_distance", 0.20)))
+    return scan_geometry.fabric_height(float(state.get("teleop_subject_distance", 0.20)))
 
 
 def _fabric_check(state):

@@ -18,14 +18,17 @@ watermarked so a synthetic frame can never be mistaken for a real capture.
 
 from __future__ import annotations
 
+import math
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+import scan_geometry
 
 
 DEFAULT_CAPTURE_SIZE = (1280, 720)
@@ -267,6 +270,132 @@ class SyntheticCameraBackend(CameraBackend):
         return f"Synthetic frames ({self.size[0]}x{self.size[1]})"
 
 
+class SimCameraBackend(CameraBackend):
+    """Simulated wrist camera rendering the 3D world from the robot's live 6-DoF pose."""
+
+    name = "sim"
+    is_real = False
+
+    def __init__(
+        self,
+        size=DEFAULT_CAPTURE_SIZE,
+        pose_provider: Callable[[], tuple[list[float], float, tuple[float, float, float]]] | None = None,
+    ):
+        self.size = (int(size[0]), int(size[1]))
+        self.pose_provider = pose_provider
+        self._lock = threading.Lock()
+        self._gl_frame: np.ndarray | None = None
+        self._gl_pose: np.ndarray | None = None
+        self._focus_auto = True
+        self._focus_value = 120.0
+
+    def open(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def set_focus(self, auto: bool, value: float) -> None:
+        self._focus_auto = bool(auto)
+        self._focus_value = float(value)
+
+    def update_gl_frame(self, frame_rgb: np.ndarray, pose: list[float] | np.ndarray) -> None:
+        arr = np.ascontiguousarray(frame_rgb, dtype=np.uint8)
+        with self._lock:
+            self._gl_frame = arr
+            self._gl_pose = np.asarray(pose, dtype=float).reshape(-1)[:6].copy()
+
+    def _current_pose_and_target(self) -> tuple[np.ndarray, float, np.ndarray]:
+        if self.pose_provider is not None:
+            try:
+                pose, hfov, target = self.pose_provider()
+                return (
+                    np.asarray(pose, dtype=float).reshape(-1)[:6],
+                    float(hfov),
+                    np.asarray(target, dtype=float).reshape(-1)[:3],
+                )
+            except Exception:
+                pass
+        return (
+            np.array([-0.45, -0.08, 0.25, math.pi, 0.0, 0.0], dtype=float),
+            55.0,
+            np.array([-0.45, -0.08, 0.0], dtype=float),
+        )
+
+    def read(self) -> np.ndarray | None:
+        pose, hfov, target = self._current_pose_and_target()
+        with self._lock:
+            gl_frame = self._gl_frame
+            gl_pose = self._gl_pose
+        if (
+            gl_frame is not None
+            and gl_pose is not None
+            and gl_frame.shape[1] == self.size[0]
+            and gl_frame.shape[0] == self.size[1]
+            and float(np.max(np.abs(pose - gl_pose))) <= 2e-3
+        ):
+            return gl_frame.copy()
+        return self._render_pinhole(pose, hfov, target)
+
+    def _render_pinhole(self, pose: np.ndarray, hfov_deg: float, target: np.ndarray) -> np.ndarray:
+        w, h = self.size
+        pos = pose[:3]
+        rot = scan_geometry.rotvec_to_matrix(pose[3:6])
+        fx = 0.5 * w / max(math.tan(math.radians(max(10.0, min(120.0, hfov_deg))) * 0.5), 1e-4)
+        fy = fx
+        cx, cy = 0.5 * w, 0.5 * h
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        dx = (xx - cx) / fx
+        dy = (yy - cy) / fy
+        dz = np.ones_like(dx)
+        rays = np.stack([dx, dy, dz], axis=-1) @ rot.T
+        rz = rays[:, :, 2]
+        plane_z = float(target[2])
+        valid = np.abs(rz) > 1e-5
+        t = np.where(valid, (plane_z - float(pos[2])) / np.where(valid, rz, -1.0), -1.0)
+        hit = valid & (t > 0.0)
+        wx = float(pos[0]) + t * rays[:, :, 0]
+        wy = float(pos[1]) + t * rays[:, :, 1]
+        u = wx - float(target[0])
+        v = wy - float(target[1])
+        in_swatch = hit & (np.abs(u) <= 0.12) & (np.abs(v) <= 0.12)
+        in_board = hit & (np.abs(u) <= 0.22) & (np.abs(v) <= 0.22)
+        stitch_w = 0.0045
+        row_h = 0.0035
+        su = u / stitch_w
+        sv = v / row_h
+        col_idx = np.floor(su).astype(np.int32)
+        row_idx = np.floor(sv).astype(np.int32)
+        pu = su - np.floor(su) - 0.5
+        pv = sv - np.floor(sv) - 0.5
+        yarn = (
+            np.cos(pu * 2.0 * math.pi) * 28.0
+            + np.sin((pv + 0.35 * np.sin(pu * math.pi)) * 2.0 * math.pi) * 22.0
+            + np.cos((u * 310.0 + v * 270.0)) * 9.0
+        )
+        stripe = ((row_idx // 3 + col_idx // 4) % 3).astype(np.float32)
+        r_sw = np.clip(148.0 + 26.0 * (stripe == 0) - 18.0 * (stripe == 2) + yarn, 20, 245)
+        g_sw = np.clip(122.0 + 18.0 * (stripe == 1) - 12.0 * (stripe == 0) + yarn * 0.9, 20, 245)
+        b_sw = np.clip(104.0 + 32.0 * (stripe == 2) - 16.0 * (stripe == 1) + yarn * 0.85, 20, 245)
+        sq = 0.024
+        bx = np.floor(u / sq).astype(np.int32)
+        by = np.floor(v / sq).astype(np.int32)
+        checker = ((bx + by) & 1).astype(np.float32)
+        board_val = np.where(checker > 0.5, 228.0, 42.0)
+        table_val = np.clip(74.0 + 8.0 * np.sin(wx * 25.0) * np.cos(wy * 25.0), 40.0, 110.0)
+        r = np.where(in_swatch, r_sw, np.where(in_board, board_val, table_val))
+        g = np.where(in_swatch, g_sw, np.where(in_board, board_val, table_val * 0.96))
+        b = np.where(in_swatch, b_sw, np.where(in_board, board_val, table_val * 0.90))
+        sky = 48.0
+        r = np.where(hit, r, sky)
+        g = np.where(hit, g, sky + 4.0)
+        b = np.where(hit, b, sky + 10.0)
+        return np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+    def describe(self) -> str:
+        return f"Simulated wrist camera ({self.size[0]}x{self.size[1]})"
+
+
 def opencv_available() -> bool:
     try:
         import cv2  # noqa: F401
@@ -414,6 +543,12 @@ def list_devices(max_devices: int = 10) -> list[dict[str, Any]]:
                 if misses >= 4:
                     break
     devices.append({
+        "backend": "sim",
+        "index": -1,
+        "label": "Simulated wrist camera (3D world)",
+        "is_real": False,
+    })
+    devices.append({
         "backend": "synthetic",
         "index": -1,
         "label": "Synthetic camera (no hardware)",
@@ -422,10 +557,17 @@ def list_devices(max_devices: int = 10) -> list[dict[str, Any]]:
     return devices
 
 
-def make_backend(spec: dict[str, Any] | None, size=DEFAULT_CAPTURE_SIZE) -> CameraBackend:
+def make_backend(
+    spec: dict[str, Any] | None,
+    size=DEFAULT_CAPTURE_SIZE,
+    pose_provider: Callable[[], tuple[list[float], float, tuple[float, float, float]]] | None = None,
+) -> CameraBackend:
     spec = spec or {}
-    if str(spec.get("backend", "")) == "opencv":
+    backend_name = str(spec.get("backend", ""))
+    if backend_name == "opencv":
         return OpenCVCameraBackend(int(spec.get("index", 0)), size=size)
+    if backend_name == "sim":
+        return SimCameraBackend(size=size, pose_provider=pose_provider)
     return SyntheticCameraBackend(size=size)
 
 

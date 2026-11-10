@@ -139,8 +139,8 @@ def _scanner_estimated_cell_colors(state):
 
 
 def _scanner_measured_cell_colors(state):
-    embedded = state.get('embedded_scanner')
-    result = getattr(embedded, "analysis_results", None) if embedded is not None else None
+    ctl = state.get('ur5_controller')
+    result = getattr(ctl, "analysis", None) if ctl is not None else None
     if not result or not result.get("cells"):
         return None
     rows = max(1, int(state.scanner_rows))
@@ -1142,13 +1142,8 @@ def _maybe_persist_scanner_state(state, force=False):
         logging.warning("scanner_core._maybe_persist_scanner_state: %s", exc)
 
 
-def _refresh_embedded_scanner_display_colors(state):
-    embedded = state.get('embedded_scanner')
-    if embedded is None or getattr(embedded, "plan", None) is None:
-        return
-    embedded.plan.display_batch_colors = _scanner_batch_colors_for_simulator(state)
-    if hasattr(embedded, "_render_frame"):
-        embedded._render_frame()
+def _refresh_embedded_scanner_display_colors(_state):
+    return
 
 
 def _puzzle_target_copies(state):

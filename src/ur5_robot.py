@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+import scan_geometry
+
 
 # UR controller enumerations, so status text reads in words rather than codes.
 ROBOT_MODES = {
@@ -92,8 +94,7 @@ MAX_ACCELERATION = 0.80
 # trade places. The camera looks straight down at the fabric from here, 20 cm above it,
 # which is why the capture check reads the fabric's height off this pose. It replaced the
 # upright [0, -90, 0, -90, 0, 0] candle, which looks sideways at nothing.
-DEFAULT_HOME_JOINTS = [-1.597935978566305, -1.6107450924315394, 1.5623295942889612,
-                       -1.615626951257223, -1.4477899710284632, -0.1366961638080042]
+DEFAULT_HOME_JOINTS = list(scan_geometry.DEFAULT_HOME_JOINTS)
 POSE_REACHED_TOL = 0.003
 POSE_REACHED_ROT_TOL = 0.05
 # Largest joint error, in radians, at which a joint move counts as arrived.
@@ -588,7 +589,149 @@ class DryRunTransport(UR5Transport):
         self._speed_scale = float(np.clip(float(fraction), 0.01, 1.0))
 
 
+class SimUR5Transport(UR5Transport):
+    """In-process simulated UR5e with URDF kinematics and smooth joint interpolation."""
+
+    name = "sim"
+    is_real = False
+
+    def __init__(self, max_joint_speed_deg: float = 45.0, floor_seconds: float = 0.08, tool_offset: float = 0.0306):
+        self.max_joint_speed_deg = float(max_joint_speed_deg)
+        self.floor_seconds = float(floor_seconds)
+        self.tool_offset = float(tool_offset)
+        self._joints = np.array(DEFAULT_HOME_JOINTS, dtype=float)
+        self._start_joints = self._joints.copy()
+        self._target_joints = self._joints.copy()
+        self._move_started = 0.0
+        self._move_duration = 0.0
+        self._connected = False
+        self._stopped = False
+        self._speed_scale = 1.0
+        self._pose_override: np.ndarray | None = None
+
+    def connect(self, ip: str = "sim") -> None:
+        self._connected = True
+        self._stopped = False
+
+    def disconnect(self) -> None:
+        self._connected = False
+        self._move_started = 0.0
+
+    def _advance(self) -> None:
+        if self._move_started <= 0.0:
+            return
+        elapsed = time.monotonic() - self._move_started
+        t = 1.0 if self._move_duration <= 0.0 else min(1.0, elapsed / self._move_duration)
+        smooth = t * t * (3.0 - 2.0 * t)
+        self._joints = self._start_joints + (self._target_joints - self._start_joints) * smooth
+        if t >= 1.0:
+            self._joints = self._target_joints.copy()
+            self._move_started = 0.0
+            self._move_duration = 0.0
+
+    def read_state(self) -> RobotState:
+        self._advance()
+        if self._pose_override is not None:
+            pose = self._pose_override
+        else:
+            cam_pos, cam_rot = scan_geometry.camera_pose(self._joints, self.tool_offset)
+            pose = np.r_[cam_pos, cam_rot]
+        return RobotState(
+            connected=self._connected,
+            robot_mode=READY_ROBOT_MODE if self._connected else 0,
+            safety_mode=3 if self._stopped else 1,
+            tcp_pose=[float(v) for v in pose],
+            joints=[float(v) for v in self._joints],
+            protective_stopped=self._stopped,
+            emergency_stopped=False,
+            program_running=self._move_started > 0.0,
+            speed_scale=self._speed_scale,
+            updated_at=time.monotonic(),
+        )
+
+    def set_joints_immediate(self, joints) -> None:
+        self._joints = np.asarray(joints, dtype=float).reshape(-1)[:6].copy()
+        self._start_joints = self._joints.copy()
+        self._target_joints = self._joints.copy()
+        self._move_started = 0.0
+        self._move_duration = 0.0
+        self._pose_override = None
+
+    def move_to_pose(self, pose, speed: float, acceleration: float) -> None:
+        if not self._connected:
+            raise RuntimeError("Not connected to the robot")
+        if self._stopped:
+            raise RuntimeError("Robot is in protective stop")
+        pose_arr = np.asarray(pose, dtype=float).reshape(-1)[:6]
+        flange_target = np.r_[
+            scan_geometry.flange_for_grasp(pose_arr[:3], pose_arr[3:6], self.tool_offset),
+            pose_arr[3:6],
+        ]
+        try:
+            joints, _, _ = scan_geometry.solve_ik(self._joints, flange_target, "sim")
+            self.move_to_joints(joints, speed, acceleration)
+            return
+        except Exception:
+            pass
+        self._pose_override = pose_arr.copy()
+        self._move_started = 0.0
+
+    def move_to_joints(self, joints, speed: float, acceleration: float) -> None:
+        if not self._connected:
+            raise RuntimeError("Not connected to the robot")
+        if self._stopped:
+            raise RuntimeError("Robot is in protective stop")
+        self._advance()
+        target = np.asarray(joints, dtype=float).reshape(-1)[:6].copy()
+        self._pose_override = None
+        self._start_joints = self._joints.copy()
+        self._target_joints = target
+        eff_speed = max(1.0, self.max_joint_speed_deg * self._speed_scale)
+        self._move_duration = scan_geometry.move_seconds(
+            self._start_joints, target, eff_speed, self.floor_seconds
+        )
+        if self._move_duration <= 1e-4 or float(np.max(np.abs(target - self._start_joints))) <= 1e-5:
+            self._joints = target
+            self._move_started = 0.0
+            self._move_duration = 0.0
+        else:
+            self._move_started = time.monotonic()
+
+    def ramp_for(self, joints) -> float:
+        eff_speed = max(1.0, self.max_joint_speed_deg * self._speed_scale)
+        return scan_geometry.move_seconds(self._joints, joints, eff_speed, self.floor_seconds)
+
+    def linked(self) -> bool:
+        return self._connected
+
+    def free_drive(self) -> None:
+        if not self._connected:
+            raise RuntimeError("Not connected to the robot")
+
+    def hold(self) -> None:
+        if not self._connected:
+            raise RuntimeError("Not connected to the robot")
+
+    def stop(self, deceleration: float = 2.0) -> None:
+        self._advance()
+        self._start_joints = self._joints.copy()
+        self._target_joints = self._joints.copy()
+        self._move_started = 0.0
+        self._move_duration = 0.0
+
+    def protective_stop(self) -> None:
+        self.stop()
+        self._stopped = True
+
+    def reset_stop(self) -> None:
+        self._stopped = False
+
+    def set_speed_scale(self, fraction: float) -> None:
+        self._speed_scale = float(np.clip(float(fraction), 0.01, 1.0))
+
+
 TRANSPORT_LABELS = {
+    "sim":     "Simulated UR5e",
     "rtde":    "UR5 over RTDE",
     "teleop":  "UR5 via TeleopApp",
     "dry-run": "Dry run (no hardware)",

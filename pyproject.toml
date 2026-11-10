@@ -12,9 +12,6 @@ dependencies = [
     "pillow>=12.2.0",
     "pyopengl>=3.1.10",
     "scipy>=1.17.1",
-    # The MuJoCo UR5e every capture path is solved and collision-checked against.
-    "mujoco>=3.2.7",
-    "robot-descriptions>=3.2.0",
     # UR5 Robot Mode's default transport speaks gRPC to CraftLabXRFleet's TeleopApp, whose
     # robot.proto stubs are regenerated into that checkout on connect. Generated stubs refuse
     # an older runtime than produced them, so these move together, at that project's floor.
