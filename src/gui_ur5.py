@@ -2978,7 +2978,7 @@ def _draw_splat_advanced(state, controller, session_id, folder, records, shown, 
                 if extras:
                     solve_folder = scans / f"combined_{time.strftime('%Y%m%d_%H%M%S')}"
                     solve_folder.mkdir(parents=True)
-                    write_json(solve_folder / "combined.json", {"sessions": [str(folder), *(str(scans / other) for other in extras)]})
+                    write_json(solve_folder / "combined.json", {"sessions": [folder.name, *extras]})
                 controller.robot_solver = _start_pose_solve(controller, solve_folder, count,
                                                             float(state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)),
                                                             COLMAP_DATASET_NAME)

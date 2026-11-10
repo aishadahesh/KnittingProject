@@ -240,6 +240,28 @@ def test_a_session_s_captures_are_its_sidecars_in_order_or_its_own_images(tmp_pa
     assert gui_captures.sessions(tmp_path) == ["ur5_b", "ur5_a"]
 
 
+
+def test_a_combined_session_finds_its_scans_under_robot_scans_whoever_wrote_it(tmp_path, monkeypatch):
+    import gui_captures
+    import paths
+
+    scans = tmp_path / "robot_scans"
+    capture = scans / "ur5_a"
+    capture.mkdir(parents=True)
+    image = capture / "ur5_0001.png"
+    Image.new("RGB", (8, 8)).save(image)
+    (capture / "ur5_0001.json").write_text(json.dumps({"path": str(image)}))
+    combined = scans / "ur5_a_rescan"
+    combined.mkdir()
+    # One entry as it is written now (a name), one as another machine wrote it (a full path there).
+    (combined / "combined.json").write_text(json.dumps({"sessions": ["ur5_a", r"C:\Users\someone\robot_scans\ur5_a"]}))
+    monkeypatch.setattr(paths, "ROBOT_SCANS_DIR", scans)
+    monkeypatch.setattr(paths.scan_session, "__defaults__", (scans,))
+
+    assert paths.scan_session("C:/Users/someone/projects/robot_scans/ur5_a") == capture
+    records = gui_captures.load_session(combined)
+    assert [r["combined_from"] for r in records] == ["ur5_a", "ur5_a"]
+
 # ============================================================================
 # The camera's image turn, measured from how the picture slides
 # ============================================================================
@@ -332,3 +354,16 @@ def test_a_huge_splat_is_sampled_down_for_the_viewer_but_keeps_its_count(tmp_pat
     splat = gaussian_splatting.load_splat_ply(tmp_path / "big.ply")
     assert splat["count"] == 5000
     assert len(splat["positions"]) == len(splat["colours"]) == len(splat["opacity"]) == 1000
+
+
+def test_a_scan_copied_from_another_machine_finds_its_pictures_beside_their_sidecars(tmp_path):
+    import gui_captures
+
+    session = tmp_path / "ur5_a"
+    session.mkdir()
+    Image.new("RGB", (8, 8)).save(session / "ur5_0001.png")
+    (session / "ur5_0001.json").write_text(json.dumps({"path": r"C:\Users\someone\robot_scans\ur5_a\ur5_0001.png",
+                                                       "detected_image": r"C:\Users\someone\robot_scans\ur5_a\gone.jpg"}))
+    record, = gui_captures.load_session(session)
+    assert record["path"] == str(session / "ur5_0001.png")
+    assert record["detected_image"] == r"C:\Users\someone\robot_scans\ur5_a\gone.jpg"   # not there either: left as written

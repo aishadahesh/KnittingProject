@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import paths  # noqa: E402
 from persistence import write_json
 
 # Sparse points with a larger reprojection error than this are left out of the plane fit.
@@ -190,7 +191,7 @@ def main() -> None:
     # stands for the sessions it lists, whose pictures are solved together under their session's name.
     combined = session / "combined.json"
     settings = json.loads(combined.read_text()) if combined.is_file() else {}
-    folders = [Path(folder) for folder in settings["sessions"]] if settings else [session]
+    folders = [paths.scan_session(folder) for folder in settings["sessions"]] if settings else [session]
     # A combined solve may say which pictures to leave out: video frames (no pose, often blurred)
     # and anything below a sharpness, so that several sessions' worth stays matchable in an hour.
     skip_video = bool(settings.get("skip_video", False))

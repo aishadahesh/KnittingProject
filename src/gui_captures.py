@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import logging
 import json
+import subprocess
+import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +23,7 @@ from imgui_bundle import imgui
 from PIL import Image
 
 import gaussian_splatting
+import paths
 import scan_geometry
 import splat_gl
 from rendering import draw_fitted_texture, upload_rgb_texture
@@ -95,6 +98,13 @@ def load_session(folder: Path) -> list[dict]:
         except Exception:
             continue
         if isinstance(record, dict) and record.get("path"):
+            # A sidecar stores its picture's full path on the machine that took it; a scan copied
+            # from elsewhere (Drive) finds the picture beside the sidecar instead, by name.
+            for key in ("path", "detected_image"):
+                if record.get(key) and not Path(record[key]).exists():
+                    beside = sidecar.parent / PureWindowsPath(str(record[key])).name
+                    if beside.exists():
+                        record[key] = str(beside)
             records.append(record)
     if records:
         return records
@@ -108,13 +118,13 @@ def load_session(folder: Path) -> list[dict]:
             settings = {}
         skip_video = bool(settings.get("skip_video", False))
         least = float(settings.get("min_sharpness", 0.0))
-        for other in settings.get("sessions", []):
-            for record in load_session(Path(other)):
+        for other in map(paths.scan_session, settings.get("sessions", [])):
+            for record in load_session(other):
                 if skip_video and record.get("camera_position") is None:
                     continue
                 if least and record.get("sharpness") is not None and float(record["sharpness"]) < least:
                     continue
-                records.append({**record, "combined_from": Path(other).name})
+                records.append({**record, "combined_from": other.name})
         return records
     return [{"path": str(path)} for path in sorted(folder.glob("*.png")) if not any(tag in path.name for tag in NOT_CAPTURES)]
 
@@ -308,8 +318,15 @@ def draw_captures_section(state, controller, header: str) -> None:
     if record.get("blurred"):
         imgui.text_colored(COLOR_WARN, "Blurred - below the sharpness threshold even after retakes")
     draw_viewpoint_sketch(view.records, view.index)
+    if imgui.small_button("Replay on the 3D arm##gallery_replay"):
+        # Its own process: MuJoCo's viewer runs its own window and GL context.
+        subprocess.Popen([sys.executable, str(paths.SCRIPTS_DIR / "replay_session.py"), view.session, "--picture", str(view.index + 1)],
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Opens the MuJoCo UR5e posed as the arm was for each picture of this session, picture beside it.\n"
+                          "Page Down / Page Up step through the pictures, Enter plays them.")
 
-    first = int(np.clip(view.index - THUMBS_SHOWN // 2, 0, max(0, len(view.records) - THUMBS_SHOWN)))
+    first =int(np.clip(view.index - THUMBS_SHOWN // 2, 0, max(0, len(view.records) - THUMBS_SHOWN)))
     for position, index in enumerate(range(first, min(len(view.records), first + THUMBS_SHOWN))):
         path = view.records[index]["path"]
         if not Path(path).exists():

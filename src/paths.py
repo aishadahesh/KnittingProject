@@ -13,7 +13,7 @@ and images in ``assets/``.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 # This file is src/paths.py, so the project root is two levels up.
@@ -65,3 +65,13 @@ def resolve(path) -> Path:
     """
     candidate = Path(path)
     return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
+
+
+def scan_session(entry, scans: Path = ROBOT_SCANS_DIR) -> Path:
+    """The scan folder a combined.json "sessions" entry names, always under this machine's robot_scans.
+
+    Entries are folder names. Older files hold the full path on whichever machine wrote them (so a scan
+    copied from Drive pointed at someone else's disk); only the folder name is used, and PureWindowsPath
+    reads both kinds of slash.
+    """
+    return Path(scans) / PureWindowsPath(str(entry)).name

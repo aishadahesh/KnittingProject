@@ -30,6 +30,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import paths
+
 REMOTE = "gdrive"
 FOLDER = "KnittingProject_data"
 REBUILDABLE = {".ckpt", ".db"}
@@ -71,8 +73,7 @@ def scan_folders(output: Path) -> list[Path]:
     combined = scan / "combined.json"
     if combined.is_file():
         for session in json.loads(combined.read_text(encoding="utf-8")).get("sessions", []):
-            path = Path(session).resolve()
-            path = path if path.is_dir() else scan.parent / path.name
+            path = paths.scan_session(session, scan.parent)
             if path.is_dir() and path != scan:
                 folders.append(path)
     return folders + [scan]

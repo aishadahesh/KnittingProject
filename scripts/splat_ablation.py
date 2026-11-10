@@ -54,7 +54,7 @@ def solve_poses(sessions: list[Path], poses: Path, fov: float) -> None:
         print(f"Reusing the poses in {poses} (delete it to solve again)", flush=True)
         return
     poses.mkdir(parents=True, exist_ok=True)
-    write_json(poses / "combined.json", {"sessions": [str(session) for session in sessions]})
+    write_json(poses / "combined.json", {"sessions": [session.name for session in sessions]})
     subprocess.run([sys.executable, str(SCRIPTS / "solve_poses.py"), "--session", str(poses), "--output", str(poses), "--fov", str(fov)], check=True)
 
 
@@ -102,6 +102,10 @@ def main() -> None:
         sessions += sorted(path for path in scans.glob("ur5_*") if path.is_dir() and path not in sessions)[-args.latest:]
     if not sessions:
         raise SystemExit("name scans with --sessions or take the newest with --latest")
+    # combined.json names its scans by folder under robot_scans, so a scan elsewhere cannot be named there.
+    outside = [str(s) for s in sessions if s.resolve().parent != scans.resolve()]
+    if outside:
+        raise SystemExit(f"scans must be folders under {scans}: {', '.join(outside)}")
     work = Path(args.out or scans / ("ablation_" + "_".join(s.name.removeprefix("ur5_") for s in sessions)[:80]))
     poses = work / "poses"
     solve_poses(sessions, poses, args.fov)

@@ -10,10 +10,10 @@
     "loop_height_1": 3.908830165863037,
     "loop_height_2": 3.908830165863037,
     "loop_height_3": 3.908830165863037,
-    "loop_height_4": 3.908830165863037,
-    "loop_height_5": 3.908830165863037,
-    "loop_height_6": 3.908830165863037,
-    "loop_height_7": 3.908830165863037
+    "loop_height_4": 3.0,
+    "loop_height_5": 3.0,
+    "loop_height_6": 3.0,
+    "loop_height_7": 3.0
   },
   "bitmap": [
     [
@@ -540,8 +540,8 @@
         -0.05677986145019531
       ],
       [
-        -0.6602203249931335,
-        14.703657150268555,
+        -1.1553139686584473,
+        15.036029815673828,
         -0.05677983537316322
       ],
       [
@@ -792,9 +792,9 @@
         0.2862745225429535
       ],
       [
-        0.7647058963775635,
-        0.15294118225574493,
-        0.13725490868091583
+        0.35,
+        0.18,
+        0.08
       ],
       [
         0.85,
@@ -854,8 +854,6 @@
     "render_light_intensity": 1.0199999809265137,
     "render_ao_strength": 0.0,
     "render_ao_radius": 0.009999999776482582,
-    "mi_cam_dist_mult": 1.100000023841858,
-    "mi_cam_fov": 40.0,
     "view_fov": 45.0,
     "viewport_zoom": 1.0,
     "viewport_pan": [
@@ -895,13 +893,9 @@
       3.2765116691589355
     ],
     "model_t": [
-      -26.1363525390625,
-      -35.25068664550781,
-      0.08473598957061768
-    ],
-    "bitmap_size": [
-      7,
-      3
+      -4.306507110595703,
+      -8.694716453552246,
+      0.08473597466945648
     ],
     "single_model_color": [
       0.8500000238418579,
@@ -920,8 +914,8 @@
     ],
     "scanner_fabric_width": 0.34,
     "scanner_fabric_length": 0.24,
-    "scanner_rows": 4,
-    "scanner_cols": 5,
+    "scanner_rows": 1,
+    "scanner_cols": 1,
     "scanner_angles": 6,
     "scanner_speed": 1.5,
     "scanner_dwell": 0.0,
@@ -1006,24 +1000,24 @@
         3.908830165863037
       ],
       [
-        3.908830165863037,
-        3.908830165863037,
-        3.908830165863037
+        3.0,
+        3.0,
+        3.0
       ],
       [
-        3.908830165863037,
-        3.908830165863037,
-        3.908830165863037
+        3.0,
+        3.0,
+        3.0
       ],
       [
-        3.908830165863037,
-        3.908830165863037,
-        3.908830165863037
+        3.0,
+        3.0,
+        3.0
       ],
       [
-        3.908830165863037,
-        3.908830165863037,
-        3.908830165863037
+        3.0,
+        3.0,
+        3.0
       ]
     ],
     "loop_height_overrides": [
@@ -1070,8 +1064,8 @@
     "scanner_pattern_density": 0.62,
     "scanner_pattern_rows": 4,
     "scanner_pattern_cols": 2,
-    "scanner_pattern_repeat_rows": 3,
-    "scanner_pattern_repeat_cols": 3,
+    "scanner_pattern_repeat_rows": 1,
+    "scanner_pattern_repeat_cols": 1,
     "scanner_repeat_spacing_x": 1.0,
     "scanner_repeat_spacing_y": 1.0,
     "scanner_capture_mode": "natural",
@@ -1098,7 +1092,7 @@
       0.8399999737739563
     ],
     "ur5_robot_ip": "192.168.0.101",
-    "ur5_transport": "rtde",
+    "ur5_transport": "teleop",
     "ur5_speed_limit": 0.25,
     "ur5_dwell": 0.2,
     "ur5_save_images": true,
