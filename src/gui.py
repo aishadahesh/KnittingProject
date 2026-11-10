@@ -3,9 +3,9 @@
 Module layout (dependencies point one way, no cycles):
 
     gui.py             this file -- imgui panels and per-mode UI
-      |- scanner_core      scanner/puzzle logic, no imgui
-      |- gui_ur5           UR5 Robot Mode UI           -> scanner_core
-      `- gui_model         Model Mode UI               -> strand_equations
+      |- scanner_core      scanner logic, no imgui
+      |- gui_ur5           Capture Mode UI             -> scanner_core
+      `- gui_model         Splatting Mode UI           -> strand_equations
 
 `app.py` imports draw_menu_bar / draw_sidebar / draw_viewport /
 draw_orbit_viewport from here. Names moved into scanner_core kept their original
@@ -26,18 +26,17 @@ from imgui_bundle import imgui, imguizmo
 
 from rendering import (draw_fitted_texture, project_to_screen, transform_points,
                        upload_rgb_texture)
-from fabric_scanner import clamp_capture_size
+from scan_geometry import clamp_capture_size
 import paths
 from gui_database import _draw_database_summary_page, draw_database_viewport
 from scanner_core import (
     _clamp_scanner_selected_cell, _ensure_scanner_shared_colors,
     _maybe_persist_scanner_state,
-    _puzzle_capture_rect,
     _refresh_embedded_scanner_display_colors, _scanner_batch_texture_size, _scanner_capture_image_size,
     _scanner_display_batch_colors, _scanner_estimated_cell_colors,
     _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
     _scanner_storage,
-    _set_scanner_estimated_batch_color, _upload_puzzle_texture,
+    _set_scanner_estimated_batch_color,
 )
 
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
@@ -157,97 +156,6 @@ def _draw_scanner_batch_color_grid(state, title=None):
             f"Selected {stage} R{selected_r + 1} C{selected_c + 1}: "
             f"RGB {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f}{suffix}"
         )
-
-
-def _draw_puzzle_capture_overlay(state, image, rect):
-    if image is None or rect is None:
-        return
-    x, y, w, h = rect
-    sx = float(w) / max(float(image.size[0]), 1.0)
-    sy = float(h) / max(float(image.size[1]), 1.0)
-    dl = imgui.get_window_draw_list()
-
-    for point in state.get('puzzle_edge_landmarks', []):
-        px = x + float(point.get("x", 0)) * sx
-        py = y + float(point.get("y", 0)) * sy
-        color = imgui.get_color_u32((0.0, 1.0, 0.55, 0.95))
-        dl.add_circle_filled(imgui.ImVec2(px, py), 3.2, color)
-
-    for point in state.get('puzzle_projected_points', []):
-        px = x + float(point.get("x", 0)) * sx
-        py = y + float(point.get("y", 0)) * sy
-        color = imgui.get_color_u32((1.0, 1.0, 1.0, 0.90))
-        dl.add_circle_filled(imgui.ImVec2(px, py), 2.4, color)
-
-    selected = state.get('puzzle_selected_pixel', None)
-    if selected is not None:
-        px = x + float(selected.get("x", 0)) * sx
-        py = y + float(selected.get("y", 0)) * sy
-        color = imgui.get_color_u32((1.0, 0.80, 0.10, 1.0))
-        dl.add_circle(imgui.ImVec2(px, py), 7.0, color, 16, 2.0)
-        dl.add_line(imgui.ImVec2(px - 10.0, py), imgui.ImVec2(px + 10.0, py), color, 1.5)
-        dl.add_line(imgui.ImVec2(px, py - 10.0), imgui.ImVec2(px, py + 10.0), color, 1.5)
-
-
-def _draw_puzzle_glue_edge_overlay(image, rect, info):
-    """Draws a line at every pasted tile boundary so individual copies (and any
-    seam mismatch between them) are visible for a sanity check."""
-    if image is None or rect is None or not info:
-        return
-    tile_w = int(info.get("tile_w", 0))
-    tile_h = int(info.get("tile_h", 0))
-    cols = int(info.get("cols", 1))
-    rows = int(info.get("rows", 1))
-    if tile_w <= 0 or tile_h <= 0:
-        return
-    x, y, w, h = rect
-    sx = float(w) / max(float(image.size[0]), 1.0)
-    sy = float(h) / max(float(image.size[1]), 1.0)
-    dl = imgui.get_window_draw_list()
-    color = imgui.get_color_u32((1.0, 0.15, 0.75, 0.85))
-
-    for col_i in range(cols + 1):
-        px = x + float(col_i * tile_w) * sx
-        dl.add_line(imgui.ImVec2(px, y), imgui.ImVec2(px, y + h), color, 1.5)
-    for row_i in range(rows + 1):
-        py = y + float(row_i * tile_h) * sy
-        dl.add_line(imgui.ImVec2(x, py), imgui.ImVec2(x + w, py), color, 1.5)
-
-
-def _draw_puzzle_capture_widget(state, image, texture, avail_w, avail_h):
-    rect = draw_fitted_texture(texture.glo, image.size[0], image.size[1], avail_w, avail_h, flip_y=True)
-    if rect is None:
-        return
-    _draw_puzzle_capture_overlay(state, image, rect)
-    x, y, w, h = rect
-    io = imgui.get_io()
-    mx, my = float(io.mouse_pos.x), float(io.mouse_pos.y)
-    hovered = imgui.is_item_hovered() and x <= mx <= x + w and y <= my <= y + h
-    if hovered and imgui.is_mouse_clicked(0):
-        px = int(np.clip(round((mx - x) / max(w, 1.0) * (image.size[0] - 1)), 0, image.size[0] - 1))
-        py = int(np.clip(round((my - y) / max(h, 1.0) * (image.size[1] - 1)), 0, image.size[1] - 1))
-        rgb = image.getpixel((px, py))[:3]
-        state.puzzle_selected_pixel = {"x": px, "y": py, "rgb": [int(v) for v in rgb]}
-
-    selected = state.get('puzzle_selected_pixel', None)
-    if selected is not None:
-        rgb = selected.get("rgb", [0, 0, 0])
-        imgui.color_button(
-            "##puzzle_selected_pixel_color",
-            (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0),
-            imgui.ColorEditFlags_.no_tooltip,
-            imgui.ImVec2(34, 22),
-        )
-        imgui.same_line()
-        imgui.text(
-            f"Pixel ({int(selected.get('x', 0))}, {int(selected.get('y', 0))}) "
-            f"RGB {rgb[0]}, {rgb[1]}, {rgb[2]}"
-        )
-    else:
-        imgui.text_disabled("Click the captured image to inspect a pixel RGB value.")
-
-
-# %% GUI DRAWING PANELS ────────────────────────────────────────────────────────
 
 
 def draw_menu_bar(state):
@@ -453,7 +361,7 @@ def _set_app_mode(state, mode):
     if current_mode == mode and mode != 'scan':
         return
     state.mode_epoch = int(state.get('mode_epoch', 0)) + 1
-    if current_mode == 'edit' and state.get('swatch_cells'):
+    if current_mode in ('edit', 'model') and state.get('swatch_cells'):
         state.save_active_swatch()
     if mode not in ('scan', 'capture'):
         controller = state.get('ur5_controller')
@@ -471,11 +379,9 @@ def _set_app_mode(state, mode):
         state.scanner_preview_rows = max(1, int(state.scanner_rows))
         state.scanner_preview_cols = max(1, int(state.scanner_cols))
         _clamp_scanner_selected_cell(state)
-    elif mode == 'model':
-        state.scanner_preview_grid_enabled = False
-        state.display_copies = np.array([0, 0], dtype=np.int32)
     else:
-        state.workflow_step = 0
+        if mode == 'edit':
+            state.workflow_step = 0
         state.scanner_preview_grid_enabled = False
         state.display_copies = np.array([0, 0], dtype=np.int32)
         if bool(state.get('_swatch_selection_dirty', False)):
@@ -1025,13 +931,13 @@ def _draw_active_swatch_bar(state):
             prev_idx = (cur_idx - 1) % total
             nr, nc = prev_idx // cols, prev_idx % cols
             state.scanner_selected_cell = [nr, nc]
-            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) == 'edit'))
+            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) in ('edit', 'model')))
         imgui.same_line()
         if imgui.small_button(">##swatch_next"):
             next_idx = (cur_idx + 1) % total
             nr, nc = next_idx // cols, next_idx % cols
             state.scanner_selected_cell = [nr, nc]
-            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) == 'edit'))
+            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) in ('edit', 'model')))
     imgui.separator()
 
 GEOMETRY_PARAM_LABELS = {
@@ -1196,6 +1102,10 @@ def _draw_appearance_controls(state, rebuild_current_mesh, is_knit=True):
 
 def draw_sidebar(state, renderer, window=None):
     _apply_ui_theme(state)
+    req_mode = state.get('request_app_mode')
+    if req_mode:
+        state.request_app_mode = None
+        _set_app_mode(state, req_mode)
     current_mode = _normalize_app_mode(state.get('app_mode', 'edit'), state)
     reset = bool(state.get('_layout_reset_pending', False)) or not bool(state.get('_sidebar_sized_once', False))
     cond = imgui.Cond_.always if reset else imgui.Cond_.first_use_ever
@@ -1220,8 +1130,8 @@ def draw_sidebar(state, renderer, window=None):
         return controller
 
     def start_scanner_process(force=False):
-        mode = str(state.scanner_execution_mode)
-        controller = ensure_ur5_controller(auto_connect_sim=(mode == "simulation"))
+        use_sim = str(state.get('ur5_transport', 'sim')) == 'sim' or str(state.get('scanner_execution_mode', 'simulation')) == 'simulation'
+        controller = ensure_ur5_controller(auto_connect_sim=use_sim)
         runner = controller.runner
         if runner is not None and runner.running:
             if runner.paused:
@@ -1242,7 +1152,7 @@ def draw_sidebar(state, renderer, window=None):
         _clamp_scanner_selected_cell(state)
         state.save_params(state.save_path, silent=True)
         if not controller.robot.connected:
-            if mode == "simulation":
+            if use_sim:
                 controller.connect_sim()
             else:
                 state.scanner_status = "Connect the real robot and camera in Capture mode first."
@@ -1619,39 +1529,39 @@ def draw_sidebar(state, renderer, window=None):
                 state.rebuild_spline_mesh(preserve_model_placement=False)
                 state.scanner_status = "Scan layout reset"
 
-            capture_mode = str(state.get('scanner_capture_mode', 'natural'))
-            focused = capture_mode == "focused"
-            mode_is_robot = str(state.scanner_execution_mode) == "robot"
-            if not single_workflow:
-                changed_mode, new_mode_robot = imgui.checkbox("Run real UR5 robot##scanner_mode", mode_is_robot)
-                if changed_mode:
-                    state.scanner_execution_mode = "robot" if new_mode_robot else "simulation"
-            changed_speed, new_speed = imgui.slider_float("Simulation speed##scanner_speed", float(state.scanner_speed), 0.05, 8.0, "%.2f")
-            if changed_speed:
-                state.scanner_speed = float(new_speed)
+            if controller is not None and controller.robot.connected:
+                robot_desc = "Real UR5e" if controller.robot.is_real else "Simulated UR5e"
+            else:
+                robot_desc = "Simulated UR5e (ready on start)"
+            if controller is not None and controller.camera is not None and controller.camera.running:
+                cam_desc = controller.camera.describe()
+            else:
+                cam_desc = "Simulated wrist camera (3D world)"
+            imgui.text_disabled(f"Active: {robot_desc} | {cam_desc}")
+            if imgui.small_button("Robot & Camera Setup (Capture Mode)##scan_to_capture"):
+                _set_app_mode(state, 'capture')
+                imgui.end()
+                return
             if not single_workflow:
                 changed_dwell, new_dwell = imgui.slider_float("Dwell per view (s)##scanner_dwell", float(state.scanner_dwell), 0.0, 2.0, "%.2f")
                 if changed_dwell:
                     state.scanner_dwell = float(new_dwell)
-            _, state.scanner_add_camera = imgui.checkbox("Show scanner camera##scanner_camera", bool(state.scanner_add_camera))
-            imgui.text("Camera image mode")
-            if imgui.radio_button("Single-batch focused##scanner_capture_focused", focused and not single_workflow):
+                    state.ur5_dwell = float(new_dwell)
+            _, state.scanner_add_camera = imgui.checkbox("Show camera frusta##scanner_camera", bool(state.scanner_add_camera))
+            imgui.text("Capture workflow")
+            if imgui.radio_button("Full grid scan path##scanner_capture_path", not single_workflow):
                 state.scanner_camera_workflow = 'path'
-                state.scanner_capture_mode = "focused"
-            if imgui.radio_button("Natural robot camera##scanner_capture_natural", not focused and not single_workflow):
-                state.scanner_camera_workflow = 'path'
-                state.scanner_capture_mode = "natural"
-            if imgui.radio_button("Single image capture##scanner_capture_single", single_workflow):
+            imgui.same_line()
+            if imgui.radio_button("Single swatch view##scanner_capture_single", single_workflow):
                 state.scanner_camera_workflow = 'single'
-                state.scanner_status = "Single image capture: click a mini-fabric in the 3D view"
+                state.scanner_status = "Single swatch view: click a swatch in the 3D view"
             single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
             if not single_workflow:
-                _, state.scanner_save_images = imgui.checkbox("Save scanner images##scanner_images", bool(state.scanner_save_images))
+                changed_save, save_imgs = imgui.checkbox("Save captured images##scanner_images", bool(state.scanner_save_images))
+                if changed_save:
+                    state.scanner_save_images = bool(save_imgs)
+                    state.ur5_save_images = bool(save_imgs)
                 if bool(state.scanner_save_images):
-                    every_view = str(state.scanner_image_every) == "view"
-                    changed_every, every_view = imgui.checkbox("Save every angle view##scanner_every", every_view)
-                    if changed_every:
-                        state.scanner_image_every = "view" if every_view else "station"
                     capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
                     changed_scan_res, scan_capture_width = imgui.slider_int(
                         "Full scan capture resolution##scanner_capture_resolution",
@@ -1666,7 +1576,7 @@ def draw_sidebar(state, renderer, window=None):
                         state.ur5_capture_width = scan_capture_width
                     imgui.text_disabled(f"Full scanner output: {scan_capture_width} x {scan_capture_height}")
             if single_workflow:
-                imgui.text_disabled("Click the fabric, adjust angle/zoom, then capture one image.")
+                imgui.text_disabled("Click a swatch in the 3D view, adjust angle, then capture one image.")
                 max_row = max(1, int(state.scanner_rows))
                 max_col = max(1, int(state.scanner_cols))
                 max_angle = max(1, int(state.scanner_angles))
@@ -1684,20 +1594,6 @@ def draw_sidebar(state, renderer, window=None):
                 )
                 if changed_single_angle:
                     state.scanner_single_angle = int(single_angle)
-                changed_camera_zoom, camera_zoom = imgui.slider_float(
-                    "Robot camera zoom##single_capture_zoom",
-                    float(np.clip(float(state.get('scanner_camera_zoom', 1.0)), 0.25, 5.0)),
-                    0.25,
-                    5.0,
-                    "%.2fx",
-                )
-                if changed_camera_zoom:
-                    state.scanner_camera_zoom = float(camera_zoom)
-                if imgui.small_button("Zoom in##single_capture_zoom_in"):
-                    state.scanner_camera_zoom = float(min(5.0, float(state.get('scanner_camera_zoom', 1.0)) * 1.15))
-                imgui.same_line()
-                if imgui.small_button("Zoom out##single_capture_zoom_out"):
-                    state.scanner_camera_zoom = float(max(0.25, float(state.get('scanner_camera_zoom', 1.0)) / 1.15))
                 current_capture_width, _current_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
                 current_capture_width = int(np.clip(current_capture_width, 320, 4096))
                 changed_capture_res, capture_width = imgui.slider_int(
@@ -1711,8 +1607,19 @@ def draw_sidebar(state, renderer, window=None):
                 if changed_capture_res:
                     state.scanner_single_capture_width = capture_width
                 imgui.text_disabled(f"Single capture output: {capture_width} x {capture_height}")
-                if imgui.button("Preview Selected Target##single_capture_preview", (-1, 0)):
+                if imgui.button("Aim Wrist Camera at Target##single_capture_preview", (-1, 0)):
                     ctrl = ensure_ur5_controller(auto_connect_sim=True)
+                    try:
+                        plan = gui_ur5.build_scan_plan(state)
+                        r_idx = int(state.get('scanner_single_row', 1)) - 1
+                        c_idx = int(state.get('scanner_single_col', 1)) - 1
+                        a_idx = int(state.get('scanner_single_angle', 1)) - 1
+                        station = r_idx * max(1, int(state.scanner_cols)) + c_idx
+                        vp_idx = min(len(plan.viewpoints) - 1, max(0, station * max(1, int(state.scanner_angles)) + a_idx))
+                        if plan.viewpoints and ctrl.robot.ready():
+                            ctrl.robot.move_to_joints(plan.viewpoints[vp_idx].joints)
+                    except Exception:
+                        pass
                     ctrl.update_preview(renderer)
                     state.scanner_status = f"Previewing R{int(state.scanner_single_row)} C{int(state.scanner_single_col)}"
                 if imgui.button("Capture Image##single_capture_save", (-1, 0)):
@@ -2214,41 +2121,6 @@ def _draw_scan_gripper_camera_canvas(state, renderer, height=0):
         )
 
 
-def _draw_puzzle_inspector_canvas(state, renderer, height=0):
-    imgui.text("Captured Frame & Landmarks")
-    imgui.same_line()
-    imgui.text_disabled("(White: loop pts | Green: edge landmarks | Click to inspect RGB)")
-    image = state.get('puzzle_capture_image', None)
-    if image is None:
-        imgui.text_disabled("No puzzle frame captured yet. Click 'Capture geometry preview' in Knitting Control.")
-        return
-    texture = _upload_puzzle_texture(state, renderer, 'capture')
-    if texture is None:
-        return
-    avail = imgui.get_content_region_avail()
-    w = max(120, int(avail.x))
-    h = max(120, int(height if height > 0 else avail.y - 36))
-    _draw_puzzle_capture_widget(state, image, texture, w, h)
-
-
-def _draw_puzzle_glue_canvas(state, renderer, height=0):
-    imgui.text("Seamless Glued Tile")
-    glued_image = state.get('puzzle_glued_image', None)
-    info = state.get('puzzle_glue_info', {}) or {}
-    if glued_image is None:
-        imgui.text_disabled("No seamless tile built yet. Click 'Build seamless tile' in Knitting Control.")
-        return
-    glue_texture = _upload_puzzle_texture(state, renderer, 'glued')
-    if glue_texture is None:
-        return
-    avail = imgui.get_content_region_avail()
-    w = max(120, int(avail.x))
-    h = max(120, int(height if height > 0 else avail.y - 8))
-    glue_rect = draw_fitted_texture(glue_texture.glo, glued_image.size[0], glued_image.size[1], w, h, flip_y=True)
-    if bool(state.get('puzzle_glue_highlight_edges', False)):
-        _draw_puzzle_glue_edge_overlay(glued_image, glue_rect, info)
-
-
 def _draw_orbit_canvas(state, window):
     orbit_renderer = getattr(state, 'orbit_renderer', None)
     orbit_camera = getattr(state, 'orbit_camera', None)
@@ -2320,32 +2192,14 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.begin("3D View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
 
     current_mode = _normalize_app_mode(state.get('app_mode', 'edit'), state)
+    controller = state.get('ur5_controller')
+    if controller is not None:
+        controller.update_preview(renderer)
+
     if current_mode == 'scan' and str(state.get('_scan_subview', 'scan')) == 'database':
         draw_database_viewport(state, renderer)
         imgui.end()
         return
-
-    if current_mode == 'model':
-        gui_model.draw_model_viewport(state, renderer)
-        imgui.end()
-        return
-
-    if current_mode == 'capture':
-        show_scene = bool(state.get('ur5_show_scene', False))
-        imgui.text("Capture Workspace:")
-        imgui.same_line()
-        if imgui.radio_button("Camera & Capture Path##ur5_vp_cam", not show_scene):
-            state.ur5_show_scene = False
-            show_scene = False
-        imgui.same_line()
-        if imgui.radio_button("3D World & Robot Cell##ur5_vp_scene", show_scene):
-            state.ur5_show_scene = True
-            show_scene = True
-        imgui.separator()
-        if not show_scene:
-            gui_ur5.draw_ur5_viewport(state, renderer, window)
-            imgui.end()
-            return
 
     split_right_mode = None
     if current_mode == 'edit':
@@ -2384,6 +2238,45 @@ def draw_viewport(state, renderer, ref_tex, window):
             return
         if scan_vp == 'split':
             split_right_mode = 'scan_robot'
+    elif current_mode == 'capture':
+        cap_vp = str(state.get('_capture_vp_mode', 'split' if bool(state.get('ur5_show_scene', True)) else 'workspace'))
+        imgui.text("Capture View:")
+        for key, label in (
+            ('split', "Split: 3D World + Camera & Path"),
+            ('3d', "3D World Only"),
+            ('workspace', "Camera & Path Only"),
+        ):
+            imgui.same_line()
+            if imgui.radio_button(f"{label}##cap_vp_{key}", cap_vp == key):
+                state._capture_vp_mode = key
+                state.ur5_show_scene = (key != 'workspace')
+                cap_vp = key
+        if cap_vp == 'workspace':
+            imgui.separator()
+            gui_ur5.draw_ur5_viewport(state, renderer, window)
+            imgui.end()
+            return
+        if cap_vp == 'split':
+            split_right_mode = 'capture_workspace'
+    elif current_mode == 'model':
+        model_vp = str(state.get('_model_vp_mode', 'split'))
+        imgui.text("Splatting View:")
+        for key, label in (
+            ('split', "Split: 3D World + Splat Inspector"),
+            ('splat', "Splat Inspector Only"),
+            ('3d', "3D World Only"),
+        ):
+            imgui.same_line()
+            if imgui.radio_button(f"{label}##model_vp_{key}", model_vp == key):
+                state._model_vp_mode = key
+                model_vp = key
+        if model_vp == 'splat':
+            imgui.separator()
+            gui_model.draw_model_viewport(state, renderer)
+            imgui.end()
+            return
+        if model_vp == 'split':
+            split_right_mode = 'splat_inspector'
 
     imgui.text("3D World Viewport")
     imgui.same_line()
@@ -2404,6 +2297,16 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.model_rot = np.zeros(3, dtype=np.float32)
         state.model_scale = np.ones(3, dtype=np.float32)
         state.center_model_in_viewport()
+    if current_mode in ('edit', 'model'):
+        imgui.same_line()
+        ch_nb, show_nb = imgui.checkbox("Neighbor Swatches##vp_neighbors", bool(state.get('world_show_neighbor_swatches', False)))
+        if ch_nb:
+            state.world_show_neighbor_swatches = bool(show_nb)
+            state.rebuild_spline_mesh(preserve_model_placement=True)
+        imgui.same_line()
+        ch_rb, show_rb = imgui.checkbox("Table & Robot##vp_robot", bool(state.get('world_show_robot', True)))
+        if ch_rb:
+            state.world_show_robot = bool(show_rb)
     imgui.same_line()
     imgui.text_disabled("LMB: move | RMB/MMB: orbit | Wheel: zoom")
 
@@ -2428,8 +2331,8 @@ def draw_viewport(state, renderer, ref_tex, window):
     # plan the arm is executing describing geometry that no longer exists.
     scanner_stage_active = current_mode in ('scan', 'capture')
     scanner_estimate_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
-    edit_controls_active = not scanner_stage_active
-    if scanner_stage_active:
+    edit_controls_active = current_mode == 'edit'
+    if not edit_controls_active:
         state.bbox_active_handle = -1
         state.bbox_hover_handle = -1
         state.spline_grab_active = False
@@ -2534,13 +2437,12 @@ def draw_viewport(state, renderer, ref_tex, window):
         model_mat   = model_mat,
         world_scene = _build_world_scene_dict(
             state,
-            show_robot=scanner_stage_active,
+            show_robot=scanner_stage_active or bool(state.get('world_show_robot', True)),
             show_frusta=scanner_stage_active,
-            show_board=True,
+            show_board=scanner_stage_active or bool(state.get('world_show_robot', True)),
         ),
     )
 
-    # Display FBO
     drawn_rect = draw_fitted_texture(
         renderer.texture_id,
         disp_w,
@@ -2555,24 +2457,6 @@ def draw_viewport(state, renderer, ref_tex, window):
         origin_x, origin_y, draw_w, _ = drawn_rect
         state.vp_origin = np.array([origin_x, origin_y], dtype=np.float32)
         state.vp_scale = float(draw_w / max(float(disp_w), 1.0))
-        if str(state.get('app_mode', 'edit')) == 'puzzle':
-            x, y, w, h = drawn_rect
-            rx, ry, rw, rh = _puzzle_capture_rect(state)
-            fx0 = x + rx * w
-            fy0 = y + ry * h
-            fx1 = x + (rx + rw) * w
-            fy1 = y + (ry + rh) * h
-            dl = imgui.get_window_draw_list()
-            shade = imgui.get_color_u32((0.0, 0.0, 0.0, 0.34))
-            frame = imgui.get_color_u32((1.0, 0.78, 0.08, 1.0))
-            dl.add_rect_filled(imgui.ImVec2(x, y), imgui.ImVec2(x + w, fy0), shade)
-            dl.add_rect_filled(imgui.ImVec2(x, fy1), imgui.ImVec2(x + w, y + h), shade)
-            dl.add_rect_filled(imgui.ImVec2(x, fy0), imgui.ImVec2(fx0, fy1), shade)
-            dl.add_rect_filled(imgui.ImVec2(fx1, fy0), imgui.ImVec2(x + w, fy1), shade)
-            dl.add_rect(imgui.ImVec2(fx0, fy0), imgui.ImVec2(fx1, fy1), frame, 0.0, 2.5, 0)
-            label_bg = imgui.get_color_u32((0.0, 0.0, 0.0, 0.70))
-            dl.add_rect_filled(imgui.ImVec2(fx0, fy0 - 22.0), imgui.ImVec2(fx0 + 148.0, fy0), label_bg)
-            dl.add_text(imgui.ImVec2(fx0 + 6.0, fy0 - 18.0), frame, "Puzzle capture area")
     is_hovered = imgui.is_item_hovered()
     state.mouse_in_vp = is_hovered
     mx, my = imgui.get_mouse_pos()
@@ -3308,6 +3192,10 @@ def draw_viewport(state, renderer, ref_tex, window):
                 _draw_orbit_canvas(state, window)
             elif split_right_mode == 'scan_robot':
                 _draw_scan_gripper_camera_canvas(state, renderer)
+            elif split_right_mode == 'capture_workspace':
+                gui_ur5.draw_ur5_viewport(state, renderer, window)
+            elif split_right_mode == 'splat_inspector':
+                gui_model.draw_model_viewport(state, renderer)
         imgui.end_child()
 
     imgui.end()

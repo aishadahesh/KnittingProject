@@ -1,17 +1,10 @@
-"""Scanner and puzzle logic, with no UI attached.
+"""Scanner logic, with no UI attached.
 
-Scan Mode, Puzzle Mode and UR5 Robot Mode all need the same things: the fabric
-palette and per-cell colours, the pattern grid geometry, the tile renderer that
-turns one knitted pattern into a seamless repeat, and the on-disk caches around
-them. None of it draws anything.
+Scan Mode and Capture Mode share the fabric palette and per-cell colours, the
+pattern grid geometry, the tile renderer that turns one knitted pattern into a
+seamless repeat, and the on-disk caches around them. None of it draws anything.
 
-Keeping it out of gui.py is what lets UR5 Mode use it. gui_ur5 previously
-imported gui from inside three functions to reach eleven of these helpers --
-a cycle it had to dodge at call time because gui imports gui_ur5. With them
-here, that import goes away.
-
-Nothing in this module may import imgui; a test enforces it. The names are
-re-imported into gui.py, so call sites there are unchanged.
+Nothing in this module may import imgui; a test enforces it.
 """
 
 import logging
@@ -23,15 +16,12 @@ import shutil
 import time
 from pathlib import Path
 
-from types import SimpleNamespace
-
 import numpy as np
 from PIL import Image, ImageDraw
 
-from fabric_scanner import _loop_heights_for_random_bitmap, clamp_capture_size
-from knitting_core import build_parametric_control_rows
-from rendering import pil_to_texture, project_to_screen
+from rendering import project_to_screen
 from persistence import write_json
+from scan_geometry import clamp_capture_size
 
 
 def _default_scanner_palette_from_model(state):
@@ -984,118 +974,6 @@ def _scanner_material_uniforms(state):
     return material_uniforms
 
 
-def _normalize_scanner_curves(curves):
-    """Scan Mode's pattern curves, normalized by fabric_scanner's own helper.
-
-    This was a second copy of that function; the fill constant it hardcoded was
-    already fabric_scanner.SCAN_PATTERN_FILL to the digit.
-    """
-    import fabric_scanner as scanner
-
-    return scanner.normalize_model_curves(curves, fallback=[])
-
-
-def _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed, density, repeat_rows=3, repeat_cols=3):
-    rng = np.random.default_rng(int(seed))
-    density = float(np.clip(density, 0.05, 0.95))
-    bitmap = (rng.random((pattern_rows, pattern_cols)) < density).astype(np.float32)
-    if not np.any(bitmap > 0.5):
-        bitmap[rng.integers(0, pattern_rows), rng.integers(0, pattern_cols)] = 1.0
-
-    if hasattr(state, '_scanner_template'):
-        try:
-            template = state._scanner_template()
-            params = np.asarray(template.get('params', state.params), dtype=np.float32).copy()
-            source = np.asarray(template.get('loop_heights', np.empty((0, 0))), dtype=np.float32)
-        except Exception:
-            params = np.asarray(state.params, dtype=np.float32)
-            source = np.empty((0, 0), dtype=np.float32)
-    else:
-        params = np.asarray(state.params, dtype=np.float32)
-        source = np.empty((0, 0), dtype=np.float32)
-
-    ctrl_rows = build_parametric_control_rows(
-        params,
-        bitmap,
-        state._pidx,
-        state._lh_idx,
-        state.samples_per_loop,
-        loop_heights=_loop_heights_for_random_bitmap(params, bitmap, getattr(state, '_lh_idx', ()), source),
-    )
-    return _normalize_scanner_curves(ctrl_rows)
-
-
-def _generate_scanner_random_patterns(state):
-    rows = max(1, int(state.scanner_rows))
-    cols = max(1, int(state.scanner_cols))
-    pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-    repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-    seed = int(state.get('scanner_random_seed', 1))
-    density = float(state.get('scanner_pattern_density', 0.62))
-    return [
-        _random_bitmap_model_curves(state, pattern_rows, pattern_cols, seed + cell * 9973, density, repeat_rows, repeat_cols)
-        for cell in range(rows * cols)
-    ]
-
-
-def build_scanner_plan_args(state, **overrides) -> SimpleNamespace:
-    """Shared argument namespace for fabric_scanner.build_plan across Scan Mode and UR5 Mode."""
-    import fabric_scanner as scanner
-
-    pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-    repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-    spacing_x, spacing_y = _scanner_repeat_spacing(state)
-    batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
-    capture_width, capture_height = _scanner_capture_image_size(state, 'scanner_capture_width')
-    single_capture_width, single_capture_height = _scanner_capture_image_size(state, 'scanner_single_capture_width')
-    cell_model_curves = _generate_scanner_random_patterns(state)
-    fields = dict(
-        rows=int(state.scanner_rows),
-        cols=int(state.scanner_cols),
-        number_of_angles=int(state.scanner_angles),
-        width=float(max(0.06, int(state.scanner_cols) * pattern_cols * 0.045)),
-        length=float(max(0.06, int(state.scanner_rows) * pattern_rows * 0.040)),
-        edge_margin=0.004,
-        square_margin=0.006,
-        surface_wave=0.003,
-        view_radius=0.018,
-        angle_lift=0.014,
-        approach_lift=0.040,
-        center=[-0.45, -0.08, 0.30],
-        max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-        speed=float(state.scanner_speed),
-        dwell=float(state.scanner_dwell),
-        add_camera=bool(state.scanner_add_camera),
-        save_images=bool(state.scanner_save_images),
-        image_dir=str((Path(state.project_root) / 'scanner_images').resolve()),
-        image_every=str(state.scanner_image_every),
-        capture_mode=str(state.get('scanner_capture_mode', 'natural')),
-        camera_zoom=float(state.get('scanner_camera_zoom', 1.0)),
-        capture_image_size=(int(capture_width), int(capture_height)),
-        single_capture_image_size=(single_capture_width, single_capture_height),
-        palette=_scanner_base_palette(state),
-        cell_color_sets=_scanner_shared_cell_color_sets(state),
-        model_json=str(state.save_path),
-        model_curves=cell_model_curves[0] if cell_model_curves else None,
-        cell_model_curves=cell_model_curves,
-        random_patterns=True,
-        pattern_rows=int(pattern_rows),
-        pattern_cols=int(pattern_cols),
-        pattern_repeat_rows=int(repeat_rows),
-        pattern_repeat_cols=int(repeat_cols),
-        pattern_repeat_spacing_x=float(spacing_x),
-        pattern_repeat_spacing_y=float(spacing_y),
-        batch_texture_width=int(batch_texture_width),
-        batch_texture_height=int(batch_texture_height),
-        pattern_density=float(state.get('scanner_pattern_density', 0.62)),
-        random_seed=int(state.get('scanner_random_seed', 1)),
-        scanner_lighting=_scanner_lighting_settings(state),
-        display_batch_colors=_scanner_batch_colors_for_simulator(state),
-    )
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
 def _clamp_scanner_selected_cell(state):
     rows = max(1, int(state.scanner_rows))
     cols = max(1, int(state.scanner_cols))
@@ -1144,142 +1022,6 @@ def _maybe_persist_scanner_state(state, force=False):
 
 def _refresh_embedded_scanner_display_colors(_state):
     return
-
-
-def _puzzle_target_copies(state):
-    copies_x = int(np.clip(int(state.get('puzzle_copies_x', 5)), 1, 9))
-    copies_y = int(np.clip(int(state.get('puzzle_copies_y', 5)), 1, 9))
-    if copies_x % 2 == 0:
-        copies_x += 1
-    if copies_y % 2 == 0:
-        copies_y += 1
-    return copies_x, copies_y
-
-
-def _puzzle_apply_geometry_copies(state, preserve=True):
-    copies_x, copies_y = _puzzle_target_copies(state)
-    state.display_copies = np.array([(copies_x - 1) // 2, (copies_y - 1) // 2], dtype=np.int32)
-    state.scanner_preview_grid_enabled = False
-    state.rebuild_spline_mesh(preserve_model_placement=preserve)
-
-
-def _set_puzzle_capture_rect(state, rect):
-    x, y, w, h = [float(v) for v in rect]
-    x = float(np.clip(x, 0.0, 0.95))
-    y = float(np.clip(y, 0.0, 0.95))
-    w = float(np.clip(w, 0.05, 1.0 - x))
-    h = float(np.clip(h, 0.05, 1.0 - y))
-    state.puzzle_capture_rect = [x, y, w, h]
-
-
-def _puzzle_capture_geometry_image(state, renderer):
-    """Reads back the actual rendered 3D viewport (same pixels shown behind the
-    'Puzzle capture area' frame) and overlays real spline control points projected
-    with the same camera/model matrices used to render that frame."""
-    vp_w = int(getattr(renderer, "vp_w", 0))
-    vp_h = int(getattr(renderer, "vp_h", 0))
-    if vp_w < 2 or vp_h < 2 or getattr(renderer, "color_tex", None) is None:
-        return None, [], []
-
-    raw = renderer.color_tex.read()
-    full_image = Image.frombytes("RGBA", (vp_w, vp_h), raw).convert("RGB")
-    full_image = full_image.transpose(Image.FLIP_TOP_BOTTOM)
-
-    model_mat = state.current_model_matrix()
-    mvp = (state.camera.mvp(vp_w, vp_h) @ model_mat).astype(np.float32)
-
-    projected_points = []
-    for verts, row_idx in _puzzle_tiled_control_points(state):
-        pix = _puzzle_project_points(verts, mvp, vp_w, vp_h)
-        for px, py in pix:
-            projected_points.append({"x": int(round(float(px))), "y": int(round(float(py))), "row": int(row_idx)})
-
-    landmarks = []
-    if projected_points:
-        xs = np.array([p["x"] for p in projected_points], dtype=np.float32)
-        ys = np.array([p["y"] for p in projected_points], dtype=np.float32)
-        x_min, x_max = float(xs.min()), float(xs.max())
-        y_min, y_max = float(ys.min()), float(ys.max())
-        for x in (x_min, x_max):
-            for y in np.linspace(y_min, y_max, 9):
-                landmarks.append({"x": int(round(x)), "y": int(round(float(y))), "kind": "x-edge"})
-        for y in (y_min, y_max):
-            for x in np.linspace(x_min, x_max, 9):
-                landmarks.append({"x": int(round(float(x))), "y": int(round(y)), "kind": "y-edge"})
-
-    rx, ry, rw, rh = _puzzle_capture_rect(state)
-    crop_box = (
-        int(round(rx * vp_w)),
-        int(round(ry * vp_h)),
-        int(round((rx + rw) * vp_w)),
-        int(round((ry + rh) * vp_h)),
-    )
-    crop_box = (
-        int(np.clip(crop_box[0], 0, vp_w - 1)),
-        int(np.clip(crop_box[1], 0, vp_h - 1)),
-        int(np.clip(crop_box[2], crop_box[0] + 1, vp_w)),
-        int(np.clip(crop_box[3], crop_box[1] + 1, vp_h)),
-    )
-    cropped = full_image.crop(crop_box)
-    x0, y0, x1, y1 = crop_box
-
-    def adjust_points(items):
-        adjusted = []
-        for item in items:
-            px = int(item.get("x", -1))
-            py = int(item.get("y", -1))
-            if x0 <= px < x1 and y0 <= py < y1:
-                out = dict(item)
-                out["x"] = px - x0
-                out["y"] = py - y0
-                adjusted.append(out)
-        return adjusted
-
-    return cropped, adjust_points(projected_points), adjust_points(landmarks)
-
-
-def _puzzle_detect_colors(image, count=6):
-    if image is None:
-        return []
-    count = max(1, int(count))
-    arr = np.asarray(image.convert("RGB"), dtype=np.uint8).reshape(-1, 3)
-    bg = np.array([18, 23, 31], dtype=np.int16)
-    mask = np.linalg.norm(arr.astype(np.int16) - bg[None, :], axis=1) > 24.0
-    pixels = arr[mask]
-    if pixels.size == 0:
-        return []
-    quantized = (pixels // 16) * 16
-    unique, counts = np.unique(quantized, axis=0, return_counts=True)
-    order = np.argsort(-counts)[:count]
-    return [
-        {"rgb": [int(v) for v in unique[i].tolist()], "count": int(counts[i])}
-        for i in order
-    ]
-
-
-def _upload_puzzle_texture(state, renderer, slot):
-    """Cache one of Puzzle Mode's preview images as a GL texture.
-
-    `slot` names the pair of state keys -- 'capture' or 'glued'. These were two
-    functions identical but for that word. The cache key is the image's identity
-    and size, so a rebuilt image uploads and an unchanged one does not.
-    """
-    image = state.get(f'puzzle_{slot}_image', None)
-    if image is None:
-        return None
-    texture = state.get(f'puzzle_{slot}_texture', None)
-    key = (id(image), image.size)
-    if texture is not None and state.get(f'puzzle_{slot}_texture_key') == key:
-        return texture
-    if texture is not None:
-        try:
-            texture.release()
-        except Exception as exc:
-            logging.warning("scanner_core._upload_puzzle_texture: %s", exc)
-    texture = pil_to_texture(renderer.ctx, image)
-    state[f'puzzle_{slot}_texture'] = texture
-    state[f'puzzle_{slot}_texture_key'] = key
-    return texture
 
 
 # Scan tiles survive between sessions on disk. Entering Scan Mode re-renders

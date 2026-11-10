@@ -735,7 +735,8 @@ class MeshRenderer:
             else:
                 color = [0.8, 0.2, 0.2]
             self.meshes.append((vao, outline_vao, depth_vao, len(tris) * 3, color, row_idx))
-            self.mesh_pick_data.append((v, row_idx))
+            if meta is None or not bool(meta[i].get('neighbor_swatch', False)):
+                self.mesh_pick_data.append((v, row_idx))
 
     @staticmethod
     def _row_visible(row_idx, visible_rows):
@@ -1077,7 +1078,9 @@ class MeshRenderer:
 
         if draw_frusta and world_scene.get("show_frusta", True):
             line_verts = []
-            plan_poses = world_scene.get("capture_plan_poses") or []
+            plan_poses = world_scene.get("capture_plan_poses")
+            if plan_poses is None:
+                plan_poses = []
             prev_pt = None
             for p in plan_poses:
                 pose_arr = np.asarray(p, dtype=np.float32).reshape(-1)
@@ -1134,6 +1137,7 @@ class MeshRenderer:
         material_uniforms,
         visible_rows=None,
         model_mat=None,
+        intrinsics=None,
     ):
         out_w = max(16, int(out_w))
         out_h = max(16, int(out_h))
@@ -1167,10 +1171,34 @@ class MeshRenderer:
         view[1, 3] = -float(np.dot(up, eye_gl))
         view[2, 3] = float(np.dot(forward, eye_gl))
 
-        aspect = float(out_w) / float(out_h)
-        half_w_tan = math.tan(math.radians(max(10.0, min(120.0, float(hfov_deg)))) * 0.5)
-        vfov_rad = 2.0 * math.atan(half_w_tan / max(aspect, 1e-4))
-        proj = perspective(math.degrees(vfov_rad), aspect, 0.05, 500.0)
+        if intrinsics is None:
+            import hand_eye
+            measured = hand_eye.load_intrinsics()
+            if measured is not None:
+                intrinsics = hand_eye.intrinsics_for(out_w, out_h, measured)
+        elif "fx" in intrinsics and "fl_x" not in intrinsics:
+            import hand_eye
+            intrinsics = hand_eye.intrinsics_for(out_w, out_h, intrinsics)
+
+        near, far = 0.05, 500.0
+        if isinstance(intrinsics, dict) and "fl_x" in intrinsics:
+            fl_x = float(intrinsics["fl_x"])
+            fl_y = float(intrinsics.get("fl_y", fl_x))
+            cx = float(intrinsics.get("cx", out_w * 0.5))
+            cy = float(intrinsics.get("cy", out_h * 0.5))
+            proj = np.zeros((4, 4), dtype=np.float32)
+            proj[0, 0] = 2.0 * fl_x / float(out_w)
+            proj[0, 2] = 1.0 - 2.0 * cx / float(out_w)
+            proj[1, 1] = 2.0 * fl_y / float(out_h)
+            proj[1, 2] = 2.0 * cy / float(out_h) - 1.0
+            proj[2, 2] = (far + near) / (near - far)
+            proj[2, 3] = (2.0 * far * near) / (near - far)
+            proj[3, 2] = -1.0
+        else:
+            aspect = float(out_w) / float(out_h)
+            half_w_tan = math.tan(math.radians(max(10.0, min(120.0, float(hfov_deg)))) * 0.5)
+            vfov_rad = 2.0 * math.atan(half_w_tan / max(aspect, 1e-4))
+            proj = perspective(math.degrees(vfov_rad), aspect, near, far)
         view_proj = proj @ view
         mvp = (view_proj @ model_mat).astype(np.float32)
         mv = (view @ model_mat).astype(np.float32)
@@ -1211,8 +1239,39 @@ class MeshRenderer:
 
         raw = self.wrist_fbo.read(components=3, dtype='f1')
         self.ctx.screen.use()
-        img = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3))
-        return np.ascontiguousarray(np.flipud(img))
+        img = np.ascontiguousarray(np.flipud(np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3))))
+        if isinstance(intrinsics, dict):
+            k1 = float(intrinsics.get("k1", 0.0))
+            k2 = float(intrinsics.get("k2", 0.0))
+            k3 = float(intrinsics.get("k3", 0.0))
+            p1 = float(intrinsics.get("p1", 0.0))
+            p2 = float(intrinsics.get("p2", 0.0))
+            if any(abs(v) > 1e-7 for v in (k1, k2, k3, p1, p2)):
+                img = self._apply_lens_distortion(img, out_w, out_h, fl_x, fl_y, cx, cy, k1, k2, k3, p1, p2)
+        return img
+
+    def _apply_lens_distortion(self, img, out_w, out_h, fl_x, fl_y, cx, cy, k1, k2, k3, p1, p2):
+        key = (out_w, out_h, round(fl_x, 3), round(fl_y, 3), round(cx, 3), round(cy, 3),
+               round(k1, 6), round(k2, 6), round(k3, 6), round(p1, 6), round(p2, 6))
+        cached = getattr(self, '_wrist_distort_cache', None)
+        if cached is None or cached[0] != key:
+            v_grid, u_grid = np.mgrid[0:out_h, 0:out_w].astype(np.float32)
+            xd = (u_grid - cx) / max(fl_x, 1e-4)
+            yd = (v_grid - cy) / max(fl_y, 1e-4)
+            x, y = xd.copy(), yd.copy()
+            for _ in range(4):
+                r2 = x * x + y * y
+                radial = np.maximum(1.0 + k1 * r2 + k2 * (r2 ** 2) + k3 * (r2 ** 3), 1e-4)
+                dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+                dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+                x = (xd - dx) / radial
+                y = (yd - dy) / radial
+            u_src = np.clip(np.rint(fl_x * x + cx).astype(np.int32), 0, out_w - 1)
+            v_src = np.clip(np.rint(fl_y * y + cy).astype(np.int32), 0, out_h - 1)
+            self._wrist_distort_cache = (key, v_src, u_src)
+        else:
+            _, v_src, u_src = cached
+        return np.ascontiguousarray(img[v_src, u_src])
 
 # %% IMAGE TEXTURE HELPER ─────────────────────────────────────────────────────
 

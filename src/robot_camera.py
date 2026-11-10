@@ -329,10 +329,9 @@ class SimCameraBackend(CameraBackend):
             gl_pose = self._gl_pose
         if (
             gl_frame is not None
-            and gl_pose is not None
             and gl_frame.shape[1] == self.size[0]
             and gl_frame.shape[0] == self.size[1]
-            and float(np.max(np.abs(pose - gl_pose))) <= 2e-3
+            and (gl_pose is None or float(np.max(np.abs(pose - gl_pose))) <= 2e-2)
         ):
             return gl_frame.copy()
         return self._render_pinhole(pose, hfov, target)

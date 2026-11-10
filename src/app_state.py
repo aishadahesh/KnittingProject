@@ -55,12 +55,9 @@ class AppState:
             return {k: AppState._clone(x) for k, x in v.items()}
         return v
 
-    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None, puzzle_renderer=None):
+    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None):
         self.camera = camera
         self.renderer = renderer
-        # Dedicated GPU scene for Puzzle Mode. Keeping this renderer distinct is
-        # what makes Scan/Puzzle isolation structural instead of timing-based.
-        self.puzzle_renderer = puzzle_renderer
         # Optional second view. rebuild_spline_mesh uploads to state.renderer
         # only, so the orbit renderer has to be fed explicitly there -- without
         # that it draws an empty scene, which is the same failure mode as a
@@ -179,6 +176,9 @@ class AppState:
         # 6. Direct assignments for types that _coerce would get wrong
         state_defaults['_row_starts'] = [0]
         state_defaults['swatch_cells'] = {}
+        state_defaults['swatch_session_id'] = ""
+        state_defaults['swatch_splat_path'] = ""
+        state_defaults['swatch_fitted_model'] = None
 
         super().__setattr__('_state_defaults', state_defaults)
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}
@@ -216,7 +216,7 @@ class AppState:
     # Live objects rather than state: they must bypass _data so they are never
     # cloned, snapshotted, undone or written to params.json.
     _DIRECT_ATTRS = (
-        'camera', 'renderer', 'puzzle_renderer',
+        'camera', 'renderer',
         'orbit_camera', 'orbit_renderer', '_data',
     )
 
@@ -427,6 +427,9 @@ class AppState:
         'fabric_type',
         'crochet_params',
         'crochet_stitches',
+        'swatch_session_id',
+        'swatch_splat_path',
+        'swatch_fitted_model',
     )
 
     def _swatch_key(self, row: int, col: int) -> str:
@@ -457,6 +460,9 @@ class AppState:
         self.scanner_selected_row = int(row)
         self.scanner_selected_col = int(col)
         key = self._swatch_key(row, col)
+        self.swatch_session_id = ""
+        self.swatch_splat_path = ""
+        self.swatch_fitted_model = None
         if key in cells:
             entry = cells[key]
             for k, v in entry.items():
@@ -754,6 +760,40 @@ class AppState:
                 copied_meta['tile_y'] = y_tile
                 copied_meta['stitched_x_copies'] = len(x_tiles)
                 display_meta.append(copied_meta)
+        if bool(self.get('world_show_neighbor_swatches', False)):
+            scanner_cols = max(1, int(self.get('scanner_cols', 1)))
+            scanner_rows = max(1, int(self.get('scanner_rows', 1)))
+            sel_r = int(self.get('scanner_selected_row', 0))
+            sel_c = int(self.get('scanner_selected_col', 0))
+            base_bounds = self._display_mesh_bounds(verts_list)
+            if base_bounds is not None and (scanner_rows > 1 or scanner_cols > 1):
+                min_v, max_v = base_bounds
+                grid_x = max(float(max_v[0] - min_v[0]) - 2.0 * SCANNER_TILE_INSET_X * radius, radius) * max(1, len(x_tiles))
+                grid_y = max(float(max_v[1] - min_v[1]) - 2.0 * SCANNER_TILE_INSET_Y * radius, radius) * max(1, len(y_tiles))
+                tile_bounds = (
+                    base_bounds[0] + np.array([radius * SCANNER_TILE_INSET_X, radius * SCANNER_TILE_INSET_Y, 0.0], dtype=np.float32),
+                    base_bounds[1] - np.array([radius * SCANNER_TILE_INSET_X, radius * SCANNER_TILE_INSET_Y, 0.0], dtype=np.float32),
+                )
+                for y_tile in range(scanner_rows):
+                    for x_tile in range(scanner_cols):
+                        if (y_tile, x_tile) == (sel_r, sel_c):
+                            continue
+                        cell_index = y_tile * scanner_cols + x_tile
+                        offset = np.array([(x_tile - sel_c) * grid_x, (y_tile - sel_r) * grid_y, 0.0], dtype=np.float32)
+                        cell_parts, cell_meta = self._scanner_pattern_meshes(cell_index, tile_bounds)
+                        for curve_idx, ((verts, n_points), part_meta) in enumerate(zip(cell_parts, cell_meta)):
+                            base_row = int(part_meta.get('row', curve_idx)) % row_count
+                            translated = np.asarray(verts, dtype=np.float32) + offset
+                            display_vl.append((translated.astype(np.float32), int(n_points)))
+                            display_fl.extend(compute_knitting_faces(seg, [(translated, int(n_points))]))
+                            display_meta.append({
+                                'row': base_row,
+                                'base_row': base_row,
+                                'tile_x': x_tile,
+                                'tile_y': y_tile,
+                                'scanner_cell': cell_index,
+                                'neighbor_swatch': True,
+                            })
         return display_vl, display_fl, display_meta
 
     def _display_copy_z_period(self, verts_list, depth_gap):
@@ -942,9 +982,7 @@ class AppState:
             self.sim_L0 = np.array([])
 
     def active_scene_renderer(self):
-        """Renderer owned by the mode currently shown in the 3D viewport."""
-        if str(self.get('app_mode', 'edit')) == 'puzzle' and self.puzzle_renderer is not None:
-            return self.puzzle_renderer
+        """Renderer owned by the 3D world viewport."""
         return self.renderer
 
     def rebuild_spline_mesh(self, preserve_model_placement=True, target_renderer=None):
@@ -1339,17 +1377,9 @@ class AppState:
     _SNAPSHOT_EXCLUDE = frozenset({
         'render_tex', 'render_result', 'undo_stack',
         'ur5_controller', 'scanner_storage', 'scanner_process',
-        # Mode workspaces are containers for snapshots, not model fields. They
-        # must never be copied into the snapshots they contain.
-        'puzzle_model_snapshot', 'puzzle_initial_snapshot', 'puzzle_undo_stack',
         'workspace_model_snapshot', 'workspace_undo_stack',
         'single_capture_job', 'single_capture_job_seq',
         'mode_epoch',
-        # Which mode the user is looking at is not part of the model, and
-        # restoring it moved them without going through _set_app_mode -- so the
-        # mode they left was never torn down and the one they landed in was
-        # never set up. Reset from Puzzle Mode silently returned to Edit Mode
-        # with Puzzle's geometry still applied, and undo could do the same.
         'app_mode',
     })
 
@@ -1409,53 +1439,6 @@ class AppState:
 
     def capture_initial_state(self):
         super().__setattr__('_initial_snapshot', self.snapshot_state())
-        # Puzzle starts from its bitmap and parameters, not from the tuned
-        # control rows stored in initial_params.json. Scan also uses that file
-        # as its fabric template and carries random patterns through per-cell
-        # loop heights; copying the saved geometry made an all-green Puzzle
-        # bitmap display height patterns that looked like Scan samples.
-        #
-        # Build Puzzle's canonical baseline once, then put the normal initial
-        # model back verbatim. Later mode switches preserve Puzzle edits from
-        # this clean baseline instead of rebuilding them away.
-        initial_snapshot = self._initial_snapshot
-        self.loop_heights = np.empty((0, 0), dtype=np.float32)
-        self.loop_height_overrides = np.zeros(tuple(int(v) for v in self.bitmap_size), dtype=bool)
-        self.rebuild_spline_from_params()
-        self.puzzle_model_snapshot = self.snapshot_state()
-        self.puzzle_initial_snapshot = self._clone(self.puzzle_model_snapshot)
-        self.restore_snapshot(initial_snapshot, target_renderer=self.renderer)
-
-    def enter_puzzle_workspace(self):
-        """Swap the independent Puzzle model into the shared render pipeline."""
-        if self.get('workspace_model_snapshot') is not None:
-            return
-
-        self.workspace_model_snapshot = self.snapshot_state()
-        self.workspace_undo_stack = self.undo_stack
-
-        puzzle_snapshot = self.get('puzzle_model_snapshot')
-        if puzzle_snapshot is None:
-            puzzle_snapshot = getattr(self, '_initial_snapshot', None)
-        if puzzle_snapshot is None:
-            puzzle_snapshot = self.snapshot_state()
-
-        self.undo_stack = self.get('puzzle_undo_stack', [])
-        self.restore_snapshot(puzzle_snapshot, target_renderer=self.puzzle_renderer)
-
-    def leave_puzzle_workspace(self):
-        """Store Puzzle edits and restore the non-Puzzle model verbatim."""
-        workspace_snapshot = self.get('workspace_model_snapshot')
-        if workspace_snapshot is None:
-            return
-
-        self.puzzle_model_snapshot = self.snapshot_state()
-        self.puzzle_undo_stack = self.undo_stack
-        workspace_undo_stack = self.get('workspace_undo_stack')
-        self.undo_stack = workspace_undo_stack if workspace_undo_stack is not None else []
-        self.restore_snapshot(workspace_snapshot, target_renderer=self.renderer)
-        self.workspace_model_snapshot = None
-        self.workspace_undo_stack = None
 
     def reset(self, unit_model=False):
         """Unified reset entry point, matching feat/simulation's call style.
@@ -1473,12 +1456,6 @@ class AppState:
             self.reset_to_initial()
 
     def reset_to_initial(self):
-        if str(self.get('app_mode', 'edit')) == 'puzzle' and self.get('puzzle_initial_snapshot') is not None:
-            self.push_undo("Reset Puzzle")
-            anchored = self.restore_snapshot(self.puzzle_initial_snapshot)
-            self.status_msg = _with_anchor_note('Reset Puzzle to its initial pattern', anchored)
-            return
-
         initial_snapshot = getattr(self, '_initial_snapshot', None)
         if initial_snapshot is not None:
             self.push_undo("Reset all")
@@ -1710,11 +1687,6 @@ class AppState:
 
     def maybe_autosave(self):
         if not self.autosave_enabled:
-            return
-        # The normal params file is the Edit/Scan workspace. Puzzle has an
-        # independent in-memory model and must never overwrite that file merely
-        # because its panel is being drawn.
-        if str(self.get('app_mode', 'edit')) == 'puzzle':
             return
         if self.autosave_deferred():
             return

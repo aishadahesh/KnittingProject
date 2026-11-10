@@ -44,7 +44,7 @@ import scanner_core
 import teleop_transport
 import ur5_robot
 import ur5_scan
-from fabric_scanner import clamp_capture_size
+from scan_geometry import clamp_capture_size
 from rendering import draw_fitted_texture, upload_rgb_texture
 
 
@@ -240,13 +240,7 @@ class UR5ModeController:
         self.runner: ur5_scan.RealScanRunner | None = None
         self.dataset: gaussian_splatting.SplatDataset | None = None
         self.trainer: gaussian_splatting.SplatTrainer | None = None
-        # The hand-held capture (5 Free capture): its session, the pose solve run over it, what
-        # that solve measured, and the dataset it made.
         self.free: free_capture.FreeCaptureSession | None = None
-        self.free_solver: gaussian_splatting.SplatTrainer | None = None
-        self.free_report: dict | None = None
-        self.free_dataset: gaussian_splatting.SplatDataset | None = None
-        # The pose solve over a robot run (4 Results), and what it measured.
         self.robot_solver: gaussian_splatting.SplatTrainer | None = None
         self.robot_solved: dict | None = None
         # The camera-mount (hand-eye) calibration fitted from a scan, running or done, and its outcome.
@@ -313,14 +307,19 @@ class UR5ModeController:
         if self.camera is None or not self.camera.running:
             return
         now = time.monotonic()
-        if now - self._last_preview_time < PREVIEW_INTERVAL:
-            return
-        if (
+        is_sim_cam = (
             isinstance(self.camera.backend, robot_camera.SimCameraBackend)
             and renderer is not None
             and hasattr(renderer, "render_wrist_camera")
-        ):
+        )
+        pose_changed = False
+        if is_sim_cam:
             pose, fov, target = self._sim_camera_pose_provider()
+            prev_pose = self.camera.backend._gl_pose
+            pose_changed = prev_pose is None or not np.allclose(prev_pose, pose, atol=1e-4)
+        if not pose_changed and now - self._last_preview_time < PREVIEW_INTERVAL:
+            return
+        if is_sim_cam:
             w, h = self.camera.backend.size
             try:
                 gl_rgb = renderer.render_wrist_camera(
@@ -1236,7 +1235,7 @@ class UR5ModeController:
         if self.runner is not None and self.runner.running:
             self.runner.stop()
             self.runner.wait(timeout=2.0)
-        for job in (self.trainer, self.free_solver, self.robot_solver):
+        for job in (self.trainer, self.robot_solver):
             if job is not None and job.running:
                 job.stop()
         if self.free is not None:
@@ -1497,10 +1496,14 @@ def _draw_simple_page(state, controller, renderer):
             imgui.text_colored(COLOR_MUTED, f"Path checked: {len(controller.plan.viewpoints)} views. Rehearse flies it without taking pictures; Run takes them.")
 
     lap("scan")
-    if header(4, "Reconstruct (Gaussian Splatting)", False, have_pictures):
+    if header(4, "Review pictures & open in Splatting Mode", False, have_pictures):
         gui_captures.draw_captures_section(state, controller, "Pictures")
         lap("pictures")
-        _draw_splatting_body(state, controller)
+        imgui.push_style_color(imgui.Col_.button, (0.18, 0.40, 0.65, 1.0))
+        imgui.push_style_color(imgui.Col_.button_hovered, (0.24, 0.50, 0.78, 1.0))
+        if imgui.button("Open in Splatting Mode (Export, Pose Solve & 3DGS)##simple_to_splat", (-1, 36)):
+            state.request_app_mode = "model"
+        imgui.pop_style_color(2)
     lap("reconstruct")
     # What the frame costs, so slowness has a name: the app's frame rate and this panel's share.
     heavy = ", ".join(f"{name} {ms:.0f}" for name, ms in sorted(timings.items(), key=lambda item: -item[1]) if ms >= 1.0)
@@ -2475,7 +2478,11 @@ def _draw_results_tab(state, controller, renderer):
     """What the runs produced, and what is made from it."""
     gui_captures.draw_captures_section(state, controller, "Captured images")
     _draw_analysis_section(state, controller)
-    _draw_splatting_section(state, controller)
+    imgui.push_style_color(imgui.Col_.button, (0.18, 0.40, 0.65, 1.0))
+    imgui.push_style_color(imgui.Col_.button_hovered, (0.24, 0.50, 0.78, 1.0))
+    if imgui.button("Open in Splatting Mode (Export, Pose Solve & 3DGS)##ur5_to_splat", (-1, 36)):
+        state.request_app_mode = "model"
+    imgui.pop_style_color(2)
     _draw_scan_section(state, controller)
 
 
@@ -2615,12 +2622,6 @@ def _draw_analysis_section(state, controller):
         imgui.tree_pop()
     if result.get("json_path"):
         imgui.text_colored(COLOR_MUTED, f"Saved {Path(result['json_path']).name}")
-
-
-def _draw_splatting_section(state, controller):
-    if not imgui.collapsing_header("Gaussian Splatting"):
-        return
-    _draw_splatting_body(state, controller)
 
 
 def _draw_splatting_body(state, controller):
@@ -3255,10 +3256,9 @@ EVENT_COLOURS = {"kept": COLOR_OK, "unlinked": COLOR_DANGER, "skipped": COLOR_WA
 
 
 def _draw_free_capture_tab(state, controller, renderer):
-    """Gaussian Splatting from pictures taken with the camera in hand, as five steps that are always on screen:
-    camera and session, shooting, whether it is enough, the pose solve, and the splat."""
+    """Hand-held capture: camera and session, shooting, readiness checklist, and handoff to Splatting Mode."""
     imgui.text_wrapped("Photograph the fabric with the camera in your hand - the arm is not used. The camera poses are then "
-                       "solved from the pictures (COLMAP), and the splat is trained on them.")
+                       "solved from the pictures (COLMAP), and the splat is trained on them in Splatting Mode.")
     session = controller.free
     running = controller.camera is not None and controller.camera.running
 
@@ -3276,11 +3276,21 @@ def _draw_free_capture_tab(state, controller, renderer):
         if changed_sides:
             state.free_require_sides = bool(sides)
         _draw_checks(free_capture.readiness(session.rows(), bool(state.get("free_require_sides", True))),
-                     "Enough pictures - go on to step 4.", "free_live_checks")
-    imgui.separator_text("Step 4 - Solve the camera poses")
-    _draw_pose_solve(state, controller, session)
-    imgui.separator_text("Step 5 - Gaussian Splatting")
-    _draw_trainer(state, controller, controller.free_dataset, None, "solve the camera poses first (step 4)")
+                     "Enough pictures - open in Splatting Mode below.", "free_live_checks")
+    imgui.separator_text("Step 4 - Solve poses & reconstruct in Splatting Mode")
+    if session is None or not session.records:
+        imgui.begin_disabled()
+    imgui.push_style_color(imgui.Col_.button, (0.18, 0.40, 0.65, 1.0))
+    imgui.push_style_color(imgui.Col_.button_hovered, (0.24, 0.50, 0.78, 1.0))
+    if imgui.button("Open in Splatting Mode (Pose Solve & 3DGS)##free_to_splat", (-1, 36)):
+        if session is not None:
+            state.swatch_session_id = session.name
+            if hasattr(state, "save_active_swatch"):
+                state.save_active_swatch()
+        state.request_app_mode = "model"
+    imgui.pop_style_color(2)
+    if session is None or not session.records:
+        imgui.end_disabled()
 
 
 def _draw_free_session(state, controller, session, running):
@@ -3306,7 +3316,9 @@ def _start_free_session(state, controller):
         controller.free.close()
     folder = Path(state.project_root) / "robot_scans" / time.strftime("free_%Y%m%d_%H%M%S")
     controller.free = free_capture.FreeCaptureSession(folder, float(state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)))
-    controller.free_solver, controller.free_report, controller.free_dataset = None, None, None
+    state.swatch_session_id = folder.name
+    if hasattr(state, "save_active_swatch"):
+        state.save_active_swatch()
     if not str(state.get("ur5_splat_command", "")).strip():
         state.ur5_splat_command = SPLATFACTO_COMMAND
     controller.status = f"Hand-held session {folder.name} started"
@@ -3437,41 +3449,6 @@ def _draw_checks(checks, enough_text, key):
     else:
         _banner(f"Next: {missing.label}", COLOR_WARN, key)
     return missing is None
-
-
-def _draw_pose_solve(state, controller, session):
-    """Solve the poses with COLMAP, then judge the capture again on what it measured."""
-    pictures = 0 if session is None else len(session.records)
-    solver = controller.free_solver
-    if not _draw_solving(solver, "free"):
-        why_not = [reason for reason, missing in (
-            ("start a session and take pictures (steps 1 and 2)", session is None),
-            (f"take at least 3 pictures (now {pictures})", session is not None and pictures < 3),
-            *_solver_missing()) if missing]
-        for reason in why_not:
-            imgui.text_colored(COLOR_WARN, f"- {reason}")
-        if not why_not and session.busy:
-            why_not.append("busy")
-        if why_not:
-            imgui.begin_disabled()
-        if imgui.button(f"Solve camera poses from the {pictures} pictures##free_solve", (-1, 36)):
-            controller.free_report, controller.free_dataset = None, None
-            controller.free_solver = _start_pose_solve(controller, session.folder, len(session.records), session.fov_degrees)
-        if why_not:
-            imgui.end_disabled()
-    if not _solve_finished(solver, "free"):
-        return
-    if controller.free_report is None:
-        try:
-            controller.free_report, controller.free_dataset = _solved_dataset(solver.output_dir, session.name)
-        except Exception as exc:
-            _banner(f"The pose solve left no usable report: {exc}", COLOR_DANGER, "free_solve_report")
-            return
-    report = controller.free_report
-    imgui.text("Measured by the pose solve:")
-    _draw_checks(free_capture.solve_checks(report) + free_capture.readiness(report["images"], bool(state.get("free_require_sides", True))),
-                 "Ready for Gaussian Splatting - go on to step 5.", "free_solved_checks")
-    _draw_unplaced(report)
 
 
 def _solver_missing():

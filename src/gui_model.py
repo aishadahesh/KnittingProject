@@ -611,7 +611,7 @@ def _start_periodic_fit(view, counts=None) -> None:
     view.periodic_job[0].start()
 
 
-def _poll_periodic(view) -> None:
+def _poll_periodic(view, state=None) -> None:
     if view.periodic_job is None or view.periodic_job[0].is_alive():
         return
     holder = view.periodic_job[1]
@@ -622,6 +622,9 @@ def _poll_periodic(view) -> None:
     view.periodic, view.source, view.tube_key = holder["result"], 1, None
     fit = view.periodic
     view.counts = (fit.n_cols, fit.n_rows)
+    if state is not None:
+        state.swatch_fitted_model = {"fabric": "knit", "parameters": fit.edit_parameters(), "bitmap": fit.bitmap.copy()}
+        state.save_active_swatch()
     view.status = (f"The cloth repeats every {fit.n_rows} rows x {fit.n_cols} stitches "
                    f"({fit.row_pitch * fit.n_rows:.1f} x {fit.stitch_width * fit.n_cols:.1f} mm); complete loops built over it")
     if view.show == 0:
@@ -653,7 +656,7 @@ def _start_crochet_fit(view) -> None:
     view.crochet_job[0].start()
 
 
-def _poll_crochet(view) -> None:
+def _poll_crochet(view, state=None) -> None:
     if view.crochet_job is None or view.crochet_job[0].is_alive():
         return
     holder = view.crochet_job[1]
@@ -665,6 +668,9 @@ def _poll_crochet(view) -> None:
     fit = view.crochet
     rows, stitches = fit.cells.shape
     view.crochet_counts, view.crochet_wraps = [stitches, rows], fit.params.wraps
+    if state is not None:
+        state.swatch_fitted_model = {"fabric": "crochet", "parameters": fit.params.as_dict(), "stitches": fit.cells.copy()}
+        state.save_active_swatch()
     view.status = (f"{fit.stitch_name}: a stitch every {fit.params.stitch_width:.2f} mm, rows {fit.params.row_height:.2f} mm; "
                    f"repeat {rows} rows x {stitches} stitches, rebuilt over the cloth")
     if view.show == 0:
@@ -960,23 +966,37 @@ def _handle_mouse(view, rects) -> None:
 
 # ----------------------------------------------------------------------------------------- panel
 
-def _draw_model_choice(view) -> None:
+def _draw_model_choice(view, state=None) -> None:
     if view.models is None:
         view.models = find_models()
     names = [m["name"] for m in view.models]
     if not names:
-        imgui.text_colored(COLOR_WARN, "No trained splats under robot_scans (train one in UR5 Robot Mode).")
+        imgui.text_colored(COLOR_WARN, "No trained splats under robot_scans (train one above under Dataset, Poses & 3DGS Training).")
         return
+    if state is not None:
+        swatch_key = (int(state.get("scanner_selected_row", 0)), int(state.get("scanner_selected_col", 0)))
+        if getattr(view, "swatch_key", None) != swatch_key:
+            view.swatch_key = swatch_key
+            swatch_ply = str(state.get("swatch_splat_path", ""))
+            if swatch_ply:
+                matched = next((i for i, m in enumerate(view.models) if str(m["ply"]) == swatch_ply or m["name"] == swatch_ply), -1)
+                if matched >= 0 and matched != view.index:
+                    _select_model(view, matched)
     if view.index < 0:
-        # The measured, cropped model with the best held-out score.
         best = max(range(len(view.models)), key=lambda i: (view.models[i]["mm_per_unit"] is not None,
                                                           view.models[i]["ply"].name == "splat_clean.ply",
                                                           view.models[i]["psnr"] or 0.0))
         _select_model(view, best)
+        if state is not None:
+            state.swatch_splat_path = str(view.models[view.index]["ply"])
+            state.save_active_swatch()
     imgui.set_next_item_width(-70)
     changed, index = imgui.combo("##model_pick", view.index, names)
     if changed and index != view.index:
         _select_model(view, index)
+        if state is not None:
+            state.swatch_splat_path = str(view.models[view.index]["ply"])
+            state.save_active_swatch()
     imgui.same_line()
     if imgui.button("Refresh##model_refresh"):
         current = view.models[view.index]["ply"] if view.index >= 0 else None
@@ -1309,12 +1329,12 @@ def draw_model_panel(state, renderer) -> None:
     view = _view(state)
     _poll_loader(view)
     _poll_extractor(view)
-    _poll_periodic(view)
-    _poll_crochet(view)
+    _poll_periodic(view, state)
+    _poll_crochet(view, state)
     _poll_fabric_job(view)
     _poll_yarns_job(view)
 
-    _draw_model_choice(view)
+    _draw_model_choice(view, state)
     imgui.separator()
     if imgui.begin_tab_bar("##splat_sidebar_tabs"):
         tab_eq, _ = imgui.begin_tab_item("Equations")
@@ -1326,6 +1346,12 @@ def draw_model_panel(state, renderer) -> None:
 
         tab_fit, _ = imgui.begin_tab_item("Stitch Fit")
         if tab_fit:
+            saved_fit = state.get("swatch_fitted_model")
+            if isinstance(saved_fit, dict) and view.periodic is None and view.crochet is None:
+                imgui.text_colored(COLOR_OK, f"Saved fit for this swatch ({saved_fit.get('fabric', 'knit')})")
+                if imgui.button("Apply Saved Fit to Swatch Geometry (Edit Mode)##apply_saved_fit", (-1, 0)):
+                    state.model_to_edit = dict(saved_fit)
+                imgui.separator()
             if imgui.collapsing_header("Crochet (posts & chains)##model_crochet_section", imgui.TreeNodeFlags_.default_open):
                 _draw_crochet(view, state)
             if imgui.collapsing_header("Knit repeating loops##model_periodic_section", imgui.TreeNodeFlags_.default_open):

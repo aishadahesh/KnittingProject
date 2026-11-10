@@ -98,10 +98,6 @@ def main(robot="sim", camera_source="sim"):
         camera   = Camera()
         renderer = MeshRenderer(ctx, 960, 720)
         resources.callback(renderer.close)
-        # Puzzle owns a separate framebuffer and mesh buffers. Scan can rebuild the
-        # main viewport as often as it needs without ever touching Puzzle's scene.
-        puzzle_renderer = MeshRenderer(ctx, 960, 720)
-        resources.callback(puzzle_renderer.close)
         # Second view with its own camera and framebuffer, so orbiting it never
         # disturbs the main viewport's fixed framing.
         orbit_camera   = Camera()
@@ -113,7 +109,6 @@ def main(robot="sim", camera_source="sim"):
             renderer,
             orbit_camera=orbit_camera,
             orbit_renderer=orbit_renderer,
-            puzzle_renderer=puzzle_renderer,
         )
         resources.callback(glfw.make_context_current, window)
 
@@ -148,6 +143,14 @@ def main(robot="sim", camera_source="sim"):
         state.scanner_execution_mode = "simulation" if str(robot) == "sim" else "robot"
         if str(camera_source).isdigit():
             state.ur5_camera_device = int(camera_source)
+        from gui_ur5 import UR5ModeController
+        ur5_ctl = UR5ModeController(state, ctx, window)
+        state.ur5_controller = ur5_ctl
+        if str(robot) == "sim" or str(camera_source) == "sim":
+            ur5_ctl.connect_sim(
+                connect_robot=(str(robot) == "sim"),
+                start_cam=(str(camera_source) == "sim"),
+            )
         scanner_storage = ScannerStorage(paths.PROJECT_ROOT)
         object.__setattr__(state, "scanner_storage", scanner_storage)
         if scanner_storage.restore_scanner_state(state):
@@ -333,6 +336,9 @@ def main(robot="sim", camera_source="sim"):
             imgui.end()
 
             # ── Sidebar ───────────────────────────────────────────────────────────
+            ur5_ctl = state.get("ur5_controller")
+            if ur5_ctl is not None:
+                ur5_ctl.update_preview(renderer)
             draw_sidebar(state, state.active_scene_renderer(), window)
 
             # MuJoCo offscreen rendering can make its own GL context current.

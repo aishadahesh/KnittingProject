@@ -10,9 +10,8 @@ Five patterns, each answering a different question about one subject:
   radius about the subject and aimed back at it, so the standoff never changes and only the
   direction of view does. ``arc`` sweeps around, ``elevation`` says how high, and ``rings``
   repeats the arc at several elevations so one pass sees both the top and the sides.
-- ``tilt`` is this project's original scan geometry, ``fabric_scanner.expand_stations_to_angle_viewpoints``,
-  kept because it is what the simulated Scan Mode uses. It holds one position and nudges the
-  attitude within a narrow cone, so its extremes differ by only ~33 degrees.
+- ``tilt`` holds one position and nudges the attitude within a narrow cone, so its extremes
+  differ by only ~33 degrees.
 - ``grid`` covers the fabric close up: a rows x cols grid of straight-down views at a fixed,
   low ``camera_height`` over the fabric plane, centred where the camera looks now. Every frame
   is square-on at the same scale, which is what the orbit's 20 cm standoff cannot give.
@@ -32,8 +31,7 @@ discovered on the hardware:
 - The camera rides on the tool, so ``max_height`` caps how far it may rise above the
   subject. Lift it and the picture is of the table around the cloth.
 
-The inverse kinematics is this project's own damped-least-squares step from
-``fabric_scanner``, iterated to a tolerance, against the MuJoCo UR5e.
+The inverse kinematics is a damped-least-squares step iterated to a tolerance against the UR5e URDF kinematics.
 """
 
 from __future__ import annotations
@@ -47,6 +45,25 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 import paths
+
+CAPTURE_MIN_WIDTH = 320
+CAPTURE_MAX_WIDTH = 4096
+CAPTURE_MIN_HEIGHT = 240
+CAPTURE_MAX_HEIGHT = 3072
+CAPTURE_ASPECT = 0.75
+NON_SCAN_VIEW_NAMES = {"approach", "retreat", "travel"}
+
+
+def clamp_capture_size(width, height=None):
+    width = int(np.clip(int(round(width)), CAPTURE_MIN_WIDTH, CAPTURE_MAX_WIDTH))
+    if height is None:
+        height = int(round(width * CAPTURE_ASPECT))
+    height = int(np.clip(int(round(height)), CAPTURE_MIN_HEIGHT, CAPTURE_MAX_HEIGHT))
+    return width, height
+
+
+def is_scan_view(name: str) -> bool:
+    return str(name) not in NON_SCAN_VIEW_NAMES
 
 TELEOP_JOINTS = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                  "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]

@@ -117,8 +117,7 @@ def state(gl_context, tmp_path):
     from rendering import Camera, MeshRenderer
 
     renderer = MeshRenderer(gl_context.ctx, 320, 240)
-    puzzle_renderer = MeshRenderer(gl_context.ctx, 320, 240)
-    app_state = AppState(Camera(), renderer, puzzle_renderer=puzzle_renderer)
+    app_state = AppState(Camera(), renderer)
     # Redirected before anything draws: draw_sidebar calls state.maybe_autosave(),
     # which would otherwise overwrite the real config/params.json every run.
     app_state.save_path = str(tmp_path / "params.json")
@@ -139,7 +138,6 @@ def state(gl_context, tmp_path):
         controller.close()
     glfw.make_context_current(gl_context.window)
     renderer.close()
-    puzzle_renderer.close()
 
 
 def _draw_one_frame(gui, app_state, renderer, mode, window=None, ref_tex=None):

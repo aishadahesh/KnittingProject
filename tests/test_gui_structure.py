@@ -11,7 +11,7 @@ MODE_MODULES = ("gui_database", "gui_ur5", "gui_model")
 
 # Modules that must stay usable without a UI: they are imported by headless
 # callers (tests, scripts, the scan runner) where imgui does not exist.
-IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core",
+IMGUI_FREE_MODULES = ("scanner_core",
                       "fabric_detector", "robot_camera", "ur5_robot", "ur5_scan",
                       "gaussian_splatting", "free_capture", "paths", "strand_equations",
                       "lace_lattice", "crochet_core", "scan_fit", "hand_eye", "charuco",

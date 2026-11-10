@@ -100,23 +100,16 @@ def test_scan_stop_reports_transport_failure(robot, plan, monkeypatch):
 
 @pytest.fixture
 def plan():
-    import fabric_scanner as scanner
+    import scan_geometry
 
-    args = SimpleNamespace(
-        rows=2, cols=2, number_of_angles=2, width=0.12, length=0.10,
-        edge_margin=0.004, square_margin=0.006, surface_wave=0.003,
-        view_radius=0.018, angle_lift=0.014, approach_lift=0.040,
-        center=[-0.45, -0.08, 0.30], max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-        palette=None, cell_color_sets=None, model_json="", model_curves=None,
-        cell_model_curves=None, random_patterns=False,
-        pattern_rows=4, pattern_cols=5,
-        pattern_repeat_rows=1, pattern_repeat_cols=1,
-        pattern_repeat_spacing_x=1.0, pattern_repeat_spacing_y=1.0,
-        batch_texture_width=420, batch_texture_height=340,
-        pattern_density=0.62, random_seed=1,
-        scanner_lighting=None, display_batch_colors=None,
+    return scan_geometry.build_capture_plan(
+        HOME_JOINTS,
+        pattern="grid",
+        grid_rows=2,
+        grid_cols=2,
+        grid_views_per_station=2,
+        fabric_z=0.20,
     )
-    return scanner.build_plan(args)
 
 
 # ============================================================================
@@ -269,12 +262,12 @@ def test_full_scan_captures_analyses_and_stores(tmp_path, robot, camera, plan):
     assert result["session_id"] == runner.session_id
 
 
-def test_scan_only_photographs_scan_views(plan):
+def test_scan_only_photographs_scan_views():
     """approach/retreat points get the arm there; they are not captures."""
-    runner = ur5_scan.RealScanRunner(None, None, plan)
-    names = [plan.view_names[i] for i in runner.scan_targets]
-    assert names
-    assert not any(name in {"approach", "retreat", "travel"} for name in names)
+    mixed_plan = SimpleNamespace(view_names=["approach", "grid 1 (r1c1)", "travel", "grid 2 (r1c2)", "retreat"])
+    runner = ur5_scan.RealScanRunner(None, None, mixed_plan)
+    names = [mixed_plan.view_names[i] for i in runner.scan_targets]
+    assert names == ["grid 1 (r1c1)", "grid 2 (r1c2)"]
 
 
 def test_preflight_refuses_without_a_camera(robot, plan):

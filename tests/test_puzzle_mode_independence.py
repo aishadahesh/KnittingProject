@@ -27,6 +27,7 @@ class StubRenderer:
         self.mesh_pick_data = [
             (np.asarray(item[0], dtype=np.float32), int(self.last_meta[idx].get("row", idx)))
             for idx, item in enumerate(verts)
+            if idx >= len(self.last_meta) or not bool(self.last_meta[idx].get("neighbor_swatch", False))
         ]
         if self.state is not None:
             self.renderer_seen_during_upload.append(self.state.renderer)
@@ -116,3 +117,31 @@ def test_late_scan_cleanup_cannot_restore_over_mode_switch(state):
     for actual, expected in zip(state.ctrl_rows, expected_rows):
         np.testing.assert_allclose(actual, expected)
     assert state.app_mode == "edit"
+
+
+def test_swatch_cells_preserve_session_splat_and_fit_state_and_neighbor_swatches(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.select_swatch(0, 0)
+    state.swatch_session_id = "20260417_120000"
+    state.swatch_splat_path = "robot_scans/20260417_120000/splat/splat_clean.ply"
+    state.swatch_fitted_model = {"fabric": "knit", "parameters": {"stitch_width": 1.1}, "bitmap": state.bitmap.copy()}
+    state.save_active_swatch()
+
+    state.select_swatch(1, 1)
+    assert state.swatch_session_id == ""
+    assert state.swatch_splat_path == ""
+    assert state.swatch_fitted_model is None
+    state.swatch_session_id = "20260417_130000"
+    state.save_active_swatch()
+
+    state.select_swatch(0, 0)
+    assert state.swatch_session_id == "20260417_120000"
+    assert state.swatch_splat_path == "robot_scans/20260417_120000/splat/splat_clean.ply"
+    assert state.swatch_fitted_model["parameters"]["stitch_width"] == 1.1
+
+    active_pick_count = len(state.renderer.mesh_pick_data)
+    state.world_show_neighbor_swatches = True
+    state.rebuild_spline_mesh(preserve_model_placement=True)
+    assert any(item.get("neighbor_swatch") for item in state.renderer.last_meta)
+    assert len(state.renderer.mesh_pick_data) == active_pick_count
