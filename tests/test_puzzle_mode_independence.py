@@ -5,6 +5,7 @@ import pytest
 
 from app_state import AppState
 from rendering import Camera
+from scanner_core import _scanner_pattern_repeats, ensure_swatch_unit_tile_images
 
 
 class StubRenderer:
@@ -135,5 +136,39 @@ def test_swatch_cells_preserve_session_splat_and_fit_state_and_neighbor_swatches
     active_pick_count = len(state.renderer.mesh_pick_data)
     state.world_show_neighbor_swatches = True
     state.rebuild_spline_mesh(preserve_model_placement=True)
-    assert any(item.get("neighbor_swatch") for item in state.renderer.last_meta)
+    assert not any(item.get("neighbor_swatch") for item in state.renderer.last_meta)
     assert len(state.renderer.mesh_pick_data) == active_pick_count
+
+
+def test_swatch_unit_tile_images_and_3x3_unit_cell_builder(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.select_swatch(0, 0)
+    assert _scanner_pattern_repeats(state) == (24, 24)
+
+    tiles_1, epoch_1 = ensure_swatch_unit_tile_images(state)
+    assert len(tiles_1) == 4
+    assert epoch_1 >= 1
+    for tile in tiles_1:
+        assert isinstance(tile, np.ndarray)
+        assert tile.dtype == np.uint8
+        assert tile.ndim == 3 and tile.shape[2] == 3
+        assert float(tile.std()) > 5.0
+
+    tiles_2, epoch_2 = ensure_swatch_unit_tile_images(state)
+    assert epoch_2 == epoch_1
+    assert tiles_2[0] is tiles_1[0]
+
+    state.bitmap[1, 0] = 0.0
+    state.on_bitmap_change()
+    tiles_3, epoch_3 = ensure_swatch_unit_tile_images(state)
+    assert epoch_3 == epoch_1 + 1
+    assert not np.array_equal(tiles_3[0], tiles_1[0])
+    assert tiles_3[3] is tiles_1[3]
+
+    prepared, colors, center_xy, xp, yp = state.build_swatch_unit_cell_data(1, 1)
+    assert len(prepared) == 9 * len(state.ctrl_rows)
+    assert len(colors) == len(prepared)
+    assert len(center_xy) == 2
+    assert xp > 0.5 and yp > 0.5
+

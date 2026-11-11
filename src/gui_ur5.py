@@ -322,6 +322,38 @@ class UR5ModeController:
             if hasattr(self.state, "get_material_uniforms")
             else {}
         )
+        sim_renderer = (
+            getattr(self.state, "renderer", None)
+            if threading.current_thread() is threading.main_thread()
+            else getattr(getattr(self.camera, "backend", None), "_renderer", None)
+        )
+        tile_images, tiles_epoch = (
+            scanner_core.ensure_swatch_unit_tile_images(self.state, sim_renderer)
+            if hasattr(scanner_core, "ensure_swatch_unit_tile_images")
+            else ([], 0)
+        )
+        swatch_slots = (
+            self.state.all_swatch_slot_rects()
+            if hasattr(self.state, "all_swatch_slot_rects")
+            else []
+        )
+        swatch_repeats = (
+            scanner_core._scanner_pattern_repeats(self.state)
+            if hasattr(scanner_core, "_scanner_pattern_repeats")
+            else (
+                self.state.swatch_repeat_counts()
+                if hasattr(self.state, "swatch_repeat_counts")
+                else (24, 24)
+            )
+        )
+        macro_keys = {
+            "swatch_tile_images": tile_images,
+            "swatch_tiles_epoch": tiles_epoch,
+            "swatch_slots": swatch_slots,
+            "swatch_repeats": swatch_repeats,
+            "hide_unit_cell_mesh": bool(tile_images and swatch_slots),
+        }
+        material_uniforms = {**material_uniforms, **macro_keys}
         return {
             "joints": joints,
             "grid_span": grid_span,
@@ -331,6 +363,7 @@ class UR5ModeController:
             "prepared_meshes": prepared_meshes,
             "colors": colors,
             "material_uniforms": material_uniforms,
+            **macro_keys,
         }
 
     def connect_sim(self, connect_robot: bool = True, start_cam: bool = True) -> None:

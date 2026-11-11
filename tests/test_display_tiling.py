@@ -267,6 +267,10 @@ def test_swatch_slot_offsets_and_canonical_bounds_are_invariant(state):
     state.scanner_selected_row = 0
     state.scanner_selected_col = 1
 
+    assert state.swatch_repeat_counts() == (24, 24)
+    uc_span = state.unit_cell_span()
+    assert uc_span > 2.0
+
     baseline_offsets = {
         (r, c): state.swatch_slot_offset(r, c).copy()
         for r in range(2)
@@ -274,7 +278,14 @@ def test_swatch_slot_offsets_and_canonical_bounds_are_invariant(state):
     }
     baseline_bounds = tuple(b.copy() for b in state.canonical_grid_bounds())
     baseline_span = state.canonical_grid_span()
-    assert baseline_span > 2.0
+    assert baseline_span > uc_span * 20.0
+
+    rects = state.all_swatch_slot_rects()
+    assert len(rects) == 4
+    slot_w, slot_h, _ = state._swatch_grid_periods()
+    x0, y0, x1, y1 = state.swatch_slot_rect(0, 1)
+    assert (x1 - x0) == pytest.approx(0.94 * slot_w, rel=1e-5)
+    assert (y1 - y0) == pytest.approx(0.94 * slot_h, rel=1e-5)
 
     for preview in (False, True):
         for neighbors in (False, True):
@@ -288,4 +299,10 @@ def test_swatch_slot_offsets_and_canonical_bounds_are_invariant(state):
             assert np.allclose(lo, baseline_bounds[0], atol=1e-6)
             assert np.allclose(hi, baseline_bounds[1], atol=1e-6)
             assert state.canonical_grid_span() == pytest.approx(baseline_span, rel=1e-6)
+            assert state.unit_cell_span() == pytest.approx(uc_span, rel=1e-6)
+
+    state.scanner_pattern_repeat_rows = 48
+    state.scanner_pattern_repeat_cols = 48
+    assert state.canonical_grid_span() == pytest.approx(baseline_span * 2.0, rel=1e-5)
+
 

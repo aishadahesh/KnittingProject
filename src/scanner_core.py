@@ -202,6 +202,161 @@ def _scanner_pattern_dimensions(state):
     )
 
 
+def _scanner_pattern_repeats(state) -> tuple[int, int]:
+    if hasattr(state, 'swatch_repeat_counts'):
+        return state.swatch_repeat_counts()
+    rep_r = int(np.clip(int(state.get('scanner_pattern_repeat_rows', 24)), 1, 128))
+    rep_c = int(np.clip(int(state.get('scanner_pattern_repeat_cols', 24)), 1, 128))
+    return rep_r, rep_c
+
+
+def _FallbackUnitTile(state, r: int, c: int) -> np.ndarray:
+    rows = max(1, int(state.get('scanner_rows', 1)))
+    cols = max(1, int(state.get('scanner_cols', 1)))
+    sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
+    sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
+    cell_index = int(r) * cols + int(c)
+    cells = state.get('swatch_cells') or {}
+    entry = cells.get(f"{int(r)},{int(c)}")
+
+    if (int(r), int(c)) == (sel_r, sel_c):
+        bitmap = np.asarray(state.get('bitmap', np.ones((4, 4), dtype=np.float32)), dtype=np.float32)
+        raw_colors = state.get('row_colors') or _scanner_base_palette(state)
+    elif isinstance(entry, dict):
+        bitmap = np.asarray(entry.get('bitmap', state._scanner_random_bitmap(cell_index)), dtype=np.float32)
+        raw_colors = entry.get('row_colors') or _scanner_base_palette(state)
+    else:
+        bitmap = np.asarray(state._scanner_random_bitmap(cell_index), dtype=np.float32)
+        raw_colors = _scanner_base_palette(state)
+
+    if bitmap.ndim != 2 or bitmap.size == 0:
+        bitmap = np.ones((4, 4), dtype=np.float32)
+    p_rows, p_cols = bitmap.shape
+    palette = np.asarray([_as_rgba(col, [0.7, 0.7, 0.7, 1.0])[:3] for col in (raw_colors or [[0.7, 0.7, 0.7]])], dtype=np.float32)
+    if palette.size == 0:
+        palette = np.asarray([[0.7, 0.7, 0.7]], dtype=np.float32)
+
+    h, w = 64, 64
+    yy = np.linspace(0.0, float(p_rows), h, endpoint=False, dtype=np.float32)[:, None]
+    xx = np.linspace(0.0, float(p_cols), w, endpoint=False, dtype=np.float32)[None, :]
+    row_idx = np.floor(yy).astype(np.int32) % p_rows
+    col_idx = np.floor(xx).astype(np.int32) % p_cols
+    u = xx - np.floor(xx)
+    v = yy - np.floor(yy)
+
+    leg_x = np.where(u < 0.5, 0.5 - 0.32 * v, 0.5 + 0.32 * v)
+    dist = np.abs(u - leg_x)
+    tube = np.clip(1.0 - (dist / 0.22) ** 2, 0.0, 1.0)
+    ridge = 0.55 + 0.45 * np.sqrt(tube) + 0.08 * np.sin((u * 12.0 + v * 8.0) * np.pi)
+
+    active = bitmap[row_idx, col_idx] > 0.5
+    eff_row = np.where(active | (v < 0.45), row_idx, (row_idx - 1) % p_rows)
+    base_rgb = palette[eff_row % len(palette)]
+    shaded = np.clip(base_rgb * ridge[:, :, None], 0.0, 1.0)
+    return np.ascontiguousarray((shaded * 255.0 + 0.5).astype(np.uint8))
+
+
+def _swatch_tile_cache_key(state, r: int, c: int, sel_r: int, sel_c: int, cols: int, lighting_sig: tuple) -> tuple:
+    palette_sig = tuple(tuple(round(float(x), 4) for x in col[:3]) for col in _scanner_base_palette(state))
+    if (r, c) == (sel_r, sel_c):
+        active_cols = tuple(tuple(round(float(x), 4) for x in col[:3]) for col in state.active_colors())
+        row_cols = tuple(tuple(round(float(x), 4) for x in col[:3]) for col in (state.get('row_colors') or []))
+        bm_bytes = np.asarray(state.get('bitmap', []), dtype=np.float32).tobytes()
+        return (
+            "active",
+            int(getattr(state, 'mesh_epoch', 0)),
+            active_cols,
+            row_cols,
+            palette_sig,
+            bm_bytes,
+            lighting_sig,
+        )
+    cells = state.get('swatch_cells') or {}
+    entry = cells.get(f"{r},{c}")
+    if isinstance(entry, dict):
+        bm_bytes = np.asarray(entry.get('bitmap', []), dtype=np.float32).tobytes()
+        ctrl_bytes = b"".join(np.asarray(cr, dtype=np.float32).tobytes() for cr in (entry.get('ctrl_rows') or []))
+        params_tuple = tuple(round(float(x), 5) for x in (entry.get('params') or []))
+        rc_tuple = tuple(tuple(round(float(x), 4) for x in col[:3]) for col in (entry.get('row_colors') or []))
+        return ("saved", bm_bytes, ctrl_bytes, params_tuple, rc_tuple, palette_sig, lighting_sig)
+    return (
+        "random",
+        int(state.get('scanner_random_seed', 1)),
+        round(float(state.get('scanner_pattern_density', 0.62)), 4),
+        _scanner_pattern_dimensions(state),
+        cols,
+        palette_sig,
+        lighting_sig,
+    )
+
+
+def ensure_swatch_unit_tile_images(state, renderer=None) -> tuple[list[np.ndarray], int]:
+    cache = state.__dict__.get('_swatch_tile_cache')
+    if not isinstance(cache, dict):
+        cache = {}
+        object.__setattr__(state, '_swatch_tile_cache', cache)
+    tiles_epoch = int(state.__dict__.get('_swatch_tiles_epoch', 0))
+
+    rows = max(1, int(state.get('scanner_rows', 1)))
+    cols = max(1, int(state.get('scanner_cols', 1)))
+    sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
+    sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
+    lighting = _scanner_lighting_settings(state)
+    lighting_sig = tuple(sorted((k, round(float(v), 4)) for k, v in lighting.items()))
+
+    tile_images: list[np.ndarray] = []
+    regenerated = False
+    for r in range(rows):
+        for c in range(cols):
+            key = _swatch_tile_cache_key(state, r, c, sel_r, sel_c, cols, lighting_sig)
+            cached = cache.get((r, c))
+            if cached is not None and len(cached) == 3:
+                cached_key, cached_is_gl, cached_img = cached
+                if cached_key == key and (cached_is_gl or renderer is None):
+                    tile_images.append(cached_img)
+                    continue
+
+            tile_rgb = None
+            is_gl = False
+            if renderer is not None and hasattr(renderer, 'render_unit_cell_tile'):
+                try:
+                    prepared, colors, center_xy, xp, yp = state.build_swatch_unit_cell_data(r, c)
+                    rendered = renderer.render_unit_cell_tile(
+                        prepared, colors, center_xy, xp, yp, _scanner_material_uniforms(state)
+                    )
+                    if (
+                        isinstance(rendered, np.ndarray)
+                        and rendered.ndim == 3
+                        and rendered.shape[2] == 3
+                        and rendered.size > 0
+                    ):
+                        tile_rgb = np.ascontiguousarray(rendered, dtype=np.uint8)
+                        is_gl = True
+                except Exception as exc:
+                    logging.warning("scanner_core.ensure_swatch_unit_tile_images: %s", exc)
+
+            if tile_rgb is None:
+                if cached is not None and len(cached) == 3 and cached[0] == key:
+                    tile_images.append(cached[2])
+                    continue
+                tile_rgb = _FallbackUnitTile(state, r, c)
+                is_gl = False
+
+            cache[(r, c)] = (key, is_gl, tile_rgb)
+            tile_images.append(tile_rgb)
+            regenerated = True
+
+    grid_shape = (rows, cols)
+    if state.__dict__.get('_swatch_tiles_grid_shape') != grid_shape:
+        object.__setattr__(state, '_swatch_tiles_grid_shape', grid_shape)
+        regenerated = True
+
+    if regenerated or tiles_epoch == 0:
+        tiles_epoch += 1
+        object.__setattr__(state, '_swatch_tiles_epoch', tiles_epoch)
+    return tile_images, tiles_epoch
+
+
 def _scanner_capture_image_size(state, key='scanner_capture_width'):
     return clamp_capture_size(state.get(key, 1024))
 

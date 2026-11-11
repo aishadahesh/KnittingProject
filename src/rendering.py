@@ -398,7 +398,8 @@ class Camera:
         # orthographic projection to remove perspective distortion.
         half_h = max(1e-4, self.dist * np.tan(np.radians(self.fov_deg) * 0.5))
         half_w = half_h * aspect
-        return orthographic(-half_w, half_w, -half_h, half_h, near=-1000.0, far=1000.0)
+        span = max(1000.0, float(self.dist) * 8.0)
+        return orthographic(-half_w, half_w, -half_h, half_h, near=-span, far=span)
 
     def mvp(self, w, h):
         return self.proj(w, h) @ self.view()
@@ -707,6 +708,12 @@ class MeshRenderer:
         self.wrist_color_tex = None
         self.wrist_depth_tex = None
         self.wrist_size = (0, 0)
+        self._tile_fbo = None
+        self._tile_color_tex = None
+        self._tile_depth_tex = None
+        self._tile_fbo_size = (0, 0)
+        self._swatch_tile_textures = []
+        self._swatch_tiles_epoch = -1
 
         self.vp_w    = 1
         self.vp_h    = 1
@@ -744,9 +751,14 @@ class MeshRenderer:
         for buf in self.board_buffers:
             buf.release()
         self.board_buffers.clear()
+        for tex in self._swatch_tile_textures:
+            tex.release()
+        self._swatch_tile_textures.clear()
+        self._swatch_tiles_epoch = -1
         for name in ('room_vao', 'room_vbo', 'board_plinth_vao', 'board_plinth_vbo',
                      'charuco_tex', 'sky_vao', 'sky_prog',
                      'wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex',
+                     '_tile_fbo', '_tile_color_tex', '_tile_depth_tex',
                      'bg_vao', 'grid_vao', 'bg_vbo', 'grid_vbo', 'grid_ibo',
                      'fbo', 'color_tex', 'depth_tex', 'prog', 'outline_prog',
                      'pt_prog', 'bg_prog', 'depth_prog', 'grid_prog',
@@ -968,21 +980,24 @@ class MeshRenderer:
             self._draw_sky(view_sky, proj_sky, self.vp_h)
             self.fbo.depth_mask = True
 
-        # 2. Depth pre-pass
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        self.ctx.enable(moderngl.CULL_FACE)
-        self.ctx.color_mask = (False, False, False, False)
-        
-        self.depth_prog['mvp'].write(mvp.T.tobytes())
-        for mesh_idx, (_, _, depth_vao, n_idx, _, row_idx) in enumerate(self.meshes):
-            if not self._row_visible(row_idx, visible_rows):
-                continue
-            depth_vao.render(moderngl.TRIANGLES)
+        hide_unit_cell = isinstance(world_scene, dict) and bool(world_scene.get("hide_unit_cell_mesh", False))
 
-        # 3. Restore color writes and disable depth writes
-        self.ctx.color_mask = (True, True, True, True)
-        self.fbo.depth_mask = False
-        self.ctx.depth_func = '<='
+        if not hide_unit_cell:
+            # 2. Depth pre-pass
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            self.ctx.enable(moderngl.CULL_FACE)
+            self.ctx.color_mask = (False, False, False, False)
+
+            self.depth_prog['mvp'].write(mvp.T.tobytes())
+            for mesh_idx, (_, _, depth_vao, n_idx, _, row_idx) in enumerate(self.meshes):
+                if not self._row_visible(row_idx, visible_rows):
+                    continue
+                depth_vao.render(moderngl.TRIANGLES)
+
+            # 3. Restore color writes and disable depth writes
+            self.ctx.color_mask = (True, True, True, True)
+            self.fbo.depth_mask = False
+            self.ctx.depth_func = '<='
 
         # ── Draw reference-image background quad ──────────────────────────────
         if bg_tex is not None:
@@ -998,81 +1013,86 @@ class MeshRenderer:
             self.bg_vao.render(moderngl.TRIANGLE_STRIP)
             self.ctx.disable(moderngl.BLEND)
 
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        self.ctx.enable(moderngl.CULL_FACE)
+        if not hide_unit_cell:
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            self.ctx.enable(moderngl.CULL_FACE)
 
-        # Enable blending for transparent model
-        model_alpha = material_uniforms.get('model_alpha', 1.0)
-        use_model_blend = model_alpha < 0.9999
-        if use_model_blend:
-            self.ctx.enable(moderngl.BLEND)
-            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            # Enable blending for transparent model
+            model_alpha = material_uniforms.get('model_alpha', 1.0)
+            use_model_blend = model_alpha < 0.9999
+            if use_model_blend:
+                self.ctx.enable(moderngl.BLEND)
+                self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
-        # Bind depth texture to unit 1
-        self.depth_tex.use(location=1)
-        if 'depth_tex' in self.prog:
-            self.prog['depth_tex'].value = 1
-        if 'viewport_size' in self.prog:
-            self.prog['viewport_size'].value = (float(self.vp_w), float(self.vp_h))
+            # Bind depth texture to unit 1
+            self.depth_tex.use(location=1)
+            if 'depth_tex' in self.prog:
+                self.prog['depth_tex'].value = 1
+            if 'viewport_size' in self.prog:
+                self.prog['viewport_size'].value = (float(self.vp_w), float(self.vp_h))
 
-        # Calculate ao_uv_scale
-        if camera is not None:
-            dist = camera.dist
-            fov = camera.fov_deg
-        else:
-            dist = 15.0
-            fov = 45.0
-        half_h = max(1e-4, dist * np.tan(np.radians(fov) * 0.5))
-        half_w = half_h * (self.vp_w / self.vp_h)
-        ao_radius = material_uniforms.get('ao_radius', 0.15)
-        ao_uv_scale = (
-            float(ao_radius / (2.0 * half_w)),
-            float(ao_radius / (2.0 * half_h))
-        )
-        if 'ao_uv_scale' in self.prog:
-            self.prog['ao_uv_scale'].value = ao_uv_scale
+            # Calculate ao_uv_scale
+            if camera is not None:
+                dist = camera.dist
+                fov = camera.fov_deg
+            else:
+                dist = 15.0
+                fov = 45.0
+            half_h = max(1e-4, dist * np.tan(np.radians(fov) * 0.5))
+            half_w = half_h * (self.vp_w / self.vp_h)
+            ao_radius = material_uniforms.get('ao_radius', 0.15)
+            ao_uv_scale = (
+                float(ao_radius / (2.0 * half_w)),
+                float(ao_radius / (2.0 * half_h))
+            )
+            if 'ao_uv_scale' in self.prog:
+                self.prog['ao_uv_scale'].value = ao_uv_scale
 
-        # Write matrices and common uniforms once per pass
-        self.prog['mvp'].write(mvp.T.tobytes())
-        self.prog['mv'].write(mv.T.tobytes())
-        if 'light_dir' in self.prog and 'light_dir' not in material_uniforms:
-            self.prog['light_dir'].value = (0.5, 1.0, 0.8)
-        self._set_program_uniforms(self.prog, material_uniforms)
+            # Write matrices and common uniforms once per pass
+            self.prog['mvp'].write(mvp.T.tobytes())
+            self.prog['mv'].write(mv.T.tobytes())
+            if 'light_dir' in self.prog and 'light_dir' not in material_uniforms:
+                self.prog['light_dir'].value = (0.5, 1.0, 0.8)
+            self._set_program_uniforms(self.prog, material_uniforms)
 
-        for mesh_idx, (vao, outline_vao, depth_vao, n_idx, color, row_idx) in enumerate(self.meshes):
-            if not self._row_visible(row_idx, visible_rows):
-                continue
-            base_color = np.asarray(color, dtype=np.float32)
-            self.prog['color'].value = tuple(float(c) for c in base_color)
-            vao.render(moderngl.TRIANGLES)
-
-        # Restore default depth settings for outline & points
-        self.ctx.depth_func = '<'
-        self.fbo.depth_mask = True
-
-        # Silhouette highlight pass: draw expanded backfaces for hover/selection.
-        has_outline = selected_mesh_idx >= 0 or hover_mesh_idx >= 0
-        if has_outline:
-            self.outline_prog['mvp'].write(mvp.T.tobytes())
-            self.outline_prog['outline_width'].value = 0.006
-            self.ctx.disable(moderngl.CULL_FACE)
-
-            def draw_outline(mesh_idx, color):
-                if mesh_idx < 0 or mesh_idx >= len(self.meshes):
-                    return
-                _, outline_vao, _, _, _, row_idx = self.meshes[mesh_idx]
+            for mesh_idx, (vao, outline_vao, depth_vao, n_idx, color, row_idx) in enumerate(self.meshes):
                 if not self._row_visible(row_idx, visible_rows):
-                    return
-                self.outline_prog['outline_color'].value = color
-                outline_vao.render(moderngl.TRIANGLES)
+                    continue
+                base_color = np.asarray(color, dtype=np.float32)
+                self.prog['color'].value = tuple(float(c) for c in base_color)
+                vao.render(moderngl.TRIANGLES)
 
-            # Selected wins if both states point to the same yarn.
-            draw_outline(selected_mesh_idx, (0.15, 1.0, 0.25))
-            if hover_mesh_idx != selected_mesh_idx:
-                draw_outline(hover_mesh_idx, (1.0, 0.95, 0.2))
+            # Restore default depth settings for outline & points
+            self.ctx.depth_func = '<'
+            self.fbo.depth_mask = True
 
-        if use_model_blend:
-            self.ctx.disable(moderngl.BLEND)
+            # Silhouette highlight pass: draw expanded backfaces for hover/selection.
+            has_outline = selected_mesh_idx >= 0 or hover_mesh_idx >= 0
+            if has_outline:
+                self.outline_prog['mvp'].write(mvp.T.tobytes())
+                self.outline_prog['outline_width'].value = 0.006
+                self.ctx.disable(moderngl.CULL_FACE)
+
+                def draw_outline(mesh_idx, color):
+                    if mesh_idx < 0 or mesh_idx >= len(self.meshes):
+                        return
+                    _, outline_vao, _, _, _, row_idx = self.meshes[mesh_idx]
+                    if not self._row_visible(row_idx, visible_rows):
+                        return
+                    self.outline_prog['outline_color'].value = color
+                    outline_vao.render(moderngl.TRIANGLES)
+
+                # Selected wins if both states point to the same yarn.
+                draw_outline(selected_mesh_idx, (0.15, 1.0, 0.25))
+                if hover_mesh_idx != selected_mesh_idx:
+                    draw_outline(hover_mesh_idx, (1.0, 0.95, 0.2))
+
+            if use_model_blend:
+                self.ctx.disable(moderngl.BLEND)
+        else:
+            self.ctx.color_mask = (True, True, True, True)
+            self.ctx.depth_func = '<'
+            self.fbo.depth_mask = True
 
         # ── Ground grid ──────────────────────────────────────────────────────
         # Depth-tested but not depth-written, so the model always reads clearly
@@ -1359,6 +1379,7 @@ class MeshRenderer:
                 self.world_prog['base_color'].value = (1.0, 1.0, 1.0)
                 self.board_vao.render(moderngl.TRIANGLES)
             self.world_prog['uUseTex'].value = 0.0
+            self._draw_macro_fabric_sheet(view_proj, model_mat, world_scene, units_per_m=units_per_m)
 
         joints = world_scene.get("joints") if "joints" in world_scene else world_scene.get("robot_joints")
         if joints is not None and self.robot_vaos and world_scene.get("show_robot", True):
@@ -1451,6 +1472,218 @@ class MeshRenderer:
             c0, c1 = corners[i], corners[(i + 1) % 4]
             out.extend((*c0, r, g, b, *c1, r, g, b))
 
+    def render_unit_cell_tile(
+        self,
+        prepared_meshes,
+        colors,
+        center_xy,
+        x_period,
+        y_period,
+        material_uniforms=None,
+        tile_h=128,
+    ) -> np.ndarray:
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+        hx = max(0.5 * abs(float(x_period)), 1e-3)
+        hy = max(0.5 * abs(float(y_period)), 1e-3)
+        th = max(64, int(tile_h))
+        tw = max(64, min(512, int(round(th * (hx / hy)))))
+
+        if self._tile_fbo is None or self._tile_fbo_size != (tw, th):
+            for name in ('_tile_fbo', '_tile_color_tex', '_tile_depth_tex'):
+                res = getattr(self, name, None)
+                if res is not None:
+                    res.release()
+                    setattr(self, name, None)
+            self._tile_color_tex = self.ctx.texture((tw, th), 3)
+            self._tile_depth_tex = self.ctx.depth_texture((tw, th))
+            self._tile_fbo = self.ctx.framebuffer(
+                color_attachments=[self._tile_color_tex],
+                depth_attachment=self._tile_depth_tex,
+            )
+            self._tile_fbo_size = (tw, th)
+
+        if (
+            isinstance(prepared_meshes, tuple)
+            and len(prepared_meshes) >= 2
+            and isinstance(prepared_meshes[0], (list, tuple))
+            and (not prepared_meshes[0] or (isinstance(prepared_meshes[0][0], tuple) and len(prepared_meshes[0][0]) == 5))
+            and not isinstance(prepared_meshes[0], np.ndarray)
+        ):
+            if colors is None and len(prepared_meshes) >= 2:
+                colors = prepared_meshes[1]
+            prepared_meshes = prepared_meshes[0]
+
+        proj = orthographic(cx - hx, cx + hx, cy - hy, cy + hy, near=-100.0, far=100.0)
+        view = np.eye(4, dtype=np.float32)
+        mvp = (proj @ view).astype(np.float32)
+        mat_uniforms = dict(material_uniforms) if material_uniforms is not None else {}
+
+        temp_vaos = []
+        temp_buffers = []
+        self._tile_fbo.use()
+        self.ctx.viewport = (0, 0, tw, th)
+        self._tile_fbo.depth_mask = True
+        self.ctx.color_mask = (True, True, True, True)
+        self.ctx.clear(0.10, 0.10, 0.12, 1.0)
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.ctx.depth_func = '<'
+        try:
+            for i, (_v, _tris, pos_bytes, norm_bytes, tri_bytes) in enumerate(prepared_meshes or ()):
+                pos_vbo = self.ctx.buffer(pos_bytes)
+                norm_vbo = self.ctx.buffer(norm_bytes)
+                ibo = self.ctx.buffer(tri_bytes)
+                temp_buffers.extend((pos_vbo, norm_vbo, ibo))
+                vao = self.ctx.vertex_array(
+                    self.prog,
+                    [(pos_vbo, '3f', 'in_pos'), (norm_vbo, '3f', 'in_norm')],
+                    ibo,
+                )
+                depth_vao = self.ctx.vertex_array(
+                    self.depth_prog,
+                    [(pos_vbo, '3f', 'in_pos')],
+                    ibo,
+                )
+                col = colors[i % len(colors)] if colors else (0.8, 0.2, 0.2)
+                temp_vaos.append((vao, depth_vao, col))
+
+            if temp_vaos:
+                self.ctx.color_mask = (False, False, False, False)
+                self.depth_prog['mvp'].write(mvp.T.tobytes())
+                for _vao, depth_vao, _col in temp_vaos:
+                    depth_vao.render(moderngl.TRIANGLES)
+
+                self.ctx.color_mask = (True, True, True, True)
+                self._tile_fbo.depth_mask = False
+                self.ctx.depth_func = '<='
+                self._tile_depth_tex.use(location=1)
+                if 'depth_tex' in self.prog:
+                    self.prog['depth_tex'].value = 1
+                if 'viewport_size' in self.prog:
+                    self.prog['viewport_size'].value = (float(tw), float(th))
+                ao_radius = float(mat_uniforms.get('ao_radius', 0.15))
+                if 'ao_uv_scale' in self.prog:
+                    self.prog['ao_uv_scale'].value = (
+                        float(ao_radius / (2.0 * hx)),
+                        float(ao_radius / (2.0 * hy)),
+                    )
+                self.prog['mvp'].write(mvp.T.tobytes())
+                self.prog['mv'].write(view.T.tobytes())
+                if 'light_dir' in self.prog and 'light_dir' not in mat_uniforms:
+                    self.prog['light_dir'].value = (0.5, 1.0, 0.8)
+                if 'model_alpha' in self.prog and 'model_alpha' not in mat_uniforms:
+                    self.prog['model_alpha'].value = 1.0
+                self._set_program_uniforms(self.prog, mat_uniforms)
+                for vao, _depth_vao, col in temp_vaos:
+                    base_col = np.asarray(col, dtype=np.float32).reshape(-1)[:3]
+                    self.prog['color'].value = (float(base_col[0]), float(base_col[1]), float(base_col[2]))
+                    vao.render(moderngl.TRIANGLES)
+
+            raw = self._tile_fbo.read(components=3, dtype='f1')
+            rgb = np.ascontiguousarray(np.flipud(np.frombuffer(raw, dtype=np.uint8).reshape((th, tw, 3))))
+            return rgb
+        finally:
+            self.ctx.color_mask = (True, True, True, True)
+            self.ctx.depth_func = '<'
+            self._tile_fbo.depth_mask = True
+            for vao, depth_vao, _col in temp_vaos:
+                vao.release()
+                depth_vao.release()
+            for buf in temp_buffers:
+                buf.release()
+            if self.ctx.screen is not None:
+                self.ctx.screen.use()
+
+    def _draw_macro_fabric_sheet(self, view_proj, model_mat, world_scene, units_per_m=None):
+        if not isinstance(world_scene, dict):
+            return
+        tile_images = world_scene.get("swatch_tile_images")
+        swatch_slots = world_scene.get("swatch_slots")
+        if not tile_images or not swatch_slots:
+            return
+        tiles_epoch = int(world_scene.get("swatch_tiles_epoch", 0))
+        swatch_repeats = world_scene.get("swatch_repeats", (24, 24))
+        rep_r = max(1, int(swatch_repeats[0]) if len(swatch_repeats) > 0 else 24)
+        rep_c = max(1, int(swatch_repeats[1]) if len(swatch_repeats) > 1 else 24)
+
+        if tiles_epoch != self._swatch_tiles_epoch or len(self._swatch_tile_textures) != len(tile_images):
+            for tex in self._swatch_tile_textures:
+                tex.release()
+            self._swatch_tile_textures = []
+            for rgb in tile_images:
+                arr = np.ascontiguousarray(np.flipud(np.asarray(rgb, dtype=np.uint8)))
+                if arr.ndim != 3 or arr.shape[2] < 3:
+                    continue
+                arr = np.ascontiguousarray(arr[:, :, :3])
+                h, w = int(arr.shape[0]), int(arr.shape[1])
+                tex = self.ctx.texture((w, h), 3, arr.tobytes())
+                tex.repeat_x = True
+                tex.repeat_y = True
+                tex.build_mipmaps()
+                tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+                self._swatch_tile_textures.append(tex)
+            self._swatch_tiles_epoch = tiles_epoch
+
+        if not self._swatch_tile_textures:
+            return
+
+        if units_per_m is None:
+            fabric_center = world_scene.get("fabric_center", (-0.45, -0.08, 0.0))
+            fabric_size = world_scene.get("fabric_size")
+            raw_phys_span = world_scene.get("phys_span")
+            if raw_phys_span is not None:
+                phys_span = float(raw_phys_span)
+            elif isinstance(fabric_size, (int, float, np.floating, np.integer)):
+                phys_span = float(fabric_size)
+            elif isinstance(fabric_size, (tuple, list, np.ndarray)) and len(fabric_size) >= 2:
+                phys_span = max(float(fabric_size[0]), float(fabric_size[1]))
+            else:
+                phys_span = 0.18
+            _, _, units_per_m = self._scene_world_mapping(
+                model_mat, fabric_center, phys_span, grid_span=world_scene.get("grid_span")
+            )
+
+        mat = np.eye(4, dtype=np.float32) if model_mat is None else np.asarray(model_mat, dtype=np.float32)
+        mvp = (view_proj @ mat).astype(np.float32)
+        z_lift = 0.0015 * float(units_per_m)
+        u_max = float(rep_c)
+        v_max = float(rep_r)
+
+        self.world_prog['mvp'].write(mvp.T.tobytes())
+        self.world_prog['model'].write(mat.T.tobytes())
+        self.world_prog['uTex'].value = 0
+        self.world_prog['uUseTex'].value = 1.0
+        self.world_prog['uUseVertexCol'].value = 0.0
+        self.world_prog['base_color'].value = (1.0, 1.0, 1.0)
+
+        quad_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
+        i_buf = self.ctx.buffer(quad_idx.tobytes())
+        try:
+            for idx, (x0, y0, x1, y1) in enumerate(swatch_slots):
+                x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+                quad_verts = np.array([
+                    [x0f, y0f, z_lift, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    [x1f, y0f, z_lift, 0.0, 0.0, 1.0, u_max, 0.0],
+                    [x1f, y1f, z_lift, 0.0, 0.0, 1.0, u_max, v_max],
+                    [x0f, y1f, z_lift, 0.0, 0.0, 1.0, 0.0, v_max],
+                ], dtype=np.float32)
+                v_buf = self.ctx.buffer(quad_verts.tobytes())
+                vao = self.ctx.vertex_array(
+                    self.world_prog,
+                    [(v_buf, '3f 3f 2f', 'in_pos', 'in_norm', 'in_uv')],
+                    i_buf,
+                )
+                try:
+                    tex = self._swatch_tile_textures[idx % len(self._swatch_tile_textures)]
+                    tex.use(location=0)
+                    vao.render(moderngl.TRIANGLES)
+                finally:
+                    vao.release()
+                    v_buf.release()
+        finally:
+            i_buf.release()
+            self.world_prog['uUseTex'].value = 0.0
+
     def render_wrist_camera(
         self,
         world_pose,
@@ -1470,6 +1703,7 @@ class MeshRenderer:
         dist_coeffs=None,
         grid_span=None,
         hfov_deg=55.0,
+        world_scene=None,
     ):
         if isinstance(joints_or_hfov, (int, float, np.floating, np.integer)):
             hfov_deg = float(joints_or_hfov)
@@ -1538,7 +1772,8 @@ class MeshRenderer:
         fl_y = float(K_render[1, 1])
         cx = float(K_render[0, 2])
         cy = float(K_render[1, 2])
-        near, far = 0.05, 2500.0
+        near = max(0.05, 0.005 * float(units_per_m))
+        far = max(2500.0, 12.0 * float(units_per_m))
         proj = np.zeros((4, 4), dtype=np.float32)
         proj[0, 0] = 2.0 * fl_x / float(out_w)
         proj[0, 2] = 1.0 - 2.0 * cx / float(out_w)
@@ -1562,19 +1797,32 @@ class MeshRenderer:
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = '<'
 
+        ws = {
+            "fabric_center": fabric_center,
+            "fabric_size": fabric_size,
+            "phys_span": phys_span,
+            "grid_span": grid_span,
+            "joints": joints,
+            "show_board": True,
+            "show_table": True,
+            "show_robot": joints is not None,
+        }
+        for src in (material_uniforms, world_scene):
+            if isinstance(src, dict):
+                for k in (
+                    "swatch_tile_images",
+                    "swatch_tiles_epoch",
+                    "swatch_slots",
+                    "swatch_repeats",
+                    "hide_unit_cell_mesh",
+                ):
+                    if k in src and src[k] is not None:
+                        ws[k] = src[k]
+
         self._draw_world_scene(
             view_proj,
             model_mat,
-            {
-                "fabric_center": fabric_center,
-                "fabric_size": fabric_size,
-                "phys_span": phys_span,
-                "grid_span": grid_span,
-                "joints": joints,
-                "show_board": True,
-                "show_table": True,
-                "show_robot": joints is not None,
-            },
+            ws,
             draw_robot=False,
             draw_frusta=False,
             draw_shadows=joints is not None,
@@ -1582,24 +1830,25 @@ class MeshRenderer:
             target_fbo=self.wrist_fbo,
         )
 
-        self.ctx.enable(moderngl.CULL_FACE)
-        self.wrist_depth_tex.use(location=1)
-        if 'depth_tex' in self.prog:
-            self.prog['depth_tex'].value = 1
-        if 'viewport_size' in self.prog:
-            self.prog['viewport_size'].value = (float(out_w), float(out_h))
-        if 'ao_uv_scale' in self.prog:
-            self.prog['ao_uv_scale'].value = (0.01, 0.01)
-        self.prog['mvp'].write(mvp.T.tobytes())
-        self.prog['mv'].write(mv.T.tobytes())
-        if 'light_dir' in self.prog and 'light_dir' not in material_uniforms:
-            self.prog['light_dir'].value = (0.5, 1.0, 0.8)
-        self._set_program_uniforms(self.prog, material_uniforms)
-        for vao, _, _, _, color, row_idx in self.meshes:
-            if not self._row_visible(row_idx, visible_rows):
-                continue
-            self.prog['color'].value = tuple(float(c) for c in np.asarray(color, dtype=np.float32))
-            vao.render(moderngl.TRIANGLES)
+        if not bool(ws.get("hide_unit_cell_mesh", False)):
+            self.ctx.enable(moderngl.CULL_FACE)
+            self.wrist_depth_tex.use(location=1)
+            if 'depth_tex' in self.prog:
+                self.prog['depth_tex'].value = 1
+            if 'viewport_size' in self.prog:
+                self.prog['viewport_size'].value = (float(out_w), float(out_h))
+            if 'ao_uv_scale' in self.prog:
+                self.prog['ao_uv_scale'].value = (0.01, 0.01)
+            self.prog['mvp'].write(mvp.T.tobytes())
+            self.prog['mv'].write(mv.T.tobytes())
+            if 'light_dir' in self.prog and 'light_dir' not in material_uniforms:
+                self.prog['light_dir'].value = (0.5, 1.0, 0.8)
+            self._set_program_uniforms(self.prog, material_uniforms)
+            for vao, _, _, _, color, row_idx in self.meshes:
+                if not self._row_visible(row_idx, visible_rows):
+                    continue
+                self.prog['color'].value = tuple(float(c) for c in np.asarray(color, dtype=np.float32))
+                vao.render(moderngl.TRIANGLES)
 
         raw = self.wrist_fbo.read(components=3, dtype='f1')
         if self.ctx.screen is not None:

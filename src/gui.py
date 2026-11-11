@@ -35,8 +35,10 @@ from scanner_core import (
     _scanner_capture_image_size,
     _scanner_display_batch_colors, _scanner_estimated_cell_colors,
     _scanner_material_uniforms, _scanner_pattern_dimensions,
+    _scanner_pattern_repeats,
     _scanner_storage,
     _set_scanner_estimated_batch_color,
+    ensure_swatch_unit_tile_images,
 )
 
 # UR5 Robot Mode's panel. Safe to import here: gui_ur5 imports gui only from
@@ -376,8 +378,7 @@ def frame_camera_for_mode(state, mode=None):
         sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
         sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
         slot = state.swatch_slot_offset(sel_r, sel_c)
-        lo, hi = state._canonical_tile_bounds()
-        swatch_span = float(max(hi[0] - lo[0], hi[1] - lo[1], 4.0))
+        swatch_span = float(state.unit_cell_span()) if hasattr(state, 'unit_cell_span') else 10.0
         fov_deg = float(getattr(camera, 'fov_deg', 45.0))
         camera.target = slot.copy()
         camera.dist = max(4.0, 1.35 * swatch_span / max(2.0 * np.tan(np.radians(fov_deg) * 0.5), 0.1))
@@ -1553,6 +1554,8 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_preview_cols = max(1, int(state.scanner_cols))
                 state.scanner_status = "Scanner layout updated"
                 state.rebuild_spline_mesh(preserve_model_placement=False)
+                if _normalize_app_mode(state.get('app_mode', 'edit'), state) in ('scan', 'capture'):
+                    frame_camera_for_mode(state)
             grid_active = str(state.get('scanner_layout_pattern', 'grid')) == 'grid'
             if imgui.radio_button("Grid##scan_layout_grid", grid_active):
                 state.scanner_layout_pattern = 'grid'
@@ -1721,6 +1724,28 @@ def draw_sidebar(state, renderer, window=None):
                 state.swatch_cells = {}
                 state.rebuild_spline_mesh(preserve_model_placement=True)
                 state.scanner_status = "Random pattern settings updated"
+            rep_r, rep_c = _scanner_pattern_repeats(state)
+            changed_rr, new_rr = imgui.slider_int(
+                "Unit cell repeats Y##scanner_pattern_repeat_rows", int(rep_r), 1, 128,
+            )
+            changed_rc, new_rc = imgui.slider_int(
+                "Unit cell repeats X##scanner_pattern_repeat_cols", int(rep_c), 1, 128,
+            )
+            if changed_rr or changed_rc:
+                if changed_rr:
+                    state.scanner_pattern_repeat_rows = int(new_rr)
+                if changed_rc:
+                    state.scanner_pattern_repeat_cols = int(new_rc)
+                rep_r, rep_c = _scanner_pattern_repeats(state)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+                if _normalize_app_mode(state.get('app_mode', 'edit'), state) in ('scan', 'capture'):
+                    frame_camera_for_mode(state)
+            rows = max(1, int(state.scanner_rows))
+            cols = max(1, int(state.scanner_cols))
+            imgui.text_disabled(
+                f"Macro scale: {rep_r} x {rep_c} = {rep_r * rep_c:,} unit cells per swatch "
+                f"({rep_r * rep_c * rows * cols:,} total cells)"
+            )
             imgui.text("Preview mode")
             if not state.get('scanner_color_mode'):
                 state.scanner_color_mode = 'realistic'
@@ -2051,7 +2076,7 @@ def draw_sidebar(state, renderer, window=None):
     imgui.end()
 
 
-def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True):
+def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True, renderer=None):
     controller = state.get('ur5_controller')
     joints = None
     if controller is not None and controller.robot is not None and controller.robot.connected:
@@ -2086,6 +2111,9 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
                 True,
             )
             plan_poses = [np.r_[v.position, v.rotvec] for v in views]
+    if renderer is None:
+        renderer = getattr(state, 'renderer', None)
+    tile_images, tiles_epoch = ensure_swatch_unit_tile_images(state, renderer)
     return {
         'show_board': bool(show_board),
         'show_robot': bool(show_robot),
@@ -2096,6 +2124,11 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
         'fabric_center': (-0.45, -0.08, 0.0),
         'phys_span': 0.18,
         'grid_span': float(state.canonical_grid_span()),
+        'swatch_tile_images': tile_images,
+        'swatch_tiles_epoch': tiles_epoch,
+        'swatch_slots': state.all_swatch_slot_rects() if hasattr(state, 'all_swatch_slot_rects') else [],
+        'swatch_repeats': _scanner_pattern_repeats(state),
+        'hide_unit_cell_mesh': (_normalize_app_mode(state.get('app_mode', 'edit'), state) in ('scan', 'capture')),
     }
 
 
@@ -2169,8 +2202,12 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
             is_active = (r == sel_r and c == sel_c)
             if not is_active and not show_neighbors:
                 continue
-            slot = state.swatch_slot_offset(r, c)
-            tl_local = slot + np.array([tile_lo[0], tile_hi[1], 0.02], dtype=np.float32)
+            if hasattr(state, 'swatch_slot_rect'):
+                rx0, _ry0, _rx1, ry1 = state.swatch_slot_rect(r, c)
+                tl_local = np.array([float(rx0), float(ry1), 0.02], dtype=np.float32)
+            else:
+                slot = state.swatch_slot_offset(r, c)
+                tl_local = slot + np.array([tile_lo[0], tile_hi[1], 0.02], dtype=np.float32)
             tl_world = transform_points([tl_local], model_mat) if model_mat is not None else np.asarray([tl_local], dtype=np.float32)
             scr, valid, _ = project_to_screen(tl_world, view_proj, disp_w, disp_h)
             if valid[0] and 0.0 <= float(scr[0, 0]) <= float(disp_w) and 0.0 <= float(scr[0, 1]) <= float(disp_h):
@@ -2450,6 +2487,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         show_robot=scanner_stage_active or bool(state.get('world_show_robot', True)),
         show_frusta=scanner_stage_active,
         show_board=scanner_stage_active or bool(state.get('world_show_robot', True)),
+        renderer=renderer,
     )
 
     renderer.render(
@@ -2606,9 +2644,22 @@ def draw_viewport(state, renderer, ref_tex, window):
         tile_lo, tile_hi = state._canonical_tile_bounds()
         bounds = []
         for cell_idx, chunks in enumerate(cell_pts):
-            if not chunks:
-                r = cell_idx // cols
-                c = cell_idx % cols
+            r = cell_idx // cols
+            c = cell_idx % cols
+            if hasattr(state, 'swatch_slot_rect'):
+                rx0, ry0, rx1, ry1 = state.swatch_slot_rect(r, c)
+                corners = np.array([
+                    [float(rx0), float(ry0), 0.0],
+                    [float(rx1), float(ry0), 0.0],
+                    [float(rx1), float(ry1), 0.0],
+                    [float(rx0), float(ry1), 0.0],
+                ], dtype=np.float32)
+                screen, valid, _ = project_to_screen(transform_points(corners, model_matrix), view_proj, disp_w, disp_h)
+                if not np.any(valid):
+                    bounds.append(None)
+                    continue
+                pts = screen[valid]
+            elif not chunks:
                 slot = state.swatch_slot_offset(r, c)
                 corners = np.array([
                     [slot[0] + tile_lo[0], slot[1] + tile_lo[1], slot[2]],
@@ -2982,7 +3033,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         if io.mouse_wheel != 0 and not io.key_shift:
             # Orthographic camera zoom by changing distance and re-rendering.
             zoom_factor = float(np.exp(io.mouse_wheel * 0.12))
-            state.camera.dist = float(np.clip(float(state.camera.dist) / zoom_factor, 1.0, 200.0))
+            max_dist = max(200.0, 10.0 * float(state.canonical_grid_span()))
+            state.camera.dist = float(np.clip(float(state.camera.dist) / zoom_factor, 0.5, max_dist))
             # Keep legacy image zoom neutral to avoid pixelated post-scale.
             state.viewport_zoom = 1.0
 
