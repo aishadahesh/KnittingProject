@@ -124,7 +124,7 @@ Never read `todo.md`.
 | File | Purpose |
 | --- | --- |
 | `AGENTS.md` | Project rules |
-| `README.md` | Setup, navigation, and non-obvious constraints; at most 400 lines |
+| `onboarding.md` | Setup, navigation, and non-obvious constraints; at most 400 lines |
 | `next.md` | Previous session results and next actions |
 | `todo.md` | Optional side tasks; prepend entries, never read |
 
