@@ -120,3 +120,5 @@ Training requires the CUDA Toolkit and Visual Studio C++ build tools used by tha
 `imgui_layout.ini` is the application's saved window layout.
 Do not delete captures, calibrations, trained models, or edited parameters during code cleanup.
 Use `scripts/profile_app.py` to profile the geometry and scanning pipeline against local data.
+
+
