@@ -377,29 +377,70 @@ def compute_normals(verts, tris):
 
 # %% CAMERA ───────────────────────────────────────────────────────────────────
 
+SCENE_VFOV_DEG = 32.0
+SCENE_MOUSE_SENS = 0.0025
+SCENE_PITCH_LIMIT_DEG = 88.0
+SCENE_MOVE_CM_S = 120.0
+SCENE_ROLL_DEG_S = 45.0
+_WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+
 class Camera:
     def __init__(self):
         self.target  = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.dist    = 15.0
         self.az      = 0.0
         self.el      = float(np.pi * 0.5)
-        self.fov_deg = 45.0
+        self.roll    = 0.0
+        self.fov_deg = SCENE_VFOV_DEG
+        self.ortho   = False
+
+    @property
+    def yaw(self) -> float:
+        return -float(self.az)
+
+    @yaw.setter
+    def yaw(self, value: float) -> None:
+        self.az = -float(value)
+
+    @property
+    def pitch(self) -> float:
+        return -float(self.el)
+
+    @pitch.setter
+    def pitch(self, value: float) -> None:
+        self.el = -float(value)
+
+    def forward(self) -> np.ndarray:
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        return np.array([sy * cp, cy * cp, sp], dtype=np.float32)
+
+    @property
+    def eye(self) -> np.ndarray:
+        return (np.asarray(self.target, dtype=np.float32) - float(self.dist) * self.forward()).astype(np.float32)
+
+    @eye.setter
+    def eye(self, value) -> None:
+        self.target = (np.asarray(value, dtype=np.float32) + float(self.dist) * self.forward()).astype(np.float32)
 
     def _basis(self):
-        ca, sa = float(np.cos(self.az)), float(np.sin(self.az))
-        ce, se = float(np.cos(self.el)), float(np.sin(self.el))
-        right = np.array([ca, sa, 0.0], dtype=np.float32)
-        up    = np.array([-se * sa, se * ca, ce], dtype=np.float32)
-        back  = np.array([ce * sa, -ce * ca, se], dtype=np.float32)
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        right = np.array([cy, -sy, 0.0], dtype=np.float32)
+        up    = np.array([-sy * sp, -cy * sp, cp], dtype=np.float32)
+        back  = np.array([-sy * cp, -cy * cp, -sp], dtype=np.float32)
+        if abs(self.roll) > 1e-6:
+            cr, sr = math.cos(self.roll), math.sin(self.roll)
+            right, up = (right * cr + up * sr).astype(np.float32), (-right * sr + up * cr).astype(np.float32)
         return right, up, back
 
     def _pos(self):
-        _, _, back = self._basis()
-        return self.target + float(self.dist) * back
+        return self.eye
 
     def view(self):
         right, up, back = self._basis()
-        eye = self.target + float(self.dist) * back
+        eye = self.eye
         m = np.eye(4, dtype=np.float32)
         m[0, :3] = right
         m[1, :3] = up
@@ -410,9 +451,11 @@ class Camera:
         return m
 
     def proj(self, w, h):
-        aspect = max(1.0, w) / max(1.0, h)
-        # Match the perspective framing at the current distance, but with
-        # orthographic projection to remove perspective distortion.
+        aspect = max(1.0, float(w)) / max(1.0, float(h))
+        if not self.ortho:
+            near = max(0.05, min(0.5, float(self.dist) * 0.01))
+            far = max(2000.0, float(self.dist) * 50.0)
+            return perspective(self.fov_deg, aspect, near=near, far=far)
         half_h = max(1e-4, self.dist * np.tan(np.radians(self.fov_deg) * 0.5))
         half_w = half_h * aspect
         span = max(1000.0, float(self.dist) * 8.0)
@@ -424,16 +467,40 @@ class Camera:
     def mv(self, w, h):
         return self.view()
 
+    def look(self, dx, dy):
+        eye = self.eye
+        limit = math.radians(SCENE_PITCH_LIMIT_DEG)
+        self.yaw += float(dx) * SCENE_MOUSE_SENS
+        self.pitch = float(np.clip(self.pitch - float(dy) * SCENE_MOUSE_SENS, -limit, limit))
+        self.ortho = False
+        self.target = (eye + float(self.dist) * self.forward()).astype(np.float32)
+
     def orbit(self, dx, dy):
-        self.az -= dx * 0.005
-        self.el = float(np.clip(self.el + dy * 0.005, np.radians(-15.0), np.pi * 0.5))
+        limit = math.radians(SCENE_PITCH_LIMIT_DEG)
+        self.yaw += float(dx) * SCENE_MOUSE_SENS
+        self.pitch = float(np.clip(self.pitch - float(dy) * SCENE_MOUSE_SENS, -limit, limit))
+        self.ortho = False
+
+    def fly(self, dt, move, roll_dir=0.0, speed=1.0):
+        fwd = self.forward()
+        right = np.cross(fwd, _WORLD_UP)
+        rn = float(np.linalg.norm(right))
+        right = (right / rn).astype(np.float32) if rn > 1e-6 else self._basis()[0]
+        mv = np.asarray(move, dtype=np.float32).reshape(3)
+        step = fwd * float(mv[0]) + right * float(mv[1]) + _WORLD_UP * float(mv[2])
+        sn = float(np.linalg.norm(step))
+        if sn > 1e-6:
+            delta = (step / sn) * (float(speed) * float(dt))
+            self.ortho = False
+            self.target = (np.asarray(self.target, dtype=np.float32) + delta).astype(np.float32)
+        if abs(roll_dir) > 1e-6:
+            self.ortho = False
+            self.roll += float(roll_dir) * math.radians(SCENE_ROLL_DEG_S) * float(dt)
 
     def zoom(self, delta):
         self.dist = max(1.0, self.dist - delta)
 
     def zoom_factor(self):
-        # 1.0 at reference distance of 15.0.
-        # Lower distance means zoom-in, so this factor increases on zoom-in.
         return 15.0 / max(self.dist, 1e-6)
 
     def pan(self, dx, dy):

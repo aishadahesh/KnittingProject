@@ -267,6 +267,10 @@ def main(robot="sim", camera_source="sim"):
         # solver, or Model Mode's spinning model - and any mouse or key event still
         # wakes it at once.
         IDLE_FRAME_SECONDS = 1.0 / 15.0
+        _FLY_KEYS = (
+            glfw.KEY_W, glfw.KEY_A, glfw.KEY_S, glfw.KEY_D,
+            glfw.KEY_Q, glfw.KEY_E, glfw.KEY_Z, glfw.KEY_C,
+        )
 
         def animating(state):
             controller = state.get('ur5_controller')
@@ -274,7 +278,12 @@ def main(robot="sim", camera_source="sim"):
             model_view = state.get('model_view')
             spinning = model_view is not None and (bool(getattr(model_view, 'spin', False))
                                                    or bool(getattr(model_view, 'wiggle', False)))
-            return scanning or spinning or sim_may_run(state)
+            cam_active = (
+                bool(state.get('_cam_look_active', False))
+                or bool(state.get('_cam_orbit_active', False))
+                or any(glfw.get_key(window, k) == glfw.PRESS for k in _FLY_KEYS)
+            )
+            return scanning or spinning or sim_may_run(state) or cam_active
 
         # ── Main loop ─────────────────────────────────────────────────────────────
         undo_shortcut_was_down = False

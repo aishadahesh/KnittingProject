@@ -362,16 +362,19 @@ def frame_camera_for_mode(state, mode=None):
     grid_span = float(state.canonical_grid_span())
     state.viewport_pan = np.zeros(2, dtype=np.float32)
     state.viewport_zoom = 1.0
+    camera.roll = 0.0
     if mode == 'scan':
+        camera.ortho = False
         camera.target = np.array([0.55 * grid_span, 0.05 * grid_span, 0.18 * grid_span], dtype=np.float32)
         camera.dist = max(12.0, 2.5 * grid_span)
-        camera.az = float(np.radians(-35.0))
-        camera.el = float(np.radians(32.0))
+        camera.yaw = float(np.radians(35.0))
+        camera.pitch = float(np.radians(-32.0))
     elif mode == 'capture':
+        camera.ortho = False
         camera.target = np.array([0.25 * grid_span, 0.0, 0.10 * grid_span], dtype=np.float32)
         camera.dist = max(10.0, 1.8 * grid_span)
-        camera.az = float(np.radians(-25.0))
-        camera.el = float(np.radians(35.0))
+        camera.yaw = float(np.radians(25.0))
+        camera.pitch = float(np.radians(-35.0))
     else:
         rows = max(1, int(state.get('scanner_rows', 1)))
         cols = max(1, int(state.get('scanner_cols', 1)))
@@ -379,11 +382,12 @@ def frame_camera_for_mode(state, mode=None):
         sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
         slot = state.swatch_slot_offset(sel_r, sel_c)
         swatch_span = float(state.unit_cell_span()) if hasattr(state, 'unit_cell_span') else 10.0
-        fov_deg = float(getattr(camera, 'fov_deg', 45.0))
+        fov_deg = float(getattr(camera, 'fov_deg', 32.0))
         camera.target = slot.copy()
         camera.dist = max(4.0, 1.35 * swatch_span / max(2.0 * np.tan(np.radians(fov_deg) * 0.5), 0.1))
-        camera.az = float(np.radians(-20.0)) if mode == 'model' else 0.0
-        camera.el = float(np.radians(55.0)) if mode == 'model' else float(np.pi * 0.5)
+        camera.ortho = (mode == 'edit')
+        camera.yaw = float(np.radians(20.0)) if mode == 'model' else 0.0
+        camera.pitch = float(np.radians(-55.0)) if mode == 'model' else float(-np.pi * 0.5)
 
 
 def _set_app_mode(state, mode):
@@ -2224,15 +2228,25 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
 
     current_mode = _normalize_app_mode(state.get('app_mode', 'edit'))
     mode_label = next((label for mid, label, _ in MODE_SPECS if mid == current_mode), current_mode.title())
-    az_deg = float(np.degrees(state.camera.az))
-    el_deg = float(np.degrees(state.camera.el))
     status_line = (
-        f"{mode_label} | Swatch R{sel_r + 1} C{sel_c + 1} | "
-        f"Cam d={float(state.camera.dist):.1f} az={az_deg:+.0f}deg el={el_deg:+.0f}deg | "
-        "Drag: orbit | Shift+Drag: pan | Wheel: zoom | WASD/QE: fly"
+        f"{mode_label} | Swatch R{sel_r + 1} C{sel_c + 1} | {_camera_pose_line(state)} | "
+        "WASD/QE fly - hold LMB to steer - R reset - Z/C roll"
     )
     status_col = imgui.get_color_u32((0.90, 0.93, 0.96, 0.94))
     _hud_text(dl, ox + 10.0, oy + float(disp_h) * vp_scale - 22.0, status_col, status_line)
+
+
+def _camera_pose_line(state) -> str:
+    grid_span = max(float(state.canonical_grid_span()), 1e-4) if hasattr(state, 'canonical_grid_span') else 10.0
+    cm_per_unit = 18.0 / grid_span
+    eye_cm = np.asarray(state.camera.eye, dtype=np.float32) * cm_per_unit
+    yaw_deg = float(np.degrees(state.camera.yaw))
+    pitch_deg = float(np.degrees(state.camera.pitch))
+    roll_deg = float(np.degrees(getattr(state.camera, 'roll', 0.0)))
+    return (
+        f"eye ({eye_cm[0]:+4.0f}, {eye_cm[1]:+4.0f}, {eye_cm[2]:+4.0f}) cm  "
+        f"yaw {yaw_deg:+4.0f}d  pitch {pitch_deg:+3.0f}d  roll {roll_deg:+4.0f}d"
+    )
 
 
 def _draw_scan_gripper_camera_canvas(state, renderer, height=0):
@@ -2349,12 +2363,16 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.same_line()
     if imgui.small_button("Front View##vp_front"):
         frame_camera_for_mode(state, current_mode)
-        state.camera.az = 0.0
-        state.camera.el = float(np.pi * 0.5)
+        state.camera.yaw = 0.0
+        state.camera.pitch = float(-np.pi * 0.5)
+        state.camera.roll = 0.0
+        state.camera.ortho = (current_mode == 'edit')
     imgui.same_line()
     if imgui.small_button("3D Angle##vp_angle"):
-        state.camera.az = float(np.radians(-30.0))
-        state.camera.el = float(np.radians(32.0))
+        state.camera.yaw = float(np.radians(30.0))
+        state.camera.pitch = float(np.radians(-32.0))
+        state.camera.roll = 0.0
+        state.camera.ortho = False
     imgui.same_line()
     if imgui.small_button("Reset Transform##vp_reset_transform"):
         state.model_t = np.zeros(3, dtype=np.float32)
@@ -2372,7 +2390,8 @@ def draw_viewport(state, renderer, ref_tex, window):
         if ch_rb:
             state.world_show_robot = bool(show_rb)
     imgui.same_line()
-    imgui.text_disabled("Drag: orbit | Shift+Drag: pan | Wheel: zoom | WASD/QE: fly")
+    imgui.text_disabled(_camera_pose_line(state))
+    imgui.text_disabled("WASD/QE fly the focused view - hold LMB to steer as you fly - R resets it - Z/C roll")
 
     total_avail_x, avail_y = imgui.get_content_region_avail()
     avail_x = max(240.0, (total_avail_x - 8.0) * 0.52) if split_right_mode else total_avail_x
@@ -2789,7 +2808,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         mat[0, 3] = pos[0]; mat[1, 3] = pos[1]; mat[2, 3] = pos[2]
         obj_m = M16(); obj_m.values[:] = mat.T.flatten()
 
-        imguizmo.im_guizmo.set_orthographic(True)
+        imguizmo.im_guizmo.set_orthographic(bool(getattr(state.camera, 'ortho', False)))
         imguizmo.im_guizmo.set_drawlist()
         gizmo_x = float(state.vp_origin[0])
         gizmo_y = float(state.vp_origin[1])
@@ -2866,7 +2885,15 @@ def draw_viewport(state, renderer, ref_tex, window):
     if is_hovered:
         io = imgui.get_io()
         lmb_down = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
-        if scanner_stage_active and scanner_cell_bounds and hover_handle < 0 and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not io.key_shift and not io.key_alt:
+        if (
+            scanner_stage_active
+            and scanner_cell_bounds
+            and hover_handle < 0
+            and imgui.is_mouse_released(imgui.MouseButton_.left)
+            and not imgui.is_mouse_dragging(imgui.MouseButton_.left, 4.0)
+            and not io.key_shift
+            and not io.key_alt
+        ):
             rows = max(1, int(getattr(state, 'scanner_rows', state.bitmap_size[0])))
             cols = max(1, int(getattr(state, 'scanner_cols', state.bitmap_size[1])))
             for cell_index, cell_bounds in enumerate(scanner_cell_bounds):
@@ -3003,57 +3030,69 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.set_local_radius(flat_idx, value, start_rows=start_rows)
         state.rebuild_spline_mesh()
 
+    io = imgui.get_io()
+    bbox_drag_active = int(state.get('bbox_active_handle', -1)) >= 0
+    spline_drag_active = (
+        edit_controls_active
+        and state.mode == 'spline'
+        and (
+            (state.selected_idx >= 0 and (imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()))
+            or state.hover_idx >= 0
+        )
+    )
+    edit_grab_active = bool(state.spline_grab_active) or bool(state.radius_grab_active)
+
+    if is_hovered and imgui.is_mouse_clicked(imgui.MouseButton_.left) and not bbox_drag_active and not spline_drag_active and not edit_grab_active:
+        state._cam_look_active = True
+    if not imgui.is_mouse_down(imgui.MouseButton_.left) or bbox_drag_active or spline_drag_active or edit_grab_active:
+        state._cam_look_active = False
+
+    if is_hovered and (imgui.is_mouse_clicked(imgui.MouseButton_.right) or imgui.is_mouse_clicked(imgui.MouseButton_.middle)) and not edit_grab_active:
+        state._cam_orbit_active = True
+    if not (imgui.is_mouse_down(imgui.MouseButton_.right) or imgui.is_mouse_down(imgui.MouseButton_.middle)) or edit_grab_active:
+        state._cam_orbit_active = False
+
+    if is_hovered and io.mouse_wheel != 0 and not io.key_shift:
+        zoom_factor = float(np.exp(io.mouse_wheel * 0.12))
+        max_dist = max(200.0, 10.0 * float(state.canonical_grid_span()))
+        state.camera.dist = float(np.clip(float(state.camera.dist) / zoom_factor, 0.5, max_dist))
+        state.viewport_zoom = 1.0
+
+    dx, dy = float(io.mouse_delta.x), float(io.mouse_delta.y)
+    if (dx != 0.0 or dy != 0.0) and not edit_grab_active:
+        if io.key_shift and (bool(state.get('_cam_look_active', False)) or bool(state.get('_cam_orbit_active', False))):
+            state.camera.target = (
+                np.asarray(state.camera.target, dtype=np.float32) - pixel_drag_to_world_delta(dx, dy)
+            ).astype(np.float32)
+        elif bool(state.get('_cam_look_active', False)):
+            if io.key_alt:
+                state.camera.orbit(dx, dy)
+            else:
+                state.camera.look(dx, dy)
+        elif bool(state.get('_cam_orbit_active', False)):
+            state.camera.orbit(dx, dy)
+
+    r_down = glfw.get_key(window, glfw.KEY_R) == glfw.PRESS
+    r_pressed = r_down and not bool(state.radius_grab_key_was_down)
+    state.radius_grab_key_was_down = r_down
+    r_used_for_radius = False
+    if is_hovered and edit_controls_active and r_pressed and not bool(state.radius_grab_active):
+        edit_idx = local_radius_edit_index()
+        if edit_idx >= 0:
+            state.push_undo("Local tube radius")
+            state.selected_idx = edit_idx
+            state.radius_grab_active = True
+            state.radius_grab_point_idx = edit_idx
+            state.radius_grab_start_mouse = np.array([mx, my], dtype=np.float32)
+            state.radius_grab_start_value = local_radius_value(edit_idx)
+            state.radius_grab_start_rows = [row.copy() for row in state.spline_radius_rows]
+            r_used_for_radius = True
+
+    if r_pressed and not r_used_for_radius and not io.want_text_input and not edit_grab_active:
+        frame_camera_for_mode(state, current_mode)
+
     if is_hovered:
         curr = (mx, my)
-        bbox_drag_active = int(state.get('bbox_active_handle', -1)) >= 0
-        spline_drag_active = (
-            state.mode == 'spline'
-            and (
-                (state.selected_idx >= 0 and (imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()))
-                or state.hover_idx >= 0
-            )
-        )
-
-        io = imgui.get_io()
-        if io.mouse_wheel != 0 and not io.key_shift:
-            # Orthographic camera zoom by changing distance and re-rendering.
-            zoom_factor = float(np.exp(io.mouse_wheel * 0.12))
-            max_dist = max(200.0, 10.0 * float(state.canonical_grid_span()))
-            state.camera.dist = float(np.clip(float(state.camera.dist) / zoom_factor, 0.5, max_dist))
-            # Keep legacy image zoom neutral to avoid pixelated post-scale.
-            state.viewport_zoom = 1.0
-
-        if state.get('prev_mouse') is not None:
-            prev = state.prev_mouse
-            dx = mx - prev[0]
-            dy = my - prev[1]
-            lmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT)   == glfw.PRESS
-            rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT)  == glfw.PRESS
-            mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
-            shift_down = imgui.get_io().key_shift
-            bg_lmb_drag = lmb and not bbox_drag_active and not spline_drag_active and not suppress_mesh_click
-
-            if not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
-                if shift_down and (mmb or rmb or bg_lmb_drag):
-                    state.camera.target = (
-                        np.asarray(state.camera.target, dtype=np.float32) - pixel_drag_to_world_delta(dx, dy)
-                    ).astype(np.float32)
-                elif mmb or rmb or bg_lmb_drag:
-                    state.camera.orbit(dx, dy)
-
-        r_down = glfw.get_key(window, glfw.KEY_R) == glfw.PRESS
-        r_pressed = r_down and not bool(state.radius_grab_key_was_down)
-        state.radius_grab_key_was_down = r_down
-        if edit_controls_active and r_pressed and not bool(state.radius_grab_active):
-            edit_idx = local_radius_edit_index()
-            if edit_idx >= 0:
-                state.push_undo("Local tube radius")
-                state.selected_idx = edit_idx
-                state.radius_grab_active = True
-                state.radius_grab_point_idx = edit_idx
-                state.radius_grab_start_mouse = np.array([mx, my], dtype=np.float32)
-                state.radius_grab_start_value = local_radius_value(edit_idx)
-                state.radius_grab_start_rows = [row.copy() for row in state.spline_radius_rows]
 
         if edit_controls_active and bool(state.radius_grab_active):
             start_mouse = np.asarray(state.radius_grab_start_mouse, dtype=np.float32)
@@ -3156,72 +3195,9 @@ def draw_viewport(state, renderer, ref_tex, window):
                         state.rebuild_spline_mesh()
                         state.spline_grab_active = False
 
-        if edit_controls_active and state.mode == 'spline' and state.selected_idx >= 0 and int(state.selected_idx) in visible_ctrl_index_map and not bool(state.radius_grab_active):
-            view = state.camera.view()
-            right = view[0, :3]
-            up = view[1, :3]
-            forward = -view[2, :3]
-            step = float(state.spline_keyboard_step)
-            if (
-                glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
-                or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
-            ):
-                step *= 0.2
-
-            world_delta = np.zeros(3, dtype=np.float32)
-            if glfw.get_key(window, glfw.KEY_LEFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
-                world_delta -= right * step
-            if glfw.get_key(window, glfw.KEY_RIGHT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
-                world_delta += right * step
-            if glfw.get_key(window, glfw.KEY_UP) == glfw.PRESS or glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
-                world_delta += up * step
-            if glfw.get_key(window, glfw.KEY_DOWN) == glfw.PRESS or glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
-                world_delta -= up * step
-            if glfw.get_key(window, glfw.KEY_PAGE_UP) == glfw.PRESS or glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
-                world_delta += forward * step
-            if glfw.get_key(window, glfw.KEY_PAGE_DOWN) == glfw.PRESS or glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
-                world_delta -= forward * step
-
-            if np.linalg.norm(world_delta) > 0.0:
-                if not state.spline_keyboard_edit_active:
-                    state.push_undo("Spline point")
-                    state.spline_keyboard_edit_active = True
-                local_delta = np.linalg.inv(model_mat)[:3, :3] @ world_delta
-                state.move_ctrl_pt(
-                    state.selected_idx,
-                    state.flat_pts_all[state.selected_idx] + local_delta.astype(np.float32),
-                )
-                state.rebuild_spline_mesh()
-            else:
-                state.spline_keyboard_edit_active = False
-        elif not io.want_text_input and not bool(state.radius_grab_active) and not bool(state.spline_grab_active):
-            view = state.camera.view()
-            right = view[0, :3]
-            up = view[1, :3]
-            fwd = -view[2, :3]
-            fly_step = max(0.15, float(state.camera.dist) * 0.025)
-            rmb_held = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-            w_axis = fwd if rmb_held else up
-            fly_delta = np.zeros(3, dtype=np.float32)
-            if glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
-                fly_delta += w_axis * fly_step
-            if glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
-                fly_delta -= w_axis * fly_step
-            if glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
-                fly_delta += right * fly_step
-            if glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
-                fly_delta -= right * fly_step
-            if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
-                fly_delta += fwd * fly_step
-            if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
-                fly_delta -= fwd * fly_step
-            if np.linalg.norm(fly_delta) > 0.0:
-                state.camera.target = (np.asarray(state.camera.target, dtype=np.float32) + fly_delta).astype(np.float32)
-
         state.model_rot_dragging = False
         state.model_drag_undo_active = False
 
-        # Spline handle hover + select
         if edit_controls_active and state.mode == 'spline' and len(visible_ctrl_indices) > 0:
             gizmo_active = state.selected_idx >= 0 and (
                 imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()
@@ -3247,6 +3223,86 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.prev_mouse = curr
     else:
         state.prev_mouse = None
+
+    spline_pt_selected = (
+        is_hovered
+        and edit_controls_active
+        and state.mode == 'spline'
+        and state.selected_idx >= 0
+        and int(state.selected_idx) in visible_ctrl_index_map
+        and not bool(state.radius_grab_active)
+    )
+    if spline_pt_selected:
+        view = state.camera.view()
+        right = view[0, :3]
+        up = view[1, :3]
+        forward = -view[2, :3]
+        step = float(state.spline_keyboard_step)
+        if (
+            glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
+            or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+        ):
+            step *= 0.2
+
+        world_delta = np.zeros(3, dtype=np.float32)
+        if glfw.get_key(window, glfw.KEY_LEFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
+            world_delta -= right * step
+        if glfw.get_key(window, glfw.KEY_RIGHT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
+            world_delta += right * step
+        if glfw.get_key(window, glfw.KEY_UP) == glfw.PRESS or glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
+            world_delta += up * step
+        if glfw.get_key(window, glfw.KEY_DOWN) == glfw.PRESS or glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
+            world_delta -= up * step
+        if glfw.get_key(window, glfw.KEY_PAGE_UP) == glfw.PRESS or glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+            world_delta += forward * step
+        if glfw.get_key(window, glfw.KEY_PAGE_DOWN) == glfw.PRESS or glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
+            world_delta -= forward * step
+
+        if np.linalg.norm(world_delta) > 0.0:
+            if not state.spline_keyboard_edit_active:
+                state.push_undo("Spline point")
+                state.spline_keyboard_edit_active = True
+            local_delta = np.linalg.inv(model_mat)[:3, :3] @ world_delta
+            state.move_ctrl_pt(
+                state.selected_idx,
+                state.flat_pts_all[state.selected_idx] + local_delta.astype(np.float32),
+            )
+            state.rebuild_spline_mesh()
+        else:
+            state.spline_keyboard_edit_active = False
+    elif not io.want_text_input and not bool(state.radius_grab_active) and not bool(state.spline_grab_active):
+        move_vec = np.zeros(3, dtype=np.float32)
+        if glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
+            move_vec[0] += 1.0
+        if glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
+            move_vec[0] -= 1.0
+        if glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
+            move_vec[1] += 1.0
+        if glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
+            move_vec[1] -= 1.0
+        if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+            move_vec[2] += 1.0
+        if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
+            move_vec[2] -= 1.0
+        ctrl_held = (
+            glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS
+            or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+        )
+        roll_dir = 0.0
+        if not ctrl_held:
+            if glfw.get_key(window, glfw.KEY_Z) == glfw.PRESS:
+                roll_dir -= 1.0
+            if glfw.get_key(window, glfw.KEY_C) == glfw.PRESS:
+                roll_dir += 1.0
+        if np.linalg.norm(move_vec) > 0.0 or abs(roll_dir) > 0.0:
+            dt = float(np.clip(io.delta_time, 1e-4, 0.1))
+            units_per_m = max(float(state.canonical_grid_span()), 1.0) / 0.18
+            speed = 1.20 * units_per_m
+            if io.key_shift:
+                speed *= 2.0
+            if ctrl_held:
+                speed *= 0.25
+            state.camera.fly(dt, move_vec, roll_dir=roll_dir, speed=speed)
 
     if split_right_mode is not None:
         right_w = max(180.0, total_avail_x - avail_x - 8.0)

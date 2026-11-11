@@ -206,6 +206,7 @@ def test_render_unit_cell_tile_and_macro_fabric_sheet():
         frame_camera_for_mode(state, "edit")
         edit_dist = float(state.camera.dist)
         edit_view = state.camera.view()
+        assert state.camera.ortho is True
         np.testing.assert_allclose(edit_view[0, :3], [1.0, 0.0, 0.0], atol=1e-5)
         np.testing.assert_allclose(edit_view[1, :3], [0.0, 1.0, 0.0], atol=1e-5)
         np.testing.assert_allclose(edit_view[2, :3], [0.0, 0.0, 1.0], atol=1e-5)
@@ -213,9 +214,24 @@ def test_render_unit_cell_tile_and_macro_fabric_sheet():
         frame_camera_for_mode(state, "scan")
         scan_dist = float(state.camera.dist)
         scan_view = state.camera.view()
+        assert state.camera.ortho is False
+        assert abs(float(state.camera.proj(240, 180)[3, 2]) + 1.0) < 1e-5
         assert scan_dist > edit_dist
         assert float(scan_view[1, 2]) > 0.75
         assert float(scan_view[2, 2]) > 0.30
+
+        eye_before = state.camera.eye.copy()
+        yaw_before = float(state.camera.yaw)
+        pitch_before = float(state.camera.pitch)
+        state.camera.look(40.0, -20.0)
+        np.testing.assert_allclose(state.camera.eye, eye_before, atol=1e-4)
+        assert float(state.camera.yaw) > yaw_before
+        assert float(state.camera.pitch) > pitch_before
+
+        fwd = state.camera.forward().copy()
+        state.camera.fly(0.5, (1.0, 0.0, 0.0), roll_dir=1.0, speed=10.0)
+        np.testing.assert_allclose(state.camera.eye, eye_before + 5.0 * fwd, atol=1e-4)
+        assert float(state.camera.roll) > 0.0
     finally:
         renderer.close()
         ctx.release()
