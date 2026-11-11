@@ -55,12 +55,9 @@ class AppState:
             return {k: AppState._clone(x) for k, x in v.items()}
         return v
 
-    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None, puzzle_renderer=None):
+    def __init__(self, camera, renderer, orbit_camera=None, orbit_renderer=None):
         self.camera = camera
         self.renderer = renderer
-        # Dedicated GPU scene for Puzzle Mode. Keeping this renderer distinct is
-        # what makes Scan/Puzzle isolation structural instead of timing-based.
-        self.puzzle_renderer = puzzle_renderer
         # Optional second view. rebuild_spline_mesh uploads to state.renderer
         # only, so the orbit renderer has to be fed explicitly there -- without
         # that it draws an empty scene, which is the same failure mode as a
@@ -79,6 +76,12 @@ class AppState:
         super().__setattr__('config', config_data)
         super().__setattr__('_scanner_template_cache', None)
         super().__setattr__('_scanner_template_mtime', None)
+        super().__setattr__('_cached_canonical_tile_bounds', None)
+        super().__setattr__('_active_swatch_render_offset', np.zeros(3, dtype=np.float32))
+        super().__setattr__('mesh_epoch', 0)
+        super().__setattr__('last_prepared_meshes', None)
+        super().__setattr__('_swatch_tile_cache', {})
+        super().__setattr__('_swatch_tiles_epoch', 0)
 
         pidx = {p["name"]: i for i, p in enumerate(config_data["knit_parameters"]["parameters"])}
         super().__setattr__('_pidx', pidx)
@@ -178,6 +181,10 @@ class AppState:
 
         # 6. Direct assignments for types that _coerce would get wrong
         state_defaults['_row_starts'] = [0]
+        state_defaults['swatch_cells'] = {}
+        state_defaults['swatch_session_id'] = ""
+        state_defaults['swatch_splat_path'] = ""
+        state_defaults['swatch_fitted_model'] = None
 
         super().__setattr__('_state_defaults', state_defaults)
         self._data = {k: self._clone(v) for k, v in state_defaults.items()}
@@ -215,7 +222,7 @@ class AppState:
     # Live objects rather than state: they must bypass _data so they are never
     # cloned, snapshotted, undone or written to params.json.
     _DIRECT_ATTRS = (
-        'camera', 'renderer', 'puzzle_renderer',
+        'camera', 'renderer',
         'orbit_camera', 'orbit_renderer', '_data',
     )
 
@@ -319,10 +326,142 @@ class AppState:
         }
         super().__setattr__('_scanner_template_cache', template)
         super().__setattr__('_scanner_template_mtime', mtime)
+        super().__setattr__('_cached_canonical_tile_bounds', None)
         return template
 
     def _scanner_template_params(self):
         return np.asarray(self._scanner_template()['params'], dtype=np.float32).copy()
+
+    def _canonical_tile_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        cached = getattr(self, '_cached_canonical_tile_bounds', None)
+        if cached is not None:
+            return cached
+        template = self._scanner_template()
+        params = np.asarray(template['params'], dtype=np.float32)
+        bitmap = np.asarray(template.get('bitmap', np.ones((4, 4), dtype=np.float32)), dtype=np.float32)
+        if bitmap.ndim != 2 or not bitmap.size:
+            bitmap = np.ones(self._scanner_pattern_size(), dtype=np.float32)
+        ctrl_rows = [np.asarray(row, dtype=np.float32) for row in (template.get('ctrl_rows') or []) if len(row) > 1]
+        if not ctrl_rows:
+            ctrl_rows = build_parametric_control_rows(
+                params, np.ones_like(bitmap), self._pidx, self._lh_idx, self.samples_per_loop
+            )
+        stitch_width = float(params[self._pidx['stitch_width']])
+        period_offset_x = np.array([float(bitmap.shape[1]) * stitch_width, 0.0, 0.0], dtype=np.float32)
+        radius = max(float(params[self._pidx['radius']]), 1e-6)
+        radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
+        vl = build_spline_mesh(
+            ctrl_rows, params, self.config, self._pidx, period_offset_x, radius_ctrl_rows=radius_profiles
+        )
+        bounds = self._display_mesh_bounds(vl)
+        if bounds is None:
+            lo = np.array([-2.0, -2.0, -0.5], dtype=np.float32)
+            hi = np.array([2.0, 2.0, 0.5], dtype=np.float32)
+        else:
+            min_v, max_v = bounds
+            center = np.array([0.5 * (min_v[0] + max_v[0]), 0.5 * (min_v[1] + max_v[1]), 0.0], dtype=np.float32)
+            lo = (min_v - center).astype(np.float32)
+            hi = (max_v - center).astype(np.float32)
+        result = (lo, hi)
+        super().__setattr__('_cached_canonical_tile_bounds', result)
+        return result
+
+    def _unit_cell_periods(self) -> tuple[float, float, float]:
+        lo, hi = self._canonical_tile_bounds()
+        canon_params = self._scanner_template()['params']
+        radius = max(float(canon_params[self._pidx['radius']]), 1e-6)
+        cell_w = max(float(hi[0] - lo[0]) - 2.0 * SCANNER_TILE_INSET_X * radius, radius)
+        cell_h = max(float(hi[1] - lo[1]) - 2.0 * SCANNER_TILE_INSET_Y * radius, radius)
+        layout_pattern = str(self.get('scanner_layout_pattern', 'grid'))
+        cell_row_shift = 0.5 * cell_w if layout_pattern in ('staggered', 'hex') else 0.0
+        return cell_w, cell_h, cell_row_shift
+
+    def unit_cell_span(self) -> float:
+        lo, hi = self._canonical_tile_bounds()
+        return float(max(hi[0] - lo[0], hi[1] - lo[1], 2.0))
+
+    def swatch_repeat_counts(self) -> tuple[int, int]:
+        rep_r = int(np.clip(int(self.get('scanner_pattern_repeat_rows', 24)), 1, 128))
+        rep_c = int(np.clip(int(self.get('scanner_pattern_repeat_cols', 24)), 1, 128))
+        return rep_r, rep_c
+
+    def _swatch_grid_periods(self) -> tuple[float, float, float]:
+        cell_w, cell_h, cell_shift = self._unit_cell_periods()
+        rep_r, rep_c = self.swatch_repeat_counts()
+        return float(cell_w * rep_c), float(cell_h * rep_r), float(cell_shift * rep_c)
+
+    def swatch_slot_offset(self, row: int, col: int) -> np.ndarray:
+        rows = max(1, int(self.get('scanner_rows', 1)))
+        cols = max(1, int(self.get('scanner_cols', 1)))
+        x_period, y_period, row_shift = self._swatch_grid_periods()
+        cx = 0.5 * float(cols - 1)
+        cy = 0.5 * float(rows - 1)
+        shift_x = (row_shift if (int(row) % 2 == 1) else 0.0) - (0.5 * row_shift if rows > 1 else 0.0)
+        x_off = (float(col) - cx) * x_period + shift_x
+        y_off = (float(row) - cy) * y_period
+        return np.array([x_off, y_off, 0.0], dtype=np.float32)
+
+    def swatch_slot_rect(self, row: int, col: int) -> tuple[float, float, float, float]:
+        slot_w, slot_h, _ = self._swatch_grid_periods()
+        off = self.swatch_slot_offset(row, col)
+        half_w = 0.47 * slot_w
+        half_h = 0.47 * slot_h
+        return (
+            float(off[0] - half_w),
+            float(off[1] - half_h),
+            float(off[0] + half_w),
+            float(off[1] + half_h),
+        )
+
+    def all_swatch_slot_rects(self) -> list[tuple[float, float, float, float]]:
+        rows = max(1, int(self.get('scanner_rows', 1)))
+        cols = max(1, int(self.get('scanner_cols', 1)))
+        return [self.swatch_slot_rect(r, c) for r in range(rows) for c in range(cols)]
+
+    def canonical_grid_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        tile_lo, tile_hi = self._canonical_tile_bounds()
+        slot_w, slot_h, _ = self._swatch_grid_periods()
+        rows = max(1, int(self.get('scanner_rows', 1)))
+        cols = max(1, int(self.get('scanner_cols', 1)))
+        offsets = np.array(
+            [self.swatch_slot_offset(r, c) for r in range(rows) for c in range(cols)],
+            dtype=np.float32,
+        )
+        half_slot = np.array([0.5 * slot_w, 0.5 * slot_h, 0.0], dtype=np.float32)
+        lo = np.array([
+            float(offsets[:, 0].min() - half_slot[0]),
+            float(offsets[:, 1].min() - half_slot[1]),
+            float(tile_lo[2]),
+        ], dtype=np.float32)
+        hi = np.array([
+            float(offsets[:, 0].max() + half_slot[0]),
+            float(offsets[:, 1].max() + half_slot[1]),
+            float(tile_hi[2]),
+        ], dtype=np.float32)
+        return lo, hi
+
+    def canonical_grid_span(self) -> float:
+        lo, hi = self.canonical_grid_bounds()
+        return float(max(hi[0] - lo[0], hi[1] - lo[1], 2.0))
+
+    def _compute_active_swatch_render_offset(self, verts_list=None) -> np.ndarray:
+        rows = max(1, int(self.get('scanner_rows', 1)))
+        cols = max(1, int(self.get('scanner_cols', 1)))
+        sel_r = int(np.clip(int(self.get('scanner_selected_row', 0)), 0, rows - 1))
+        sel_c = int(np.clip(int(self.get('scanner_selected_col', 0)), 0, cols - 1))
+        active_offset = self.swatch_slot_offset(sel_r, sel_c)
+        ref_rows = self.get('param_ref_ctrl_rows') or self.ctrl_rows
+        bounds = self._ctrl_rows_bounds(ref_rows)
+        if bounds is None and verts_list is not None:
+            bounds = self._display_mesh_bounds(verts_list)
+        if bounds is not None:
+            min_v, max_v = bounds
+            local_xy_center = np.array([0.5 * (min_v[0] + max_v[0]), 0.5 * (min_v[1] + max_v[1]), 0.0], dtype=np.float32)
+        else:
+            local_xy_center = np.zeros(3, dtype=np.float32)
+        offset = (active_offset - local_xy_center).astype(np.float32)
+        self._active_swatch_render_offset = offset
+        return offset
 
     def apply_scanner_template_base(self):
         """Install the scan template's own tuned fabric as the working model.
@@ -413,7 +552,89 @@ class AppState:
             int(np.clip(cols, 2, self.SCANNER_PATTERN_MAX_COLS)),
         )
 
+    SWATCH_STATE_KEYS = (
+        'bitmap',
+        'bitmap_size',
+        'params',
+        'loop_heights',
+        'loop_height_overrides',
+        'ctrl_rows',
+        'spline_radius_rows',
+        'row_colors',
+        'use_row_colors',
+        'period_offset_x',
+        'period_offset_y',
+        'fabric_type',
+        'crochet_params',
+        'crochet_stitches',
+        'swatch_session_id',
+        'swatch_splat_path',
+        'swatch_fitted_model',
+    )
+
+    def _swatch_key(self, row: int, col: int) -> str:
+        return f"{int(row)},{int(col)}"
+
+    def _cell_index_to_row_col(self, cell_index: int) -> tuple[int, int]:
+        cols = max(1, int(self.get('scanner_cols', 1)))
+        idx = max(0, int(cell_index))
+        return idx // cols, idx % cols
+
+    def save_active_swatch(self) -> None:
+        cells = self._data.setdefault('swatch_cells', {})
+        row = int(self.get('scanner_selected_row', 0))
+        col = int(self.get('scanner_selected_col', 0))
+        key = self._swatch_key(row, col)
+        entry = {}
+        for k in self.SWATCH_STATE_KEYS:
+            if k in self._data:
+                entry[k] = self._clone(self._data[k])
+        cells[key] = entry
+
+    def select_swatch(self, row: int, col: int, rebuild: bool = True) -> None:
+        cells = self._data.setdefault('swatch_cells', {})
+        cur_row = int(self.get('scanner_selected_row', 0))
+        cur_col = int(self.get('scanner_selected_col', 0))
+        if (cur_row, cur_col) != (int(row), int(col)) or self._swatch_key(cur_row, cur_col) in cells:
+            self.save_active_swatch()
+        self.scanner_selected_row = int(row)
+        self.scanner_selected_col = int(col)
+        key = self._swatch_key(row, col)
+        self.swatch_session_id = ""
+        self.swatch_splat_path = ""
+        self.swatch_fitted_model = None
+        if key in cells:
+            entry = cells[key]
+            for k, v in entry.items():
+                self._data[k] = self._clone(v)
+            self.param_ref_ctrl_rows = [r.copy() for r in self._fresh_rebuild_rows()]
+            self._rebuild_spline_points()
+        else:
+            cols = max(1, int(self.get('scanner_cols', 1)))
+            cell_index = int(row) * cols + int(col)
+            pattern_bitmap = self._scanner_random_bitmap(cell_index)
+            loop_heights = self._scanner_loop_heights_for_bitmap(pattern_bitmap)
+            params = self._scanner_template_params()
+            self.bitmap = pattern_bitmap.copy()
+            self.bitmap_size = np.array(pattern_bitmap.shape, dtype=np.int32)
+            self.params = [float(v) for v in params]
+            self.loop_heights = loop_heights.copy()
+            self.loop_height_overrides = np.ones_like(pattern_bitmap, dtype=bool)
+            self._sync_row_colors(int(pattern_bitmap.shape[0]))
+            self._sync_row_visibility(int(pattern_bitmap.shape[0]))
+            self.rebuild_spline_from_params(rebuild_mesh=False)
+            self.save_active_swatch()
+        if rebuild:
+            self.rebuild_spline_mesh(preserve_model_placement=True)
+
     def _scanner_random_bitmap(self, cell_index):
+        r, c = self._cell_index_to_row_col(cell_index)
+        cells = self.get('swatch_cells') or {}
+        entry = cells.get(self._swatch_key(r, c))
+        if isinstance(entry, dict) and 'bitmap' in entry:
+            bm = np.asarray(entry['bitmap'], dtype=np.float32)
+            if bm.ndim == 2 and bm.size:
+                return bm.copy()
         pattern_rows, pattern_cols = self._scanner_pattern_size()
         density = float(np.clip(float(self.get('scanner_pattern_density', 0.62)), 0.05, 0.95))
         seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
@@ -447,178 +668,146 @@ class AppState:
         scale = active + (1.0 - active) * float(self.SCANNER_INACTIVE_LOOP_HEIGHT_SCALE)
         return heights * scale
 
-    def _fit_vl_to_bounds(self, vl, target_bounds):
-        if not vl:
-            return vl
-        src_bounds = self._display_mesh_bounds(vl)
-        if src_bounds is None or target_bounds is None:
-            return vl
-        src_min, src_max = src_bounds
-        dst_min, dst_max = target_bounds
-        src_center = (src_min + src_max) * 0.5
-        dst_center = (dst_min + dst_max) * 0.5
-        src_span = np.maximum(src_max - src_min, 1e-6)
-        dst_span = np.maximum(dst_max - dst_min, 1e-6)
-        scale = float(min(dst_span[0] / src_span[0], dst_span[1] / src_span[1]))
-        fitted = []
-        for verts, n_points in vl:
-            verts = (np.asarray(verts, dtype=np.float32) - src_center) * scale + dst_center
-            fitted.append((verts.astype(np.float32), int(n_points)))
-        return fitted
+    def build_swatch_unit_cell_data(self, row: int, col: int):
+        from rendering import MeshRenderer
+        scanner_rows = max(1, int(self.get('scanner_rows', 1)))
+        scanner_cols = max(1, int(self.get('scanner_cols', 1)))
+        sel_r = int(np.clip(int(self.get('scanner_selected_row', 0)), 0, scanner_rows - 1))
+        sel_c = int(np.clip(int(self.get('scanner_selected_col', 0)), 0, scanner_cols - 1))
+        r = int(np.clip(int(row), 0, scanner_rows - 1))
+        c = int(np.clip(int(col), 0, scanner_cols - 1))
+        cell_index = r * scanner_cols + c
+        cells = self.get('swatch_cells') or {}
+        entry = cells.get(self._swatch_key(r, c))
 
-    def _scanner_pattern_meshes(self, cell_index, target_bounds):
-        pattern_bitmap = self._scanner_random_bitmap(cell_index)
-        loop_heights = self._scanner_loop_heights_for_bitmap(pattern_bitmap)
-        params = self._scanner_template_params()
-        # Same two rules the scan captures use, so the preview grid shows the
-        # fabric that will actually be scanned. Every stitch exists and the
-        # pattern is carried by loop height alone -- a zero in the bitmap
-        # deletes the stitch outright, which broke each sample into disconnected
-        # motifs -- and the row period follows the stitch width rather than a
-        # bare column count, or each row closes on a period several times
-        # narrower than the geometry and runs off the side of its cell.
-        bitmap = np.ones_like(pattern_bitmap)
-        ctrl_rows = build_parametric_control_rows(
-            params,
-            bitmap,
-            self._pidx,
-            self._lh_idx,
-            self.samples_per_loop,
-            loop_heights=loop_heights,
-        )
-        stitch_width = float(params[self._pidx['stitch_width']])
-        period_offset_x = np.array(
-            [float(bitmap.shape[1]) * stitch_width, 0.0, 0.0], dtype=np.float32
-        )
-        radius = max(float(params[self._pidx['radius']]), 1e-6)
-        radius_profiles = [np.full(len(row), radius, dtype=np.float32) for row in ctrl_rows]
+        if (r, c) == (sel_r, sel_c) and self.ctrl_rows:
+            ctrl_rows = [np.asarray(row_pts, dtype=np.float32) for row_pts in self.ctrl_rows if len(row_pts) > 1]
+            params = np.asarray(self.params, dtype=np.float32)
+            period_offset_x = np.asarray(self.period_offset_x, dtype=np.float32)
+            radius = max(float(params[self._pidx['radius']]), 1e-6)
+            saved_radii = self.get('spline_radius_rows') or []
+            if len(saved_radii) == len(ctrl_rows):
+                radius_profiles = [np.asarray(rad, dtype=np.float32) for rad in saved_radii]
+            else:
+                radius_profiles = [np.full(len(row_pts), radius, dtype=np.float32) for row_pts in ctrl_rows]
+            base_colors = list(self.row_colors or self.get('scanner_color_variants') or [self.single_model_color])
+        elif isinstance(entry, dict) and entry.get('ctrl_rows'):
+            ctrl_rows = [np.asarray(row_pts, dtype=np.float32) for row_pts in entry['ctrl_rows'] if len(row_pts) > 1]
+            params = np.asarray(entry.get('params', self._scanner_template_params()), dtype=np.float32)
+            bm = np.asarray(entry.get('bitmap', self._scanner_random_bitmap(cell_index)), dtype=np.float32)
+            stitch_width = float(params[self._pidx['stitch_width']])
+            period_offset_x = np.asarray(
+                entry.get('period_offset_x', [float(bm.shape[1]) * stitch_width, 0.0, 0.0]),
+                dtype=np.float32,
+            )
+            radius = max(float(params[self._pidx['radius']]), 1e-6)
+            saved_radii = entry.get('spline_radius_rows') or []
+            if len(saved_radii) == len(ctrl_rows):
+                radius_profiles = [np.asarray(rad, dtype=np.float32) for rad in saved_radii]
+            else:
+                radius_profiles = [np.full(len(row_pts), radius, dtype=np.float32) for row_pts in ctrl_rows]
+            base_colors = list(entry.get('row_colors') or self.get('scanner_color_variants') or self.row_colors or [self.single_model_color])
+        else:
+            pattern_bitmap = self._scanner_random_bitmap(cell_index)
+            loop_heights = self._scanner_loop_heights_for_bitmap(pattern_bitmap)
+            params = self._scanner_template_params()
+            bitmap = np.ones_like(pattern_bitmap)
+            ctrl_rows = build_parametric_control_rows(
+                params,
+                bitmap,
+                self._pidx,
+                self._lh_idx,
+                self.samples_per_loop,
+                loop_heights=loop_heights,
+            )
+            stitch_width = float(params[self._pidx['stitch_width']])
+            period_offset_x = np.array([float(bitmap.shape[1]) * stitch_width, 0.0, 0.0], dtype=np.float32)
+            radius = max(float(params[self._pidx['radius']]), 1e-6)
+            radius_profiles = [np.full(len(row_pts), radius, dtype=np.float32) for row_pts in ctrl_rows]
+            base_colors = list(self.get('scanner_color_variants') or self.row_colors or [self.single_model_color])
+
+        seg = min(int(self.config['knit_parameters']['segments']), 12)
+        loop_res = min(int(self.config['knit_parameters']['loop_res']), 12)
+        tile_config = {
+            **self.config,
+            'knit_parameters': {
+                **self.config['knit_parameters'],
+                'segments': seg,
+                'loop_res': loop_res,
+            },
+        }
         vl = build_spline_mesh(
             ctrl_rows,
             params,
-            self.config,
+            tile_config,
             self._pidx,
             period_offset_x,
             radius_ctrl_rows=radius_profiles,
         )
-        vl, meta = build_surface_fiber_meshes(
-            vl,
-            segments=int(self.config['knit_parameters']['segments']),
-            enabled=self.fiber_geometry_enabled,
-            count=max(1, int(round(float(self.fiber_geometry_count)))),
-            radius=radius,
-            radius_scale=float(self.fiber_geometry_radius_scale),
-            lift=float(self.fiber_geometry_lift),
-            surface_arc=float(self.fiber_geometry_surface_arc),
-            randomness=float(self.fiber_geometry_randomness),
-            twist=float(self.fiber_geometry_twist),
-        )
-        return self._fit_vl_to_bounds(vl, target_bounds), meta
+        meta = [{'row': i, 'base_row': i} for i in range(len(vl))]
+        bounds = self._display_mesh_bounds(vl)
+        if bounds is not None:
+            min_v, max_v = bounds
+            cx = 0.5 * float(min_v[0] + max_v[0])
+            cy = 0.5 * float(min_v[1] + max_v[1])
+        else:
+            cx, cy = 0.0, 0.0
+        x_period = self._display_copy_x_period(vl, radius)
+        pitch = row_base_pitch(ctrl_rows)
+        if pitch is None:
+            dy_idx = self._pidx.get('dy')
+            pitch = abs(float(params[dy_idx])) if dy_idx is not None else 0.0
+        if pitch and pitch > 1e-6:
+            y_period = max(float(pitch * len(ctrl_rows)), radius)
+        elif bounds is not None:
+            y_period = max(float(bounds[1][1] - bounds[0][1]), radius)
+        else:
+            y_period = radius
 
-    def build_display_meshes_precise(self, verts_list, faces_list, meta):
+        base_fl = compute_knitting_faces(seg, vl)
+        vl_3x3, fl_3x3, colors_3x3 = [], [], []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                offset = np.array([dx * x_period, dy * y_period, 0.0], dtype=np.float32)
+                for (verts, n_points), faces, part_meta in zip(vl, base_fl, meta):
+                    translated = (np.asarray(verts, dtype=np.float32) + offset).astype(np.float32)
+                    vl_3x3.append((translated, int(n_points)))
+                    fl_3x3.append(faces)
+                    row_idx = int(part_meta.get('row', 0))
+                    c_rgb = base_colors[row_idx % len(base_colors)]
+                    colors_3x3.append([float(c_rgb[0]), float(c_rgb[1]), float(c_rgb[2])])
+        prepared_meshes = MeshRenderer.prepare_meshes(vl_3x3, fl_3x3)
+        return prepared_meshes, colors_3x3, (float(cx), float(cy)), float(x_period), float(y_period)
+
+    def build_display_meshes_precise(self, verts_list, faces_list, meta=None):
         if not verts_list:
             return [], [], []
+        if meta is None:
+            meta = [{'row': i, 'base_row': i} for i in range(len(verts_list))]
         radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        row_count = max(1, int(self.bitmap_size[0]))
+        seg = int(self.config['knit_parameters']['segments'])
+        scanner_preview = bool(self.get('scanner_preview_grid_enabled', False))
+        scanner_rows = max(1, int(self.get('scanner_rows', 1)))
+        scanner_cols = max(1, int(self.get('scanner_cols', 1)))
+        sel_r = int(np.clip(int(self.get('scanner_selected_row', 0)), 0, scanner_rows - 1))
+        sel_c = int(np.clip(int(self.get('scanner_selected_col', 0)), 0, scanner_cols - 1))
+        cell_index = sel_r * scanner_cols + sel_c
+
         x_period = self._display_copy_x_period(verts_list, radius)
         y_period = self._display_copy_y_period(verts_list, radius)
-        scanner_preview = bool(self.get('scanner_preview_grid_enabled', False))
         if scanner_preview:
-            template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
-            if template_bitmap.ndim == 2 and template_bitmap.shape[0] > 0:
-                row_count = int(template_bitmap.shape[0])
-            bounds = self._display_mesh_bounds(verts_list)
-            if bounds is not None:
-                min_v, max_v = bounds
-                model_w = float(max_v[0] - min_v[0])
-                model_h = float(max_v[1] - min_v[1])
-                # Space the samples by exactly the size each one is fitted to,
-                # so the grid reads as one sheet of fabric divided into squares.
-                # The spacing used to be the model's size less a margin -- 2.25
-                # radii across and 7.25 down -- while every sample is scaled to
-                # fill its whole tile, so each one reached a fifth of a cell into
-                # its neighbour above and the samples grew into each other.
-                x_period = max(model_w - 2.0 * SCANNER_TILE_INSET_X * radius, radius)
-                y_period = max(model_h - 2.0 * SCANNER_TILE_INSET_Y * radius, radius)
-        
-        seg = int(self.config['knit_parameters']['segments'])
-        if scanner_preview:
-            x_tiles = list(range(max(1, int(self.get('scanner_preview_cols', 1)))))
-            y_tiles = list(range(max(1, int(self.get('scanner_preview_rows', 1)))))
+            x_tiles = [0]
+            y_tiles = [0]
         else:
             x_tiles = list(range(-int(self.display_copies[0]), int(self.display_copies[0]) + 1))
             y_tiles = list(range(-int(self.display_copies[1]), int(self.display_copies[1]) + 1))
+        active_render_offset = self._compute_active_swatch_render_offset(verts_list)
 
         display_vl, display_fl, display_meta = [], [], []
-        if scanner_preview:
-            scanner_cols = max(1, int(self.get('scanner_preview_cols', 1)))
-            scanner_rows = max(1, int(self.get('scanner_preview_rows', 1)))
-            layout_pattern = str(self.get('scanner_layout_pattern', 'grid'))
-            base_bounds = self._display_mesh_bounds(verts_list)
-            for y_tile in range(scanner_rows):
-                # Flat, like the fabric it stands for. Each row of samples was
-                # pushed back a depth layer, so a sample's bottom row was drawn
-                # behind the top row of the sample beneath it.
-                y_translation = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
-                row_offset = 0.5 * x_period if layout_pattern == 'staggered' and (y_tile % 2 == 1) else 0.0
-                for x_tile in range(scanner_cols):
-                    cell_index = y_tile * scanner_cols + x_tile
-                    x_translation = np.array([x_tile * x_period + row_offset, 0.0, 0.0], dtype=np.float32)
-                    if base_bounds is not None:
-                        tile_bounds = (
-                            base_bounds[0] + np.array(
-                                [radius * SCANNER_TILE_INSET_X, radius * SCANNER_TILE_INSET_Y, 0.0],
-                                dtype=np.float32),
-                            base_bounds[1] - np.array(
-                                [radius * SCANNER_TILE_INSET_X, radius * SCANNER_TILE_INSET_Y, 0.0],
-                                dtype=np.float32),
-                        )
-                        cell_parts, cell_meta = self._scanner_pattern_meshes(cell_index, tile_bounds)
-                        for curve_idx, ((verts, n_points), part_meta) in enumerate(zip(cell_parts, cell_meta)):
-                            base_row = int(part_meta.get('row', curve_idx)) % row_count
-                            translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation
-                            display_vl.append((translated.astype(np.float32), int(n_points)))
-                            display_fl.extend(compute_knitting_faces(seg, [(translated, int(n_points))]))
-                            display_meta.append({
-                                'row': cell_index * row_count + base_row,
-                                'base_row': base_row,
-                                'tile_x': x_tile,
-                                'tile_y': y_tile,
-                                'scanner_cell': cell_index,
-                            })
-                        continue
-
-                    for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
-                        base_row = int(part_meta.get('row', 0))
-                        translated = np.asarray(verts, dtype=np.float32) + x_translation + y_translation
-                        display_vl.append((translated.astype(np.float32), int(n_points)))
-                        display_fl.extend(compute_knitting_faces(seg, [(translated, int(n_points))]))
-                        copied_meta = dict(part_meta)
-                        copied_meta['row'] = cell_index * row_count + base_row
-                        copied_meta['base_row'] = base_row
-                        copied_meta['tile_x'] = x_tile
-                        copied_meta['tile_y'] = y_tile
-                        copied_meta['scanner_cell'] = cell_index
-                        display_meta.append(copied_meta)
-            return display_vl, display_fl, display_meta
-
         for y_tile in y_tiles:
-            # No depth offset between vertical copies. A copy above is simply
-            # more rows of the same fabric, so it belongs in the same plane and
-            # interlocks with the row below it exactly as the rows within a copy
-            # do. Pushing each copy back by a whole z span instead stacked them
-            # in separate depth layers, so the bottom row of one copy was drawn
-            # behind the top row of the copy beneath -- the brown sitting behind
-            # the red rather than above it, no matter how the heights were set.
             y_translation = np.array([0.0, y_tile * y_period, 0.0], dtype=np.float32)
             for (verts, n_points), _faces, part_meta in zip(verts_list, faces_list, meta):
-                rings = np.asarray(verts, dtype=np.float32).reshape(int(n_points), seg, 3)
-                # Copies are strung into one tube, so they have to be visited in
-                # the direction the row itself travels. Rows are knitted
-                # alternately; a right-to-left row finishes at its left edge, so
-                # taking the copies left-to-right joined that finish to the next
-                # copy's start over on the right -- a jump back across the whole
-                # fabric, drawn as a long line behind it. Walking those copies
-                # right-to-left keeps each join between neighbours.
+                rings = (np.asarray(verts, dtype=np.float32) + active_render_offset).reshape(int(n_points), seg, 3)
                 row_direction = 1.0
                 if int(n_points) > 1:
                     row_direction = float(rings[-1, :, 0].mean() - rings[0, :, 0].mean())
@@ -629,7 +818,6 @@ class AppState:
                     if tile_i > 0 and len(translated) > 1:
                         translated = translated[1:]
                     stitched_rings.append(translated)
-
                 stitched = np.concatenate(stitched_rings, axis=0) + y_translation
                 stitched_n_points = int(stitched.shape[0])
                 stitched_verts = stitched.reshape(-1, 3)
@@ -639,9 +827,11 @@ class AppState:
                 base_row = int(part_meta.get('row', 0))
                 copied_meta['row'] = base_row
                 copied_meta['base_row'] = base_row
-                copied_meta['tile_x'] = 0
+                copied_meta['tile_x'] = sel_c
                 copied_meta['tile_y'] = y_tile
+                copied_meta['scanner_cell'] = cell_index
                 copied_meta['stitched_x_copies'] = len(x_tiles)
+                copied_meta['neighbor_swatch'] = False
                 display_meta.append(copied_meta)
         return display_vl, display_fl, display_meta
 
@@ -716,8 +906,8 @@ class AppState:
     def active_colors(self):
         base_colors = self.row_colors if self.use_row_colors else [self.single_model_color]
         if bool(self.get('scanner_preview_grid_enabled', False)):
-            rows = max(1, int(self.get('scanner_preview_rows', 1)))
-            cols = max(1, int(self.get('scanner_preview_cols', 1)))
+            rows = max(1, int(self.get('scanner_rows', 1)))
+            cols = max(1, int(self.get('scanner_cols', 1)))
             template_bitmap = np.asarray(self._scanner_template().get('bitmap', np.empty((0, 0))), dtype=np.float32)
             base_rows = int(template_bitmap.shape[0]) if template_bitmap.ndim == 2 and template_bitmap.shape[0] > 0 else max(1, int(self.bitmap_size[0]))
             scanner_palette = self.get('scanner_color_variants', [])
@@ -831,19 +1021,11 @@ class AppState:
             self.sim_L0 = np.array([])
 
     def active_scene_renderer(self):
-        """Renderer owned by the mode currently shown in the 3D viewport."""
-        if str(self.get('app_mode', 'edit')) == 'puzzle' and self.puzzle_renderer is not None:
-            return self.puzzle_renderer
+        """Renderer owned by the 3D world viewport."""
         return self.renderer
 
     def rebuild_spline_mesh(self, preserve_model_placement=True, target_renderer=None):
-        """Build the current model and upload it to the requested renderer.
-
-        The normal destination is the main viewport renderer. Scan capture code
-        passes its private renderer explicitly; it must never replace
-        ``state.renderer``, because a mode switch during that temporary ownership
-        leaves the visible viewport holding Scan meshes.
-        """
+        """Build the current model and upload it to the requested renderer."""
         old_center = np.asarray(self.mesh_center, dtype=np.float32).copy()
         old_model_t = np.asarray(self.model_t, dtype=np.float32).copy()
         if self.crochet_active():
@@ -865,15 +1047,12 @@ class AppState:
         display_vl, display_fl, meta = self.prepare_display_meshes(vl, fl)
         colors = self.active_colors()
         destination = self.active_scene_renderer() if target_renderer is None else target_renderer
-        # Triangulation, normals and buffer packing are identical for both
-        # renderers, so they are done once here and the GL uploads share them.
         prepared = destination.prepare_meshes(display_vl, display_fl)
+        self.mesh_epoch = int(getattr(self, 'mesh_epoch', 0)) + 1
+        self.last_prepared_meshes = (prepared, colors)
         destination.set_meshes(display_vl, display_fl, colors=colors, meta=meta, prepared=prepared)
+        self._rebuild_spline_points()
         destination.set_ctrl_pts(self.flat_pts)
-        # Same meshes into the orbit view. Note this uploads to a second
-        # renderer, so it costs a duplicate GL upload per rebuild; skipped
-        # entirely for private Scan renders and when no orbit renderer is
-        # attached (e.g. headless callers).
         if destination is self.renderer and self.orbit_renderer is not None and self.orbit_renderer is not self.renderer:
             self.orbit_renderer.set_meshes(display_vl, display_fl, colors=colors, meta=meta, prepared=prepared)
         if preserve_model_placement:
@@ -898,28 +1077,40 @@ class AppState:
         segments = int(self.config['knit_parameters']['segments'])
         meshes, rows = crochet_core.ring_meshes(stitches, self.crochet_parameters(), segments,
                                                 copies=tuple(int(c) for c in self.display_copies))
+        bounds = self._display_mesh_bounds(meshes)
+        if bounds is not None:
+            min_v, max_v = bounds
+            center = np.array([0.5 * (min_v[0] + max_v[0]), 0.5 * (min_v[1] + max_v[1]), 0.0], dtype=np.float32)
+            rows_cnt = max(1, int(self.get('scanner_rows', 1)))
+            cols_cnt = max(1, int(self.get('scanner_cols', 1)))
+            sel_r = int(np.clip(int(self.get('scanner_selected_row', 0)), 0, rows_cnt - 1))
+            sel_c = int(np.clip(int(self.get('scanner_selected_col', 0)), 0, cols_cnt - 1))
+            shift = self.swatch_slot_offset(sel_r, sel_c) - center
+            meshes = [((np.asarray(v, dtype=np.float32) + shift).astype(np.float32), int(n)) for v, n in meshes]
         faces = [compute_knitting_faces(segments, [mesh])[0] for mesh in meshes]
         meta = [{'row': row, 'base_row': row} for row in rows]
         destination = self.active_scene_renderer() if target_renderer is None else target_renderer
+        colors = self.active_colors()
         prepared = destination.prepare_meshes(meshes, faces)
-        destination.set_meshes(meshes, faces, colors=self.active_colors(), meta=meta, prepared=prepared)
-        # The knit control points are not this fabric's: nothing to pick or drag.
+        self.mesh_epoch = int(getattr(self, 'mesh_epoch', 0)) + 1
+        self.last_prepared_meshes = (prepared, colors)
+        destination.set_meshes(meshes, faces, colors=colors, meta=meta, prepared=prepared)
         destination.set_ctrl_pts(np.empty((0, 3), dtype=np.float32))
         if destination is self.renderer and self.orbit_renderer is not None and self.orbit_renderer is not self.renderer:
-            self.orbit_renderer.set_meshes(meshes, faces, colors=self.active_colors(), meta=meta, prepared=prepared)
+            self.orbit_renderer.set_meshes(meshes, faces, colors=colors, meta=meta, prepared=prepared)
         self._recompute_center(meshes)
 
-    def _recompute_center(self, display_vl):
-        if not display_vl:
-            self.mesh_center = np.zeros(3, dtype=np.float32)
-        else:
-            all_v = np.vstack([v for v, _ in display_vl])
-            self.mesh_center = (all_v.min(axis=0) + all_v.max(axis=0)) / 2.0
-        self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
+    def _recompute_center(self, _display_vl=None):
+        self.mesh_center = np.zeros(3, dtype=np.float32)
+        self.model_t = np.zeros(3, dtype=np.float32)
 
     def _rebuild_spline_points(self):
         self._row_starts = np.concatenate(([0], np.cumsum([len(r) for r in self.ctrl_rows]))).tolist()
-        self.flat_pts = np.concatenate(self.ctrl_rows).astype(np.float32) if self.ctrl_rows else np.empty((0, 3), np.float32)
+        if self.ctrl_rows:
+            offset = self._compute_active_swatch_render_offset()
+            self.flat_pts = (np.concatenate(self.ctrl_rows).astype(np.float32) + offset[None, :]).astype(np.float32)
+        else:
+            self.flat_pts = np.empty((0, 3), np.float32)
 
     def _period_offset_from_ctrl_rows(self):
         periods = []
@@ -987,14 +1178,13 @@ class AppState:
     def flat_pts_all(self):
         if not self.ctrl_rows:
             return np.empty((0, 3), dtype=np.float32)
-        # Layout: [ real control points | one X-period handle per row |
-        #           one Y-period handle per row ]. The virtual handles are not
-        #           part of the model; dragging one edits the period vector.
-        virtual_pts_x = np.array([row[0] + self.period_offset_x for row in self.ctrl_rows], dtype=np.float32)
-        virtual_pts_y = np.array([row[0] + self.period_offset_y for row in self.ctrl_rows], dtype=np.float32)
+        offset = self._compute_active_swatch_render_offset()
+        virtual_pts_x = np.array([row[0] + self.period_offset_x + offset for row in self.ctrl_rows], dtype=np.float32)
+        virtual_pts_y = np.array([row[0] + self.period_offset_y + offset for row in self.ctrl_rows], dtype=np.float32)
         return np.concatenate((self.flat_pts, virtual_pts_x, virtual_pts_y), axis=0)
 
     def move_ctrl_pt(self, flat_idx, pos):
+        local_pos = np.asarray(pos, dtype=np.float32) - self._compute_active_swatch_render_offset()
         n_real = len(self.flat_pts)
         if flat_idx >= n_real:
             n_rows = len(self.ctrl_rows)
@@ -1003,22 +1193,21 @@ class AppState:
             if not (0 <= row_idx < n_rows):
                 return
             if virtual_idx < n_rows:
-                self.period_offset_x = pos - self.ctrl_rows[row_idx][0]
+                self.period_offset_x = local_pos - self.ctrl_rows[row_idx][0]
                 self.rebuild_spline_mesh()
             else:
-                # Y period feeds only the simulation's periodic collision
-                # topology, so the drawn mesh does not change.
-                self.period_offset_y = pos - self.ctrl_rows[row_idx][0]
+                self.period_offset_y = local_pos - self.ctrl_rows[row_idx][0]
             with self.sim_lock:
                 self.sim_needs_jacobian_rebuild = True
         else:
             r = np.searchsorted(self._row_starts, flat_idx, side="right") - 1
             if 0 <= r < len(self.ctrl_rows):
-                self.ctrl_rows[r][flat_idx - self._row_starts[r]] = pos
+                self.ctrl_rows[r][flat_idx - self._row_starts[r]] = local_pos
                 self._rebuild_spline_points()
 
     def center_model_on_view(self):
-        self.model_t = np.asarray(self.camera.target, dtype=np.float32) - np.asarray(self.mesh_center, dtype=np.float32)
+        self.mesh_center = np.zeros(3, dtype=np.float32)
+        self.model_t = np.zeros(3, dtype=np.float32)
 
     def _default_loop_height_for_row(self, row_idx):
         if not self._lh_idx:
@@ -1129,8 +1318,8 @@ class AppState:
             for row in self.ctrl_rows
         ]
         self.param_ref_radius = base_radius
-        self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in self.ctrl_rows]
+        self._rebuild_spline_points()
         if rebuild_mesh:
             self.rebuild_spline_mesh(preserve_model_placement=True)
 
@@ -1192,8 +1381,8 @@ class AppState:
             self.ctrl_rows = self._fit_ctrl_rows_to_bounds(self.ctrl_rows, old_bounds)
 
         self.param_ref_radius = current_radius
-        self._rebuild_spline_points()
         self.param_ref_ctrl_rows = [row.copy() for row in target_rows]
+        self._rebuild_spline_points()
         self.sync_period_offset_to_model_width()
         # Y as well as X: nudged rows can change the fabric's height, and the
         # display and the simulation both read the Y period back.
@@ -1227,18 +1416,12 @@ class AppState:
     # a live robot connection mid-scan, leaving nothing able to stop the arm.
     _SNAPSHOT_EXCLUDE = frozenset({
         'render_tex', 'render_result', 'undo_stack',
-        'ur5_controller', 'embedded_scanner', 'scanner_storage', 'scanner_process',
-        # Mode workspaces are containers for snapshots, not model fields. They
-        # must never be copied into the snapshots they contain.
-        'puzzle_model_snapshot', 'puzzle_initial_snapshot', 'puzzle_undo_stack',
+        'ur5_controller', 'scanner_storage', 'scanner_process',
         'workspace_model_snapshot', 'workspace_undo_stack',
         'single_capture_job', 'single_capture_job_seq',
-        'mode_epoch',
-        # Which mode the user is looking at is not part of the model, and
-        # restoring it moved them without going through _set_app_mode -- so the
-        # mode they left was never torn down and the one they landed in was
-        # never set up. Reset from Puzzle Mode silently returned to Edit Mode
-        # with Puzzle's geometry still applied, and undo could do the same.
+        'mode_epoch', 'mesh_epoch', 'last_prepared_meshes',
+        '_cached_canonical_tile_bounds', '_active_swatch_render_offset',
+        '_swatch_tile_cache', '_swatch_tiles_epoch',
         'app_mode',
     })
 
@@ -1280,8 +1463,8 @@ class AppState:
         self.spline_radius_rows = [row.copy() for row in snap.get('spline_radius_rows', [])]
         self._ensure_spline_radius_rows()
         self.param_ref_radius = max(float(self.params[self._pidx['radius']]), 1e-6)
-        self._rebuild_spline_points()
         self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
+        self._rebuild_spline_points()
 
         if anchored_columns.size:
             # The snapshot's control rows carry the flat bottom row, same as a
@@ -1298,53 +1481,6 @@ class AppState:
 
     def capture_initial_state(self):
         super().__setattr__('_initial_snapshot', self.snapshot_state())
-        # Puzzle starts from its bitmap and parameters, not from the tuned
-        # control rows stored in initial_params.json. Scan also uses that file
-        # as its fabric template and carries random patterns through per-cell
-        # loop heights; copying the saved geometry made an all-green Puzzle
-        # bitmap display height patterns that looked like Scan samples.
-        #
-        # Build Puzzle's canonical baseline once, then put the normal initial
-        # model back verbatim. Later mode switches preserve Puzzle edits from
-        # this clean baseline instead of rebuilding them away.
-        initial_snapshot = self._initial_snapshot
-        self.loop_heights = np.empty((0, 0), dtype=np.float32)
-        self.loop_height_overrides = np.zeros(tuple(int(v) for v in self.bitmap_size), dtype=bool)
-        self.rebuild_spline_from_params()
-        self.puzzle_model_snapshot = self.snapshot_state()
-        self.puzzle_initial_snapshot = self._clone(self.puzzle_model_snapshot)
-        self.restore_snapshot(initial_snapshot, target_renderer=self.renderer)
-
-    def enter_puzzle_workspace(self):
-        """Swap the independent Puzzle model into the shared render pipeline."""
-        if self.get('workspace_model_snapshot') is not None:
-            return
-
-        self.workspace_model_snapshot = self.snapshot_state()
-        self.workspace_undo_stack = self.undo_stack
-
-        puzzle_snapshot = self.get('puzzle_model_snapshot')
-        if puzzle_snapshot is None:
-            puzzle_snapshot = getattr(self, '_initial_snapshot', None)
-        if puzzle_snapshot is None:
-            puzzle_snapshot = self.snapshot_state()
-
-        self.undo_stack = self.get('puzzle_undo_stack', [])
-        self.restore_snapshot(puzzle_snapshot, target_renderer=self.puzzle_renderer)
-
-    def leave_puzzle_workspace(self):
-        """Store Puzzle edits and restore the non-Puzzle model verbatim."""
-        workspace_snapshot = self.get('workspace_model_snapshot')
-        if workspace_snapshot is None:
-            return
-
-        self.puzzle_model_snapshot = self.snapshot_state()
-        self.puzzle_undo_stack = self.undo_stack
-        workspace_undo_stack = self.get('workspace_undo_stack')
-        self.undo_stack = workspace_undo_stack if workspace_undo_stack is not None else []
-        self.restore_snapshot(workspace_snapshot, target_renderer=self.renderer)
-        self.workspace_model_snapshot = None
-        self.workspace_undo_stack = None
 
     def reset(self, unit_model=False):
         """Unified reset entry point, matching feat/simulation's call style.
@@ -1362,12 +1498,6 @@ class AppState:
             self.reset_to_initial()
 
     def reset_to_initial(self):
-        if str(self.get('app_mode', 'edit')) == 'puzzle' and self.get('puzzle_initial_snapshot') is not None:
-            self.push_undo("Reset Puzzle")
-            anchored = self.restore_snapshot(self.puzzle_initial_snapshot)
-            self.status_msg = _with_anchor_note('Reset Puzzle to its initial pattern', anchored)
-            return
-
         initial_snapshot = getattr(self, '_initial_snapshot', None)
         if initial_snapshot is not None:
             self.push_undo("Reset all")
@@ -1600,11 +1730,6 @@ class AppState:
     def maybe_autosave(self):
         if not self.autosave_enabled:
             return
-        # The normal params file is the Edit/Scan workspace. Puzzle has an
-        # independent in-memory model and must never overwrite that file merely
-        # because its panel is being drawn.
-        if str(self.get('app_mode', 'edit')) == 'puzzle':
-            return
         if self.autosave_deferred():
             return
         now = time.monotonic()
@@ -1621,7 +1746,7 @@ class AppState:
         else:
             self.save_params(target_path, silent=True)
 
-    def load_params(self, path, *, restore_mode=False):
+    def load_params(self, path, *, restore_mode=False, rebuild_mesh=True):
         with self.sim_lock:
             previous = self._data
             camera = {attr: self._clone(getattr(self.camera, attr)) for attr in self.camera_attributes}
@@ -1653,6 +1778,10 @@ class AppState:
                         if default.ndim == 1 and default.size and value.shape != default.shape and key != 'row_visible':
                             raise ValueError(f'{key} must have shape {default.shape}')
                     self._data[key] = value
+                if int(self._data.get('scanner_pattern_repeat_rows', 24)) <= 4:
+                    self._data['scanner_pattern_repeat_rows'] = 24
+                if int(self._data.get('scanner_pattern_repeat_cols', 24)) <= 4:
+                    self._data['scanner_pattern_repeat_cols'] = 24
                 for attr in self.camera_attributes:
                     key = f'camera_{attr}'
                     if key in gui_state:
@@ -1688,8 +1817,9 @@ class AppState:
                         self._reconcile_rows_after_anchor(pre_anchor_bitmap)
                     else:
                         self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
-                uploading = True
-                self.rebuild_spline_mesh(preserve_model_placement=False)
+                if rebuild_mesh:
+                    uploading = True
+                    self.rebuild_spline_mesh(preserve_model_placement=False)
                 self.load_path = path
                 self.status_msg = _with_anchor_note(f'Loaded {os.path.basename(path)}', anchored_columns)
                 return True

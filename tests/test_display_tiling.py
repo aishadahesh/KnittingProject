@@ -260,93 +260,49 @@ def test_scan_template_falls_back_when_it_has_no_saved_rows(state, tmp_path, mon
     assert state.apply_scanner_template_base() is False
 
 
-def test_puzzle_tiles_carry_no_depth_shift(state):
-    """Y copies translate in Y alone, in every one of the three tiling sites.
+def test_swatch_slot_offsets_and_canonical_bounds_are_invariant(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.scanner_layout_pattern = "grid"
+    state.scanner_selected_row = 0
+    state.scanner_selected_col = 1
 
-    scanner_core used to push each Y copy back by a whole depth period while
-    the rendered mesh did not, so the pixel vectors driving the seamless-tile
-    glue described a fabric that was never drawn.
-    """
-    from scanner_core import _puzzle_tiled_control_points
+    assert state.swatch_repeat_counts() == (24, 24)
+    uc_span = state.unit_cell_span()
+    assert uc_span > 2.0
 
-    state.display_copies = np.array([1, 1], dtype=np.int32)
-    tiled = _puzzle_tiled_control_points(state)
-    assert tiled, "expected tiled control rows"
+    baseline_offsets = {
+        (r, c): state.swatch_slot_offset(r, c).copy()
+        for r in range(2)
+        for c in range(2)
+    }
+    baseline_bounds = tuple(b.copy() for b in state.canonical_grid_bounds())
+    baseline_span = state.canonical_grid_span()
+    assert baseline_span > uc_span * 20.0
 
-    y_period = state.display_copy_periods()[1]
-    sources = {int(row_idx): row for row_idx, row in enumerate(state.ctrl_rows)}
+    rects = state.all_swatch_slot_rects()
+    assert len(rects) == 4
+    slot_w, slot_h, _ = state._swatch_grid_periods()
+    x0, y0, x1, y1 = state.swatch_slot_rect(0, 1)
+    assert (x1 - x0) == pytest.approx(0.94 * slot_w, rel=1e-5)
+    assert (y1 - y0) == pytest.approx(0.94 * slot_h, rel=1e-5)
 
-    offsets = set()
-    for row, row_idx in tiled:
-        source = sources[int(row_idx)]
-        assert np.allclose(row[:, 2], source[:, 2], atol=1e-6), "Y copies must not shift in Z"
-        offsets.add(round(float(row[0, 1] - source[0, 1]), 4))
+    for preview in (False, True):
+        for neighbors in (False, True):
+            state.scanner_preview_grid_enabled = preview
+            state.world_show_neighbor_swatches = neighbors
+            state.ctrl_rows[0][0, :2] += np.array([3.5, -2.0], dtype=np.float32)
+            state.rebuild_spline_mesh()
+            for (r, c), expected in baseline_offsets.items():
+                assert np.allclose(state.swatch_slot_offset(r, c), expected, atol=1e-6)
+            lo, hi = state.canonical_grid_bounds()
+            assert np.allclose(lo, baseline_bounds[0], atol=1e-6)
+            assert np.allclose(hi, baseline_bounds[1], atol=1e-6)
+            assert state.canonical_grid_span() == pytest.approx(baseline_span, rel=1e-6)
+            assert state.unit_cell_span() == pytest.approx(uc_span, rel=1e-6)
 
-    expected = {round(k * y_period, 4) for k in (-1, 0, 1)}
-    assert offsets == expected
-
-class CaptureRenderer(StubRenderer):
-    """A stub that also hands back a readable colour buffer, like the real one."""
-
-    def __init__(self, vp_w, vp_h, rgba_bytes):
-        self.vp_w = int(vp_w)
-        self.vp_h = int(vp_h)
-        self.color_tex = _ColorTex(rgba_bytes)
-
-
-class _ColorTex:
-    def __init__(self, rgba_bytes):
-        self._rgba_bytes = rgba_bytes
-
-    def read(self):
-        return self._rgba_bytes
-
-
-def _lattice_pixel(px, py, period_w, period_h):
-    """A synthetic fabric: any pixel is fixed by its phase within one repeat."""
-    u = np.asarray(px) % period_w
-    v = np.asarray(py) % period_h
-    return np.stack([
-        (u * 7 + v * 3) % 256,
-        (u * 3 + v * 11) % 256,
-        (u * 13 + v * 5) % 256,
-    ], axis=-1).astype(np.uint8)
+    state.scanner_pattern_repeat_rows = 48
+    state.scanner_pattern_repeat_cols = 48
+    assert state.canonical_grid_span() == pytest.approx(baseline_span * 2.0, rel=1e-5)
 
 
-def test_puzzle_glue_tile_is_exactly_one_repeat_period(state):
-    """The glued tile must be one period tall, not one whole model tall.
-
-    Cropping the model's full projected height instead -- every row of the
-    central copy -- still produces a tile, but it is several periods plus the
-    top and bottom loop overhang. Stamped edge to edge that repeats partial
-    rows, which is the banding the glue exists to rule out.
-    """
-    from scanner_core import _puzzle_build_seamless_tile, _puzzle_period_pixel_vectors
-
-    vp_w, vp_h = 960, 720
-    state.camera.dist = 120.0
-    probe = StubRenderer()
-    probe.vp_w, probe.vp_h = vp_w, vp_h
-    periods = _puzzle_period_pixel_vectors(state, probe)
-    period_w = int(round(abs(float(periods["x_step"][0]))))
-    period_h = int(round(abs(float(periods["y_step"][1]))))
-    assert 4 < period_w < vp_w and 4 < period_h < vp_h
-
-    # A viewport painted with a fabric that repeats on exactly that lattice.
-    ys, xs = np.mgrid[0:vp_h, 0:vp_w]
-    visible = _lattice_pixel(xs, ys, period_w, period_h)
-    rgba = np.dstack([np.flipud(visible), np.full((vp_h, vp_w, 1), 255, np.uint8)])
-    renderer = CaptureRenderer(vp_w, vp_h, rgba.tobytes())
-
-    tile, glued, info = _puzzle_build_seamless_tile(state, renderer, 3, 4)
-
-    assert (info["tile_w"], info["tile_h"]) == (period_w, period_h)
-    assert tile.size == (period_w, period_h)
-
-    # The glue continues the fabric: every pixel of the canvas is the pixel the
-    # underlying lattice would have had, extended past the captured viewport.
-    x0, y0 = info["tile_box"][0], info["tile_box"][1]
-    out = np.asarray(glued, dtype=np.uint8)
-    gys, gxs = np.mgrid[0:out.shape[0], 0:out.shape[1]]
-    expected = _lattice_pixel(gxs + x0, gys + y0, period_w, period_h)
-    assert np.array_equal(out, expected)

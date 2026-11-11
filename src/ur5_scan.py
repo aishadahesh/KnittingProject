@@ -1,12 +1,9 @@
-"""The real UR5 scan run: move, photograph, save, measure, store.
+"""The UR5 scan run: move, photograph, save, measure, store.
 
-This is the physical counterpart of the loop ``EmbeddedMujocoScanner.update``
-runs in simulation, and it visits the same targets from the same
-``fabric_scanner`` plan so the two produce comparable datasets. What differs is
-what happens at each stop: the simulation renders its camera image, while here a
-real camera is asked for a frame taken after the arm actually settled.
+This runner executes a ``scan_geometry.CapturePlan`` across both the simulated and
+real UR5e robot and camera.
 
-The run lives on its own thread, because a real move takes seconds and the UI
+The run lives on its own thread, because a move takes seconds and the UI
 has to keep drawing (and its stop button has to keep working) throughout. That
 has two consequences the code is shaped around:
 
@@ -34,9 +31,9 @@ import numpy as np
 from PIL import Image
 
 import fabric_detector
-import fabric_scanner
 import free_capture
 import robot_camera
+import scan_geometry
 import ur5_robot
 from persistence import write_json
 
@@ -288,7 +285,7 @@ class RealScanRunner:
         self.scan_targets = [
             index
             for index, name in enumerate(plan.view_names)
-            if fabric_scanner.is_scan_view(str(name))
+            if scan_geometry.is_scan_view(str(name))
         ]
 
         self._progress = ScanProgress(target_count=len(self.scan_targets))

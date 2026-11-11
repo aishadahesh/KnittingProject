@@ -19,7 +19,7 @@ import pytest
 from app_state import AppState  # noqa: E402
 from rendering import Camera  # noqa: E402
 
-MODES = ("edit", "scan", "puzzle", "database", "ur5")
+MODES = ("scan", "capture", "model", "edit")
 
 
 class StubRenderer:
@@ -72,7 +72,7 @@ def test_leaving_and_returning_to_edit_restores_the_overlay(state, overlay_activ
     state.show_ref_bg = True
     assert overlay_active(state) is True
 
-    state.app_mode = "puzzle"
+    state.app_mode = "scan"
     assert overlay_active(state) is False
     # The preference itself must survive -- this is what "do not permanently
     # lose the checkbox state" means.
@@ -85,7 +85,7 @@ def test_leaving_and_returning_to_edit_restores_the_overlay(state, overlay_activ
 def test_a_disabled_overlay_is_still_disabled_on_return(state, overlay_active):
     state.app_mode = "edit"
     state.show_ref_bg = False
-    state.app_mode = "puzzle"
+    state.app_mode = "scan"
     state.app_mode = "edit"
     assert overlay_active(state) is False
 
@@ -101,25 +101,25 @@ def test_reset_does_not_change_the_mode(state):
     without going through _set_app_mode -- so the mode they left was never torn
     down and the one they landed in was never set up.
     """
-    state.app_mode = "puzzle"
+    state.app_mode = "scan"
     state.reset_to_initial()
-    assert state.app_mode == "puzzle"
+    assert state.app_mode == "scan"
 
 
 def test_undo_does_not_change_the_mode(state):
-    state.app_mode = "puzzle"
+    state.app_mode = "scan"
     state.push_undo("something")
-    state.app_mode = "puzzle"
+    state.app_mode = "scan"
     state.undo_last()
-    assert state.app_mode == "puzzle"
+    assert state.app_mode == "scan"
 
 
 def test_reset_in_puzzle_mode_does_not_bring_back_the_overlay(state, overlay_active):
     """The reported symptom, end to end."""
-    state.app_mode = "puzzle"
+    state.app_mode = "scan"
     state.show_ref_bg = False
     state.reset_to_initial()
-    assert state.app_mode == "puzzle"
+    assert state.app_mode == "scan"
     assert overlay_active(state) is False
 
 

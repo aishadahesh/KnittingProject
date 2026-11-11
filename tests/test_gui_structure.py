@@ -11,7 +11,7 @@ MODE_MODULES = ("gui_database", "gui_ur5", "gui_model")
 
 # Modules that must stay usable without a UI: they are imported by headless
 # callers (tests, scripts, the scan runner) where imgui does not exist.
-IMGUI_FREE_MODULES = ("fabric_scanner", "scanner_core", "embedded_scanner",
+IMGUI_FREE_MODULES = ("scanner_core",
                       "fabric_detector", "robot_camera", "ur5_robot", "ur5_scan",
                       "gaussian_splatting", "free_capture", "paths", "strand_equations",
                       "lace_lattice", "crochet_core", "scan_fit", "hand_eye", "charuco",
@@ -68,7 +68,7 @@ def test_app_imports_only_the_documented_entry_points():
 
 def test_no_top_level_name_is_defined_twice():
     """A moved function must not be left behind in its old home as well."""
-    modules = ("gui", "gui_captures", "scanner_core", "embedded_scanner", *MODE_MODULES)
+    modules = ("gui", "gui_captures", "scanner_core", *MODE_MODULES)
     owner: dict[str, str] = {}
     clashes = []
     for name in modules:

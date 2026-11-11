@@ -37,7 +37,10 @@ def test_startup_and_shutdown_with_a_saved_model(tmp_path, fail_frame):
 
         def draw_frame(state, renderer, window):
             if not renderers:
-                renderers.extend([state.renderer, state.orbit_renderer, state.puzzle_renderer])
+                renderers.append(state.renderer)
+                assert state.ur5_controller is not None
+                assert state.ur5_controller.robot.connected
+                assert state.ur5_controller.camera is not None and state.ur5_controller.camera.running
             if fail_frame:
                 raise RuntimeError('injected frame failure')
             draw_sidebar(state, renderer, window)

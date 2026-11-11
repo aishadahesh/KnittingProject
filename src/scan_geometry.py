@@ -10,9 +10,8 @@ Five patterns, each answering a different question about one subject:
   radius about the subject and aimed back at it, so the standoff never changes and only the
   direction of view does. ``arc`` sweeps around, ``elevation`` says how high, and ``rings``
   repeats the arc at several elevations so one pass sees both the top and the sides.
-- ``tilt`` is this project's original scan geometry, ``fabric_scanner.expand_stations_to_angle_viewpoints``,
-  kept because it is what the simulated Scan Mode uses. It holds one position and nudges the
-  attitude within a narrow cone, so its extremes differ by only ~33 degrees.
+- ``tilt`` holds one position and nudges the attitude within a narrow cone, so its extremes
+  differ by only ~33 degrees.
 - ``grid`` covers the fabric close up: a rows x cols grid of straight-down views at a fixed,
   low ``camera_height`` over the fabric plane, centred where the camera looks now. Every frame
   is square-on at the same scale, which is what the orbit's 20 cm standoff cannot give.
@@ -32,26 +31,65 @@ discovered on the hardware:
 - The camera rides on the tool, so ``max_height`` caps how far it may rise above the
   subject. Lift it and the picture is of the table around the cloth.
 
-The inverse kinematics is this project's own damped-least-squares step from
-``fabric_scanner``, iterated to a tolerance, against the MuJoCo UR5e.
+The inverse kinematics is a damped-least-squares step iterated to a tolerance against the UR5e URDF kinematics.
 """
 
 from __future__ import annotations
 
-import math
-import threading
 import dataclasses
 from dataclasses import dataclass, field
+import math
+import xml.etree.ElementTree as ET
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
-import fabric_scanner as scanner
-import ur5_robot
+import paths
 
-# The UR5e's driven joints, in the order MuJoCo reports them in qpos. TeleopApp names them
-# identically, which load_model asserts rather than assumes.
+CAPTURE_MIN_WIDTH = 320
+CAPTURE_MAX_WIDTH = 4096
+CAPTURE_MIN_HEIGHT = 240
+CAPTURE_MAX_HEIGHT = 3072
+CAPTURE_ASPECT = 0.75
+NON_SCAN_VIEW_NAMES = {"approach", "retreat", "travel"}
+
+
+def clamp_capture_size(width, height=None):
+    width = int(np.clip(int(round(width)), CAPTURE_MIN_WIDTH, CAPTURE_MAX_WIDTH))
+    if height is None:
+        height = int(round(width * CAPTURE_ASPECT))
+    height = int(np.clip(int(round(height)), CAPTURE_MIN_HEIGHT, CAPTURE_MAX_HEIGHT))
+    return width, height
+
+
+def is_scan_view(name: str) -> bool:
+    return str(name) not in NON_SCAN_VIEW_NAMES
+
 TELEOP_JOINTS = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                  "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
+DEFAULT_HOME_JOINTS = [-1.597935978566305, -1.6107450924315394, 1.5623295942889612,
+                       -1.615626951257223, -1.4477899710284632, -0.1366961638080042]
+
+IK_KP = 0.70
+IK_DAMPING = 0.08
+BASE_TRANSFORM = np.diag([-1.0, -1.0, 1.0, 1.0])
+ATTACHMENT_SITE_TRANSFORM = np.array([
+    [1.0,  0.0, 0.0, 0.0],
+    [0.0,  0.0, 1.0, 0.1],
+    [0.0, -1.0, 0.0, 0.0],
+    [0.0,  0.0, 0.0, 1.0],
+])
+COLLISION_CAPSULES = (
+    (0, "shoulder_link",  (0.0,  0.0,  -0.04), (0.0, 0.0, 0.0),          0.06,  0.06),
+    (1, "upper_arm_link", (0.0, -0.04,  0.0),  (math.pi / 2, 0.0, 0.0),  0.06,  0.06),
+    (1, "upper_arm_link", (0.0,  0.0,   0.20), (0.0, 0.0, 0.0),          0.05,  0.20),
+    (2, "forearm_link",   (0.0,  0.08,  0.0),  (math.pi / 2, 0.0, 0.0),  0.055, 0.06),
+    (2, "forearm_link",   (0.0,  0.0,   0.20), (0.0, 0.0, 0.0),          0.038, 0.19),
+    (3, "wrist_1_link",   (0.0,  0.05,  0.0),  (math.pi / 2, 0.0, 0.0),  0.04,  0.07),
+    (4, "wrist_2_link",   (0.0,  0.0,   0.04), (0.0, 0.0, 0.0),          0.04,  0.06),
+    (4, "wrist_2_link",   (0.0,  0.02,  0.10), (math.pi / 2, 0.0, 0.0),  0.04,  0.04),
+    (5, "wrist_3_link",   (0.0,  0.08,  0.0),  (math.pi / 2, 0.0, 0.0),  0.04,  0.02),
+)
 
 # How close the solve has to get before a pose is accepted, and how far off counts as not
 # having reached it at all.
@@ -275,35 +313,187 @@ class CapturePlan:
 # The model, and the two checks every pose passes
 # ============================================================================
 
-_loaded = threading.local()
+_ur5_arm: dict | None = None
 
 
-def load_model():
-    """The MuJoCo UR5e used for the solve, with its joint order checked against TeleopApp's.
-
-    Parsed once per thread and kept: parsing the MJCF costs a noticeable fraction of a second, and a
-    Check, a Home move and every probe used to pay it again. One per thread, because a solve writes
-    the model's state - the panel's worker and the panel itself must never share one. Every entry
-    point seeds the state it starts from, so a reused model carries nothing over.
-    """
-    if getattr(_loaded, "model", None) is None:
-        mj, model, data, site_id = scanner.load_ur5e_model_data()
-        named = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, index) for index in range(6)]
-        if named != TELEOP_JOINTS:
-            raise RuntimeError(f"MuJoCo joint order {named} is not TeleopApp's {TELEOP_JOINTS}")
-        _loaded.model = (mj, model, data, site_id)
-    return _loaded.model
+def _mat_to_rotvec(matrix: np.ndarray) -> np.ndarray:
+    trace = float(matrix[0, 0] + matrix[1, 1] + matrix[2, 2])
+    cos_angle = min(1.0, max(-1.0, 0.5 * (trace - 1.0)))
+    angle = math.acos(cos_angle)
+    if angle < 1e-7:
+        return 0.5 * np.array([matrix[2, 1] - matrix[1, 2], matrix[0, 2] - matrix[2, 0], matrix[1, 0] - matrix[0, 1]])
+    if angle > math.pi - 1e-4:
+        return Rotation.from_matrix(matrix).as_rotvec()
+    scale = 0.5 * angle / math.sin(angle)
+    return scale * np.array([matrix[2, 1] - matrix[1, 2], matrix[0, 2] - matrix[2, 0], matrix[1, 0] - matrix[0, 1]])
 
 
-def solve_ik(mj, model, data, site_id, target_pose, label):
-    """Iterate this project's damped-least-squares step until the pose is met, or refuse.
+def load_model(urdf_path=paths.UR5E_URDF) -> dict:
+    """Parse the UR5e URDF once and return its kinematic chain and self-collision capsules."""
+    from pathlib import Path
+    global _ur5_arm
+    if _ur5_arm is not None and _ur5_arm["urdf_path"] == Path(urdf_path):
+        return _ur5_arm
 
-    Gives up as soon as the error stops falling: an unreachable pose used to spend all MAX_IK_ITERS
-    steps proving it, and the nearest-safe search tries many of them - which is what froze Check.
-    """
+    root = ET.parse(urdf_path).getroot()
+    joints = []
+    for elem in root.findall("joint"):
+        origin, axis_el, limit_el = elem.find("origin"), elem.find("axis"), elem.find("limit")
+        xyz = [float(x) for x in (origin.get("xyz", "0 0 0") if origin is not None else "0 0 0").split()]
+        rpy = [float(x) for x in (origin.get("rpy", "0 0 0") if origin is not None else "0 0 0").split()]
+        axis = [float(x) for x in (axis_el.get("xyz", "0 0 1") if axis_el is not None else "0 0 1").split()]
+        origin_t = np.eye(4, dtype=float)
+        origin_t[:3, :3] = Rotation.from_euler("xyz", rpy).as_matrix()
+        origin_t[:3, 3] = xyz
+        joints.append({
+            "name": elem.get("name"),
+            "parent": elem.find("parent").get("link"),
+            "child": elem.find("child").get("link"),
+            "origin_t": origin_t,
+            "axis": np.asarray(axis, dtype=float),
+            "lower": float(limit_el.get("lower", -2.0 * math.pi)) if limit_el is not None else -2.0 * math.pi,
+            "upper": float(limit_el.get("upper", 2.0 * math.pi)) if limit_el is not None else 2.0 * math.pi,
+        })
+    named = [jt["name"] for jt in joints]
+    if named != TELEOP_JOINTS:
+        raise RuntimeError(f"URDF joint order {named} is not TeleopApp's {TELEOP_JOINTS}")
+
+    capsules = []
+    for body_idx, link_name, pos, rpy, radius, half_len in COLLISION_CAPSULES:
+        rot = Rotation.from_euler("xyz", rpy).as_matrix()
+        center = np.asarray(pos, dtype=float)
+        offset = rot[:, 2] * float(half_len)
+        capsules.append((body_idx, link_name, center - offset, center + offset, float(radius)))
+    pairs = [(i, j) for i in range(len(capsules)) for j in range(i + 1, len(capsules))
+             if abs(capsules[i][0] - capsules[j][0]) >= 2]
+
+    _ur5_arm = {
+        "urdf_path": Path(urdf_path),
+        "joints": joints,
+        "origin_ts": np.array([jt["origin_t"] for jt in joints], dtype=float),
+        "axis_is_z": tuple(bool(jt["axis"][2] == 1.0) for jt in joints),
+        "jnt_range": np.array([[jt["lower"], jt["upper"]] for jt in joints], dtype=float),
+        "capsules": capsules,
+        "capsule_pairs": pairs,
+        "cap_body": np.array([c[0] for c in capsules], dtype=int),
+        "cap_end_a": np.array([c[2] for c in capsules], dtype=float),
+        "cap_end_b": np.array([c[3] for c in capsules], dtype=float),
+        "pair_i": np.array([p[0] for p in pairs], dtype=int),
+        "pair_j": np.array([p[1] for p in pairs], dtype=int),
+        "pair_radii": np.array([capsules[i][4] + capsules[j][4] for i, j in pairs], dtype=float),
+    }
+    return _ur5_arm
+
+
+def _fk_batch(qs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Batch forward kinematics for (N, 6) joint configurations, returning (link_mats (N, 6, 4, 4), site_mats (N, 4, 4))."""
+    arm = load_model()
+    qs = np.atleast_2d(np.asarray(qs, dtype=float))[:, :6]
+    n = len(qs)
+    cur = np.broadcast_to(BASE_TRANSFORM, (n, 4, 4)).copy()
+    link_mats = np.empty((n, 6, 4, 4), dtype=float)
+    cos_q, sin_q = np.cos(qs), np.sin(qs)
+    for idx in range(6):
+        cur = cur @ arm["origin_ts"][idx]
+        c, s = cos_q[:, idx], sin_q[:, idx]
+        step = np.broadcast_to(np.eye(4, dtype=float), (n, 4, 4)).copy()
+        if arm["axis_is_z"][idx]:
+            step[:, 0, 0], step[:, 0, 1] = c, -s
+            step[:, 1, 0], step[:, 1, 1] = s, c
+        else:
+            step[:, 0, 0], step[:, 0, 2] = c, s
+            step[:, 2, 0], step[:, 2, 2] = -s, c
+        cur = cur @ step
+        link_mats[:, idx] = cur
+    return link_mats, cur @ ATTACHMENT_SITE_TRANSFORM
+
+
+def forward_kinematics(joints) -> dict:
+    """World transforms for every link, joint anchors/axes, and the flange pose in robot base frame."""
+    arm = load_model()
+    q = np.asarray(joints, dtype=float)
+    transform = BASE_TRANSFORM.copy()
+    links = {"base": transform.copy()}
+    anchors = np.empty((6, 3), dtype=float)
+    axes = np.empty((6, 3), dtype=float)
+    for index, (jt, angle) in enumerate(zip(arm["joints"], q[:6])):
+        transform = transform @ jt["origin_t"]
+        anchors[index] = transform[:3, 3]
+        c, s = math.cos(float(angle)), math.sin(float(angle))
+        if arm["axis_is_z"][index]:
+            axes[index] = transform[:3, 2]
+            rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        else:
+            axes[index] = transform[:3, 1]
+            rot = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+        step = np.eye(4, dtype=float)
+        step[:3, :3] = rot
+        transform = transform @ step
+        links[jt["child"]] = transform.copy()
+    site_t = transform @ ATTACHMENT_SITE_TRANSFORM
+    flange = np.r_[site_t[:3, 3], _mat_to_rotvec(site_t[:3, :3])]
+    return {"links": links, "anchors": anchors, "axes": axes, "site_t": site_t, "flange": flange}
+
+
+def rotvec_to_matrix(rotvec) -> np.ndarray:
+    return Rotation.from_rotvec(np.asarray(rotvec, dtype=float)).as_matrix()
+
+
+def link_world_transforms(joints) -> dict[str, np.ndarray]:
+    """4x4 world transforms of all UR5e links for 3D scene rendering."""
+    return forward_kinematics(joints)["links"]
+
+
+def flange_pose(joints) -> np.ndarray:
+    """The 6-DoF flange pose [x, y, z, rx, ry, rz] at `attachment_site` for `joints`."""
+    return forward_kinematics(joints)["flange"]
+
+
+def seed_from(joints) -> np.ndarray:
+    """Forward kinematics at `joints`, returning the 6-DoF flange pose."""
+    return flange_pose(joints)
+
+
+def solve_ik(seed_joints, target_pose, label):
+    """Iterate damped-least-squares IK from `seed_joints` until `target_pose` is met, or refuse."""
+    arm = load_model()
+    origin_ts = arm["origin_ts"]
+    axis_is_z = arm["axis_is_z"]
+    jnt_low, jnt_high = arm["jnt_range"][:, 0], arm["jnt_range"][:, 1]
+    q = np.array(seed_joints[:6], dtype=float)
+    target = np.asarray(target_pose, dtype=float)
+    target_pos = target[:3]
+    target_rot = Rotation.from_rotvec(target[3:6]).as_matrix()
+    damping_eye = (IK_DAMPING ** 2) * np.eye(6, dtype=float)
+    anchors = np.empty((6, 3), dtype=float)
+    axes = np.empty((6, 3), dtype=float)
+
     best, since_better = math.inf, 0
+    err_pos, err_rot = math.inf, math.inf
     for _ in range(MAX_IK_ITERS):
-        err_pos, err_rot = scanner.pose_errors(scanner.get_tcp(mj, model, data, site_id), target_pose)
+        transform = BASE_TRANSFORM.copy()
+        cos_q, sin_q = np.cos(q), np.sin(q)
+        for index in range(6):
+            transform = transform @ origin_ts[index]
+            anchors[index] = transform[:3, 3]
+            c, s = float(cos_q[index]), float(sin_q[index])
+            if axis_is_z[index]:
+                axes[index] = transform[:3, 2]
+                col0, col1 = transform[:, 0].copy(), transform[:, 1].copy()
+                transform[:, 0] = c * col0 + s * col1
+                transform[:, 1] = -s * col0 + c * col1
+            else:
+                axes[index] = transform[:3, 1]
+                col0, col2 = transform[:, 0].copy(), transform[:, 2].copy()
+                transform[:, 0] = c * col0 - s * col2
+                transform[:, 2] = s * col0 + c * col2
+        site_t = transform @ ATTACHMENT_SITE_TRANSFORM
+        cur_pos = site_t[:3, 3]
+        cur_rot = site_t[:3, :3]
+        diff_pos = target_pos - cur_pos
+        rot_vec = _mat_to_rotvec(target_rot @ cur_rot.T)
+        err_pos = float(np.linalg.norm(diff_pos))
+        err_rot = float(np.linalg.norm(rot_vec))
         if err_pos < POSE_TOL and err_rot < ROT_TOL:
             break
         score = err_pos + 0.1 * err_rot
@@ -313,60 +503,87 @@ def solve_ik(mj, model, data, site_id, target_pose, label):
             since_better += 1
             if since_better >= IK_STALL_STEPS:
                 break
-        scanner.step_ik(mj, model, data, site_id, target_pose)
+        jac_p = np.cross(axes, cur_pos - anchors).T
+        jac = np.vstack([jac_p, axes.T])
+        err = IK_KP * np.r_[diff_pos, 0.35 * rot_vec]
+        dq = jac.T @ np.linalg.solve(jac @ jac.T + damping_eye, err)
+        q = np.clip(q + dq, jnt_low, jnt_high)
 
-    err_pos, err_rot = scanner.pose_errors(scanner.get_tcp(mj, model, data, site_id), target_pose)
+    state = forward_kinematics(q)
+    site_t = state["site_t"]
+    err_pos = float(np.linalg.norm(target_pos - site_t[:3, 3]))
+    err_rot = float(np.linalg.norm(_mat_to_rotvec(target_rot @ site_t[:3, :3].T)))
     if err_pos > UNREACHED_POS or err_rot > UNREACHED_ROT:
-        raise Unreachable(label, err_pos, err_rot, target_pose)
-    return np.array(data.qpos[:6], dtype=float), err_pos, err_rot
+        raise Unreachable(label, err_pos, err_rot, target)
+    return q, err_pos, err_rot
 
 
-def contacts_at(mj, model, data, q):
-    """How many self-collisions the model reports in configuration `q`.
+def _segments_distance(p1: np.ndarray, q1: np.ndarray, p2: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    u, v, w = q1 - p1, q2 - p2, p1 - p2
+    a = np.sum(u * u, axis=-1)
+    b = np.sum(u * v, axis=-1)
+    c = np.sum(v * v, axis=-1)
+    d = np.sum(u * w, axis=-1)
+    e = np.sum(v * w, axis=-1)
+    denom = a * c - b * b
+    parallel = denom < 1e-12
+    s_den = np.where(parallel, 1.0, denom)
+    s_num = np.where(parallel, 0.0, b * e - c * d)
+    t_den = np.where(parallel, c, denom)
+    t_num = np.where(parallel, e, a * e - b * d)
 
-    The UR5e MJCF carries 9 collision geoms, so this is a real check: sane poses report 0
-    and a folded-back arm reports several. It sees the ARM ONLY - the fabric, the table and
-    the camera mount are not in this model, so 0 means "the arm does not hit itself", never
-    "the cell is clear".
-    """
-    held = np.array(data.qpos[:6], dtype=float)
-    data.qpos[:6] = q
-    mj.mj_forward(model, data)
-    found = int(data.ncon)
+    low_s = (~parallel) & (s_num < 0.0)
+    high_s = (~parallel) & (s_num > s_den)
+    s_num = np.where(low_s, 0.0, np.where(high_s, s_den, s_num))
+    t_num = np.where(low_s, e, np.where(high_s, e + b, t_num))
+    t_den = np.where(low_s | high_s, c, t_den)
 
-    data.qpos[:6] = held
-    mj.mj_forward(model, data)
-    return found
+    low_t = t_num < 0.0
+    high_t = (~low_t) & (t_num > t_den)
+    t_num = np.where(low_t, 0.0, np.where(high_t, t_den, t_num))
+    nd_low = -d
+    s_num = np.where(low_t, np.where(nd_low < 0.0, 0.0, np.where(nd_low > a, s_den, nd_low)), s_num)
+    s_den = np.where(low_t & (nd_low >= 0.0) & (nd_low <= a), a, s_den)
+    nd_high = -d + b
+    s_num = np.where(high_t, np.where(nd_high < 0.0, 0.0, np.where(nd_high > a, s_den, nd_high)), s_num)
+    s_den = np.where(high_t & (nd_high >= 0.0) & (nd_high <= a), a, s_den)
 
-
-def seed_from(mj, model, data, site_id, joints):
-    """Put the model where the arm is and return its tool pose.
-
-    Every plan is built from the arm's measured configuration, so the solve starts on the
-    branch the arm is already on and the geometry is centred where the camera actually looks.
-    """
-    data.qpos[:6] = [float(value) for value in joints]
-    mj.mj_forward(model, data)
-    return scanner.get_tcp(mj, model, data, site_id)
+    sc = np.where(np.abs(s_num) < 1e-12, 0.0, s_num / np.maximum(s_den, 1e-12))
+    tc = np.where(np.abs(t_num) < 1e-12, 0.0, t_num / np.maximum(t_den, 1e-12))
+    diff = w + sc[..., None] * u - tc[..., None] * v
+    return np.linalg.norm(diff, axis=-1)
 
 
-def fabric_height(mj, model, data, site_id, subject_distance, measured=None):
-    """The fabric plane every clearance is measured from.
+def _batch_contacts(link_mats: np.ndarray, arm: dict) -> np.ndarray:
+    mats = link_mats[:, arm["cap_body"]]
+    rots = mats[:, :, :3, :3]
+    pos = mats[:, :, :3, 3]
+    world_a = np.einsum("nkij,kj->nki", rots, arm["cap_end_a"]) + pos
+    world_b = np.einsum("nkij,kj->nki", rots, arm["cap_end_b"]) + pos
+    dists = _segments_distance(
+        world_a[:, arm["pair_i"]], world_b[:, arm["pair_i"]],
+        world_a[:, arm["pair_j"]], world_b[:, arm["pair_j"]],
+    )
+    return np.sum(dists < arm["pair_radii"], axis=-1)
 
-    `measured` is the plane taken by touching the camera to the fabric, and is the one to
-    trust. Without it the plane is estimated as `subject_distance` down the flange's axis at
-    Home - which is only as good as that number, and a wrong one refuses every move.
-    """
+
+def contacts_at(q) -> int:
+    """How many self-collisions the UR5e link capsules report in configuration `q`."""
+    arm = load_model()
+    link_mats, _ = _fk_batch(q)
+    return int(_batch_contacts(link_mats, arm)[0])
+
+
+def fabric_height(subject_distance, measured=None) -> float:
+    """The fabric plane every clearance is measured from."""
     if measured is not None:
         return float(measured)
-    return float(subject_in_front_of(seed_from(mj, model, data, site_id, ur5_robot.DEFAULT_HOME_JOINTS),
-                                     subject_distance)[2])
+    return float(subject_in_front_of(flange_pose(DEFAULT_HOME_JOINTS), subject_distance)[2])
 
 
 def camera_pose(joints, tool_offset):
     """Where the camera is in configuration `joints`, and its attitude as a rotation vector."""
-    mj, model, data, site_id = load_model()
-    flange = seed_from(mj, model, data, site_id, joints)
+    flange = flange_pose(joints)
     return np.asarray(camera_point(flange, tool_offset), dtype=float), np.asarray(flange[3:6], dtype=float)
 
 
@@ -375,81 +592,82 @@ def camera_position(joints, tool_offset):
     return camera_pose(joints, tool_offset)[0]
 
 
-def camera_point(flange_pose, tool_offset):
+def camera_point(flange, tool_offset):
     """Where the camera is, one tool offset along the flange's +Z."""
-    from scipy.spatial.transform import Rotation
-
-    return np.asarray(flange_pose[:3], dtype=float) + Rotation.from_rotvec(flange_pose[3:6]).apply([0.0, 0.0, float(tool_offset)])
+    return np.asarray(flange[:3], dtype=float) + Rotation.from_rotvec(flange[3:6]).apply([0.0, 0.0, float(tool_offset)])
 
 
-def lowest_point(mj, model, data, site_id, q, tool_offset):
+def lowest_point(q, tool_offset) -> float:
     """The lowest of the wrist's joint centres and the camera point in configuration `q`."""
-    camera = camera_point(seed_from(mj, model, data, site_id, q), tool_offset)
-    wrist = [float(data.xpos[mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)][2]) for name in SWEPT_BODIES]
-    return min(wrist + [float(camera[2])])
+    link_mats, site_mats = _fk_batch(q)
+    cam_z = site_mats[0, 2, 3] + site_mats[0, 2, 2] * float(tool_offset)
+    return float(min(float(np.min(link_mats[0, 3:6, 2, 3])), float(cam_z)))
 
 
-def lowest_arm_point(mj, model, data, site_id, q):
+def lowest_arm_point(q) -> float:
     """The lowest of the elbow, the wrist joints and the middles of the upper arm and forearm in configuration `q`."""
-    seed_from(mj, model, data, site_id, q)
-    ids = {name: mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name) for name in ARM_BODIES}
-    if min(ids.values()) < 0:
-        raise RuntimeError(f"The UR5e model has no body named {[name for name, index in ids.items() if index < 0]}")
-    upper, elbow, wrist_1, wrist_2 = (np.array(data.xpos[ids[name]], dtype=float) for name in ARM_BODIES)
-    return float(min(elbow[2], wrist_1[2], wrist_2[2], 0.5 * (upper[2] + elbow[2]), 0.5 * (elbow[2] + wrist_1[2])))
+    link_mats, _ = _fk_batch(q)
+    upper, elbow, wrist_1, wrist_2 = link_mats[0, 1:5, 2, 3]
+    return float(min(elbow, wrist_1, wrist_2, 0.5 * (upper + elbow), 0.5 * (elbow + wrist_1)))
 
 
-def singularity_margins(mj, model, data, site_id, q):
+def singularity_margins(q):
     """How far configuration `q` is from the shoulder, elbow and wrist singularities: (metres, degrees, degrees)."""
-    seed_from(mj, model, data, site_id, q)
-    bodies = {name: mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name) for name in ("shoulder_link", "wrist_2_link")}
-    if min(bodies.values()) < 0:
-        raise RuntimeError(f"The UR5e model has no body named {[name for name, index in bodies.items() if index < 0]}")
-    radius = float(np.linalg.norm((data.xpos[bodies["wrist_2_link"]] - data.xpos[bodies["shoulder_link"]])[:2]))
+    link_mats, _ = _fk_batch(q)
+    radius = float(np.linalg.norm(link_mats[0, 4, :2, 3] - link_mats[0, 0, :2, 3]))
     bend = lambda angle: math.degrees(math.asin(min(1.0, abs(math.sin(float(angle))))))
     return radius, bend(q[2]), bend(q[4])
 
 
-def check_move(mj, model, data, site_id, point, previous_q, fabric_z, tool_offset, leaving=False):
-    """Fill in what flying from `previous_q` to `point.config` would do, sampled every SWEEP_STEP_DEG.
+def check_move(point, previous_q, fabric_z, tool_offset, leaving=False):
+    """Fill in what flying from `previous_q` to `point.config` would do, sampled every SWEEP_STEP_DEG."""
+    arm_model = load_model()
+    prev_arr = np.asarray(previous_q, dtype=float)
+    pieces = interpolate_steps(prev_arr, point.config, SWEEP_STEP_DEG)
+    all_qs = np.vstack([prev_arr[None, :6], np.asarray(pieces, dtype=float)[:, :6]])
+    link_mats, site_mats = _fk_batch(all_qs)
 
-    The endpoint is sampled with the path, and must also stand clear on its own. `leaving`
-    marks the move out of where the arm actually is, the one move allowed to start low.
-    Leaves the model where it found it, since the caller solves from there next.
-    """
-    held = np.array(data.qpos[:6], dtype=float)
-    pieces = interpolate_steps(previous_q, point.config, SWEEP_STEP_DEG)
-    point.contacts = contacts_at(mj, model, data, point.config)
-    point.transition_deg = math.degrees(float(np.max(np.abs(np.asarray(point.config) - np.asarray(previous_q)))))
-    point.path_contacts = sum(1 for piece in pieces if contacts_at(mj, model, data, piece))
-    point.clearance = min(lowest_point(mj, model, data, site_id, piece, tool_offset) for piece in pieces) - fabric_z
-    arm = [lowest_arm_point(mj, model, data, site_id, piece) - fabric_z for piece in pieces]
-    arm_start = lowest_arm_point(mj, model, data, site_id, np.asarray(previous_q, dtype=float)) - fabric_z
-    arm_floor = min(ARM_CLEARANCE, arm_start - DESCENT_TOLERANCE, arm[-1] - DESCENT_TOLERANCE if point.fixed else math.inf)
+    hit_counts = _batch_contacts(link_mats[1:], arm_model)
+    point.contacts = int(hit_counts[-1])
+    point.transition_deg = math.degrees(float(np.max(np.abs(np.asarray(point.config) - prev_arr))))
+    point.path_contacts = int(np.sum(hit_counts > 0))
+
+    cam_z = site_mats[:, 2, 3] + site_mats[:, 2, 2] * float(tool_offset)
+    low_pts = np.minimum(np.min(link_mats[:, 3:6, 2, 3], axis=1), cam_z)
+    point.clearance = float(np.min(low_pts[1:]) - fabric_z)
+
+    upper_z, elbow_z, w1_z, w2_z = link_mats[:, 1, 2, 3], link_mats[:, 2, 2, 3], link_mats[:, 3, 2, 3], link_mats[:, 4, 2, 3]
+    low_arm = np.minimum.reduce([elbow_z, w1_z, w2_z, 0.5 * (upper_z + elbow_z), 0.5 * (elbow_z + w1_z)]) - fabric_z
+    arm = low_arm[1:]
+    arm_start = float(low_arm[0])
+    arm_floor = min(ARM_CLEARANCE, arm_start - DESCENT_TOLERANCE, float(arm[-1]) - DESCENT_TOLERANCE if point.fixed else math.inf)
     arm_end_floor = -math.inf if point.fixed else ARM_CLEARANCE
-    point.arm_clearance = min([value for value in arm[:-1] if value < arm_floor] + [arm[-1]] * (arm[-1] < arm_end_floor), default=math.inf)
+    point.arm_clearance = float(min([float(value) for value in arm[:-1] if value < arm_floor] + [float(arm[-1])] * bool(arm[-1] < arm_end_floor), default=math.inf))
+
     required = (MIN_WRIST_RADIUS, MIN_ELBOW_BEND_DEG, MIN_WRIST_BEND_DEG)
-    samples =[singularity_margins(mj, model, data, site_id, piece) for piece in pieces]
-    start_margins = singularity_margins(mj, model, data, site_id, np.asarray(previous_q, dtype=float))
-    path_floors = [min(need, begin - slack, finish - slack if point.fixed else math.inf)
+    radii = np.linalg.norm(link_mats[:, 4, :2, 3] - link_mats[:, 0, :2, 3], axis=1)
+    elbow_bends = np.degrees(np.arcsin(np.minimum(1.0, np.abs(np.sin(all_qs[:, 2])))))
+    wrist_bends = np.degrees(np.arcsin(np.minimum(1.0, np.abs(np.sin(all_qs[:, 4])))))
+    all_margins = np.column_stack([radii, elbow_bends, wrist_bends])
+    start_margins = all_margins[0]
+    samples = all_margins[1:]
+    path_floors = [min(need, float(begin) - slack, float(finish) - slack if point.fixed else math.inf)
                    for need, begin, slack, finish in zip(required, start_margins, SINGULARITY_SLACK, samples[-1])]
     end_floors = [-math.inf] * 3 if point.fixed else required
-    violations = lambda index: [sample[index] for sample in samples[:-1] if sample[index] < path_floors[index]] + [
-        samples[-1][index]] * (samples[-1][index] < end_floors[index])
+    violations = lambda index: [float(sample[index]) for sample in samples[:-1] if sample[index] < path_floors[index]] + [
+        float(samples[-1][index])] * bool(samples[-1][index] < end_floors[index])
     point.wrist_radius, point.elbow_bend_deg, point.wrist_bend_deg = (min(violations(index), default=math.inf) for index in range(3))
-    point.standing = lowest_point(mj, model, data, site_id, point.config, tool_offset) - fabric_z
-    start = lowest_point(mj, model, data, site_id, np.asarray(previous_q, dtype=float), tool_offset) - fabric_z
+    point.standing = float(low_pts[-1] - fabric_z)
+    start = float(low_pts[0] - fabric_z)
     point.floor = min(FABRIC_CLEARANCE, start - DESCENT_TOLERANCE) if leaving else FABRIC_CLEARANCE
-    seed_from(mj, model, data, site_id, held)
 
 
 def check_home_move(joints, *, subject_distance, tool_offset, fabric_z=None, home_joints=None, fixed=False) -> Viewpoint:
     """The move from `joints` to Home - or, with `fixed`, to a pose the arm was taught - checked exactly as a capture path's moves are."""
-    mj, model, data, site_id = load_model()
-    fabric_z = fabric_height(mj, model, data, site_id, subject_distance, fabric_z)
+    fabric_z = fabric_height(subject_distance, fabric_z)
     home = Viewpoint("Home", np.zeros(3), np.zeros(3), fixed=fixed,
-                     config=np.asarray(ur5_robot.DEFAULT_HOME_JOINTS if home_joints is None else home_joints, dtype=float))
-    check_move(mj, model, data, site_id, home, np.asarray(joints, dtype=float), fabric_z, tool_offset, leaving=True)
+                     config=np.asarray(DEFAULT_HOME_JOINTS if home_joints is None else home_joints, dtype=float))
+    check_move(home, np.asarray(joints, dtype=float), fabric_z, tool_offset, leaving=True)
     return home
 
 
@@ -629,9 +847,15 @@ def orbit_views(tool_pose, subject, count, radius, arc_degrees=120.0, elevation_
 
 def tilt_views(tool_pose, count, view_radius):
     """This project's own scan angles: one position, attitudes within a narrow cone."""
-    points, _, names, rotvecs = scanner.expand_stations_to_angle_viewpoints(
-        np.array([np.asarray(tool_pose[:3], dtype=float)]), int(count), float(view_radius), 0.0)
-    return [Viewpoint(name, point, rotvec) for name, point, rotvec in zip(names, points, rotvecs)]
+    point = np.asarray(tool_pose[:3], dtype=float)
+    total = max(1, int(count))
+    tilt = min(0.60, max(0.0, float(view_radius) / 0.060 * 0.45))
+    views = []
+    for index in range(total):
+        theta = 2.0 * math.pi * index / total
+        rotvec = np.array([math.pi, tilt * math.sin(theta), tilt * math.cos(theta)], dtype=float)
+        views.append(Viewpoint(f"angle {360.0 * index / total:.0f}", point.copy(), rotvec))
+    return views
 
 
 def looking_down_along(heading):
@@ -716,11 +940,10 @@ def camera_rotation(rotvec, turn=IDENTITY_TURN) -> np.ndarray:
 def straight_home(home_joints, tool_offset, region=None, turn=IDENTITY_TURN):
     """Home's camera position, with the lens exactly down and the image squared to the cloth - solved
     from Home itself, so the arm stays on Home's branch and only the wrist moves."""
-    mj, model, data, site_id = load_model()
-    flange = seed_from(mj, model, data, site_id, home_joints)
+    flange = flange_pose(home_joints)
     camera = camera_point(flange, tool_offset)
     rotvec = looking_down_along(straight_heading(region, flange[3:6], turn))
-    config, _, _ = solve_ik(mj, model, data, site_id, np.r_[flange_for_grasp(camera, rotvec, tool_offset), rotvec], "straight Home")
+    config, _, _ = solve_ik(home_joints, np.r_[flange_for_grasp(camera, rotvec, tool_offset), rotvec], "straight Home")
     return config
 
 
@@ -897,7 +1120,7 @@ def centre_view(tool_pose, camera_height, fabric_z, region, subject_distance, to
     return [view], centre
 
 
-def taught_views(mj, model, data, site_id, taught, tool_offset):
+def taught_views(taught, tool_offset):
     """The views the user posed the arm at by hand, as recorded - joints first, geometry derived.
 
     A taught view is flown in exactly the joints it was recorded in, so nothing is solved;
@@ -907,7 +1130,7 @@ def taught_views(mj, model, data, site_id, taught, tool_offset):
     views = []
     for index, entry in enumerate(taught):
         config = np.asarray(entry["joints"], dtype=float)
-        flange = seed_from(mj, model, data, site_id, config)
+        flange = flange_pose(config)
         views.append(Viewpoint(str(entry.get("name") or f"taught {index + 1}"), camera_point(flange, tool_offset),
                                np.asarray(flange[3:6], dtype=float), config=config, fixed=True))
     return views
@@ -1095,11 +1318,10 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
     is solved and checked, so every safety check is the usual one. `splat_subject` fixes the
     dome's centre instead of taking the fabric point the camera looks at from `joints`.
     """
-    mj, model, data, site_id = load_model()
-    fabric_z = fabric_height(mj, model, data, site_id, subject_distance, fabric_z)
+    fabric_z = fabric_height(subject_distance, fabric_z)
     region = FabricRegion(np.asarray(fabric_outline, dtype=float).reshape(-1, 3)) if len(fabric_outline) else None
     here = np.asarray(joints, dtype=float)
-    tool_pose = seed_from(mj, model, data, site_id, here)
+    tool_pose = flange_pose(here)
 
     sphere = None
     subject = None
@@ -1154,7 +1376,7 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
     elif pattern == "taught":
         if not taught:
             raise RuntimeError("No taught views yet - put the arm in free drive, pose the camera by hand, and Record view")
-        views = taught_views(mj, model, data, site_id, taught, tool_offset)
+        views = taught_views(taught, tool_offset)
         subject = np.mean([subject_in_front_of(np.r_[view.position, view.rotvec], subject_distance) for view in views], axis=0)
     else:
         # With the fabric outlined, the orbit circles its middle wherever the arm happens to stand;
@@ -1168,7 +1390,7 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
     # reconfiguration just getting there, for nothing. A taught path is flown in the order
     # it was taught, because that order is part of what was taught.
     if len(views) > 1 and pattern != "taught":
-        first, last = [_probe(mj, model, data, site_id, view, tool_offset, here) for view in (views[0], views[-1])]
+        first, last = [_probe(view, tool_offset, here) for view in (views[0], views[-1])]
         if last is not None and first is not None and last < first:
             views.reverse()
 
@@ -1176,7 +1398,7 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
     # view reports where it strays but is not refused for it: it is where the user put it. The
     # splat dome is not held to it - its far, tilted views are meant to take in the cloth's edge.
     frame = None if region is None or not region.has_outline or pattern == "splat" else (region, float(lens_hfov_deg))
-    solver = (mj, model, data, site_id, fabric_z, tool_offset, frame)
+    solver = (fabric_z, tool_offset, frame)
     mount = camera_mount if pattern == "splat" else None
     kept, skipped = [], []
     previous = here
@@ -1319,13 +1541,13 @@ def _nearest_safe(solver, candidates, previous_q, leaving):
 
 def _as_taught(solver, view, previous_q, leaving):
     """A taught view is flown as taught or not at all - moving it would be un-teaching it."""
-    mj, model, data, site_id, fabric_z, tool_offset, frame = solver
-    check_move(mj, model, data, site_id, view, previous_q, fabric_z, tool_offset, leaving)
+    fabric_z, tool_offset, frame = solver
+    check_move(view, previous_q, fabric_z, tool_offset, leaving)
     _judge_frame(view, frame, fabric_z, enforced=False)
     return (view, "") if view.clear else (None, "; ".join(view.problems))
 
 
-def _seeds(mj, model, data, site_id, previous_q, target_xy):
+def _seeds(previous_q, target_xy):
     """Whole-arm configurations to start a solve from, nearest first.
 
     The damped step only ever slides downhill from where it starts, so from the arm's own pose it
@@ -1334,13 +1556,14 @@ def _seeds(mj, model, data, site_id, previous_q, target_xy):
     the cloth, and each start is also offered with the base already turned to face the target, so
     the shoulder, elbow and wrist only have to solve the reach and the height.
     """
+    model = load_model()
     starts = []
-    for start in (np.asarray(previous_q, dtype=float), np.asarray(ur5_robot.DEFAULT_HOME_JOINTS, dtype=float)):
-        flange = seed_from(mj, model, data, site_id, start)[:2]
-        base = np.asarray(data.xanchor[0][:2], dtype=float)
+    for start in (np.asarray(previous_q, dtype=float), np.asarray(DEFAULT_HOME_JOINTS, dtype=float)):
+        flange = flange_pose(start)[:2]
+        base = np.zeros(2, dtype=float)
         turn = math.atan2(target_xy[1] - base[1], target_xy[0] - base[0]) - math.atan2(flange[1] - base[1], flange[0] - base[0])
         turned = start.copy()
-        turned[0] = np.clip(start[0] + (turn + math.pi) % (2.0 * math.pi) - math.pi, model.jnt_range[0, 0], model.jnt_range[0, 1])
+        turned[0] = np.clip(start[0] + (turn + math.pi) % (2.0 * math.pi) - math.pi, model["jnt_range"][0, 0], model["jnt_range"][0, 1])
         starts += [start, turned]
     seeds = []
     for start in starts:
@@ -1357,18 +1580,17 @@ def _solve(solver, view, previous_q, leaving=False) -> Viewpoint:
     """
     import dataclasses
 
-    mj, model, data, site_id, fabric_z, tool_offset, frame = solver
+    fabric_z, tool_offset, frame = solver
     target = np.r_[flange_for_grasp(view.position, view.rotvec, tool_offset), view.rotvec]
     refused, missed = None, None
-    for seed in _seeds(mj, model, data, site_id, previous_q, target[:2]):
+    for seed in _seeds(previous_q, target[:2]):
         attempt = dataclasses.replace(view)
-        seed_from(mj, model, data, site_id, seed)
         try:
-            attempt.config, attempt.err_pos, attempt.err_rot = solve_ik(mj, model, data, site_id, target, view.name)
+            attempt.config, attempt.err_pos, attempt.err_rot = solve_ik(seed, target, view.name)
         except Unreachable as exc:
             missed = exc if missed is None or exc.err_pos < missed.err_pos else missed
             continue
-        check_move(mj, model, data, site_id, attempt, previous_q, fabric_z, tool_offset, leaving)
+        check_move(attempt, previous_q, fabric_z, tool_offset, leaving)
         _judge_frame(attempt, frame, fabric_z, enforced=True)
         if attempt.clear:
             return attempt
@@ -1387,16 +1609,14 @@ def _judge_frame(view, frame, fabric_z, enforced):
     view.frame_enforced = enforced
 
 
-def _probe(mj, model, data, site_id, view, tool_offset, here):
+def _probe(view, tool_offset, here):
     """How far `view` is from `here` in joint space, or None if it cannot be reached.
 
     Used only to decide which end of a sweep to enter from, so a refusal here is not fatal -
     the real solve reports it properly.
     """
-    seed_from(mj, model, data, site_id, here)
     try:
-        config, _, _ = solve_ik(mj, model, data, site_id,
-                                np.r_[flange_for_grasp(view.position, view.rotvec, tool_offset), view.rotvec], view.name)
+        config, _, _ = solve_ik(here, np.r_[flange_for_grasp(view.position, view.rotvec, tool_offset), view.rotvec], view.name)
     except Unreachable:
         return None
     return float(np.max(np.abs(config - here)))

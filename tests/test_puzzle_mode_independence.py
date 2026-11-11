@@ -1,12 +1,11 @@
-"""Puzzle Mode owns a model instead of borrowing the last visited mode's one."""
-
+"""Each swatch cell in the shared 3D world owns its own independent pattern state."""
 
 import numpy as np
 import pytest
 
-
-from app_state import AppState  # noqa: E402
-from rendering import Camera  # noqa: E402
+from app_state import AppState
+from rendering import Camera
+from scanner_core import _scanner_pattern_repeats, ensure_swatch_unit_tile_images
 
 
 class StubRenderer:
@@ -29,6 +28,7 @@ class StubRenderer:
         self.mesh_pick_data = [
             (np.asarray(item[0], dtype=np.float32), int(self.last_meta[idx].get("row", idx)))
             for idx, item in enumerate(verts)
+            if idx >= len(self.last_meta) or not bool(self.last_meta[idx].get("neighbor_swatch", False))
         ]
         if self.state is not None:
             self.renderer_seen_during_upload.append(self.state.renderer)
@@ -58,155 +58,117 @@ def _change_cell(state, row, col):
     return np.asarray(state.bitmap, dtype=np.float32).copy()
 
 
-def test_puzzle_pattern_survives_edit_and_scan_without_leaking(state):
-    import gui
-
-    baseline = np.asarray(state.bitmap, dtype=np.float32).copy()
-    puzzle_baseline_rows = [
-        np.asarray(row, dtype=np.float32).copy()
-        for row in state.puzzle_model_snapshot["ctrl_rows"]
-    ]
-    edit_pattern = _change_cell(state, 1, 0)
+def test_swatch_cells_preserve_independent_patterns_across_edit_and_scan(state):
+    state.select_swatch(0, 0)
+    pattern_00 = _change_cell(state, 1, 0)
     state.ctrl_rows[1][0, 2] += 0.25
     state._rebuild_spline_points()
     state.rebuild_spline_mesh()
-    edit_rows = [row.copy() for row in state.ctrl_rows]
-    state.push_undo("Edit workspace")
-    edit_undo_count = len(state.undo_stack)
+    rows_00 = [row.copy() for row in state.ctrl_rows]
 
-    gui._set_app_mode(state, "puzzle")
-    np.testing.assert_array_equal(state.bitmap, baseline)
-    np.testing.assert_allclose(state.ctrl_rows[1], puzzle_baseline_rows[1])
-    # An all-active Puzzle pattern has one height per row, not Scan's random
-    # short/tall height per cell.
-    assert all(np.allclose(row, row[0]) for row in np.asarray(state.loop_heights))
-    assert not np.any(state.loop_height_overrides)
-    assert state.undo_stack == []
-
-    puzzle_pattern = _change_cell(state, 1, 1)
+    state.select_swatch(0, 1)
+    pattern_01 = _change_cell(state, 1, 1)
     state.ctrl_rows[1][0, 2] -= 0.35
     state._rebuild_spline_points()
     state.rebuild_spline_mesh()
-    puzzle_rows = [row.copy() for row in state.ctrl_rows]
-    state.model_t = np.asarray(state.model_t, dtype=np.float32) + np.array([2.5, -1.25, 0.4], dtype=np.float32)
-    state.model_scale = np.array([1.3, 0.8, 1.1], dtype=np.float32)
-    state.camera.az = 0.37
-    state.camera.el = -0.21
-    puzzle_model_t = state.model_t.copy()
-    puzzle_model_scale = state.model_scale.copy()
-    puzzle_camera = (state.camera.az, state.camera.el)
-    state.push_undo("Puzzle workspace")
-    puzzle_undo_count = len(state.undo_stack)
+    rows_01 = [row.copy() for row in state.ctrl_rows]
 
-    gui._set_app_mode(state, "scan")
-    np.testing.assert_array_equal(state.bitmap, edit_pattern)
-    np.testing.assert_allclose(state.ctrl_rows[1], edit_rows[1])
-    assert len(state.undo_stack) == edit_undo_count
+    state.save_active_swatch()
+    state.app_mode = "scan"
+    state.scanner_preview_grid_enabled = True
+    state.rebuild_spline_mesh(preserve_model_placement=False)
     assert state.scanner_preview_grid_enabled is True
     assert any("scanner_cell" in item for item in state.renderer.last_meta)
-    # A Scan-only placement change must not become Puzzle's placement.
-    state.model_t = np.asarray(state.model_t, dtype=np.float32) + np.array([20.0, 10.0, 0.0], dtype=np.float32)
 
-    gui._set_app_mode(state, "puzzle")
-    np.testing.assert_array_equal(state.bitmap, puzzle_pattern)
-    np.testing.assert_allclose(state.ctrl_rows[1], puzzle_rows[1])
-    np.testing.assert_allclose(state.model_t, puzzle_model_t)
-    np.testing.assert_allclose(state.model_scale, puzzle_model_scale)
-    assert (state.camera.az, state.camera.el) == pytest.approx(puzzle_camera)
-    assert len(state.undo_stack) == puzzle_undo_count
+    state.app_mode = "edit"
+    state.scanner_preview_grid_enabled = False
+    state.rebuild_spline_mesh(preserve_model_placement=False)
     assert state.scanner_preview_grid_enabled is False
-    assert not any("scanner_cell" in item for item in state.renderer.last_meta)
+    np.testing.assert_array_equal(state.bitmap, pattern_01)
+    np.testing.assert_allclose(state.ctrl_rows[1], rows_01[1])
 
-    gui._set_app_mode(state, "edit")
-    np.testing.assert_array_equal(state.bitmap, edit_pattern)
-    np.testing.assert_allclose(state.ctrl_rows[1], edit_rows[1])
-    assert len(state.undo_stack) == edit_undo_count
-
-
-def test_puzzle_does_not_overwrite_the_main_autosave(state, monkeypatch):
-    calls = []
-    monkeypatch.setattr(state, "save_params", lambda *args, **kwargs: calls.append(args))
-    state.autosave_enabled = True
-    state.autosave_last_time = 0.0
-    state.app_mode = "puzzle"
-
-    state.maybe_autosave()
-
-    assert calls == []
+    state.select_swatch(0, 0)
+    np.testing.assert_array_equal(state.bitmap, pattern_00)
+    np.testing.assert_allclose(state.ctrl_rows[1], rows_00[1])
 
 
-def test_reset_initial_in_puzzle_uses_the_clean_puzzle_baseline(state):
-    import gui
+def test_in_place_swatch_slot_offsets_and_ctrl_pt_editing(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.select_swatch(1, 1)
+    epoch_before = state.mesh_epoch
+    state.rebuild_spline_mesh()
+    assert state.mesh_epoch == epoch_before + 1
+    assert state.last_prepared_meshes is not None
 
-    gui._set_app_mode(state, "puzzle")
-    _change_cell(state, 1, 0)
-
-    state.reset_to_initial()
-
-    np.testing.assert_array_equal(state.bitmap, state.puzzle_initial_snapshot["bitmap"])
-    assert all(np.allclose(row, row[0]) for row in np.asarray(state.loop_heights))
-    assert not np.any(state.loop_height_overrides)
-    assert state.app_mode == "puzzle"
-
-
-def test_private_scan_render_never_owns_the_main_renderer(state):
-    from scanner_core import _scan_measure_pattern_frame
-
-    main_renderer = state.renderer
-    private_renderer = StubRenderer(state)
-
-    _scan_measure_pattern_frame(state, private_renderer, state.bitmap.shape)
-
-    assert state.renderer is main_renderer
-    assert private_renderer.renderer_seen_during_upload
-    assert all(renderer is main_renderer for renderer in private_renderer.renderer_seen_during_upload)
+    slot_11 = state.swatch_slot_offset(1, 1)
+    assert np.linalg.norm(slot_11[:2]) > 1.0
+    pts_before = state.flat_pts.copy()
+    delta = np.array([0.4, -0.3, 0.2], dtype=np.float32)
+    state.move_ctrl_pt(1, pts_before[1] + delta)
+    np.testing.assert_allclose(state.flat_pts[1], pts_before[1] + delta, atol=1e-5)
+    np.testing.assert_allclose(state.flat_pts[0], pts_before[0], atol=1e-5)
+    np.testing.assert_allclose(state.flat_pts[2:], pts_before[2:], atol=1e-5)
 
 
-def test_puzzle_uses_dedicated_gpu_scene(tmp_path):
-    import gui
 
-    main_renderer = StubRenderer()
-    puzzle_renderer = StubRenderer()
-    state = AppState(Camera(), main_renderer, puzzle_renderer=puzzle_renderer)
-    main_renderer.state = state
-    puzzle_renderer.state = state
-    state.save_path = str(tmp_path / "params.json")
-    state.load_path = str(tmp_path / "params.json")
-    state.autosave_enabled = False
-    state.rebuild_spline_from_params()
-    state.capture_initial_state()
+def test_swatch_cells_preserve_session_splat_and_fit_state_and_neighbor_swatches(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.select_swatch(0, 0)
+    state.swatch_session_id = "20260417_120000"
+    state.swatch_splat_path = "robot_scans/20260417_120000/splat/splat_clean.ply"
+    state.swatch_fitted_model = {"fabric": "knit", "parameters": {"stitch_width": 1.1}, "bitmap": state.bitmap.copy()}
+    state.save_active_swatch()
 
-    gui._set_app_mode(state, "scan")
-    assert state.active_scene_renderer() is main_renderer
-    assert any("scanner_cell" in item for item in main_renderer.last_meta)
+    state.select_swatch(1, 1)
+    assert state.swatch_session_id == ""
+    assert state.swatch_splat_path == ""
+    assert state.swatch_fitted_model is None
+    state.swatch_session_id = "20260417_130000"
+    state.save_active_swatch()
 
-    gui._set_app_mode(state, "puzzle")
-    assert state.active_scene_renderer() is puzzle_renderer
-    assert puzzle_renderer.last_meta
-    assert not any("scanner_cell" in item for item in puzzle_renderer.last_meta)
-    # The main Scan buffers may still exist, but Puzzle never displays them.
-    assert any("scanner_cell" in item for item in main_renderer.last_meta)
+    state.select_swatch(0, 0)
+    assert state.swatch_session_id == "20260417_120000"
+    assert state.swatch_splat_path == "robot_scans/20260417_120000/splat/splat_clean.ply"
+    assert state.swatch_fitted_model["parameters"]["stitch_width"] == 1.1
+
+    active_pick_count = len(state.renderer.mesh_pick_data)
+    state.world_show_neighbor_swatches = True
+    state.rebuild_spline_mesh(preserve_model_placement=True)
+    assert not any(item.get("neighbor_swatch") for item in state.renderer.last_meta)
+    assert len(state.renderer.mesh_pick_data) == active_pick_count
 
 
-def test_late_scan_cleanup_cannot_restore_over_puzzle(state):
-    import gui
-    from scanner_core import _scan_batch
+def test_swatch_unit_tile_images_and_3x3_unit_cell_builder(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.select_swatch(0, 0)
+    assert _scanner_pattern_repeats(state) == (24, 24)
 
-    puzzle_renderer = StubRenderer(state)
-    state.puzzle_renderer = puzzle_renderer
-    gui._set_app_mode(state, "scan")
+    tiles_1, epoch_1 = ensure_swatch_unit_tile_images(state)
+    assert len(tiles_1) == 4
+    assert epoch_1 >= 1
+    for tile in tiles_1:
+        assert isinstance(tile, np.ndarray)
+        assert tile.dtype == np.uint8
+        assert tile.ndim == 3 and tile.shape[2] == 3
+        assert float(tile.std()) > 5.0
 
-    # Model the dangerous ordering directly: a Scan batch owns a temporary
-    # snapshot, the user enters Puzzle, then the old Scan cleanup completes.
-    batch = _scan_batch(state)
-    batch.__enter__()
-    gui._set_app_mode(state, "puzzle")
-    expected_bitmap = np.asarray(state.bitmap, dtype=np.float32).copy()
-    expected_rows = [np.asarray(row, dtype=np.float32).copy() for row in state.ctrl_rows]
-    batch.__exit__(None, None, None)
+    tiles_2, epoch_2 = ensure_swatch_unit_tile_images(state)
+    assert epoch_2 == epoch_1
+    assert tiles_2[0] is tiles_1[0]
 
-    np.testing.assert_array_equal(state.bitmap, expected_bitmap)
-    for actual, expected in zip(state.ctrl_rows, expected_rows):
-        np.testing.assert_allclose(actual, expected)
-    assert state.app_mode == "puzzle"
-    assert not any("scanner_cell" in item for item in puzzle_renderer.last_meta)
+    state.bitmap[1, 0] = 0.0
+    state.on_bitmap_change()
+    tiles_3, epoch_3 = ensure_swatch_unit_tile_images(state)
+    assert epoch_3 == epoch_1 + 1
+    assert not np.array_equal(tiles_3[0], tiles_1[0])
+    assert tiles_3[3] is tiles_1[3]
+
+    prepared, colors, center_xy, xp, yp = state.build_swatch_unit_cell_data(1, 1)
+    assert len(prepared) == 9 * len(state.ctrl_rows)
+    assert len(colors) == len(prepared)
+    assert len(center_xy) == 2
+    assert xp > 0.5 and yp > 0.5
+

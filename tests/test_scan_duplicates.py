@@ -221,18 +221,3 @@ def test_scans_recorded_before_this_feature_are_still_matched(tmp_path, state):
     found = gui._scan_duplicate_runs(state)
     assert found is not None, "an existing run must be recognised after migration"
     assert found[0]["scan_run"] == "run_old"
-
-
-# ---------------------------------------------------------------------------
-# Rescan must not overwrite the run it matched
-# ---------------------------------------------------------------------------
-
-def test_a_rescan_gets_its_own_run_folder(tmp_path):
-    from embedded_scanner import _unique_scan_run_id
-
-    first = _unique_scan_run_id(tmp_path)
-    (tmp_path / first).mkdir(parents=True)
-    second = _unique_scan_run_id(tmp_path)
-
-    assert second != first, "a rescan started in the same second must not reuse the folder"
-    assert not (tmp_path / second).exists()

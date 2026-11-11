@@ -25,6 +25,7 @@ import threading
 import time
 from collections import namedtuple
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from imgui_bundle import imgui
@@ -44,7 +45,7 @@ import scanner_core
 import teleop_transport
 import ur5_robot
 import ur5_scan
-from fabric_scanner import clamp_capture_size
+from scan_geometry import clamp_capture_size
 from rendering import draw_fitted_texture, upload_rgb_texture
 
 
@@ -144,6 +145,8 @@ Transport = namedtuple("Transport", "label explain build available")
 # while the arm stays still, which shows the motion a run will make - a stand-in that only
 # reported arriving showed nothing, and planned from a pose the arm was never in.
 TRANSPORTS = {
+    "sim":     Transport("Simulated UR5e", "In-process 3D UR5e in the shared world. Moves smoothly at the configured joint speed.",
+                         ur5_robot.SimUR5Transport, lambda: True),
     "teleop":  Transport("Via TeleopApp", "TeleopApp holds the controller and this app asks it to move. "
                                           "To simulate, leave TeleopApp not following the arm (or on its emulator), "
                                           "then Check and Rehearse: its 3D arm flies the path and the real one stays still.",
@@ -238,13 +241,7 @@ class UR5ModeController:
         self.runner: ur5_scan.RealScanRunner | None = None
         self.dataset: gaussian_splatting.SplatDataset | None = None
         self.trainer: gaussian_splatting.SplatTrainer | None = None
-        # The hand-held capture (5 Free capture): its session, the pose solve run over it, what
-        # that solve measured, and the dataset it made.
         self.free: free_capture.FreeCaptureSession | None = None
-        self.free_solver: gaussian_splatting.SplatTrainer | None = None
-        self.free_report: dict | None = None
-        self.free_dataset: gaussian_splatting.SplatDataset | None = None
-        # The pose solve over a robot run (4 Results), and what it measured.
         self.robot_solver: gaussian_splatting.SplatTrainer | None = None
         self.robot_solved: dict | None = None
         # The camera-mount (hand-eye) calibration fitted from a scan, running or done, and its outcome.
@@ -255,7 +252,12 @@ class UR5ModeController:
         self.video_extract: threading.Thread | None = None
         self.video_extract_result = ""
         self.status = "UR5 Robot Mode ready"
-        self.devices: list[dict] = []
+        self.devices: list[dict] = [{
+            "backend": "sim",
+            "index": -1,
+            "label": "Simulated wrist camera (3D world)",
+            "is_real": False,
+        }]
         # Names which run was asked for and is awaiting confirmation - "scan", "capture",
         # or "" for none. The arm does not move while one is pending.
         self.pending_start = ""
@@ -284,8 +286,98 @@ class UR5ModeController:
 
     # -- camera preview ----------------------------------------------------
 
-    def update_preview(self) -> None:
+    def _sim_camera_pose_provider(self):
+        joints = self.robot.refresh().joints
+        tool_offset = float(self.state.get("teleop_tool_offset", 0.0306))
+        pos, rotvec = scan_geometry.camera_pose(joints, tool_offset)
+        pose = [*pos, *rotvec]
+        fov = float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES))
+        fz = _settings_fabric_z(self.state, None)
+        return pose, fov, (-0.45, -0.08, float(fz))
+
+    def _sim_camera_scene_provider(self) -> dict[str, Any]:
+        robot_state = self.robot.state() if callable(self.robot.state) else self.robot.refresh()
+        raw_joints = getattr(robot_state, "joints", None)
+        if raw_joints and (getattr(robot_state, "connected", False) or any(float(v) != 0.0 for v in raw_joints)):
+            joints = [float(v) for v in raw_joints]
+        else:
+            joints = [float(v) for v in (self.state.get("ur5_home_joints") or ur5_robot.DEFAULT_HOME_JOINTS)]
+        grid_span = (
+            float(self.state.canonical_grid_span())
+            if hasattr(self.state, "canonical_grid_span")
+            else 80.0
+        )
+        fabric_center = (-0.45, -0.08, 0.0)
+        fabric_size = (
+            float(self.state.get("scanner_fabric_width", 0.28)),
+            float(self.state.get("scanner_fabric_length", 0.19)),
+        )
+        mesh_epoch = int(getattr(self.state, "mesh_epoch", 0))
+        cached = getattr(self.state, "last_prepared_meshes", (None, None))
+        prepared_meshes, colors = (
+            cached if isinstance(cached, tuple) and len(cached) == 2 else (None, None)
+        )
+        material_uniforms = (
+            scanner_core._scanner_material_uniforms(self.state)
+            if hasattr(self.state, "get_material_uniforms")
+            else {}
+        )
+        sim_renderer = (
+            getattr(self.state, "renderer", None)
+            if threading.current_thread() is threading.main_thread()
+            else None
+        )
+        tile_images, tiles_epoch = (
+            scanner_core.ensure_swatch_unit_tile_images(self.state, sim_renderer)
+            if hasattr(scanner_core, "ensure_swatch_unit_tile_images")
+            else ([], 0)
+        )
+        swatch_slots = (
+            self.state.all_swatch_slot_rects()
+            if hasattr(self.state, "all_swatch_slot_rects")
+            else []
+        )
+        swatch_repeats = (
+            scanner_core._scanner_pattern_repeats(self.state)
+            if hasattr(scanner_core, "_scanner_pattern_repeats")
+            else (
+                self.state.swatch_repeat_counts()
+                if hasattr(self.state, "swatch_repeat_counts")
+                else (24, 24)
+            )
+        )
+        macro_keys = {
+            "swatch_tile_images": tile_images,
+            "swatch_tiles_epoch": tiles_epoch,
+            "swatch_slots": swatch_slots,
+            "swatch_repeats": swatch_repeats,
+            "hide_unit_cell_mesh": bool(tile_images and swatch_slots),
+        }
+        material_uniforms = {**material_uniforms, **macro_keys}
+        return {
+            "joints": joints,
+            "grid_span": grid_span,
+            "fabric_center": fabric_center,
+            "fabric_size": fabric_size,
+            "mesh_epoch": mesh_epoch,
+            "prepared_meshes": prepared_meshes,
+            "colors": colors,
+            "material_uniforms": material_uniforms,
+            **macro_keys,
+        }
+
+    def connect_sim(self, connect_robot: bool = True, start_cam: bool = True) -> None:
+        if connect_robot:
+            self.state.ur5_transport = "sim"
+            self.connect("sim", "sim")
+        if start_cam:
+            spec = {"backend": "sim", "index": -1, "label": "Simulated wrist camera (3D world)", "is_real": False}
+            self.start_camera(spec, clamp_capture_size(self.state.get("ur5_capture_width", 1280)))
+
+    def update_preview(self, renderer=None) -> None:
         """Refreshes the live camera texture, rate limited to the UI's needs."""
+        if (self.camera is None or not self.camera.running) and self.robot.connected and getattr(self.robot.transport, "name", "") == "sim":
+            self.connect_sim(connect_robot=False, start_cam=True)
         if self.camera is None or not self.camera.running:
             return
         now = time.monotonic()
@@ -313,17 +405,22 @@ class UR5ModeController:
         self._upload_preview(image)
 
     def _upload_preview(self, image: Image.Image) -> None:
-        # Shared helper, which also sets the texture filter -- this uploader
-        # never did, leaving the preview sampling at moderngl's default.
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         height, width = rgb.shape[:2]
-        self.preview_texture = upload_rgb_texture(self.gl_ctx, self.preview_texture, rgb)
+        if self.gl_ctx is not None:
+            self.preview_texture = upload_rgb_texture(self.gl_ctx, self.preview_texture, rgb)
         self._preview_size = (width, height)
 
     # -- camera ------------------------------------------------------------
 
     def scan_devices(self) -> None:
-        self.devices = self._simulated_cameras() + robot_camera.list_devices()
+        sim_spec = [{
+            "backend": "sim",
+            "index": -1,
+            "label": "Simulated wrist camera (3D world)",
+            "is_real": False,
+        }]
+        self.devices = sim_spec + self._simulated_cameras() + robot_camera.list_devices()
         real = [d for d in self.devices if d.get("is_real")]
         self.status = (
             f"Found {len(real)} camera(s)" if real
@@ -344,8 +441,16 @@ class UR5ModeController:
 
     def start_camera(self, spec: dict, size) -> bool:
         self.stop_camera()
-        backend = (teleop_transport.TeleopCameraBackend(self.robot.transport, spec["camera"], size)
-                   if spec.get("backend") == "teleop" else robot_camera.make_backend(spec, size=size))
+        backend = (
+            teleop_transport.TeleopCameraBackend(self.robot.transport, spec["camera"], size)
+            if spec.get("backend") == "teleop"
+            else robot_camera.make_backend(
+                spec,
+                size=size,
+                pose_provider=self._sim_camera_pose_provider,
+                scene_provider=self._sim_camera_scene_provider,
+            )
+        )
         self.camera = robot_camera.RobotCamera(backend)
         self._previewed_index = -1
         if not self.camera.start():
@@ -1089,7 +1194,7 @@ class UR5ModeController:
         ok = self.robot.connect(ip)
         failure = self.robot.last_exception
         self.blocking_program = failure if isinstance(failure, ur5_robot.ProgramAlreadyRunning) else None
-        if ok:
+        if ok and transport_kind != "sim":
             self.scan_devices()
         self.status = self.robot.status
         return ok
@@ -1108,9 +1213,33 @@ class UR5ModeController:
             self.status = "Simulated cell refused: TeleopApp is driving the real arm - this is for its emulator"
             return
         try:
-            texture, _ = scanner_core._scanner_generate_tiled_layout(self.state, renderer)
-            if texture is None:
-                raise RuntimeError("Scan Mode could not render the knitted layout - check the pattern in Scan Mode")
+            if renderer is not None and hasattr(renderer, "render_wrist_camera"):
+                rgb = renderer.render_wrist_camera(
+                    [-0.45, -0.08, 0.25, float(np.pi), 0.0, 0.0],
+                    float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)),
+                    (-0.45, -0.08, 0.0),
+                    0.18,
+                    512,
+                    512,
+                    scanner_core._scanner_material_uniforms(self.state)
+                    if hasattr(self.state, "get_material_uniforms")
+                    else {},
+                    visible_rows=getattr(self.state, "row_visible", None),
+                    model_mat=(
+                        self.state.current_model_matrix()
+                        if hasattr(self.state, "current_model_matrix")
+                        else None
+                    ),
+                )
+                texture = Image.fromarray(rgb, "RGB")
+            else:
+                colors, _ = scanner_core._scanner_display_batch_colors(self.state)
+                rows = max(1, int(self.state.get("scanner_rows", 1)))
+                cols = max(1, int(self.state.get("scanner_cols", 1)))
+                grid = np.full((rows, cols, 3), 128, dtype=np.uint8)
+                for idx, rgb_val in enumerate(colors[: rows * cols]):
+                    grid[idx // cols, idx % cols] = np.clip(rgb_val[:3], 0, 255).astype(np.uint8)
+                texture = Image.fromarray(grid, "RGB").resize((512, 512), Image.Resampling.NEAREST)
             corners = teleop_transport.build(transport, texture)
         except Exception as exc:
             self.status = f"Simulated cell not built: {exc}"
@@ -1187,7 +1316,7 @@ class UR5ModeController:
         if self.runner is not None and self.runner.running:
             self.runner.stop()
             self.runner.wait(timeout=2.0)
-        for job in (self.trainer, self.free_solver, self.robot_solver):
+        for job in (self.trainer, self.robot_solver):
             if job is not None and job.running:
                 job.stop()
         if self.free is not None:
@@ -1214,16 +1343,21 @@ def taught_set_names() -> list[str]:
 
 
 def build_scan_plan(state):
-    """Builds the same fabric scan plan Scan Mode uses, for the real arm.
-
-    Both modes go through ``fabric_scanner.build_plan`` with the same settings,
-    which is what makes a real dataset comparable to a simulated one: same grid,
-    same stations, same camera angles.
-    """
-    import fabric_scanner as scanner
-
-    center = [float(v) for v in state.get("ur5_workspace_center", [-0.45, -0.08, 0.30])]
-    return scanner.build_plan(scanner_core.build_scanner_plan_args(state, center=center, model_curves=None))
+    """Builds the grid CapturePlan from the scanner grid settings."""
+    controller = state.get("ur5_controller")
+    joints = (
+        controller.robot.refresh().joints
+        if controller is not None and controller.robot.connected
+        else list(state.get("ur5_home_joints") or ur5_robot.DEFAULT_HOME_JOINTS)
+    )
+    settings = {
+        **_capture_settings(state),
+        "pattern": "grid",
+        "grid_rows": max(1, int(state.get("scanner_rows", 1))),
+        "grid_cols": max(1, int(state.get("scanner_cols", 1))),
+        "grid_views_per_station": max(1, int(state.get("scanner_angles", 3))),
+    }
+    return scan_geometry.build_capture_plan(joints, **settings)
 
 
 def _make_runner(state, controller, plan):
@@ -1308,23 +1442,37 @@ def _draw_ur5_controls_column(state, controller, renderer):
     imgui.pop_id()
 
 
-def draw_ur5_panel(state, renderer, window=None):
-    """UR5 Robot Mode sidebar controls inside 'Knitting Control'."""
+def ensure_controller(state, gl_ctx=None, window=None, auto_connect_sim: bool = False) -> UR5ModeController:
     controller = state.get("ur5_controller")
     if controller is None:
-        controller = UR5ModeController(state, renderer.ctx, window)
+        ctx = getattr(gl_ctx, "ctx", gl_ctx)
+        controller = UR5ModeController(state, ctx, window)
         state.ur5_controller = controller
+    if auto_connect_sim and not controller.robot.connected:
+        controller.connect_sim()
+    return controller
 
-    controller.update_preview()
+
+def draw_ur5_panel(state, renderer, window=None):
+    """UR5 Robot Mode sidebar controls inside 'Knitting Control'."""
+    controller = ensure_controller(state, renderer, window)
+    controller.update_preview(renderer)
     _draw_ur5_controls_column(state, controller, renderer)
+
+
+def draw_splatting_workflow_section(state, renderer, window=None):
+    """3DGS dataset export, pose solver, and training workflow for Splatting mode."""
+    controller = ensure_controller(state, renderer, window)
+    imgui.push_id("splat_workflow_panel")
+    if imgui.collapsing_header("Dataset, Poses & 3DGS Training##splat_workflow_hdr", imgui.TreeNodeFlags_.default_open):
+        gui_captures.draw_captures_section(state, controller, "Captured Scan Sessions")
+        _draw_splatting_body(state, controller)
+    imgui.pop_id()
 
 
 def draw_ur5_viewport(state, renderer, window=None):
     """UR5 Robot Mode visual workspace inside '3D View'."""
-    controller = state.get("ur5_controller")
-    if controller is None:
-        controller = UR5ModeController(state, renderer.ctx, window)
-        state.ur5_controller = controller
+    controller = ensure_controller(state, renderer, window)
 
     avail_w = max(240.0, float(imgui.get_content_region_avail().x))
     left_w = max(240.0, (avail_w - imgui.get_style().item_spacing.x) * 0.5)
@@ -1430,10 +1578,14 @@ def _draw_simple_page(state, controller, renderer):
             imgui.text_colored(COLOR_MUTED, f"Path checked: {len(controller.plan.viewpoints)} views. Rehearse flies it without taking pictures; Run takes them.")
 
     lap("scan")
-    if header(4, "Reconstruct (Gaussian Splatting)", False, have_pictures):
+    if header(4, "Review pictures & open in Splatting Mode", False, have_pictures):
         gui_captures.draw_captures_section(state, controller, "Pictures")
         lap("pictures")
-        _draw_splatting_body(state, controller)
+        imgui.push_style_color(imgui.Col_.button, (0.18, 0.40, 0.65, 1.0))
+        imgui.push_style_color(imgui.Col_.button_hovered, (0.24, 0.50, 0.78, 1.0))
+        if imgui.button("Open in Splatting Mode (Export, Pose Solve & 3DGS)##simple_to_splat", (-1, 36)):
+            state.request_app_mode = "model"
+        imgui.pop_style_color(2)
     lap("reconstruct")
     # What the frame costs, so slowness has a name: the app's frame rate and this panel's share.
     heavy = ", ".join(f"{name} {ms:.0f}" for name, ms in sorted(timings.items(), key=lambda item: -item[1]) if ms >= 1.0)
@@ -1537,24 +1689,26 @@ def _draw_connection(state, controller):
 
     kind = _draw_transport_choice(state, connected)
     address_key = "teleop_address" if kind == "teleop" else "ur5_robot_ip"
-    label = "TeleopApp address" if kind == "teleop" else "Robot IP"
-    changed_address, address = imgui.input_text(f"{label}##ur5_address_{kind}", str(state.get(address_key, "")))
-    if changed_address:
-        state[address_key] = address
+    if kind != "sim":
+        label = "TeleopApp address" if kind == "teleop" else "Robot IP"
+        changed_address, address = imgui.input_text(f"{label}##ur5_address_{kind}", str(state.get(address_key, "")))
+        if changed_address:
+            state[address_key] = address
 
     if connected:
         if imgui.button("Disconnect##ur5_disconnect", (-1, 0)):
             controller.disconnect()
     else:
+        target_addr = "sim" if kind == "sim" else str(state.get(address_key, ""))
         if imgui.button("Connect##ur5_connect", (-1, 0)):
-            controller.connect(str(state.get(address_key, "")), kind)
+            controller.connect(target_addr, kind)
         blocking = controller.blocking_program
         if blocking is not None:
             imgui.text_colored(COLOR_WARN, blocking.describe()[0].upper() + blocking.describe()[1:])
             imgui.text_wrapped("Make sure TeleopApp is really closed first (check Task Manager for TeleopApp.exe) - "
                                "a hidden one would lose the arm mid-command. Stopping brings the arm to rest.")
             if imgui.button("Stop that program, then connect##ur5_stop_and_connect", (-1, 0)):
-                controller.stop_program_and_connect(str(state.get(address_key, "")), kind)
+                controller.stop_program_and_connect(target_addr, kind)
 
     state_now = robot.refresh()
     imgui.text("Status:")
@@ -1754,8 +1908,7 @@ def _settings_fabric_z(state, view):
     known = _measured_fabric_z(state)
     if known is not None:
         return known
-    mj, model, data, site_id = scan_geometry.load_model()
-    return scan_geometry.fabric_height(mj, model, data, site_id, float(state.get("teleop_subject_distance", 0.20)))
+    return scan_geometry.fabric_height(float(state.get("teleop_subject_distance", 0.20)))
 
 
 def _fabric_check(state):
@@ -2407,7 +2560,11 @@ def _draw_results_tab(state, controller, renderer):
     """What the runs produced, and what is made from it."""
     gui_captures.draw_captures_section(state, controller, "Captured images")
     _draw_analysis_section(state, controller)
-    _draw_splatting_section(state, controller)
+    imgui.push_style_color(imgui.Col_.button, (0.18, 0.40, 0.65, 1.0))
+    imgui.push_style_color(imgui.Col_.button_hovered, (0.24, 0.50, 0.78, 1.0))
+    if imgui.button("Open in Splatting Mode (Export, Pose Solve & 3DGS)##ur5_to_splat", (-1, 36)):
+        state.request_app_mode = "model"
+    imgui.pop_style_color(2)
     _draw_scan_section(state, controller)
 
 
@@ -2547,12 +2704,6 @@ def _draw_analysis_section(state, controller):
         imgui.tree_pop()
     if result.get("json_path"):
         imgui.text_colored(COLOR_MUTED, f"Saved {Path(result['json_path']).name}")
-
-
-def _draw_splatting_section(state, controller):
-    if not imgui.collapsing_header("Gaussian Splatting"):
-        return
-    _draw_splatting_body(state, controller)
 
 
 def _draw_splatting_body(state, controller):
@@ -3187,10 +3338,9 @@ EVENT_COLOURS = {"kept": COLOR_OK, "unlinked": COLOR_DANGER, "skipped": COLOR_WA
 
 
 def _draw_free_capture_tab(state, controller, renderer):
-    """Gaussian Splatting from pictures taken with the camera in hand, as five steps that are always on screen:
-    camera and session, shooting, whether it is enough, the pose solve, and the splat."""
+    """Hand-held capture: camera and session, shooting, readiness checklist, and handoff to Splatting Mode."""
     imgui.text_wrapped("Photograph the fabric with the camera in your hand - the arm is not used. The camera poses are then "
-                       "solved from the pictures (COLMAP), and the splat is trained on them.")
+                       "solved from the pictures (COLMAP), and the splat is trained on them in Splatting Mode.")
     session = controller.free
     running = controller.camera is not None and controller.camera.running
 
@@ -3208,11 +3358,21 @@ def _draw_free_capture_tab(state, controller, renderer):
         if changed_sides:
             state.free_require_sides = bool(sides)
         _draw_checks(free_capture.readiness(session.rows(), bool(state.get("free_require_sides", True))),
-                     "Enough pictures - go on to step 4.", "free_live_checks")
-    imgui.separator_text("Step 4 - Solve the camera poses")
-    _draw_pose_solve(state, controller, session)
-    imgui.separator_text("Step 5 - Gaussian Splatting")
-    _draw_trainer(state, controller, controller.free_dataset, None, "solve the camera poses first (step 4)")
+                     "Enough pictures - open in Splatting Mode below.", "free_live_checks")
+    imgui.separator_text("Step 4 - Solve poses & reconstruct in Splatting Mode")
+    if session is None or not session.records:
+        imgui.begin_disabled()
+    imgui.push_style_color(imgui.Col_.button, (0.18, 0.40, 0.65, 1.0))
+    imgui.push_style_color(imgui.Col_.button_hovered, (0.24, 0.50, 0.78, 1.0))
+    if imgui.button("Open in Splatting Mode (Pose Solve & 3DGS)##free_to_splat", (-1, 36)):
+        if session is not None:
+            state.swatch_session_id = session.name
+            if hasattr(state, "save_active_swatch"):
+                state.save_active_swatch()
+        state.request_app_mode = "model"
+    imgui.pop_style_color(2)
+    if session is None or not session.records:
+        imgui.end_disabled()
 
 
 def _draw_free_session(state, controller, session, running):
@@ -3238,7 +3398,9 @@ def _start_free_session(state, controller):
         controller.free.close()
     folder = Path(state.project_root) / "robot_scans" / time.strftime("free_%Y%m%d_%H%M%S")
     controller.free = free_capture.FreeCaptureSession(folder, float(state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)))
-    controller.free_solver, controller.free_report, controller.free_dataset = None, None, None
+    state.swatch_session_id = folder.name
+    if hasattr(state, "save_active_swatch"):
+        state.save_active_swatch()
     if not str(state.get("ur5_splat_command", "")).strip():
         state.ur5_splat_command = SPLATFACTO_COMMAND
     controller.status = f"Hand-held session {folder.name} started"
@@ -3369,41 +3531,6 @@ def _draw_checks(checks, enough_text, key):
     else:
         _banner(f"Next: {missing.label}", COLOR_WARN, key)
     return missing is None
-
-
-def _draw_pose_solve(state, controller, session):
-    """Solve the poses with COLMAP, then judge the capture again on what it measured."""
-    pictures = 0 if session is None else len(session.records)
-    solver = controller.free_solver
-    if not _draw_solving(solver, "free"):
-        why_not = [reason for reason, missing in (
-            ("start a session and take pictures (steps 1 and 2)", session is None),
-            (f"take at least 3 pictures (now {pictures})", session is not None and pictures < 3),
-            *_solver_missing()) if missing]
-        for reason in why_not:
-            imgui.text_colored(COLOR_WARN, f"- {reason}")
-        if not why_not and session.busy:
-            why_not.append("busy")
-        if why_not:
-            imgui.begin_disabled()
-        if imgui.button(f"Solve camera poses from the {pictures} pictures##free_solve", (-1, 36)):
-            controller.free_report, controller.free_dataset = None, None
-            controller.free_solver = _start_pose_solve(controller, session.folder, len(session.records), session.fov_degrees)
-        if why_not:
-            imgui.end_disabled()
-    if not _solve_finished(solver, "free"):
-        return
-    if controller.free_report is None:
-        try:
-            controller.free_report, controller.free_dataset = _solved_dataset(solver.output_dir, session.name)
-        except Exception as exc:
-            _banner(f"The pose solve left no usable report: {exc}", COLOR_DANGER, "free_solve_report")
-            return
-    report = controller.free_report
-    imgui.text("Measured by the pose solve:")
-    _draw_checks(free_capture.solve_checks(report) + free_capture.readiness(report["images"], bool(state.get("free_require_sides", True))),
-                 "Ready for Gaussian Splatting - go on to step 5.", "free_solved_checks")
-    _draw_unplaced(report)
 
 
 def _solver_missing():

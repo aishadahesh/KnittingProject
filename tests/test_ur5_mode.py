@@ -100,23 +100,16 @@ def test_scan_stop_reports_transport_failure(robot, plan, monkeypatch):
 
 @pytest.fixture
 def plan():
-    import fabric_scanner as scanner
+    import scan_geometry
 
-    args = SimpleNamespace(
-        rows=2, cols=2, number_of_angles=2, width=0.12, length=0.10,
-        edge_margin=0.004, square_margin=0.006, surface_wave=0.003,
-        view_radius=0.018, angle_lift=0.014, approach_lift=0.040,
-        center=[-0.45, -0.08, 0.30], max_span=scanner.DEFAULT_MAX_SPAN.tolist(),
-        palette=None, cell_color_sets=None, model_json="", model_curves=None,
-        cell_model_curves=None, random_patterns=False,
-        pattern_rows=4, pattern_cols=5,
-        pattern_repeat_rows=1, pattern_repeat_cols=1,
-        pattern_repeat_spacing_x=1.0, pattern_repeat_spacing_y=1.0,
-        batch_texture_width=420, batch_texture_height=340,
-        pattern_density=0.62, random_seed=1,
-        scanner_lighting=None, display_batch_colors=None,
+    return scan_geometry.build_capture_plan(
+        HOME_JOINTS,
+        pattern="grid",
+        grid_rows=2,
+        grid_cols=2,
+        grid_views_per_station=2,
+        fabric_z=0.20,
     )
-    return scanner.build_plan(args)
 
 
 # ============================================================================
@@ -269,12 +262,12 @@ def test_full_scan_captures_analyses_and_stores(tmp_path, robot, camera, plan):
     assert result["session_id"] == runner.session_id
 
 
-def test_scan_only_photographs_scan_views(plan):
+def test_scan_only_photographs_scan_views():
     """approach/retreat points get the arm there; they are not captures."""
-    runner = ur5_scan.RealScanRunner(None, None, plan)
-    names = [plan.view_names[i] for i in runner.scan_targets]
-    assert names
-    assert not any(name in {"approach", "retreat", "travel"} for name in names)
+    mixed_plan = SimpleNamespace(view_names=["approach", "grid 1 (r1c1)", "travel", "grid 2 (r1c2)", "retreat"])
+    runner = ur5_scan.RealScanRunner(None, None, mixed_plan)
+    names = [mixed_plan.view_names[i] for i in runner.scan_targets]
+    assert names == ["grid 1 (r1c1)", "grid 2 (r1c2)"]
 
 
 def test_preflight_refuses_without_a_camera(robot, plan):
@@ -345,16 +338,6 @@ def test_analysis_ignores_background_and_measures_the_fabric():
     assert stats["rgb"][0] > stats["rgb"][1] > stats["rgb"][2]
     assert stats["rgb"][0] == pytest.approx(200, abs=12)
     assert stats["pixel_count"] < stats["total_pixels"]
-
-
-def test_analysis_is_the_same_function_the_simulation_uses():
-    """Sim and real captures must not diverge on what a colour measurement is."""
-    import gui
-
-    image = Image.new("RGB", (80, 80), (90, 140, 70))
-    assert gui.EmbeddedMujocoScanner._fabric_rgb_stats(image)["rgb"] == pytest.approx(
-        fabric_detector.fabric_rgb_stats(image)["rgb"]
-    )
 
 
 def test_comparison_ranks_most_different_colours_first():
@@ -463,7 +446,6 @@ def test_undo_does_not_orphan_a_live_robot_connection():
     try:
         snapshot = state.snapshot_state()
         assert "ur5_controller" not in snapshot
-        assert "embedded_scanner" not in snapshot
 
         state.restore_snapshot(snapshot)
         assert state.get("ur5_controller") is controller
@@ -600,7 +582,6 @@ class FakeTeleop:
 
 @pytest.fixture
 def teleop():
-    pytest.importorskip("mujoco")
     import teleop_transport
 
     fake = FakeTeleop()
@@ -759,7 +740,6 @@ def test_not_following_blocks_a_move_through_the_guard(teleop):
 # ============================================================================
 
 def test_a_capture_plan_only_offers_reachable_collision_free_poses():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
@@ -772,7 +752,6 @@ def test_a_capture_plan_only_offers_reachable_collision_free_poses():
 
 def test_every_capture_viewpoint_is_photographed():
     """A view named approach/retreat/travel is skipped by the runner, so none may be."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
@@ -781,7 +760,6 @@ def test_every_capture_viewpoint_is_photographed():
 
 
 def test_a_capture_records_the_geometry_it_was_taken_from():
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="orbit", count=3, rings=1, fabric_z=0.20)
@@ -798,7 +776,6 @@ def test_a_capture_run_stores_one_image_per_viewpoint(tmp_path, robot, camera):
     Same runner, same storage, same records as a fabric scan - only the plan differs, so a
     capture session is queryable next to every other session in the database.
     """
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="spin", count=3, fabric_z=0.20)
@@ -832,8 +809,50 @@ def test_a_capture_run_stores_one_image_per_viewpoint(tmp_path, robot, camera):
 
 def test_a_path_with_nothing_reachable_is_refused_before_the_arm_moves():
     """The refusal has to come before the arm moves, not 363 mm short of the target."""
-    pytest.importorskip("mujoco")
     import scan_geometry
 
     with pytest.raises(RuntimeError, match="No viewpoint"):
         scan_geometry.build_capture_plan(HOME_JOINTS, pattern="grid", grid_rows=1, grid_cols=2, fabric_z=1.5)
+
+
+def test_sim_ur5_and_sim_camera_run_unified_grid_scan(tmp_path):
+    import scan_geometry
+
+    transport = ur5_robot.SimUR5Transport(max_joint_speed_deg=360.0)
+    bot = ur5_robot.UR5Robot(transport)
+    assert bot.connect("sim") is True
+    time.sleep(0.15)
+    cam_backend = robot_camera.SimCameraBackend(
+        size=(160, 120),
+        pose_provider=lambda: (bot.state.tcp_pose, 55.0, (-0.45, -0.08, 0.20)),
+    )
+    cam = robot_camera.RobotCamera(cam_backend)
+    assert cam.start() is True
+    try:
+        plan = scan_geometry.build_capture_plan(
+            HOME_JOINTS,
+            pattern="grid",
+            grid_rows=1,
+            grid_cols=2,
+            grid_views_per_station=1,
+            fabric_z=0.20,
+        )
+        storage = ScannerStorage(tmp_path)
+        runner = ur5_scan.RealScanRunner(
+            bot,
+            cam,
+            plan,
+            storage,
+            output_root=tmp_path / "robot_scans",
+            dwell=0.0,
+        )
+        assert runner.preflight()[0] is True
+        assert runner.start() is True
+        runner.wait(timeout=60)
+        assert runner.progress.error == ""
+        assert runner.progress.captured == 2
+        result = runner.analyze()
+        assert len(result["cells"]) == 2
+    finally:
+        cam.stop()
+        bot.disconnect()

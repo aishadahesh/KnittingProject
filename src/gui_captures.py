@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import logging
 import json
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path, PureWindowsPath
@@ -266,9 +264,17 @@ def draw_captures_section(state, controller, header: str) -> None:
     view = gallery(controller)
     root = Path(state.project_root) / "robot_scans"
     names = every(("sessions", str(root)), lambda: sessions(root))
+    swatch_key = (int(state.get("scanner_selected_row", 0)), int(state.get("scanner_selected_col", 0)))
+    if getattr(view, "swatch_key", None) != swatch_key:
+        view.swatch_key = swatch_key
+        swatch_sess = str(state.get("swatch_session_id", ""))
+        if swatch_sess and swatch_sess in names and view.session != swatch_sess:
+            _select_session(controller, root, swatch_sess)
     runner = controller.runner
     if runner is not None and runner.session_id and not runner.running and runner.session_id in names and view.session != runner.session_id:
         _select_session(controller, root, runner.session_id)
+        state.swatch_session_id = view.session
+        state.save_active_swatch()
     if not names:
         imgui.text_disabled("No scan sessions yet.")
         return
@@ -278,6 +284,8 @@ def draw_captures_section(state, controller, header: str) -> None:
     changed, chosen = imgui.combo("Session##gallery_session", names.index(view.session), names)
     if changed:
         _select_session(controller, root, names[chosen])
+        state.swatch_session_id = view.session
+        state.save_active_swatch()
     imgui.same_line()
     if imgui.small_button("Reload##gallery_reload"):
         _select_session(controller, root, view.session)
@@ -318,15 +326,8 @@ def draw_captures_section(state, controller, header: str) -> None:
     if record.get("blurred"):
         imgui.text_colored(COLOR_WARN, "Blurred - below the sharpness threshold even after retakes")
     draw_viewpoint_sketch(view.records, view.index)
-    if imgui.small_button("Replay on the 3D arm##gallery_replay"):
-        # Its own process: MuJoCo's viewer runs its own window and GL context.
-        subprocess.Popen([sys.executable, str(paths.SCRIPTS_DIR / "replay_session.py"), view.session, "--picture", str(view.index + 1)],
-                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-    if imgui.is_item_hovered():
-        imgui.set_tooltip("Opens the MuJoCo UR5e posed as the arm was for each picture of this session, picture beside it.\n"
-                          "Page Down / Page Up step through the pictures, Enter plays them.")
 
-    first =int(np.clip(view.index - THUMBS_SHOWN // 2, 0, max(0, len(view.records) - THUMBS_SHOWN)))
+    first = int(np.clip(view.index - THUMBS_SHOWN // 2, 0, max(0, len(view.records) - THUMBS_SHOWN)))
     for position, index in enumerate(range(first, min(len(view.records), first + THUMBS_SHOWN))):
         path = view.records[index]["path"]
         if not Path(path).exists():

@@ -96,7 +96,7 @@ def database_path(project_root: str | Path) -> Path:
 
 def _scanner_state_fields(data):
     return {key: value for key, value in data.items()
-            if key not in {'scanner_storage', 'scanner_process', 'embedded_scanner'}
+            if key not in {'scanner_storage', 'scanner_process'}
             and (key.startswith('scanner_') or key in {'app_mode', 'ui_theme'})}
 
 
@@ -272,6 +272,10 @@ class ScannerStorage:
             state.scanner_status = f"Restore error: {exc}"
             return False
         data.update(restored)
+        if int(data.get("scanner_pattern_repeat_rows", 24)) <= 4:
+            data["scanner_pattern_repeat_rows"] = 24
+        if int(data.get("scanner_pattern_repeat_cols", 24)) <= 4:
+            data["scanner_pattern_repeat_cols"] = 24
         return True
 
     def pattern_signature(self, state) -> str:
