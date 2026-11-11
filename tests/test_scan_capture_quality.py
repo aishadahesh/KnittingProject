@@ -136,7 +136,7 @@ def test_render_unit_cell_tile_and_macro_fabric_sheet():
     moderngl = pytest.importorskip("moderngl")
     from app_state import AppState
     from gui import frame_camera_for_mode
-    from rendering import Camera, MeshRenderer
+    from rendering import Camera, MeshRenderer, _load_ur5e_visual_meshes
 
     try:
         ctx = moderngl.create_standalone_context()
@@ -202,6 +202,19 @@ def test_render_unit_cell_tile_and_macro_fabric_sheet():
         )
         assert with_macro_sheet.shape == (180, 240, 3)
         assert not np.array_equal(board_only, with_macro_sheet)
+        assert renderer.shadow_fbo is not None
+        assert renderer.shadow_tex is not None
+
+        ur5_meshes = _load_ur5e_visual_meshes()
+        assert len(ur5_meshes) == 20
+        seen_colors = set()
+        for _link_name, _vb, nb, _tb, n_idx, col in ur5_meshes:
+            assert n_idx > 0
+            norms = np.linalg.norm(np.frombuffer(nb, dtype=np.float32).reshape(-1, 3), axis=1)
+            assert float(norms.min()) > 0.99
+            assert min(col) >= 0.239
+            seen_colors.add(tuple(round(c, 2) for c in col))
+        assert len(seen_colors) == 4
 
         frame_camera_for_mode(state, "edit")
         edit_dist = float(state.camera.dist)
