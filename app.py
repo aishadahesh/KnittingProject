@@ -37,6 +37,7 @@ from gui import (
      draw_menu_bar,
      draw_sidebar,
      draw_viewport,
+     frame_camera_for_mode,
 )
 
 # %% MAIN ─────────────────────────────────────────────────────────────────────
@@ -98,18 +99,8 @@ def main(robot="sim", camera_source="sim"):
         camera   = Camera()
         renderer = MeshRenderer(ctx, 960, 720)
         resources.callback(renderer.close)
-        # Second view with its own camera and framebuffer, so orbiting it never
-        # disturbs the main viewport's fixed framing.
-        orbit_camera   = Camera()
-        orbit_renderer = MeshRenderer(ctx, 960, 720)
-        resources.callback(orbit_renderer.close)
         # ── App state ─────────────────────────────────────────────────────────────
-        state = AppState(
-            camera,
-            renderer,
-            orbit_camera=orbit_camera,
-            orbit_renderer=orbit_renderer,
-        )
+        state = AppState(camera, renderer)
         resources.callback(glfw.make_context_current, window)
 
         def close_controllers():
@@ -159,7 +150,8 @@ def main(robot="sim", camera_source="sim"):
                 state.scanner_preview_grid_enabled = True
                 state.scanner_preview_rows = max(1, int(state.scanner_rows))
                 state.scanner_preview_cols = max(1, int(state.scanner_cols))
-                state.rebuild_spline_mesh(preserve_model_placement=False)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
+        frame_camera_for_mode(state)
 
         # ── Background simulation thread ──────────────────────────────────────────
         def sim_may_run(state):
@@ -303,12 +295,6 @@ def main(robot="sim", camera_source="sim"):
             if undo_shortcut_down and not undo_shortcut_was_down and state.undo_stack:
                 state.undo_last()
             undo_shortcut_was_down = undo_shortcut_down
-
-            # Camera movement is disabled in the viewport; only model transforms are interactive.
-
-
-
-            win_w, win_h = glfw.get_window_size(window)
 
             viewport = imgui.get_main_viewport()
             imgui.set_next_window_pos(viewport.pos)

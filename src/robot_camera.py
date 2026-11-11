@@ -28,8 +28,6 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image, ImageDraw
 
-import scan_geometry
-
 
 DEFAULT_CAPTURE_SIZE = (1280, 720)
 DEFAULT_PREVIEW_WIDTH = 480
@@ -270,6 +268,9 @@ class SyntheticCameraBackend(CameraBackend):
         return f"Synthetic frames ({self.size[0]}x{self.size[1]})"
 
 
+from rendering import _resolve_k_and_d, distortion_map
+
+
 class SimCameraBackend(CameraBackend):
     """Simulated wrist camera rendering the 3D world from the robot's live 6-DoF pose."""
 
@@ -278,41 +279,104 @@ class SimCameraBackend(CameraBackend):
 
     def __init__(
         self,
-        size=DEFAULT_CAPTURE_SIZE,
-        pose_provider: Callable[[], tuple[list[float], float, tuple[float, float, float]]] | None = None,
+        width: int | tuple[int, int] = DEFAULT_CAPTURE_SIZE[0],
+        height: int = DEFAULT_CAPTURE_SIZE[1],
+        pose_provider: Callable[..., Any] | None = None,
+        scene_provider: Callable[[], dict[str, Any]] | None = None,
+        intrinsics: dict[str, float] | tuple[float, ...] | np.ndarray | None = None,
+        dist_coeffs: tuple[float, ...] | list[float] | np.ndarray | None = None,
+        *,
+        size: tuple[int, int] | None = None,
     ):
-        self.size = (int(size[0]), int(size[1]))
+        if size is not None:
+            self.width, self.height = int(size[0]), int(size[1])
+        elif isinstance(width, (tuple, list, np.ndarray)):
+            self.width, self.height = int(width[0]), int(width[1])
+        else:
+            self.width, self.height = int(width), int(height)
+        self.size = (self.width, self.height)
         self.pose_provider = pose_provider
-        self._lock = threading.Lock()
-        self._gl_frame: np.ndarray | None = None
+        self.scene_provider = scene_provider
+        self.intrinsics = intrinsics
+        self.dist_coeffs = dist_coeffs
         self._gl_pose: np.ndarray | None = None
         self._focus_auto = True
         self._focus_value = 120.0
+        self._ctx = None
+        self._renderer = None
+        self._ctx_thread_id: int | None = None
+        self._loaded_mesh_epoch: int = -1
+        self._distort_cache: tuple[Any, np.ndarray, tuple[np.ndarray, np.ndarray]] | None = None
 
     def open(self) -> None:
         pass
 
+    @staticmethod
+    def _current_glfw_window():
+        import sys
+        glfw = sys.modules.get("glfw")
+        if glfw is None:
+            return None
+        prev_rep = getattr(glfw, "ERROR_REPORTING", "raise")
+        try:
+            glfw.ERROR_REPORTING = "ignore"
+            return glfw.get_current_context()
+        except Exception:
+            return None
+        finally:
+            glfw.ERROR_REPORTING = prev_rep
+
+    def _release_gl(self) -> None:
+        same_thread = self._ctx_thread_id == threading.get_ident()
+        prev_win = self._current_glfw_window() if same_thread else None
+        if self._renderer is not None:
+            if same_thread:
+                try:
+                    self._renderer.close()
+                except Exception as exc:
+                    logging.warning("SimCameraBackend.close renderer: %s", exc)
+            self._renderer = None
+        if self._ctx is not None:
+            if same_thread:
+                try:
+                    self._ctx.release()
+                except Exception as exc:
+                    logging.warning("SimCameraBackend.close ctx: %s", exc)
+            self._ctx = None
+        if prev_win is not None:
+            try:
+                import glfw
+                glfw.make_context_current(prev_win)
+            except Exception:
+                pass
+        self._ctx_thread_id = None
+        self._loaded_mesh_epoch = -1
+
     def close(self) -> None:
-        pass
+        self._release_gl()
 
     def set_focus(self, auto: bool, value: float) -> None:
         self._focus_auto = bool(auto)
         self._focus_value = float(value)
 
     def update_gl_frame(self, frame_rgb: np.ndarray, pose: list[float] | np.ndarray) -> None:
-        arr = np.ascontiguousarray(frame_rgb, dtype=np.uint8)
-        with self._lock:
-            self._gl_frame = arr
-            self._gl_pose = np.asarray(pose, dtype=float).reshape(-1)[:6].copy()
+        self._gl_pose = np.asarray(pose, dtype=float).reshape(-1)[:6].copy()
 
     def _current_pose_and_target(self) -> tuple[np.ndarray, float, np.ndarray]:
         if self.pose_provider is not None:
             try:
-                pose, hfov, target = self.pose_provider()
+                res = self.pose_provider()
+                if isinstance(res, tuple) and len(res) == 3 and hasattr(res[0], "__len__"):
+                    pose, hfov, target = res
+                    return (
+                        np.asarray(pose, dtype=float).reshape(-1)[:6],
+                        float(hfov),
+                        np.asarray(target, dtype=float).reshape(-1)[:3],
+                    )
                 return (
-                    np.asarray(pose, dtype=float).reshape(-1)[:6],
-                    float(hfov),
-                    np.asarray(target, dtype=float).reshape(-1)[:3],
+                    np.asarray(res, dtype=float).reshape(-1)[:6],
+                    55.0,
+                    np.array([-0.45, -0.08, 0.0], dtype=float),
                 )
             except Exception:
                 pass
@@ -323,73 +387,88 @@ class SimCameraBackend(CameraBackend):
         )
 
     def read(self) -> np.ndarray | None:
-        pose, hfov, target = self._current_pose_and_target()
-        with self._lock:
-            gl_frame = self._gl_frame
-            gl_pose = self._gl_pose
-        if (
-            gl_frame is not None
-            and gl_frame.shape[1] == self.size[0]
-            and gl_frame.shape[0] == self.size[1]
-            and (gl_pose is None or float(np.max(np.abs(pose - gl_pose))) <= 2e-2)
-        ):
-            return gl_frame.copy()
-        return self._render_pinhole(pose, hfov, target)
+        import cv2
+        import moderngl
+        import rendering
 
-    def _render_pinhole(self, pose: np.ndarray, hfov_deg: float, target: np.ndarray) -> np.ndarray:
-        w, h = self.size
-        pos = pose[:3]
-        rot = scan_geometry.rotvec_to_matrix(pose[3:6])
-        fx = 0.5 * w / max(math.tan(math.radians(max(10.0, min(120.0, hfov_deg))) * 0.5), 1e-4)
-        fy = fx
-        cx, cy = 0.5 * w, 0.5 * h
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        dx = (xx - cx) / fx
-        dy = (yy - cy) / fy
-        dz = np.ones_like(dx)
-        rays = np.stack([dx, dy, dz], axis=-1) @ rot.T
-        rz = rays[:, :, 2]
-        plane_z = float(target[2])
-        valid = np.abs(rz) > 1e-5
-        t = np.where(valid, (plane_z - float(pos[2])) / np.where(valid, rz, -1.0), -1.0)
-        hit = valid & (t > 0.0)
-        wx = float(pos[0]) + t * rays[:, :, 0]
-        wy = float(pos[1]) + t * rays[:, :, 1]
-        u = wx - float(target[0])
-        v = wy - float(target[1])
-        in_swatch = hit & (np.abs(u) <= 0.12) & (np.abs(v) <= 0.12)
-        in_board = hit & (np.abs(u) <= 0.22) & (np.abs(v) <= 0.22)
-        stitch_w = 0.0045
-        row_h = 0.0035
-        su = u / stitch_w
-        sv = v / row_h
-        col_idx = np.floor(su).astype(np.int32)
-        row_idx = np.floor(sv).astype(np.int32)
-        pu = su - np.floor(su) - 0.5
-        pv = sv - np.floor(sv) - 0.5
-        yarn = (
-            np.cos(pu * 2.0 * math.pi) * 28.0
-            + np.sin((pv + 0.35 * np.sin(pu * math.pi)) * 2.0 * math.pi) * 22.0
-            + np.cos((u * 310.0 + v * 270.0)) * 9.0
-        )
-        stripe = ((row_idx // 3 + col_idx // 4) % 3).astype(np.float32)
-        r_sw = np.clip(148.0 + 26.0 * (stripe == 0) - 18.0 * (stripe == 2) + yarn, 20, 245)
-        g_sw = np.clip(122.0 + 18.0 * (stripe == 1) - 12.0 * (stripe == 0) + yarn * 0.9, 20, 245)
-        b_sw = np.clip(104.0 + 32.0 * (stripe == 2) - 16.0 * (stripe == 1) + yarn * 0.85, 20, 245)
-        sq = 0.024
-        bx = np.floor(u / sq).astype(np.int32)
-        by = np.floor(v / sq).astype(np.int32)
-        checker = ((bx + by) & 1).astype(np.float32)
-        board_val = np.where(checker > 0.5, 228.0, 42.0)
-        table_val = np.clip(74.0 + 8.0 * np.sin(wx * 25.0) * np.cos(wy * 25.0), 40.0, 110.0)
-        r = np.where(in_swatch, r_sw, np.where(in_board, board_val, table_val))
-        g = np.where(in_swatch, g_sw, np.where(in_board, board_val, table_val * 0.96))
-        b = np.where(in_swatch, b_sw, np.where(in_board, board_val, table_val * 0.90))
-        sky = 48.0
-        r = np.where(hit, r, sky)
-        g = np.where(hit, g, sky + 4.0)
-        b = np.where(hit, b, sky + 10.0)
-        return np.stack([r, g, b], axis=-1).astype(np.uint8)
+        prev_win = self._current_glfw_window()
+
+        try:
+            tid = threading.get_ident()
+            if self._ctx is None or self._renderer is None or self._ctx_thread_id != tid:
+                if self._ctx is not None or self._renderer is not None:
+                    self._release_gl()
+                self._ctx = moderngl.create_standalone_context()
+                self._renderer = rendering.MeshRenderer(self._ctx, self.width, self.height)
+                self._ctx_thread_id = tid
+                self._loaded_mesh_epoch = -1
+            elif prev_win is not None:
+                self._ctx.__enter__()
+
+            pose, hfov, target = self._current_pose_and_target()
+            self._gl_pose = pose.copy()
+            scene = self.scene_provider() if self.scene_provider is not None else {}
+            if not isinstance(scene, dict):
+                scene = {}
+
+            joints = scene.get("joints") if "joints" in scene else scene.get("robot_joints")
+            grid_span = scene.get("grid_span")
+            fabric_center = scene.get("fabric_center", target)
+            fabric_size = scene.get("fabric_size", (0.28, 0.19))
+            material_uniforms = scene.get("material_uniforms")
+            prepared_meshes = scene.get("prepared_meshes")
+            colors = scene.get("colors")
+            mesh_epoch = scene.get("mesh_epoch")
+            intrinsics = scene.get("intrinsics", self.intrinsics)
+            dist_coeffs = scene.get("dist_coeffs", self.dist_coeffs)
+
+            if prepared_meshes is not None and (mesh_epoch is None or int(mesh_epoch) != self._loaded_mesh_epoch):
+                self._renderer.set_prepared_meshes(prepared_meshes, colors)
+                if mesh_epoch is not None:
+                    self._loaded_mesh_epoch = int(mesh_epoch)
+
+            K, D = _resolve_k_and_d(intrinsics, dist_coeffs, self.width, self.height, hfov)
+            has_distortion = bool(np.any(np.abs(D) > 1e-7))
+            if has_distortion:
+                cache_key = (
+                    self.width,
+                    self.height,
+                    tuple(round(float(v), 4) for v in K.ravel()),
+                    tuple(round(float(v), 6) for v in D.ravel()),
+                )
+                if self._distort_cache is None or self._distort_cache[0] != cache_key:
+                    K_render, remap_xy = distortion_map(K, D, (self.width, self.height))
+                    self._distort_cache = (cache_key, K_render, remap_xy)
+                else:
+                    _, K_render, remap_xy = self._distort_cache
+                render_intrinsics = K_render
+            else:
+                render_intrinsics = K
+                remap_xy = None
+
+            rgb = self._renderer.render_wrist_camera(
+                pose,
+                joints,
+                width=self.width,
+                height=self.height,
+                fabric_center=fabric_center,
+                fabric_size=fabric_size,
+                material_uniforms=material_uniforms,
+                intrinsics=render_intrinsics,
+                dist_coeffs=None,
+                grid_span=grid_span,
+                hfov_deg=hfov,
+            )
+            if remap_xy is not None:
+                rgb = cv2.remap(rgb, remap_xy[0], remap_xy[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+            return rgb
+        finally:
+            if prev_win is not None:
+                try:
+                    import glfw
+                    glfw.make_context_current(prev_win)
+                except Exception:
+                    pass
 
     def describe(self) -> str:
         return f"Simulated wrist camera ({self.size[0]}x{self.size[1]})"
@@ -559,14 +638,23 @@ def list_devices(max_devices: int = 10) -> list[dict[str, Any]]:
 def make_backend(
     spec: dict[str, Any] | None,
     size=DEFAULT_CAPTURE_SIZE,
-    pose_provider: Callable[[], tuple[list[float], float, tuple[float, float, float]]] | None = None,
+    pose_provider: Callable[..., Any] | None = None,
+    scene_provider: Callable[[], dict[str, Any]] | None = None,
+    intrinsics: dict[str, float] | tuple[float, ...] | np.ndarray | None = None,
+    dist_coeffs: tuple[float, ...] | list[float] | np.ndarray | None = None,
 ) -> CameraBackend:
     spec = spec or {}
     backend_name = str(spec.get("backend", ""))
     if backend_name == "opencv":
         return OpenCVCameraBackend(int(spec.get("index", 0)), size=size)
     if backend_name == "sim":
-        return SimCameraBackend(size=size, pose_provider=pose_provider)
+        return SimCameraBackend(
+            size=size,
+            pose_provider=pose_provider,
+            scene_provider=scene_provider,
+            intrinsics=intrinsics,
+            dist_coeffs=dist_coeffs,
+        )
     return SyntheticCameraBackend(size=size)
 
 
@@ -644,50 +732,56 @@ class RobotCamera:
             self._pending_settings = True
 
     def _grab_loop(self) -> None:
-        while not self._stop.is_set():
-            with self._frame_lock:
-                focus, self._pending_focus = self._pending_focus, None
-                settings, self._pending_settings = self._pending_settings, False
-            if settings:
+        try:
+            while not self._stop.is_set():
+                with self._frame_lock:
+                    focus, self._pending_focus = self._pending_focus, None
+                    settings, self._pending_settings = self._pending_settings, False
+                if settings:
+                    try:
+                        self.backend.open_settings()
+                        self.status = "Camera settings window opened"
+                    except Exception as exc:
+                        self.last_error = str(exc)
+                        self.status = f"No camera settings window: {exc}"
+                if focus is not None:
+                    try:
+                        self.backend.set_focus(*focus)
+                        self.status = "Autofocus on" if focus[0] else f"Focus fixed at {focus[1]:.0f}"
+                    except Exception as exc:
+                        self.last_error = str(exc)
+                        self.status = f"Focus not set: {exc}"
                 try:
-                    self.backend.open_settings()
-                    self.status = "Camera settings window opened"
+                    raw = self.backend.read()
                 except Exception as exc:
                     self.last_error = str(exc)
-                    self.status = f"No camera settings window: {exc}"
-            if focus is not None:
-                try:
-                    self.backend.set_focus(*focus)
-                    self.status = "Autofocus on" if focus[0] else f"Focus fixed at {focus[1]:.0f}"
-                except Exception as exc:
-                    self.last_error = str(exc)
-                    self.status = f"Focus not set: {exc}"
+                    raw = None
+                if raw is None:
+                    self._read_failures += 1
+                    if self._read_failures >= 30:
+                        self.status = "Camera stopped delivering frames"
+                    time.sleep(0.03)
+                    continue
+                self._read_failures = 0
+                image = Image.fromarray(np.asarray(raw, dtype=np.uint8), "RGB")
+                self._frame_index += 1
+                frame = CameraFrame(
+                    image=image,
+                    timestamp=time.monotonic(),
+                    index=self._frame_index,
+                    backend=str(getattr(self.backend, "name", "unknown")),
+                    is_real=bool(getattr(self.backend, "is_real", False)),
+                )
+                with self._new_frame:
+                    self._frame = frame
+                    self._new_frame.notify_all()
+                # The loop is the only reader of the device, so it sets the rate for preview and capture alike.
+                time.sleep(GRAB_INTERVAL)
+        finally:
             try:
-                raw = self.backend.read()
+                self.backend.close()
             except Exception as exc:
-                self.last_error = str(exc)
-                raw = None
-            if raw is None:
-                self._read_failures += 1
-                if self._read_failures >= 30:
-                    self.status = "Camera stopped delivering frames"
-                time.sleep(0.03)
-                continue
-            self._read_failures = 0
-            image = Image.fromarray(np.asarray(raw, dtype=np.uint8), "RGB")
-            self._frame_index += 1
-            frame = CameraFrame(
-                image=image,
-                timestamp=time.monotonic(),
-                index=self._frame_index,
-                backend=str(getattr(self.backend, "name", "unknown")),
-                is_real=bool(getattr(self.backend, "is_real", False)),
-            )
-            with self._new_frame:
-                self._frame = frame
-                self._new_frame.notify_all()
-            # The loop is the only reader of the device, so it sets the rate for preview and capture alike.
-            time.sleep(GRAB_INTERVAL)
+                logging.warning("robot_camera._grab_loop close: %s", exc)
 
     # -- frames ------------------------------------------------------------
 

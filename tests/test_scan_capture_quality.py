@@ -1,113 +1,132 @@
-"""3D OpenGL wrist camera rendering, lens intrinsics/distortion, and lazy tiled textures."""
+"""3D OpenGL wrist camera rendering, lens intrinsics/distortion, and standalone GL SimCameraBackend."""
 
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw
 
 import robot_camera
-import scan_geometry
 import ur5_robot
-from scanner_core import TiledFabricTexture
-
-REPEATS = 64
 
 
-def _knit_tile(width=480, height=105):
-    tile = Image.new("RGB", (width, height), (26, 18, 12))
-    draw = ImageDraw.Draw(tile)
-    for i in range(6):
-        x = (i + 0.5) * width / 6
-        draw.arc([x - width / 14, 4, x + width / 14, height - 4], 200, 340, fill=(196, 128, 72), width=7)
-        draw.arc([x - width / 14, -height // 2, x + width / 14, height // 2], 20, 160, fill=(150, 96, 54), width=7)
-    return tile
+def test_distortion_map_produces_valid_remap():
+    k = np.array([[380.0, 0.0, 160.0], [0.0, 380.0, 120.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    d = np.array([-0.22, 0.05, 0.0, 0.0, 0.0], dtype=np.float64)
+    k_render, (xs, ys) = robot_camera.distortion_map(k, d, (320, 240))
+    assert k_render.shape == (3, 3)
+    assert xs.shape == (240, 320) and xs.dtype == np.float32
+    assert ys.shape == (240, 320) and ys.dtype == np.float32
+    assert np.isfinite(k_render).all()
+    assert np.isfinite(xs).all() and np.isfinite(ys).all()
 
 
-def test_tiled_fabric_texture_caps_rasterize_size():
-    tex = TiledFabricTexture(_knit_tile(), REPEATS, REPEATS)
-    assert tex.size == (480 * REPEATS, 105 * REPEATS)
-    raster = tex.rasterize(max_dim=1024)
-    assert max(raster.size) <= 1024
-    arr = np.asarray(raster.convert("L"), dtype=np.float32)
-    assert float(np.abs(np.diff(arr, axis=0)).mean() + np.abs(np.diff(arr, axis=1)).mean()) > 4.0
-
-
-def test_sim_camera_backend_prefers_live_gl_frame_and_falls_back_to_pinhole():
-    plan = scan_geometry.build_capture_plan(
-        ur5_robot.DEFAULT_HOME_JOINTS,
-        pattern="grid",
-        grid_rows=2,
-        grid_cols=2,
-        grid_views_per_station=2,
-        fabric_z=0.0,
-    )
-    pose = list(plan.poses[0])
-    backend = robot_camera.SimCameraBackend(
-        size=(320, 240),
-        pose_provider=lambda: (pose, 42.0, (-0.45, -0.08, 0.0)),
-    )
-    pinhole = backend.read()
-    assert pinhole.shape == (240, 320, 3)
-
-    gl_img = np.full((240, 320, 3), 187, dtype=np.uint8)
-    backend.update_gl_frame(gl_img, pose)
-    from_gl = backend.read()
-    assert np.array_equal(from_gl, gl_img)
-
-
-def test_render_wrist_camera_respects_calibrated_intrinsics_and_distortion():
-    glfw = pytest.importorskip("glfw")
+def test_sim_camera_backend_renders_3d_gl_scene_and_syncs_meshes():
     moderngl = pytest.importorskip("moderngl")
-    if not glfw.init():
-        pytest.skip("GLFW unavailable")
-    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, True)
-    glfw.window_hint(glfw.VISIBLE, False)
-    window = glfw.create_window(320, 240, "test_wrist", None, None)
-    if window is None:
-        glfw.terminate()
-        pytest.skip("No GL context available")
-    glfw.make_context_current(window)
-    try:
-        from app_state import AppState
-        from rendering import Camera, MeshRenderer
+    from app_state import AppState
+    from rendering import Camera, MeshRenderer
 
-        ctx = moderngl.create_context()
-        renderer = MeshRenderer(ctx, 320, 240)
+    try:
+        ctx = moderngl.create_standalone_context()
+    except Exception:
+        pytest.skip("No standalone GL context available")
+    renderer = MeshRenderer(ctx, 320, 240)
+    try:
+        state = AppState(Camera(), renderer)
+        state.rebuild_spline_from_params()
+        prepared, colors = state.last_prepared_meshes
+        grid_span = state.canonical_grid_span()
+        mat_uniforms = state.get_material_uniforms()
+    finally:
+        renderer.close()
+        ctx.release()
+
+    pose = [-0.45, -0.08, 0.22, float(np.pi), 0.0, 0.0]
+
+    scene_box = {
+        "joints": list(ur5_robot.DEFAULT_HOME_JOINTS),
+        "grid_span": grid_span,
+        "fabric_center": (-0.45, -0.08, 0.0),
+        "fabric_size": 0.18,
+        "mesh_epoch": 0,
+        "prepared_meshes": [],
+        "colors": [],
+        "material_uniforms": mat_uniforms,
+    }
+
+    backend = robot_camera.SimCameraBackend(
+        320,
+        240,
+        pose_provider=lambda: (pose, 55.0, (-0.45, -0.08, 0.0)),
+        scene_provider=lambda: scene_box,
+        intrinsics={"fl_x": 380.0, "fl_y": 380.0, "cx": 160.0, "cy": 120.0},
+    )
+    try:
+        board_only = backend.read()
+        assert board_only.shape == (240, 320, 3)
+        assert float(board_only.std()) > 5.0
+
+        scene_box["prepared_meshes"] = prepared
+        scene_box["colors"] = colors
+        scene_box["mesh_epoch"] = 1
+        with_meshes = backend.read()
+        assert with_meshes.shape == (240, 320, 3)
+        assert not np.array_equal(board_only, with_meshes)
+    finally:
+        backend.close()
+
+
+def test_render_wrist_camera_respects_calibrated_intrinsics_and_invariant_world_mapping():
+    moderngl = pytest.importorskip("moderngl")
+    from app_state import AppState
+    from rendering import Camera, MeshRenderer
+
+    try:
+        ctx = moderngl.create_standalone_context()
+    except Exception:
+        pytest.skip("No standalone GL context available")
+    renderer = MeshRenderer(ctx, 320, 240)
+    try:
         state = AppState(Camera(), renderer)
         state.rebuild_spline_from_params()
 
+        center_single, _, upm_single = renderer._scene_world_mapping(
+            np.eye(4, dtype=np.float32), (-0.45, -0.08, 0.0), 0.18, grid_span=80.0
+        )
+        renderer.mesh_pick_data = []
+        center_empty, _, upm_empty = renderer._scene_world_mapping(
+            np.eye(4, dtype=np.float32), (-0.45, -0.08, 0.0), 0.18, grid_span=80.0
+        )
+        np.testing.assert_allclose(center_single, np.zeros(3, dtype=np.float32), atol=1e-6)
+        np.testing.assert_allclose(center_empty, center_single, atol=1e-6)
+        assert np.isclose(upm_single, upm_empty)
+
+        state.rebuild_spline_from_params()
+        grid_span = state.canonical_grid_span()
         pose = [-0.45, -0.08, 0.22, float(np.pi), 0.0, 0.0]
         base = renderer.render_wrist_camera(
             pose,
-            40.0,
-            (-0.45, -0.08, 0.0),
-            0.18,
-            320,
-            240,
-            state.get_material_uniforms(),
-            visible_rows=state.row_visible,
-            model_mat=state.current_model_matrix(),
+            ur5_robot.DEFAULT_HOME_JOINTS,
+            width=320,
+            height=240,
+            fabric_center=(-0.45, -0.08, 0.0),
+            fabric_size=0.18,
+            material_uniforms=state.get_material_uniforms(),
             intrinsics={"fl_x": 380.0, "fl_y": 380.0, "cx": 160.0, "cy": 120.0},
+            grid_span=grid_span,
         )
         distorted = renderer.render_wrist_camera(
             pose,
-            40.0,
-            (-0.45, -0.08, 0.0),
-            0.18,
-            320,
-            240,
-            state.get_material_uniforms(),
-            visible_rows=state.row_visible,
-            model_mat=state.current_model_matrix(),
-            intrinsics={"fl_x": 380.0, "fl_y": 380.0, "cx": 160.0, "cy": 120.0, "k1": -0.22, "k2": 0.05},
+            ur5_robot.DEFAULT_HOME_JOINTS,
+            width=320,
+            height=240,
+            fabric_center=(-0.45, -0.08, 0.0),
+            fabric_size=0.18,
+            material_uniforms=state.get_material_uniforms(),
+            intrinsics={"fl_x": 380.0, "fl_y": 380.0, "cx": 160.0, "cy": 120.0},
+            dist_coeffs=(-0.22, 0.05, 0.0, 0.0, 0.0),
+            grid_span=grid_span,
         )
         assert base.shape == (240, 320, 3)
         assert distorted.shape == (240, 320, 3)
         assert not np.array_equal(base, distorted)
+    finally:
         renderer.close()
         ctx.release()
-    finally:
-        glfw.destroy_window(window)
-        glfw.terminate()

@@ -7,9 +7,9 @@ Module layout (dependencies point one way, no cycles):
       |- gui_ur5           Capture Mode UI             -> scanner_core
       `- gui_model         Splatting Mode UI           -> strand_equations
 
-`app.py` imports draw_menu_bar / draw_sidebar / draw_viewport /
-draw_orbit_viewport from here. Names moved into scanner_core kept their original
-spelling and are re-imported below, so call sites in this file are unchanged.
+`app.py` imports draw_menu_bar / draw_sidebar / draw_viewport from here. Names
+moved into scanner_core kept their original spelling and are re-imported below,
+so call sites in this file are unchanged.
 """
 import os
 import json
@@ -32,9 +32,9 @@ from gui_database import _draw_database_summary_page, draw_database_viewport
 from scanner_core import (
     _clamp_scanner_selected_cell, _ensure_scanner_shared_colors,
     _maybe_persist_scanner_state,
-    _refresh_embedded_scanner_display_colors, _scanner_batch_texture_size, _scanner_capture_image_size,
+    _scanner_capture_image_size,
     _scanner_display_batch_colors, _scanner_estimated_cell_colors,
-    _scanner_material_uniforms, _scanner_pattern_dimensions, _scanner_pattern_repeats, _scanner_repeat_spacing,
+    _scanner_material_uniforms, _scanner_pattern_dimensions,
     _scanner_storage,
     _set_scanner_estimated_batch_color,
 )
@@ -312,8 +312,9 @@ def _open_model_in_edit(state, request):
         state.crochet_params = dict(request['parameters'])
         state.crochet_stitches = np.asarray(request['stitches'], dtype=np.float32).copy()
         state.display_copies = np.array([1, 1], dtype=np.int32)
-        state.rebuild_spline_mesh(preserve_model_placement=False)
+        state.rebuild_spline_mesh(preserve_model_placement=True)
         state.center_model_on_view()
+        frame_camera_for_mode(state, 'edit')
         if state.get('swatch_cells'):
             state.save_active_swatch()
         rows, stitches = state.crochet_stitches.shape
@@ -322,8 +323,9 @@ def _open_model_in_edit(state, request):
     state.fabric_type = 'knit'
     state.apply_knit_pattern(request['parameters'], request['bitmap'])
     state.display_copies = np.array([1, 1], dtype=np.int32)
-    state.rebuild_spline_mesh(preserve_model_placement=False)
+    state.rebuild_spline_mesh(preserve_model_placement=True)
     state.center_model_on_view()
+    frame_camera_for_mode(state, 'edit')
     if state.get('swatch_cells'):
         state.save_active_swatch()
     state.status_msg = f"Pattern from the scan: {state.bitmap.shape[0]} rows x {state.bitmap.shape[1]} stitches"
@@ -348,6 +350,39 @@ def _normalize_app_mode(mode, state=None):
     if m == 'puzzle':
         return 'edit'
     return m if m in ('scan', 'capture', 'model', 'edit') else 'edit'
+
+
+def frame_camera_for_mode(state, mode=None):
+    camera = getattr(state, 'camera', None)
+    if camera is None:
+        return
+    mode = _normalize_app_mode(mode or state.get('app_mode', 'edit'), state)
+    grid_span = float(state.canonical_grid_span())
+    state.viewport_pan = np.zeros(2, dtype=np.float32)
+    state.viewport_zoom = 1.0
+    if mode == 'scan':
+        camera.target = np.array([0.25 * grid_span, 0.0, 0.10 * grid_span], dtype=np.float32)
+        camera.dist = max(12.0, 2.2 * grid_span)
+        camera.az = float(np.radians(-35.0))
+        camera.el = float(np.radians(28.0))
+    elif mode == 'capture':
+        camera.target = np.zeros(3, dtype=np.float32)
+        camera.dist = max(10.0, 1.6 * grid_span)
+        camera.az = float(np.radians(-25.0))
+        camera.el = float(np.radians(35.0))
+    else:
+        rows = max(1, int(state.get('scanner_rows', 1)))
+        cols = max(1, int(state.get('scanner_cols', 1)))
+        sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
+        sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
+        slot = state.swatch_slot_offset(sel_r, sel_c)
+        lo, hi = state._canonical_tile_bounds()
+        swatch_span = float(max(hi[0] - lo[0], hi[1] - lo[1], 4.0))
+        fov_deg = float(getattr(camera, 'fov_deg', 45.0))
+        camera.target = slot.copy()
+        camera.dist = max(4.0, 1.35 * swatch_span / max(2.0 * np.tan(np.radians(fov_deg) * 0.5), 0.1))
+        camera.az = 0.0
+        camera.el = float(np.radians(22.0)) if mode == 'model' else 0.0
 
 
 def _set_app_mode(state, mode):
@@ -390,7 +425,8 @@ def _set_app_mode(state, mode):
             r = int(sel[0]) if sel.size > 0 else 0
             c = int(sel[1]) if sel.size > 1 else 0
             state.select_swatch(r, c, rebuild=False)
-    state.rebuild_spline_mesh(preserve_model_placement=False)
+    state.rebuild_spline_mesh(preserve_model_placement=True)
+    frame_camera_for_mode(state, mode)
 
 
 def _scan_duplicate_runs(state):
@@ -931,13 +967,19 @@ def _draw_active_swatch_bar(state):
             prev_idx = (cur_idx - 1) % total
             nr, nc = prev_idx // cols, prev_idx % cols
             state.scanner_selected_cell = [nr, nc]
-            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) in ('edit', 'model')))
+            is_edit_or_model = _normalize_app_mode(state.get('app_mode', 'edit')) in ('edit', 'model')
+            state.select_swatch(nr, nc, rebuild=is_edit_or_model)
+            if is_edit_or_model:
+                frame_camera_for_mode(state)
         imgui.same_line()
         if imgui.small_button(">##swatch_next"):
             next_idx = (cur_idx + 1) % total
             nr, nc = next_idx // cols, next_idx % cols
             state.scanner_selected_cell = [nr, nc]
-            state.select_swatch(nr, nc, rebuild=(str(state.get('app_mode', 'edit')) in ('edit', 'model')))
+            is_edit_or_model = _normalize_app_mode(state.get('app_mode', 'edit')) in ('edit', 'model')
+            state.select_swatch(nr, nc, rebuild=is_edit_or_model)
+            if is_edit_or_model:
+                frame_camera_for_mode(state)
     imgui.separator()
 
 GEOMETRY_PARAM_LABELS = {
@@ -994,6 +1036,7 @@ def _draw_appearance_controls(state, rebuild_current_mesh, is_knit=True):
         if imgui.small_button("Center model##display_center"):
             state.push_undo("Center model")
             state.center_model_on_view()
+            frame_camera_for_mode(state)
         changed_alpha, new_alpha = imgui.slider_float("Model opacity##mdl", float(state.model_alpha), 0.0, 1.0, "%.2f")
         if changed_alpha:
             state.model_alpha = float(new_alpha)
@@ -1638,34 +1681,7 @@ def draw_sidebar(state, renderer, window=None):
 
         if imgui.collapsing_header("Random Pattern & Shared Colors##scan_pattern_section"):
             pattern_rows, pattern_cols = _scanner_pattern_dimensions(state)
-            repeat_rows, repeat_cols = _scanner_pattern_repeats(state)
-            spacing_x, spacing_y = _scanner_repeat_spacing(state)
-            batch_texture_width, batch_texture_height = _scanner_batch_texture_size(state)
             imgui.text_disabled(f"Template bitmap: {pattern_rows} x {pattern_cols} (randomizes 0/1 values per sample)")
-            changed_rr, new_rr = imgui.slider_int("Image repeats Y##scanner_pattern_repeat_rows", repeat_rows, 1, 64)
-            changed_rc, new_rc = imgui.slider_int("Image repeats X##scanner_pattern_repeat_cols", repeat_cols, 1, 64)
-            changed_tex_res, new_tex_res = imgui.slider_int(
-                "Batch texture resolution##scanner_batch_texture_width",
-                batch_texture_width,
-                160,
-                4096,
-            )
-            new_tex_res = int(np.clip(int(round(float(new_tex_res) / 32.0) * 32), 160, 4096))
-            changed_sx, new_sx = imgui.slider_float(
-                "X repeat spacing##scanner_repeat_spacing_x",
-                spacing_x,
-                0.55,
-                1.45,
-                "%.2f",
-            )
-            changed_sy, new_sy = imgui.slider_float(
-                "Y repeat spacing##scanner_repeat_spacing_y",
-                spacing_y,
-                0.55,
-                1.45,
-                "%.2f",
-            )
-            imgui.text_disabled(f"Batch texture: {batch_texture_width} x {batch_texture_height} px (1.00 = edge-to-edge)")
             changed_density, new_density = imgui.slider_float(
                 "Active stitch probability##scanner_density",
                 float(state.get('scanner_pattern_density', 0.62)),
@@ -1683,18 +1699,7 @@ def draw_sidebar(state, renderer, window=None):
                 "Pattern columns##scanner_pattern_cols", pattern_cols_now,
                 2, int(state.SCANNER_PATTERN_MAX_COLS),
             )
-            random_changed = (changed_rr or changed_rc or changed_tex_res or changed_sx or changed_sy
-                              or changed_density or changed_seed or changed_prows or changed_pcols)
-            if changed_rr:
-                state.scanner_pattern_repeat_rows = int(new_rr)
-            if changed_rc:
-                state.scanner_pattern_repeat_cols = int(new_rc)
-            if changed_tex_res:
-                state.scanner_batch_texture_width = int(new_tex_res)
-            if changed_sx:
-                state.scanner_repeat_spacing_x = float(new_sx)
-            if changed_sy:
-                state.scanner_repeat_spacing_y = float(new_sy)
+            random_changed = changed_density or changed_seed or changed_prows or changed_pcols
             if changed_density:
                 state.scanner_pattern_density = float(new_density)
             if changed_seed:
@@ -1714,7 +1719,7 @@ def draw_sidebar(state, renderer, window=None):
                     )
             if random_changed:
                 state.swatch_cells = {}
-                state.rebuild_spline_mesh(preserve_model_placement=False)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
                 state.scanner_status = "Random pattern settings updated"
             imgui.text("Preview mode")
             if not state.get('scanner_color_mode'):
@@ -1762,7 +1767,7 @@ def draw_sidebar(state, renderer, window=None):
                 state.scanner_estimated_color_overrides = []
                 state.swatch_cells = {}
                 state.scanner_status = "Shared scanner colors updated"
-                state.rebuild_spline_mesh(preserve_model_placement=False)
+                state.rebuild_spline_mesh(preserve_model_placement=True)
             if estimate_mode:
                 _draw_scanner_batch_color_grid(state)
                 rows = max(1, int(state.scanner_rows))
@@ -1781,19 +1786,17 @@ def draw_sidebar(state, renderer, window=None):
                 if changed_batch_color:
                     _set_scanner_estimated_batch_color(state, selected_r, selected_c, batch_color)
                     state.scanner_status = f"Updated estimated color for R{selected_r + 1} C{selected_c + 1}"
-                    state.rebuild_spline_mesh(preserve_model_placement=False)
+                    state.rebuild_spline_mesh(preserve_model_placement=True)
                 if imgui.small_button("Reset selected estimate##scanner_reset_selected_estimate"):
                     overrides = state.get('scanner_estimated_color_overrides', [])
                     if isinstance(overrides, list) and selected_index < len(overrides):
                         overrides[selected_index] = None
                         state.scanner_estimated_color_overrides = overrides
-                        _refresh_embedded_scanner_display_colors(state)
-                        state.rebuild_spline_mesh(preserve_model_placement=False)
+                        state.rebuild_spline_mesh(preserve_model_placement=True)
                 imgui.same_line()
                 if imgui.small_button("Reset all estimates##scanner_reset_all_estimates"):
                     state.scanner_estimated_color_overrides = []
-                    _refresh_embedded_scanner_display_colors(state)
-                    state.rebuild_spline_mesh(preserve_model_placement=False)
+                    state.rebuild_spline_mesh(preserve_model_placement=True)
 
         if imgui.collapsing_header("Scanner Lighting##scan_lighting_section"):
             lighting_changed = False
@@ -1881,7 +1884,6 @@ def draw_sidebar(state, renderer, window=None):
             if imgui.button("Analyze captured RGB##scanner_analyze_rgb", (-1, 0)):
                 result = gui_ur5.ur5_scan.analyze_run_captures(records, state) if hasattr(gui_ur5.ur5_scan, "analyze_run_captures") else {}
                 state.scanner_analysis_results = result
-                _refresh_embedded_scanner_display_colors(state)
                 if result.get("cells"):
                     state.scanner_status = f"RGB analysis saved for {len(result['cells'])} mini-squares"
                 else:
@@ -2093,7 +2095,104 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
         'capture_plan_poses': plan_poses,
         'fabric_center': (-0.45, -0.08, 0.0),
         'phys_span': 0.18,
+        'grid_span': float(state.canonical_grid_span()),
     }
+
+
+def _hud_text(dl, x, y, col_u32, text):
+    dl.add_text(imgui.ImVec2(float(x) + 1.0, float(y) + 1.0), 0xDC000000, str(text))
+    dl.add_text(imgui.ImVec2(float(x), float(y)), col_u32, str(text))
+
+
+def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
+    ox, oy = float(state.vp_origin[0]), float(state.vp_origin[1])
+    vp_scale = max(float(state.vp_scale), 1e-6)
+    view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+    grid_span = float(world_scene.get('grid_span') or state.canonical_grid_span())
+    phys_span = max(float(world_scene.get('phys_span', 0.18)), 0.05)
+    units_per_m = grid_span / phys_span
+    fc = np.asarray(world_scene.get('fabric_center', (-0.45, -0.08, 0.0)), dtype=np.float32).reshape(-1)[:3]
+    if model_mat is not None:
+        scene_center = transform_points(np.zeros((1, 3), dtype=np.float32), model_mat)[0].astype(np.float32)
+    else:
+        scene_center = np.zeros(3, dtype=np.float32)
+
+    axis_cols = (
+        imgui.get_color_u32((0.92, 0.26, 0.26, 0.95)),
+        imgui.get_color_u32((0.26, 0.85, 0.36, 0.95)),
+        imgui.get_color_u32((0.30, 0.56, 0.96, 0.95)),
+    )
+    label_col = imgui.get_color_u32((0.95, 0.96, 0.98, 0.96))
+
+    def draw_gnomon(origin_gl, rot_mat, length_gl, label):
+        pts = np.vstack([
+            origin_gl,
+            origin_gl + rot_mat[:, 0] * length_gl,
+            origin_gl + rot_mat[:, 1] * length_gl,
+            origin_gl + rot_mat[:, 2] * length_gl,
+        ]).astype(np.float32)
+        scr, valid, ndc = project_to_screen(pts, view_proj, disp_w, disp_h)
+        if not (valid[0] and -1.05 <= ndc[0, 0] <= 1.05 and -1.05 <= ndc[0, 1] <= 1.05):
+            return
+        p0 = imgui.ImVec2(ox + float(scr[0, 0]) * vp_scale, oy + float(scr[0, 1]) * vp_scale)
+        for axis_i, axis_col in enumerate(axis_cols):
+            if valid[axis_i + 1]:
+                p1 = imgui.ImVec2(ox + float(scr[axis_i + 1, 0]) * vp_scale, oy + float(scr[axis_i + 1, 1]) * vp_scale)
+                dl.add_line(p0, p1, axis_col, 2.0)
+        if label:
+            _hud_text(dl, p0.x + 6.0, p0.y - 15.0, label_col, label)
+
+    eye3 = np.eye(3, dtype=np.float32)
+    if bool(world_scene.get('show_board', True)):
+        draw_gnomon(scene_center, eye3, 0.04 * units_per_m, "BOARD")
+    if bool(world_scene.get('show_robot', True)):
+        base_gl = scene_center - fc * units_per_m
+        draw_gnomon(base_gl, eye3, 0.055 * units_per_m, "BASE")
+        cam_pose = world_scene.get('camera_pose')
+        if cam_pose is not None:
+            pose_arr = np.asarray(cam_pose, dtype=np.float32).reshape(-1)
+            if pose_arr.size >= 6:
+                cam_gl = scene_center + (pose_arr[:3] - fc) * units_per_m
+                cam_rot = gui_ur5.scan_geometry.rotvec_to_matrix(pose_arr[3:6]).astype(np.float32)
+                draw_gnomon(cam_gl, cam_rot, 0.032 * units_per_m, "CAM")
+
+    rows = max(1, int(state.get('scanner_rows', 1)))
+    cols = max(1, int(state.get('scanner_cols', 1)))
+    sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
+    sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
+    show_neighbors = bool(state.get('scanner_preview_grid_enabled', False)) or bool(state.get('world_show_neighbor_swatches', True))
+    tile_lo, tile_hi = state._canonical_tile_bounds()
+    gold_col = imgui.get_color_u32((1.0, 0.82, 0.22, 0.98))
+    slot_col = imgui.get_color_u32((0.86, 0.90, 0.95, 0.85))
+    for r in range(rows):
+        for c in range(cols):
+            is_active = (r == sel_r and c == sel_c)
+            if not is_active and not show_neighbors:
+                continue
+            slot = state.swatch_slot_offset(r, c)
+            tl_local = slot + np.array([tile_lo[0], tile_hi[1], 0.02], dtype=np.float32)
+            tl_world = transform_points([tl_local], model_mat) if model_mat is not None else np.asarray([tl_local], dtype=np.float32)
+            scr, valid, _ = project_to_screen(tl_world, view_proj, disp_w, disp_h)
+            if valid[0] and 0.0 <= float(scr[0, 0]) <= float(disp_w) and 0.0 <= float(scr[0, 1]) <= float(disp_h):
+                _hud_text(
+                    dl,
+                    ox + float(scr[0, 0]) * vp_scale + 4.0,
+                    oy + float(scr[0, 1]) * vp_scale + 2.0,
+                    gold_col if is_active else slot_col,
+                    f"R{r + 1} C{c + 1}",
+                )
+
+    current_mode = _normalize_app_mode(state.get('app_mode', 'edit'))
+    mode_label = next((label for mid, label, _ in MODE_SPECS if mid == current_mode), current_mode.title())
+    az_deg = float(np.degrees(state.camera.az))
+    el_deg = float(np.degrees(state.camera.el))
+    status_line = (
+        f"{mode_label} | Swatch R{sel_r + 1} C{sel_c + 1} | "
+        f"Cam d={float(state.camera.dist):.1f} az={az_deg:+.0f}deg el={el_deg:+.0f}deg | "
+        "Drag: orbit | Shift+Drag: pan | Wheel: zoom | WASD/QE: fly"
+    )
+    status_col = imgui.get_color_u32((0.90, 0.93, 0.96, 0.94))
+    _hud_text(dl, ox + 10.0, oy + float(disp_h) * vp_scale - 22.0, status_col, status_line)
 
 
 def _draw_scan_gripper_camera_canvas(state, renderer, height=0):
@@ -2121,66 +2220,6 @@ def _draw_scan_gripper_camera_canvas(state, renderer, height=0):
         )
 
 
-def _draw_orbit_canvas(state, window):
-    orbit_renderer = getattr(state, 'orbit_renderer', None)
-    orbit_camera = getattr(state, 'orbit_camera', None)
-    if orbit_renderer is None or orbit_camera is None:
-        imgui.text_disabled("No orbit renderer attached.")
-        return
-    imgui.text("3D Orbit Grid")
-    imgui.same_line()
-    if imgui.small_button("Reset Orbit##orbit_reset"):
-        orbit_camera.az = float(np.radians(-30.0))
-        orbit_camera.el = float(np.radians(28.0))
-        orbit_camera.dist = 32.0
-    imgui.same_line()
-    imgui.text_disabled("LMB drag: orbit | Wheel: zoom")
-    avail_x, avail_y = imgui.get_content_region_avail()
-    disp_w = max(1, int(avail_x))
-    disp_h = max(1, int(avail_y))
-    orbit_renderer.resize(disp_w, disp_h)
-    orbit_camera.target = (np.asarray(state.mesh_center, dtype=np.float32)
-                           + np.asarray(state.model_t, dtype=np.float32)).astype(np.float32)
-    model_mat = state.current_model_matrix()
-    mvp = (orbit_camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
-    mv = (orbit_camera.mv(disp_w, disp_h) @ model_mat).astype(np.float32)
-    orbit_renderer.render(
-        mvp, mv,
-        state.get_material_uniforms(),
-        camera=orbit_camera,
-        visible_rows=state.row_visible,
-        model_mat=model_mat,
-        show_grid=True,
-    )
-    draw_fitted_texture(
-        orbit_renderer.texture_id,
-        disp_w,
-        disp_h,
-        avail_x,
-        avail_y,
-        flip_y=True,
-    )
-    is_hovered = imgui.is_item_hovered()
-    mx, my = imgui.get_mouse_pos()
-    if is_hovered:
-        wheel = float(imgui.get_io().mouse_wheel)
-        if wheel != 0.0:
-            zoom_factor = float(np.exp(wheel * 0.12))
-            orbit_camera.dist = float(np.clip(float(orbit_camera.dist) / zoom_factor, 1.0, 200.0))
-    if window is not None and glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS:
-        if state.get('orbit_dragging', False):
-            prev = state.get('prev_orbit_mouse', None)
-            if prev is not None:
-                orbit_camera.orbit(mx - prev[0], my - prev[1])
-            state.prev_orbit_mouse = (mx, my)
-        elif is_hovered:
-            state.orbit_dragging = True
-            state.prev_orbit_mouse = (mx, my)
-    else:
-        state.orbit_dragging = False
-        state.prev_orbit_mouse = None
-
-
 def draw_viewport(state, renderer, ref_tex, window):
     reset_vp = bool(state.get('_layout_reset_viewport', False)) or not bool(state.get('_viewport_sized_once', False))
     vp_cond = imgui.Cond_.always if reset_vp else imgui.Cond_.first_use_ever
@@ -2202,22 +2241,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         return
 
     split_right_mode = None
-    if current_mode == 'edit':
-        edit_vp = str(state.get('_edit_vp_mode', 'split'))
-        imgui.text("Edit View:")
-        for key, label in (('split', "Split: 3D + Orbit Grid"), ('3d', "3D Fabric Only"), ('orbit', "3D Orbit Grid Only")):
-            imgui.same_line()
-            if imgui.radio_button(f"{label}##edit_vp_{key}", edit_vp == key):
-                state._edit_vp_mode = key
-                edit_vp = key
-        if edit_vp == 'orbit':
-            imgui.separator()
-            _draw_orbit_canvas(state, window)
-            imgui.end()
-            return
-        if edit_vp == 'split':
-            split_right_mode = 'edit_orbit'
-    elif current_mode == 'scan':
+    if current_mode == 'scan':
         scan_vp = str(state.get('_scan_vp_mode', 'split'))
         if scan_vp == 'simulator':
             scan_vp = 'fabric'
@@ -2281,12 +2305,12 @@ def draw_viewport(state, renderer, ref_tex, window):
     imgui.text("3D World Viewport")
     imgui.same_line()
     if imgui.small_button("Center##vp_center"):
-        state.center_model_in_viewport()
+        frame_camera_for_mode(state, current_mode)
     imgui.same_line()
     if imgui.small_button("Front View##vp_front"):
+        frame_camera_for_mode(state, current_mode)
         state.camera.az = 0.0
         state.camera.el = 0.0
-        state.center_model_in_viewport()
     imgui.same_line()
     if imgui.small_button("3D Angle##vp_angle"):
         state.camera.az = float(np.radians(-30.0))
@@ -2296,7 +2320,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         state.model_t = np.zeros(3, dtype=np.float32)
         state.model_rot = np.zeros(3, dtype=np.float32)
         state.model_scale = np.ones(3, dtype=np.float32)
-        state.center_model_in_viewport()
+        frame_camera_for_mode(state, current_mode)
     if current_mode in ('edit', 'model'):
         imgui.same_line()
         ch_nb, show_nb = imgui.checkbox("Neighbor Swatches##vp_neighbors", bool(state.get('world_show_neighbor_swatches', False)))
@@ -2308,7 +2332,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         if ch_rb:
             state.world_show_robot = bool(show_rb)
     imgui.same_line()
-    imgui.text_disabled("LMB: move | RMB/MMB: orbit | Wheel: zoom")
+    imgui.text_disabled("Drag: orbit | Shift+Drag: pan | Wheel: zoom | WASD/QE: fly")
 
     total_avail_x, avail_y = imgui.get_content_region_avail()
     avail_x = max(240.0, (total_avail_x - 8.0) * 0.52) if split_right_mode else total_avail_x
@@ -2421,6 +2445,12 @@ def draw_viewport(state, renderer, ref_tex, window):
         return pixels[py, px, :3].astype(np.float32)
 
     material_uniforms = _scanner_material_uniforms(state) if scanner_stage_active else dict(state.get_material_uniforms())
+    world_scene = _build_world_scene_dict(
+        state,
+        show_robot=scanner_stage_active or bool(state.get('world_show_robot', True)),
+        show_frusta=scanner_stage_active,
+        show_board=scanner_stage_active or bool(state.get('world_show_robot', True)),
+    )
 
     renderer.render(
         mvp, mv,
@@ -2435,12 +2465,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         camera      = state.camera,
         n_real_pts  = sum(len(row) for r_idx, row in enumerate(state.ctrl_rows) if state.row_visible[r_idx]),
         model_mat   = model_mat,
-        world_scene = _build_world_scene_dict(
-            state,
-            show_robot=scanner_stage_active or bool(state.get('world_show_robot', True)),
-            show_frusta=scanner_stage_active,
-            show_board=scanner_stage_active or bool(state.get('world_show_robot', True)),
-        ),
+        world_scene = world_scene,
     )
 
     drawn_rect = draw_fitted_texture(
@@ -2457,6 +2482,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         origin_x, origin_y, draw_w, _ = drawn_rect
         state.vp_origin = np.array([origin_x, origin_y], dtype=np.float32)
         state.vp_scale = float(draw_w / max(float(disp_w), 1.0))
+    _draw_scene_hud_overlays(imgui.get_window_draw_list(), state, world_scene, model_mat, disp_w, disp_h)
     is_hovered = imgui.is_item_hovered()
     state.mouse_in_vp = is_hovered
     mx, my = imgui.get_mouse_pos()
@@ -2558,12 +2584,9 @@ def draw_viewport(state, renderer, ref_tex, window):
                 for c in range(cols)
             ]
 
-        if not renderer.mesh_pick_data:
-            return None
-
         view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
         cell_pts = [[] for _ in range(rows * cols)]
-        for verts, row_idx in renderer.mesh_pick_data:
+        for verts, row_idx in (renderer.mesh_pick_data or ()):
             cell_index = int(row_idx) // base_rows
             if not (0 <= cell_index < rows * cols):
                 continue
@@ -2580,12 +2603,26 @@ def draw_viewport(state, renderer, ref_tex, window):
                 continue
             cell_pts[cell_index].append(screen[valid])
 
+        tile_lo, tile_hi = state._canonical_tile_bounds()
         bounds = []
-        for chunks in cell_pts:
+        for cell_idx, chunks in enumerate(cell_pts):
             if not chunks:
-                bounds.append(None)
-                continue
-            pts = np.concatenate(chunks, axis=0)
+                r = cell_idx // cols
+                c = cell_idx % cols
+                slot = state.swatch_slot_offset(r, c)
+                corners = np.array([
+                    [slot[0] + tile_lo[0], slot[1] + tile_lo[1], slot[2]],
+                    [slot[0] + tile_hi[0], slot[1] + tile_lo[1], slot[2]],
+                    [slot[0] + tile_hi[0], slot[1] + tile_hi[1], slot[2]],
+                    [slot[0] + tile_lo[0], slot[1] + tile_hi[1], slot[2]],
+                ], dtype=np.float32)
+                screen, valid, _ = project_to_screen(transform_points(corners, model_matrix), view_proj, disp_w, disp_h)
+                if not np.any(valid):
+                    bounds.append(None)
+                    continue
+                pts = screen[valid]
+            else:
+                pts = np.concatenate(chunks, axis=0)
             x_min, y_min = np.min(pts, axis=0)
             x_max, y_max = np.max(pts, axis=0)
             pad = 8.0
@@ -2772,12 +2809,6 @@ def draw_viewport(state, renderer, ref_tex, window):
                     dl.add_line(p0, p1, force_color, 2.0)
                     dl.add_circle_filled(p1, 3.0, force_color)
 
-    # Mouse interaction inside the viewport
-    # Follows what is actually on screen, not just the checkbox: the lock exists
-    # to stop the model drifting against the reference image, so it has no job
-    # in a mode that does not draw one.
-    alignment_locked = bool(_reference_overlay_active(state) and state.ref_bg_lock_zoom)
-
     def viewport_pixel_delta_to_world(dx_px, dy_px):
         aspect = max(1.0, disp_w) / max(1.0, disp_h)
         half_h = max(1e-4, float(state.camera.dist) * np.tan(np.radians(float(state.camera.fov_deg)) * 0.5))
@@ -2809,13 +2840,8 @@ def draw_viewport(state, renderer, ref_tex, window):
                 if x_min <= lx <= x_max and y_min <= ly <= y_max:
                     cell_r = cell_index // cols
                     cell_c = cell_index % cols
-                    state.scanner_selected_cell = [cell_r, cell_c]
-                    state.scanner_selected_row = int(cell_r)
-                    state.scanner_selected_col = int(cell_c)
-                    state._swatch_selection_dirty = True
+                    state.select_swatch(cell_r, cell_c)
                     if str(state.get('scanner_camera_workflow', 'path')) == 'single':
-                        state.scanner_single_row = int(cell_r + 1)
-                        state.scanner_single_col = int(cell_c + 1)
                         state.scanner_status = f"Single capture target: row {cell_r + 1}, col {cell_c + 1}"
                     else:
                         state.scanner_status = f"Selected mini-fabric R{cell_r + 1} C{cell_c + 1}"
@@ -2968,32 +2994,15 @@ def draw_viewport(state, renderer, ref_tex, window):
             rmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT)  == glfw.PRESS
             mmb = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
             shift_down = imgui.get_io().key_shift
+            bg_lmb_drag = lmb and not bbox_drag_active and not spline_drag_active and not suppress_mesh_click
 
-            if not edit_controls_active:
-                can_transform_model = False
-            elif shift_down and state.mode == 'spline' and state.selected_idx >= 0 and (
-                    imguizmo.im_guizmo.is_using() or imguizmo.im_guizmo.is_over()):
-                can_transform_model = False
-            elif shift_down and state.mode == 'spline' and state.hover_idx >= 0:
-                can_transform_model = False
-            else:
-                can_transform_model = shift_down and not alignment_locked
-
-            if bool(state.spline_grab_active) or bool(state.radius_grab_active):
-                can_transform_model = False
-
-            if can_transform_model and rmb:
-                if not state.model_drag_undo_active:
-                    state.push_undo("Model transform")
-                    state.model_drag_undo_active = True
-                state.model_t += pixel_drag_to_world_delta(dx, dy)
-            elif (mmb or (rmb and not shift_down)) and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
-                state.camera.orbit(dx, dy)
-            elif edit_controls_active and lmb and not shift_down and not bbox_drag_active and not spline_drag_active and not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
-                if not state.model_drag_undo_active:
-                    state.push_undo("Model translate")
-                    state.model_drag_undo_active = True
-                state.model_t += pixel_drag_to_world_delta(dx, dy)
+            if not bool(state.spline_grab_active) and not bool(state.radius_grab_active):
+                if shift_down and (mmb or rmb or bg_lmb_drag):
+                    state.camera.target = (
+                        np.asarray(state.camera.target, dtype=np.float32) - pixel_drag_to_world_delta(dx, dy)
+                    ).astype(np.float32)
+                elif mmb or rmb or bg_lmb_drag:
+                    state.camera.orbit(dx, dy)
 
         r_down = glfw.get_key(window, glfw.KEY_R) == glfw.PRESS
         r_pressed = r_down and not bool(state.radius_grab_key_was_down)
@@ -3148,14 +3157,32 @@ def draw_viewport(state, renderer, ref_tex, window):
                 state.rebuild_spline_mesh()
             else:
                 state.spline_keyboard_edit_active = False
+        elif not io.want_text_input and not bool(state.radius_grab_active) and not bool(state.spline_grab_active):
+            view = state.camera.view()
+            right = view[0, :3]
+            up = view[1, :3]
+            fwd = -view[2, :3]
+            fly_step = max(0.15, float(state.camera.dist) * 0.025)
+            rmb_held = glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+            w_axis = fwd if rmb_held else up
+            fly_delta = np.zeros(3, dtype=np.float32)
+            if glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
+                fly_delta += w_axis * fly_step
+            if glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
+                fly_delta -= w_axis * fly_step
+            if glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
+                fly_delta += right * fly_step
+            if glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
+                fly_delta -= right * fly_step
+            if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+                fly_delta += fwd * fly_step
+            if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
+                fly_delta -= fwd * fly_step
+            if np.linalg.norm(fly_delta) > 0.0:
+                state.camera.target = (np.asarray(state.camera.target, dtype=np.float32) + fly_delta).astype(np.float32)
 
         state.model_rot_dragging = False
-        if not (
-            not alignment_locked
-            and imgui.get_io().key_shift
-            and glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-        ):
-            state.model_drag_undo_active = False
+        state.model_drag_undo_active = False
 
         # Spline handle hover + select
         if edit_controls_active and state.mode == 'spline' and len(visible_ctrl_indices) > 0:
@@ -3188,9 +3215,7 @@ def draw_viewport(state, renderer, ref_tex, window):
         right_w = max(180.0, total_avail_x - avail_x - 8.0)
         imgui.set_cursor_screen_pos(imgui.ImVec2(draw_pos.x + avail_x + 8.0, draw_pos.y))
         if imgui.begin_child("##vp_split_right", imgui.ImVec2(right_w, avail_y), imgui.ChildFlags_.borders):
-            if split_right_mode == 'edit_orbit':
-                _draw_orbit_canvas(state, window)
-            elif split_right_mode == 'scan_robot':
+            if split_right_mode == 'scan_robot':
                 _draw_scan_gripper_camera_canvas(state, renderer)
             elif split_right_mode == 'capture_workspace':
                 gui_ur5.draw_ur5_viewport(state, renderer, window)
@@ -3198,13 +3223,4 @@ def draw_viewport(state, renderer, ref_tex, window):
                 gui_model.draw_model_viewport(state, renderer)
         imgui.end_child()
 
-    imgui.end()
-
-
-def draw_orbit_viewport(state, window):
-    """Second, freely-orbitable view of the same model, over a ground grid."""
-    imgui.set_next_window_pos((1220, 20), cond=imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size((360, 370), cond=imgui.Cond_.first_use_ever)
-    imgui.begin("3D Orbit View", flags=imgui.WindowFlags_.no_scroll_with_mouse)
-    _draw_orbit_canvas(state, window)
     imgui.end()

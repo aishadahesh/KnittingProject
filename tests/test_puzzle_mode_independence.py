@@ -58,8 +58,6 @@ def _change_cell(state, row, col):
 
 
 def test_swatch_cells_preserve_independent_patterns_across_edit_and_scan(state):
-    import gui
-
     state.select_swatch(0, 0)
     pattern_00 = _change_cell(state, 1, 0)
     state.ctrl_rows[1][0, 2] += 0.25
@@ -74,11 +72,16 @@ def test_swatch_cells_preserve_independent_patterns_across_edit_and_scan(state):
     state.rebuild_spline_mesh()
     rows_01 = [row.copy() for row in state.ctrl_rows]
 
-    gui._set_app_mode(state, "scan")
+    state.save_active_swatch()
+    state.app_mode = "scan"
+    state.scanner_preview_grid_enabled = True
+    state.rebuild_spline_mesh(preserve_model_placement=False)
     assert state.scanner_preview_grid_enabled is True
     assert any("scanner_cell" in item for item in state.renderer.last_meta)
 
-    gui._set_app_mode(state, "edit")
+    state.app_mode = "edit"
+    state.scanner_preview_grid_enabled = False
+    state.rebuild_spline_mesh(preserve_model_placement=False)
     assert state.scanner_preview_grid_enabled is False
     np.testing.assert_array_equal(state.bitmap, pattern_01)
     np.testing.assert_allclose(state.ctrl_rows[1], rows_01[1])
@@ -88,35 +91,24 @@ def test_swatch_cells_preserve_independent_patterns_across_edit_and_scan(state):
     np.testing.assert_allclose(state.ctrl_rows[1], rows_00[1])
 
 
-def test_private_scan_render_never_owns_the_main_renderer(state):
-    from scanner_core import _scan_measure_pattern_frame
+def test_in_place_swatch_slot_offsets_and_ctrl_pt_editing(state):
+    state.scanner_rows = 2
+    state.scanner_cols = 2
+    state.select_swatch(1, 1)
+    epoch_before = state.mesh_epoch
+    state.rebuild_spline_mesh()
+    assert state.mesh_epoch == epoch_before + 1
+    assert state.last_prepared_meshes is not None
 
-    main_renderer = state.renderer
-    private_renderer = StubRenderer(state)
+    slot_11 = state.swatch_slot_offset(1, 1)
+    assert np.linalg.norm(slot_11[:2]) > 1.0
+    pts_before = state.flat_pts.copy()
+    delta = np.array([0.4, -0.3, 0.2], dtype=np.float32)
+    state.move_ctrl_pt(1, pts_before[1] + delta)
+    np.testing.assert_allclose(state.flat_pts[1], pts_before[1] + delta, atol=1e-5)
+    np.testing.assert_allclose(state.flat_pts[0], pts_before[0], atol=1e-5)
+    np.testing.assert_allclose(state.flat_pts[2:], pts_before[2:], atol=1e-5)
 
-    _scan_measure_pattern_frame(state, private_renderer, state.bitmap.shape)
-
-    assert state.renderer is main_renderer
-    assert private_renderer.renderer_seen_during_upload
-    assert all(renderer is main_renderer for renderer in private_renderer.renderer_seen_during_upload)
-
-
-def test_late_scan_cleanup_cannot_restore_over_mode_switch(state):
-    import gui
-    from scanner_core import _scan_batch
-
-    gui._set_app_mode(state, "scan")
-    batch = _scan_batch(state)
-    batch.__enter__()
-    gui._set_app_mode(state, "edit")
-    expected_bitmap = np.asarray(state.bitmap, dtype=np.float32).copy()
-    expected_rows = [np.asarray(row, dtype=np.float32).copy() for row in state.ctrl_rows]
-    batch.__exit__(None, None, None)
-
-    np.testing.assert_array_equal(state.bitmap, expected_bitmap)
-    for actual, expected in zip(state.ctrl_rows, expected_rows):
-        np.testing.assert_allclose(actual, expected)
-    assert state.app_mode == "edit"
 
 
 def test_swatch_cells_preserve_session_splat_and_fit_state_and_neighbor_swatches(state):

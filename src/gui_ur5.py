@@ -25,6 +25,7 @@ import threading
 import time
 from collections import namedtuple
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from imgui_bundle import imgui
@@ -294,6 +295,44 @@ class UR5ModeController:
         fz = _settings_fabric_z(self.state, None)
         return pose, fov, (-0.45, -0.08, float(fz))
 
+    def _sim_camera_scene_provider(self) -> dict[str, Any]:
+        robot_state = self.robot.state() if callable(self.robot.state) else self.robot.refresh()
+        raw_joints = getattr(robot_state, "joints", None)
+        if raw_joints and (getattr(robot_state, "connected", False) or any(float(v) != 0.0 for v in raw_joints)):
+            joints = [float(v) for v in raw_joints]
+        else:
+            joints = [float(v) for v in (self.state.get("ur5_home_joints") or ur5_robot.DEFAULT_HOME_JOINTS)]
+        grid_span = (
+            float(self.state.canonical_grid_span())
+            if hasattr(self.state, "canonical_grid_span")
+            else 80.0
+        )
+        fabric_center = (-0.45, -0.08, 0.0)
+        fabric_size = (
+            float(self.state.get("scanner_fabric_width", 0.28)),
+            float(self.state.get("scanner_fabric_length", 0.19)),
+        )
+        mesh_epoch = int(getattr(self.state, "mesh_epoch", 0))
+        cached = getattr(self.state, "last_prepared_meshes", (None, None))
+        prepared_meshes, colors = (
+            cached if isinstance(cached, tuple) and len(cached) == 2 else (None, None)
+        )
+        material_uniforms = (
+            scanner_core._scanner_material_uniforms(self.state)
+            if hasattr(self.state, "get_material_uniforms")
+            else {}
+        )
+        return {
+            "joints": joints,
+            "grid_span": grid_span,
+            "fabric_center": fabric_center,
+            "fabric_size": fabric_size,
+            "mesh_epoch": mesh_epoch,
+            "prepared_meshes": prepared_meshes,
+            "colors": colors,
+            "material_uniforms": material_uniforms,
+        }
+
     def connect_sim(self, connect_robot: bool = True, start_cam: bool = True) -> None:
         if connect_robot:
             self.state.ur5_transport = "sim"
@@ -304,38 +343,13 @@ class UR5ModeController:
 
     def update_preview(self, renderer=None) -> None:
         """Refreshes the live camera texture, rate limited to the UI's needs."""
+        if (self.camera is None or not self.camera.running) and self.robot.connected and getattr(self.robot.transport, "name", "") == "sim":
+            self.connect_sim(connect_robot=False, start_cam=True)
         if self.camera is None or not self.camera.running:
             return
         now = time.monotonic()
-        is_sim_cam = (
-            isinstance(self.camera.backend, robot_camera.SimCameraBackend)
-            and renderer is not None
-            and hasattr(renderer, "render_wrist_camera")
-        )
-        pose_changed = False
-        if is_sim_cam:
-            pose, fov, target = self._sim_camera_pose_provider()
-            prev_pose = self.camera.backend._gl_pose
-            pose_changed = prev_pose is None or not np.allclose(prev_pose, pose, atol=1e-4)
-        if not pose_changed and now - self._last_preview_time < PREVIEW_INTERVAL:
+        if now - self._last_preview_time < PREVIEW_INTERVAL:
             return
-        if is_sim_cam:
-            w, h = self.camera.backend.size
-            try:
-                gl_rgb = renderer.render_wrist_camera(
-                    pose,
-                    fov,
-                    target,
-                    0.18,
-                    w,
-                    h,
-                    self.state.get_material_uniforms(),
-                    visible_rows=self.state.row_visible,
-                    model_mat=self.state.current_model_matrix(),
-                )
-                self.camera.backend.update_gl_frame(gl_rgb, pose)
-            except Exception as exc:
-                logging.warning("gui_ur5.update_preview: %s", exc)
         self._last_preview_time = now
         latest = self.camera.latest_frame()
         if latest is None or latest.index == self._previewed_index:
@@ -358,11 +372,10 @@ class UR5ModeController:
         self._upload_preview(image)
 
     def _upload_preview(self, image: Image.Image) -> None:
-        # Shared helper, which also sets the texture filter -- this uploader
-        # never did, leaving the preview sampling at moderngl's default.
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         height, width = rgb.shape[:2]
-        self.preview_texture = upload_rgb_texture(self.gl_ctx, self.preview_texture, rgb)
+        if self.gl_ctx is not None:
+            self.preview_texture = upload_rgb_texture(self.gl_ctx, self.preview_texture, rgb)
         self._preview_size = (width, height)
 
     # -- camera ------------------------------------------------------------
@@ -392,7 +405,12 @@ class UR5ModeController:
         backend = (
             teleop_transport.TeleopCameraBackend(self.robot.transport, spec["camera"], size)
             if spec.get("backend") == "teleop"
-            else robot_camera.make_backend(spec, size=size, pose_provider=self._sim_camera_pose_provider)
+            else robot_camera.make_backend(
+                spec,
+                size=size,
+                pose_provider=self._sim_camera_pose_provider,
+                scene_provider=self._sim_camera_scene_provider,
+            )
         )
         self.camera = robot_camera.RobotCamera(backend)
         self._previewed_index = -1
@@ -1156,9 +1174,33 @@ class UR5ModeController:
             self.status = "Simulated cell refused: TeleopApp is driving the real arm - this is for its emulator"
             return
         try:
-            texture, _ = scanner_core._scanner_generate_tiled_layout(self.state, renderer)
-            if texture is None:
-                raise RuntimeError("Scan Mode could not render the knitted layout - check the pattern in Scan Mode")
+            if renderer is not None and hasattr(renderer, "render_wrist_camera"):
+                rgb = renderer.render_wrist_camera(
+                    [-0.45, -0.08, 0.25, float(np.pi), 0.0, 0.0],
+                    float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)),
+                    (-0.45, -0.08, 0.0),
+                    0.18,
+                    512,
+                    512,
+                    scanner_core._scanner_material_uniforms(self.state)
+                    if hasattr(self.state, "get_material_uniforms")
+                    else {},
+                    visible_rows=getattr(self.state, "row_visible", None),
+                    model_mat=(
+                        self.state.current_model_matrix()
+                        if hasattr(self.state, "current_model_matrix")
+                        else None
+                    ),
+                )
+                texture = Image.fromarray(rgb, "RGB")
+            else:
+                colors, _ = scanner_core._scanner_display_batch_colors(self.state)
+                rows = max(1, int(self.state.get("scanner_rows", 1)))
+                cols = max(1, int(self.state.get("scanner_cols", 1)))
+                grid = np.full((rows, cols, 3), 128, dtype=np.uint8)
+                for idx, rgb_val in enumerate(colors[: rows * cols]):
+                    grid[idx // cols, idx % cols] = np.clip(rgb_val[:3], 0, 255).astype(np.uint8)
+                texture = Image.fromarray(grid, "RGB").resize((512, 512), Image.Resampling.NEAREST)
             corners = teleop_transport.build(transport, texture)
         except Exception as exc:
             self.status = f"Simulated cell not built: {exc}"
@@ -1361,23 +1403,27 @@ def _draw_ur5_controls_column(state, controller, renderer):
     imgui.pop_id()
 
 
-def draw_ur5_panel(state, renderer, window=None):
-    """UR5 Robot Mode sidebar controls inside 'Knitting Control'."""
+def ensure_controller(state, gl_ctx=None, window=None, auto_connect_sim: bool = False) -> UR5ModeController:
     controller = state.get("ur5_controller")
     if controller is None:
-        controller = UR5ModeController(state, renderer.ctx, window)
+        ctx = getattr(gl_ctx, "ctx", gl_ctx)
+        controller = UR5ModeController(state, ctx, window)
         state.ur5_controller = controller
+    if auto_connect_sim and not controller.robot.connected:
+        controller.connect_sim()
+    return controller
 
+
+def draw_ur5_panel(state, renderer, window=None):
+    """UR5 Robot Mode sidebar controls inside 'Knitting Control'."""
+    controller = ensure_controller(state, renderer, window)
     controller.update_preview(renderer)
     _draw_ur5_controls_column(state, controller, renderer)
 
 
 def draw_splatting_workflow_section(state, renderer, window=None):
     """3DGS dataset export, pose solver, and training workflow for Splatting mode."""
-    controller = state.get("ur5_controller")
-    if controller is None:
-        controller = UR5ModeController(state, renderer.ctx, window)
-        state.ur5_controller = controller
+    controller = ensure_controller(state, renderer, window)
     imgui.push_id("splat_workflow_panel")
     if imgui.collapsing_header("Dataset, Poses & 3DGS Training##splat_workflow_hdr", imgui.TreeNodeFlags_.default_open):
         gui_captures.draw_captures_section(state, controller, "Captured Scan Sessions")
@@ -1387,10 +1433,7 @@ def draw_splatting_workflow_section(state, renderer, window=None):
 
 def draw_ur5_viewport(state, renderer, window=None):
     """UR5 Robot Mode visual workspace inside '3D View'."""
-    controller = state.get("ur5_controller")
-    if controller is None:
-        controller = UR5ModeController(state, renderer.ctx, window)
-        state.ur5_controller = controller
+    controller = ensure_controller(state, renderer, window)
 
     avail_w = max(240.0, float(imgui.get_content_region_avail().x))
     left_w = max(240.0, (avail_w - imgui.get_style().item_spacing.x) * 0.5)

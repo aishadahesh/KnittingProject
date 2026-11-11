@@ -805,7 +805,7 @@
       "ur5_home_joints": [],
       "ur5_camera_image_turn": [],
       "ur5_show_scene": true,
-      "world_show_neighbor_swatches": false,
+      "world_show_neighbor_swatches": true,
       "world_show_robot": true,
       "ur5_expert": false,
       "ur5_splat_object_only": true,

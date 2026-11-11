@@ -1,10 +1,12 @@
 import logging
 import math
+import cv2
 import numpy as np
 import moderngl
 from PIL import Image
 from imgui_bundle import imgui
 
+import charuco
 import paths
 import scan_geometry
 
@@ -435,48 +437,91 @@ def transform_points(points, matrix):
     return res[:, :3] / res[:, 3:4]
 
 
+SKY_VERT = """
+#version 330 core
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+SKY_FRAG = """
+#version 330 core
+uniform float uHeight;
+uniform float uHorizon;
+uniform vec3 uStops[4];
+out vec4 fragColor;
+void main() {
+    float row = uHeight - gl_FragCoord.y;
+    float t = (row - uHorizon) / max(uHeight, 1.0);
+    fragColor = vec4(row < uHorizon
+        ? mix(uStops[0], uStops[1], clamp(t + 1.0, 0.0, 1.0))
+        : mix(uStops[2], uStops[3], clamp(t, 0.0, 1.0)), 1.0);
+}
+"""
+
 WORLD_VERT = """
-#version 330
+#version 330 core
 in vec3 in_pos;
 in vec3 in_norm;
+in vec3 in_col;
+in vec2 in_uv;
 uniform mat4 mvp;
 uniform mat4 model;
-out vec3 v_world_pos;
-out vec3 v_world_norm;
+out vec3 vPos;
+out vec3 vNrm;
+out vec3 vCol;
+out vec2 vUv;
 void main() {
     vec4 wp = model * vec4(in_pos, 1.0);
-    v_world_pos = wp.xyz;
-    v_world_norm = normalize(mat3(model) * in_norm);
+    vPos = wp.xyz;
+    vNrm = mat3(model) * in_norm;
+    vCol = in_col;
+    vUv = in_uv;
     gl_Position = mvp * vec4(in_pos, 1.0);
 }
 """
 
 WORLD_FRAG = """
-#version 330
-in vec3 v_world_pos;
-in vec3 v_world_norm;
+#version 330 core
+in vec3 vPos;
+in vec3 vNrm;
+in vec3 vCol;
+in vec2 vUv;
 uniform vec3 base_color;
-uniform int surface_mode;
-uniform vec3 board_center;
-uniform float board_half;
-out vec4 frag_color;
+uniform vec3 uLight;
+uniform vec3 uUp;
+uniform vec3 uCamPos;
+uniform float uShadow;
+uniform float uShadowAlpha;
+uniform float uUseTex;
+uniform float uUseVertexCol;
+uniform sampler2D uTex;
+out vec4 fragColor;
 void main() {
-    vec3 col = base_color;
-    if (surface_mode == 1) {
-        vec2 d = v_world_pos.xy - board_center.xy;
-        if (abs(d.x) <= board_half && abs(d.y) <= board_half) {
-            float cell = max(board_half * 0.125, 1e-4);
-            int cx = int(floor(d.x / cell));
-            int cy = int(floor(d.y / cell));
-            int parity = (cx + cy) & 1;
-            col = parity == 0 ? vec3(0.90, 0.90, 0.92) : vec3(0.16, 0.16, 0.18);
-        }
+    if (uShadow > 0.5) {
+        fragColor = vec4(0.10, 0.11, 0.13, uShadowAlpha);
+        return;
     }
-    vec3 n = normalize(v_world_norm);
-    vec3 l1 = normalize(vec3(0.35, -0.45, 0.82));
-    vec3 l2 = normalize(vec3(-0.40, 0.55, 0.45));
-    float diff = max(dot(n, l1), 0.0) * 0.65 + max(dot(n, l2), 0.0) * 0.25 + 0.25;
-    frag_color = vec4(clamp(col * diff, 0.0, 1.0), 1.0);
+    vec3 col = (uUseVertexCol > 0.5) ? vCol : base_color;
+    if (uUseTex > 0.5) {
+        col = texture(uTex, vUv).rgb;
+    }
+    if (dot(vNrm, vNrm) < 1e-8) {
+        fragColor = vec4(col, 1.0);
+        return;
+    }
+    vec3 n = normalize(vNrm);
+    if (!gl_FrontFacing) n = -n;
+    vec3 l = normalize(uLight);
+    vec3 v = normalize(uCamPos - vPos);
+    vec3 h = normalize(l + v);
+    float diff = max(dot(n, l), 0.0);
+    float spec = pow(max(dot(n, h), 0.0), 48.0);
+    vec3 amb = mix(vec3(0.34, 0.34, 0.32), vec3(0.55, 0.58, 0.62),
+                   0.5 + 0.5 * dot(n, normalize(uUp)));
+    vec3 c = col * (amb + 0.70 * diff) + vec3(0.9) * (0.20 * spec);
+    fragColor = vec4(min(c, vec3(1.0)), 1.0);
 }
 """
 
@@ -500,6 +545,50 @@ void main() {
     frag_color = vec4(v_color, 1.0);
 }
 """
+
+_SKY_STOPS = np.array([
+    (0.518, 0.690, 0.871),
+    (0.878, 0.925, 0.965),
+    (0.894, 0.886, 0.871),
+    (0.776, 0.769, 0.753),
+], dtype=np.float32)
+
+_WORLD_LIGHT_DIR = (
+    np.array([0.35, -0.25, 0.90], dtype=np.float32)
+    / float(np.linalg.norm([0.35, -0.25, 0.90]))
+)
+_WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+
+def _ground_projection_z(light, plane_z):
+    M = np.eye(4, dtype=np.float32)
+    rx = float(light[0]) / float(light[2])
+    ry = float(light[1]) / float(light[2])
+    pz = float(plane_z)
+    M[0, 2], M[0, 3] = -rx, pz * rx
+    M[1, 2], M[1, 3] = -ry, pz * ry
+    M[2, 2], M[2, 3] = 0.0, pz
+    return M
+
+
+def _box_vertices(lo, hi, col, include_top=True):
+    x0, y0, z0 = float(lo[0]), float(lo[1]), float(lo[2])
+    x1, y1, z1 = float(hi[0]), float(hi[1]), float(hi[2])
+    c = (float(col[0]), float(col[1]), float(col[2]))
+    faces = [
+        (((x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0)), (0.0, 0.0, -1.0)),
+        (((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)), (1.0, 0.0, 0.0)),
+        (((x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)), (-1.0, 0.0, 0.0)),
+        (((x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)), (0.0, 1.0, 0.0)),
+        (((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)), (0.0, -1.0, 0.0)),
+    ]
+    if include_top:
+        faces.append((((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)), (0.0, 0.0, 1.0)))
+    rows = []
+    for pts, nrm in faces:
+        for i in (0, 1, 2, 0, 2, 3):
+            rows.append((*pts[i], *nrm, *c))
+    return rows
 
 _UR5E_LINK_FILES = (
     ("base", ("base_0.obj", "base_1.obj")),
@@ -564,7 +653,7 @@ def _load_ur5e_visual_meshes():
 # %% MESH RENDERER ────────────────────────────────────────────────────────────
 
 class MeshRenderer:
-    def __init__(self, ctx, vp_w, vp_h):
+    def __init__(self, ctx, vp_w=640, vp_h=480):
         self.ctx     = ctx
         self.prog    = ctx.program(vertex_shader=MESH_VERT, fragment_shader=MESH_FRAG)
         self.outline_prog = ctx.program(vertex_shader=OUTLINE_VERT, fragment_shader=OUTLINE_FRAG)
@@ -596,12 +685,24 @@ class MeshRenderer:
             [(self.grid_vbo, '3f', 'in_pos')],
             self.grid_ibo,
         )
+        self.sky_prog = ctx.program(vertex_shader=SKY_VERT, fragment_shader=SKY_FRAG)
+        self.sky_vao = ctx.vertex_array(self.sky_prog, [])
+        if 'uStops' in self.sky_prog:
+            self.sky_prog['uStops'].write(_SKY_STOPS.tobytes())
         self.world_prog = ctx.program(vertex_shader=WORLD_VERT, fragment_shader=WORLD_FRAG)
         self.line_prog = ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
         self.robot_vaos = []
         self.robot_buffers = []
+        self.room_vao = None
+        self.room_vbo = None
+        self.room_vertex_count = 0
+        self.board_plinth_vao = None
+        self.board_plinth_vbo = None
+        self.board_plinth_vertex_count = 0
         self.board_vao = None
         self.board_buffers = []
+        self.charuco_tex = None
+        self._env_cache_key = None
         self.wrist_fbo = None
         self.wrist_color_tex = None
         self.wrist_depth_tex = None
@@ -643,7 +744,9 @@ class MeshRenderer:
         for buf in self.board_buffers:
             buf.release()
         self.board_buffers.clear()
-        for name in ('wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex',
+        for name in ('room_vao', 'room_vbo', 'board_plinth_vao', 'board_plinth_vbo',
+                     'charuco_tex', 'sky_vao', 'sky_prog',
+                     'wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex',
                      'bg_vao', 'grid_vao', 'bg_vbo', 'grid_vbo', 'grid_ibo',
                      'fbo', 'color_tex', 'depth_tex', 'prog', 'outline_prog',
                      'pt_prog', 'bg_prog', 'depth_prog', 'grid_prog',
@@ -738,6 +841,32 @@ class MeshRenderer:
             if meta is None or not bool(meta[i].get('neighbor_swatch', False)):
                 self.mesh_pick_data.append((v, row_idx))
 
+    def set_prepared_meshes(self, prepared_meshes, colors=None, meta=None):
+        if not prepared_meshes:
+            self.set_meshes([], [], colors=colors, meta=meta, prepared=[])
+            return
+        if (
+            isinstance(prepared_meshes, tuple)
+            and len(prepared_meshes) >= 2
+            and isinstance(prepared_meshes[0], (list, tuple))
+            and (not prepared_meshes[0] or (isinstance(prepared_meshes[0][0], tuple) and len(prepared_meshes[0][0]) == 5))
+            and not isinstance(prepared_meshes[0], np.ndarray)
+        ):
+            prep = prepared_meshes[0]
+            if len(prepared_meshes) == 2 and meta is None and isinstance(prepared_meshes[1], list):
+                if prepared_meshes[1] and isinstance(prepared_meshes[1][0], dict):
+                    meta = prepared_meshes[1]
+                elif colors is None:
+                    colors = prepared_meshes[1]
+            elif len(prepared_meshes) >= 3:
+                if colors is None:
+                    colors = prepared_meshes[1]
+                if meta is None:
+                    meta = prepared_meshes[2]
+            self.set_meshes([], [], colors=colors, meta=meta, prepared=list(prep))
+            return
+        self.set_meshes([], [], colors=colors, meta=meta, prepared=list(prepared_meshes))
+
     @staticmethod
     def _row_visible(row_idx, visible_rows):
         if visible_rows is None or len(visible_rows) == 0:
@@ -831,6 +960,13 @@ class MeshRenderer:
         # 1. Clear color and depth with depth writes enabled
         self.fbo.depth_mask = True
         self.ctx.clear(0.12, 0.12, 0.12, 1.0)
+
+        if world_scene is not None and world_scene.get("show_sky", True) and bg_tex is None:
+            view_sky = camera.view() if camera is not None else mv
+            proj_sky = camera.proj(self.vp_w, self.vp_h) if camera is not None else np.eye(4, dtype=np.float32)
+            self.fbo.depth_mask = False
+            self._draw_sky(view_sky, proj_sky, self.vp_h)
+            self.fbo.depth_mask = True
 
         # 2. Depth pre-pass
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -957,8 +1093,9 @@ class MeshRenderer:
             self.ctx.disable(moderngl.BLEND)
 
         if world_scene is not None and camera is not None:
-            view_proj = camera.proj(self.vp_w, self.vp_h) @ camera.view()
-            self._draw_world_scene(view_proj, model_mat, world_scene)
+            view = camera.view()
+            view_proj = camera.proj(self.vp_w, self.vp_h) @ view
+            self._draw_world_scene(view_proj, model_mat, world_scene, view=view, target_fbo=self.fbo)
 
         if self.pt_vao:
             self.ctx.disable(moderngl.DEPTH_TEST)
@@ -971,34 +1108,58 @@ class MeshRenderer:
                 self.pt_prog['n_real'].value   = n_real_pts if n_real_pts >= 0 else self.n_pts
             self.pt_vao.render(moderngl.POINTS, vertices=self.n_pts)
 
-        self.ctx.screen.use()
+        if self.ctx.screen is not None:
+            self.ctx.screen.use()
 
-    def _ensure_world_vaos(self):
-        if self.board_vao is None:
-            quad_pos = np.array([
-                [-0.5, -0.5, 0.0],
-                [ 0.5, -0.5, 0.0],
-                [ 0.5,  0.5, 0.0],
-                [-0.5,  0.5, 0.0],
-            ], dtype=np.float32)
-            quad_norm = np.array([
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
-            ], dtype=np.float32)
-            quad_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
-            p_buf = self.ctx.buffer(quad_pos.tobytes())
-            n_buf = self.ctx.buffer(quad_norm.tobytes())
-            i_buf = self.ctx.buffer(quad_idx.tobytes())
-            self.board_buffers = [p_buf, n_buf, i_buf]
-            self.board_vao = self.ctx.vertex_array(
-                self.world_prog,
-                [(p_buf, '3f', 'in_pos'), (n_buf, '3f', 'in_norm')],
-                i_buf,
+    def _draw_sky(self, view, proj, vp_h):
+        if self.sky_vao is None or self.sky_prog is None:
+            return
+        fwd = -np.asarray(view[2, :3], dtype=np.float32)
+        flat = np.array([fwd[0], fwd[1], 0.0], dtype=np.float32)
+        n = float(np.linalg.norm(flat))
+        d = view[:3, :3] @ (flat / n) if n > 1e-6 else np.zeros(3, dtype=np.float32)
+        dz = -float(d[2])
+        if dz > 1e-6:
+            if abs(float(proj[3, 2])) > 1e-6:
+                ndc_y = (float(proj[1, 1]) * float(d[1]) + float(proj[1, 2]) * float(d[2])) / dz
+            else:
+                ndc_y = 2.41421356 * (float(d[1]) / dz)
+            horizon = (0.5 - 0.5 * ndc_y) * float(vp_h)
+        else:
+            horizon = 0.0 if float(fwd[2]) < 0.0 else float(vp_h)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.CULL_FACE)
+        self.sky_prog['uHeight'].value = float(vp_h)
+        self.sky_prog['uHorizon'].value = float(horizon)
+        self.sky_vao.render(moderngl.TRIANGLES, vertices=3)
+
+    def _ensure_environment_buffers(self, fabric_center, fabric_size=None):
+        fc = np.asarray(fabric_center, dtype=np.float32).reshape(-1)[:3]
+        spec = charuco.DEFAULT_BOARD
+        if isinstance(fabric_size, (tuple, list, np.ndarray)) and len(fabric_size) >= 2:
+            w_pat = float(fabric_size[0])
+            h_pat = float(fabric_size[1])
+        else:
+            w_pat = float(spec["squares_x"]) * float(spec["square_mm"]) / 1000.0
+            h_pat = float(spec["squares_y"]) * float(spec["square_mm"]) / 1000.0
+        border = float(charuco.SHEET_BORDER_M)
+        w_sheet = w_pat + 2.0 * border
+        h_sheet = h_pat + 2.0 * border
+
+        if self.charuco_tex is None:
+            page = charuco.board_image(
+                spec,
+                px_per_mm=8.0,
+                page_mm=(w_sheet * 1000.0, h_sheet * 1000.0),
             )
+            paper = np.clip(24 + (page.astype(np.uint16) * (242 - 24)) // 255, 0, 255).astype(np.uint8)
+            rgb = np.dstack((paper, paper, paper))
+            self.charuco_tex = self.ctx.texture((rgb.shape[1], rgb.shape[0]), 3, rgb.tobytes())
+            self.charuco_tex.build_mipmaps()
+            self.charuco_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+
         if not self.robot_vaos:
-            for link_idx, pos_b, norm_b, tri_b, n_idx, color in _load_ur5e_visual_meshes():
+            for link_idx, pos_b, norm_b, tri_b, _n_idx, color in _load_ur5e_visual_meshes():
                 p_buf = self.ctx.buffer(pos_b)
                 n_buf = self.ctx.buffer(norm_b)
                 i_buf = self.ctx.buffer(tri_b)
@@ -1010,20 +1171,112 @@ class MeshRenderer:
                 )
                 self.robot_vaos.append((vao, link_idx, color))
 
-    def _scene_world_mapping(self, model_mat, fabric_center, phys_span):
-        if self.mesh_pick_data and model_mat is not None:
+        key = (
+            round(float(fc[0]), 4),
+            round(float(fc[1]), 4),
+            round(float(fc[2]), 4),
+            round(w_sheet, 4),
+            round(h_sheet, 4),
+        )
+        if self._env_cache_key == key and self.room_vao is not None and self.board_vao is not None:
+            return
+        self._env_cache_key = key
+
+        for name in ('room_vao', 'room_vbo', 'board_plinth_vao', 'board_plinth_vbo', 'board_vao'):
+            res = getattr(self, name, None)
+            if res is not None:
+                res.release()
+                setattr(self, name, None)
+        for buf in self.board_buffers:
+            buf.release()
+        self.board_buffers.clear()
+
+        bx, by, bz = float(fc[0]), float(fc[1]), float(fc[2])
+        z_table = bz - 0.002
+        z_floor = z_table - 0.80
+
+        room_rows = []
+        tile = 0.64
+        half_floor = 3.20
+        shades = ((0.792, 0.784, 0.769), (0.741, 0.729, 0.714))
+        for i in range(10):
+            x0 = -half_floor + i * tile
+            x1 = x0 + tile
+            for j in range(10):
+                y0 = -half_floor + j * tile
+                y1 = y0 + tile
+                col = shades[(i + j) & 1]
+                pts = ((x0, y0, z_floor), (x1, y0, z_floor), (x1, y1, z_floor), (x0, y1, z_floor))
+                for idx in (0, 1, 2, 0, 2, 3):
+                    room_rows.append((*pts[idx], 0.0, 0.0, 0.0, *col))
+
+        tx0 = min(-0.20, bx - 0.35)
+        tx1 = max(0.20, bx + 0.35)
+        ty0, ty1 = -0.60, 0.60
+        table_thick = 0.04
+        leg = 0.06
+        room_rows.extend(_box_vertices((tx0, ty0, z_table - table_thick), (tx1, ty1, z_table), (0.659, 0.620, 0.588)))
+        for lx in (tx0, tx1 - leg):
+            for ly in (ty0, ty1 - leg):
+                room_rows.extend(_box_vertices((lx, ly, z_floor), (lx + leg, ly + leg, z_table - table_thick), (0.557, 0.518, 0.486)))
+
+        room_arr = np.asarray(room_rows, dtype=np.float32)
+        self.room_vertex_count = len(room_arr)
+        self.room_vbo = self.ctx.buffer(room_arr.tobytes())
+        self.room_vao = self.ctx.vertex_array(
+            self.world_prog,
+            [(self.room_vbo, '3f 3f 3f', 'in_pos', 'in_norm', 'in_col')],
+        )
+
+        hw, hh = 0.5 * w_sheet, 0.5 * h_sheet
+        plinth_rows = _box_vertices(
+            (bx - hw, by - hh, bz - 0.002),
+            (bx + hw, by + hh, bz),
+            (0.94, 0.94, 0.92),
+            include_top=False,
+        )
+        plinth_arr = np.asarray(plinth_rows, dtype=np.float32)
+        self.board_plinth_vertex_count = len(plinth_arr)
+        self.board_plinth_vbo = self.ctx.buffer(plinth_arr.tobytes())
+        self.board_plinth_vao = self.ctx.vertex_array(
+            self.world_prog,
+            [(self.board_plinth_vbo, '3f 3f 3f', 'in_pos', 'in_norm', 'in_col')],
+        )
+
+        top_verts = np.array([
+            [bx - hw, by - hh, bz, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [bx + hw, by - hh, bz, 0.0, 0.0, 0.0, 1.0, 1.0],
+            [bx + hw, by + hh, bz, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [bx - hw, by + hh, bz, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ], dtype=np.float32)
+        top_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
+        v_buf = self.ctx.buffer(top_verts.tobytes())
+        i_buf = self.ctx.buffer(top_idx.tobytes())
+        self.board_buffers = [v_buf, i_buf]
+        self.board_vao = self.ctx.vertex_array(
+            self.world_prog,
+            [(v_buf, '3f 3f 2f', 'in_pos', 'in_norm', 'in_uv')],
+            i_buf,
+        )
+
+    def _ensure_world_vaos(self):
+        self._ensure_environment_buffers((-0.45, -0.08, 0.0))
+
+    def _scene_world_mapping(self, model_mat, fabric_center, phys_span, grid_span=None):
+        if model_mat is not None:
+            center = transform_points(np.zeros((1, 3), dtype=np.float32), model_mat)[0].astype(np.float32)
+        else:
+            center = np.zeros(3, dtype=np.float32)
+        if grid_span is not None and float(grid_span) > 0.0:
+            span = float(grid_span)
+        elif self.mesh_pick_data and model_mat is not None:
             pts = np.vstack([v[::max(1, len(v) // 80)] for v, _ in self.mesh_pick_data if len(v)])
             world_pts = transform_points(pts, model_mat)
             min_v = world_pts.min(axis=0)
             max_v = world_pts.max(axis=0)
-            center = np.array(
-                [(min_v[0] + max_v[0]) * 0.5, (min_v[1] + max_v[1]) * 0.5, float(min_v[2])],
-                dtype=np.float32,
-            )
             span = max(float(max_v[0] - min_v[0]), float(max_v[1] - min_v[1]), 2.0)
         else:
-            center = np.zeros(3, dtype=np.float32)
-            span = 16.0
+            span = 80.0
         units_per_meter = span / max(float(phys_span), 0.05)
         fc = np.asarray(fabric_center, dtype=np.float32).reshape(-1)[:3]
         return center, fc, float(units_per_meter)
@@ -1035,46 +1288,118 @@ class MeshRenderer:
         m[:3, 3] = scene_center + (ur_pos - fabric_center) * float(units_per_meter)
         return m
 
-    def _draw_world_scene(self, view_proj, model_mat, world_scene, draw_robot=True, draw_frusta=True):
-        self._ensure_world_vaos()
+    def _draw_world_scene(
+        self,
+        view_proj,
+        model_mat,
+        world_scene,
+        draw_robot=True,
+        draw_frusta=True,
+        draw_shadows=True,
+        view=None,
+        target_fbo=None,
+    ):
         fabric_center = world_scene.get("fabric_center", (-0.45, -0.08, 0.0))
-        phys_span = float(world_scene.get("phys_span", 0.18))
-        scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span)
+        fabric_size = world_scene.get("fabric_size")
+        raw_phys_span = world_scene.get("phys_span")
+        if raw_phys_span is not None:
+            phys_span = float(raw_phys_span)
+        elif isinstance(fabric_size, (int, float, np.floating, np.integer)):
+            phys_span = float(fabric_size)
+        elif isinstance(fabric_size, (tuple, list, np.ndarray)) and len(fabric_size) >= 2:
+            phys_span = max(float(fabric_size[0]), float(fabric_size[1]))
+        else:
+            phys_span = 0.18
+        grid_span = world_scene.get("grid_span")
+        self._ensure_environment_buffers(fabric_center, fabric_size)
+        scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span, grid_span=grid_span)
 
+        fbo = target_fbo if target_fbo is not None else self.fbo
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.CULL_FACE)
-        self.fbo.depth_mask = True
+        if fbo is not None:
+            fbo.depth_mask = True
 
-        if self.board_vao is not None and world_scene.get("show_board", True):
-            board_span_m = max(phys_span * 1.45, 0.24)
-            board_half = 0.5 * board_span_m * units_per_m
-            board_mat = np.eye(4, dtype=np.float32)
-            board_mat[0, 0] = board_span_m * units_per_m * 2.2
-            board_mat[1, 1] = board_span_m * units_per_m * 2.2
-            board_mat[:3, 3] = scene_center + np.array([0.0, 0.0, -0.003 * units_per_m], dtype=np.float32)
-            mvp_board = (view_proj @ board_mat).astype(np.float32)
-            self.world_prog['mvp'].write(mvp_board.T.tobytes())
-            self.world_prog['model'].write(board_mat.T.tobytes())
-            self.world_prog['base_color'].value = (0.24, 0.25, 0.27)
-            self.world_prog['surface_mode'].value = 1
-            self.world_prog['board_center'].value = tuple(float(v) for v in scene_center)
-            self.world_prog['board_half'].value = float(board_half)
-            self.board_vao.render(moderngl.TRIANGLES)
+        if view is not None:
+            cam_pos = (-view[:3, :3].T @ view[:3, 3]).astype(np.float32)
+        else:
+            cam_pos = np.array([0.0, -50.0, 80.0], dtype=np.float32)
 
-        joints = world_scene.get("robot_joints")
-        if draw_robot and world_scene.get("show_robot", True) and joints is not None and self.robot_vaos:
+        self.world_prog['uLight'].value = tuple(float(v) for v in _WORLD_LIGHT_DIR)
+        self.world_prog['uUp'].value = tuple(float(v) for v in _WORLD_UP)
+        self.world_prog['uCamPos'].value = tuple(float(v) for v in cam_pos)
+        self.world_prog['uShadow'].value = 0.0
+        self.world_prog['uShadowAlpha'].value = 0.20
+
+        env_model = self._ur_to_gl_matrix(np.eye(4, dtype=np.float32), scene_center, fc, units_per_m)
+        env_mvp = (view_proj @ env_model).astype(np.float32)
+
+        show_table = bool(world_scene.get("show_table", world_scene.get("show_board", True)))
+        show_board = bool(world_scene.get("show_board", show_table))
+
+        if show_table and self.room_vao is not None:
+            self.world_prog['mvp'].write(env_mvp.T.tobytes())
+            self.world_prog['model'].write(env_model.T.tobytes())
+            self.world_prog['uUseTex'].value = 0.0
+            self.world_prog['uUseVertexCol'].value = 1.0
+            self.room_vao.render(moderngl.TRIANGLES, vertices=self.room_vertex_count)
+
+        if show_board and self.board_vao is not None:
+            self.world_prog['mvp'].write(env_mvp.T.tobytes())
+            self.world_prog['model'].write(env_model.T.tobytes())
+            if self.board_plinth_vao is not None:
+                self.world_prog['uUseTex'].value = 0.0
+                self.world_prog['uUseVertexCol'].value = 1.0
+                self.board_plinth_vao.render(moderngl.TRIANGLES, vertices=self.board_plinth_vertex_count)
+            if self.charuco_tex is not None:
+                self.charuco_tex.use(location=0)
+                self.world_prog['uTex'].value = 0
+                self.world_prog['uUseTex'].value = 1.0
+                self.world_prog['uUseVertexCol'].value = 0.0
+                self.world_prog['base_color'].value = (1.0, 1.0, 1.0)
+                self.board_vao.render(moderngl.TRIANGLES)
+            self.world_prog['uUseTex'].value = 0.0
+
+        joints = world_scene.get("joints") if "joints" in world_scene else world_scene.get("robot_joints")
+        if joints is not None and self.robot_vaos and world_scene.get("show_robot", True):
             link_mats = scan_geometry.link_world_transforms(joints)
-            self.world_prog['surface_mode'].value = 0
-            for vao, link_name, color in self.robot_vaos:
-                link_mat = link_mats.get(link_name)
-                if link_mat is None:
-                    continue
-                gl_model = self._ur_to_gl_matrix(link_mat, scene_center, fc, units_per_m)
-                mvp_link = (view_proj @ gl_model).astype(np.float32)
-                self.world_prog['mvp'].write(mvp_link.T.tobytes())
-                self.world_prog['model'].write(gl_model.T.tobytes())
-                self.world_prog['base_color'].value = color
-                vao.render(moderngl.TRIANGLES)
+            if draw_shadows and (show_table or show_board):
+                ground_proj = _ground_projection_z(_WORLD_LIGHT_DIR, float(fc[2]) + 0.0005)
+                self.ctx.enable(moderngl.BLEND)
+                self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+                if fbo is not None:
+                    fbo.depth_mask = False
+                self.world_prog['uShadow'].value = 1.0
+                self.world_prog['uUseTex'].value = 0.0
+                self.world_prog['uUseVertexCol'].value = 0.0
+                for vao, link_name, _color in self.robot_vaos:
+                    link_mat = link_mats.get(link_name)
+                    if link_mat is None:
+                        continue
+                    gl_shadow = self._ur_to_gl_matrix(ground_proj @ link_mat, scene_center, fc, units_per_m)
+                    mvp_shadow = (view_proj @ gl_shadow).astype(np.float32)
+                    self.world_prog['mvp'].write(mvp_shadow.T.tobytes())
+                    self.world_prog['model'].write(gl_shadow.T.tobytes())
+                    vao.render(moderngl.TRIANGLES)
+                self.world_prog['uShadow'].value = 0.0
+                if fbo is not None:
+                    fbo.depth_mask = True
+                self.ctx.disable(moderngl.BLEND)
+
+            if draw_robot:
+                self.world_prog['uShadow'].value = 0.0
+                self.world_prog['uUseTex'].value = 0.0
+                self.world_prog['uUseVertexCol'].value = 0.0
+                for vao, link_name, color in self.robot_vaos:
+                    link_mat = link_mats.get(link_name)
+                    if link_mat is None:
+                        continue
+                    gl_model = self._ur_to_gl_matrix(link_mat, scene_center, fc, units_per_m)
+                    mvp_link = (view_proj @ gl_model).astype(np.float32)
+                    self.world_prog['mvp'].write(mvp_link.T.tobytes())
+                    self.world_prog['model'].write(gl_model.T.tobytes())
+                    self.world_prog['base_color'].value = color
+                    vao.render(moderngl.TRIANGLES)
 
         if draw_frusta and world_scene.get("show_frusta", True):
             line_verts = []
@@ -1129,18 +1454,40 @@ class MeshRenderer:
     def render_wrist_camera(
         self,
         world_pose,
-        hfov_deg,
-        fabric_center,
-        phys_span,
-        out_w,
-        out_h,
-        material_uniforms,
+        joints_or_hfov=None,
+        fabric_center=(-0.45, -0.08, 0.0),
+        phys_span=None,
+        out_w=None,
+        out_h=None,
+        material_uniforms=None,
         visible_rows=None,
         model_mat=None,
         intrinsics=None,
+        *,
+        width=None,
+        height=None,
+        fabric_size=(0.28, 0.19),
+        dist_coeffs=None,
+        grid_span=None,
+        hfov_deg=55.0,
     ):
-        out_w = max(16, int(out_w))
-        out_h = max(16, int(out_h))
+        if isinstance(joints_or_hfov, (int, float, np.floating, np.integer)):
+            hfov_deg = float(joints_or_hfov)
+            joints = None
+        else:
+            joints = joints_or_hfov
+        out_w = max(16, int(width if width is not None else (out_w if out_w is not None else 640)))
+        out_h = max(16, int(height if height is not None else (out_h if out_h is not None else 480)))
+        if phys_span is None:
+            if isinstance(fabric_size, (int, float, np.floating, np.integer)):
+                phys_span = float(fabric_size)
+            elif isinstance(fabric_size, (tuple, list, np.ndarray)) and len(fabric_size) >= 2:
+                phys_span = max(float(fabric_size[0]), float(fabric_size[1]))
+            else:
+                phys_span = 0.18
+        if material_uniforms is None:
+            material_uniforms = {}
+
         if self.wrist_fbo is None or self.wrist_size != (out_w, out_h):
             for name in ('wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex'):
                 res = getattr(self, name, None)
@@ -1156,7 +1503,7 @@ class MeshRenderer:
 
         if model_mat is None:
             model_mat = np.eye(4, dtype=np.float32)
-        scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span)
+        scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span, grid_span=grid_span)
         pose_arr = np.asarray(world_pose, dtype=np.float32).reshape(-1)[:6]
         eye_gl = scene_center + (pose_arr[:3] - fc) * units_per_m
         rot_wc = scan_geometry.rotvec_to_matrix(pose_arr[3:6]).astype(np.float32)
@@ -1176,29 +1523,31 @@ class MeshRenderer:
             measured = hand_eye.load_intrinsics()
             if measured is not None:
                 intrinsics = hand_eye.intrinsics_for(out_w, out_h, measured)
-        elif "fx" in intrinsics and "fl_x" not in intrinsics:
+        elif isinstance(intrinsics, dict) and "fx" in intrinsics and "fl_x" not in intrinsics:
             import hand_eye
             intrinsics = hand_eye.intrinsics_for(out_w, out_h, intrinsics)
 
-        near, far = 0.05, 500.0
-        if isinstance(intrinsics, dict) and "fl_x" in intrinsics:
-            fl_x = float(intrinsics["fl_x"])
-            fl_y = float(intrinsics.get("fl_y", fl_x))
-            cx = float(intrinsics.get("cx", out_w * 0.5))
-            cy = float(intrinsics.get("cy", out_h * 0.5))
-            proj = np.zeros((4, 4), dtype=np.float32)
-            proj[0, 0] = 2.0 * fl_x / float(out_w)
-            proj[0, 2] = 1.0 - 2.0 * cx / float(out_w)
-            proj[1, 1] = 2.0 * fl_y / float(out_h)
-            proj[1, 2] = 2.0 * cy / float(out_h) - 1.0
-            proj[2, 2] = (far + near) / (near - far)
-            proj[2, 3] = (2.0 * far * near) / (near - far)
-            proj[3, 2] = -1.0
+        K_mat, D_vec = _resolve_k_and_d(intrinsics, dist_coeffs, out_w, out_h, hfov_deg)
+        has_distortion = bool(np.any(np.abs(D_vec) > 1e-7))
+        if has_distortion:
+            K_render, remap_xy = distortion_map(K_mat, D_vec, (out_w, out_h))
         else:
-            aspect = float(out_w) / float(out_h)
-            half_w_tan = math.tan(math.radians(max(10.0, min(120.0, float(hfov_deg)))) * 0.5)
-            vfov_rad = 2.0 * math.atan(half_w_tan / max(aspect, 1e-4))
-            proj = perspective(math.degrees(vfov_rad), aspect, near, far)
+            K_render, remap_xy = K_mat, None
+
+        fl_x = float(K_render[0, 0])
+        fl_y = float(K_render[1, 1])
+        cx = float(K_render[0, 2])
+        cy = float(K_render[1, 2])
+        near, far = 0.05, 2500.0
+        proj = np.zeros((4, 4), dtype=np.float32)
+        proj[0, 0] = 2.0 * fl_x / float(out_w)
+        proj[0, 2] = 1.0 - 2.0 * cx / float(out_w)
+        proj[1, 1] = 2.0 * fl_y / float(out_h)
+        proj[1, 2] = 2.0 * cy / float(out_h) - 1.0
+        proj[2, 2] = (far + near) / (near - far)
+        proj[2, 3] = (2.0 * far * near) / (near - far)
+        proj[3, 2] = -1.0
+
         view_proj = proj @ view
         mvp = (view_proj @ model_mat).astype(np.float32)
         mv = (view @ model_mat).astype(np.float32)
@@ -1207,15 +1556,30 @@ class MeshRenderer:
         self.ctx.viewport = (0, 0, out_w, out_h)
         self.wrist_fbo.depth_mask = True
         self.ctx.clear(0.18, 0.19, 0.22, 1.0)
+        self.wrist_fbo.depth_mask = False
+        self._draw_sky(view, proj, out_h)
+        self.wrist_fbo.depth_mask = True
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = '<'
 
         self._draw_world_scene(
             view_proj,
             model_mat,
-            {"fabric_center": fabric_center, "phys_span": phys_span, "show_board": True},
+            {
+                "fabric_center": fabric_center,
+                "fabric_size": fabric_size,
+                "phys_span": phys_span,
+                "grid_span": grid_span,
+                "joints": joints,
+                "show_board": True,
+                "show_table": True,
+                "show_robot": joints is not None,
+            },
             draw_robot=False,
             draw_frusta=False,
+            draw_shadows=joints is not None,
+            view=view,
+            target_fbo=self.wrist_fbo,
         )
 
         self.ctx.enable(moderngl.CULL_FACE)
@@ -1238,42 +1602,80 @@ class MeshRenderer:
             vao.render(moderngl.TRIANGLES)
 
         raw = self.wrist_fbo.read(components=3, dtype='f1')
-        self.ctx.screen.use()
+        if self.ctx.screen is not None:
+            self.ctx.screen.use()
         img = np.ascontiguousarray(np.flipud(np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3))))
-        if isinstance(intrinsics, dict):
-            k1 = float(intrinsics.get("k1", 0.0))
-            k2 = float(intrinsics.get("k2", 0.0))
-            k3 = float(intrinsics.get("k3", 0.0))
-            p1 = float(intrinsics.get("p1", 0.0))
-            p2 = float(intrinsics.get("p2", 0.0))
-            if any(abs(v) > 1e-7 for v in (k1, k2, k3, p1, p2)):
-                img = self._apply_lens_distortion(img, out_w, out_h, fl_x, fl_y, cx, cy, k1, k2, k3, p1, p2)
+        if remap_xy is not None:
+            img = cv2.remap(img, remap_xy[0], remap_xy[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         return img
 
-    def _apply_lens_distortion(self, img, out_w, out_h, fl_x, fl_y, cx, cy, k1, k2, k3, p1, p2):
-        key = (out_w, out_h, round(fl_x, 3), round(fl_y, 3), round(cx, 3), round(cy, 3),
-               round(k1, 6), round(k2, 6), round(k3, 6), round(p1, 6), round(p2, 6))
-        cached = getattr(self, '_wrist_distort_cache', None)
-        if cached is None or cached[0] != key:
-            v_grid, u_grid = np.mgrid[0:out_h, 0:out_w].astype(np.float32)
-            xd = (u_grid - cx) / max(fl_x, 1e-4)
-            yd = (v_grid - cy) / max(fl_y, 1e-4)
-            x, y = xd.copy(), yd.copy()
-            for _ in range(4):
-                r2 = x * x + y * y
-                radial = np.maximum(1.0 + k1 * r2 + k2 * (r2 ** 2) + k3 * (r2 ** 3), 1e-4)
-                dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
-                dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
-                x = (xd - dx) / radial
-                y = (yd - dy) / radial
-            u_src = np.clip(np.rint(fl_x * x + cx).astype(np.int32), 0, out_w - 1)
-            v_src = np.clip(np.rint(fl_y * y + cy).astype(np.int32), 0, out_h - 1)
-            self._wrist_distort_cache = (key, v_src, u_src)
-        else:
-            _, v_src, u_src = cached
-        return np.ascontiguousarray(img[v_src, u_src])
-
 # %% IMAGE TEXTURE HELPER ─────────────────────────────────────────────────────
+
+def distortion_map(
+    K: np.ndarray,
+    D: np.ndarray,
+    size: tuple[int, int],
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+    import cv2
+
+    w, h = int(size[0]), int(size[1])
+    K_arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    D_arr = np.asarray(D, dtype=np.float64).reshape(-1)
+    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    rays = cv2.undistortPoints(
+        np.stack([u.ravel(), v.ravel()], axis=1).reshape(-1, 1, 2),
+        K_arr,
+        D_arr,
+    ).reshape(-1, 2)
+    focal = float(min(
+        w * 0.5 / max(float(np.abs(rays[:, 0]).max()), 1e-6),
+        h * 0.5 / max(float(np.abs(rays[:, 1]).max()), 1e-6),
+    ))
+    K_render = np.array(
+        [[focal, 0.0, w * 0.5], [0.0, focal, h * 0.5], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    xs = (rays[:, 0] * focal + w * 0.5).reshape(h, w).astype(np.float32)
+    ys = (rays[:, 1] * focal + h * 0.5).reshape(h, w).astype(np.float32)
+    return K_render, (xs, ys)
+
+
+def _resolve_k_and_d(
+    intrinsics: dict[str, float] | tuple[float, ...] | np.ndarray | None,
+    dist_coeffs: tuple[float, ...] | list[float] | np.ndarray | None,
+    width: int,
+    height: int,
+    hfov_deg: float = 55.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    d_from_intr = None
+    if isinstance(intrinsics, np.ndarray) and intrinsics.shape == (3, 3):
+        K = intrinsics.astype(np.float64)
+    elif isinstance(intrinsics, (tuple, list, np.ndarray)) and len(intrinsics) >= 4:
+        fx, fy, cx, cy = (float(v) for v in intrinsics[:4])
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    elif isinstance(intrinsics, dict):
+        default_fx = 0.5 * width / max(math.tan(math.radians(max(10.0, min(120.0, float(hfov_deg)))) * 0.5), 1e-4)
+        fx = float(intrinsics.get("fl_x", intrinsics.get("fx", default_fx)))
+        fy = float(intrinsics.get("fl_y", intrinsics.get("fy", fx)))
+        cx = float(intrinsics.get("cx", width * 0.5))
+        cy = float(intrinsics.get("cy", height * 0.5))
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        d_from_intr = np.array(
+            [float(intrinsics.get(k, 0.0)) for k in ("k1", "k2", "p1", "p2", "k3")],
+            dtype=np.float64,
+        )
+    else:
+        fx = 0.5 * width / max(math.tan(math.radians(max(10.0, min(120.0, float(hfov_deg)))) * 0.5), 1e-4)
+        K = np.array([[fx, 0.0, width * 0.5], [0.0, fx, height * 0.5], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    if dist_coeffs is not None:
+        D = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+    elif d_from_intr is not None:
+        D = d_from_intr
+    else:
+        D = np.zeros(5, dtype=np.float64)
+    return K, D
+
 
 def pil_to_texture(ctx, pil_img):
     """Upload a PIL image as a moderngl texture (RGBA, Y-flipped for GL)."""
