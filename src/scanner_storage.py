@@ -272,6 +272,10 @@ class ScannerStorage:
             state.scanner_status = f"Restore error: {exc}"
             return False
         data.update(restored)
+        if int(data.get("scanner_pattern_repeat_rows", 24)) <= 4:
+            data["scanner_pattern_repeat_rows"] = 24
+        if int(data.get("scanner_pattern_repeat_cols", 24)) <= 4:
+            data["scanner_pattern_repeat_cols"] = 24
         return True
 
     def pattern_signature(self, state) -> str:

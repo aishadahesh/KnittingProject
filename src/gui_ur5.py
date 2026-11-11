@@ -325,7 +325,7 @@ class UR5ModeController:
         sim_renderer = (
             getattr(self.state, "renderer", None)
             if threading.current_thread() is threading.main_thread()
-            else getattr(getattr(self.camera, "backend", None), "_renderer", None)
+            else None
         )
         tile_images, tiles_epoch = (
             scanner_core.ensure_swatch_unit_tile_images(self.state, sim_renderer)

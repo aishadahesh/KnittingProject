@@ -205,9 +205,17 @@ def test_render_unit_cell_tile_and_macro_fabric_sheet():
 
         frame_camera_for_mode(state, "edit")
         edit_dist = float(state.camera.dist)
+        edit_view = state.camera.view()
+        np.testing.assert_allclose(edit_view[0, :3], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(edit_view[1, :3], [0.0, 1.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(edit_view[2, :3], [0.0, 0.0, 1.0], atol=1e-5)
+
         frame_camera_for_mode(state, "scan")
         scan_dist = float(state.camera.dist)
+        scan_view = state.camera.view()
         assert scan_dist > edit_dist
+        assert float(scan_view[1, 2]) > 0.75
+        assert float(scan_view[2, 2]) > 0.30
     finally:
         renderer.close()
         ctx.release()

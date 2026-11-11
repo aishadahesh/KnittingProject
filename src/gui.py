@@ -363,13 +363,13 @@ def frame_camera_for_mode(state, mode=None):
     state.viewport_pan = np.zeros(2, dtype=np.float32)
     state.viewport_zoom = 1.0
     if mode == 'scan':
-        camera.target = np.array([0.25 * grid_span, 0.0, 0.10 * grid_span], dtype=np.float32)
-        camera.dist = max(12.0, 2.2 * grid_span)
+        camera.target = np.array([0.55 * grid_span, 0.05 * grid_span, 0.18 * grid_span], dtype=np.float32)
+        camera.dist = max(12.0, 2.5 * grid_span)
         camera.az = float(np.radians(-35.0))
-        camera.el = float(np.radians(28.0))
+        camera.el = float(np.radians(32.0))
     elif mode == 'capture':
-        camera.target = np.zeros(3, dtype=np.float32)
-        camera.dist = max(10.0, 1.6 * grid_span)
+        camera.target = np.array([0.25 * grid_span, 0.0, 0.10 * grid_span], dtype=np.float32)
+        camera.dist = max(10.0, 1.8 * grid_span)
         camera.az = float(np.radians(-25.0))
         camera.el = float(np.radians(35.0))
     else:
@@ -382,8 +382,8 @@ def frame_camera_for_mode(state, mode=None):
         fov_deg = float(getattr(camera, 'fov_deg', 45.0))
         camera.target = slot.copy()
         camera.dist = max(4.0, 1.35 * swatch_span / max(2.0 * np.tan(np.radians(fov_deg) * 0.5), 0.1))
-        camera.az = 0.0
-        camera.el = float(np.radians(22.0)) if mode == 'model' else 0.0
+        camera.az = float(np.radians(-20.0)) if mode == 'model' else 0.0
+        camera.el = float(np.radians(55.0)) if mode == 'model' else float(np.pi * 0.5)
 
 
 def _set_app_mode(state, mode):
@@ -414,6 +414,9 @@ def _set_app_mode(state, mode):
         state.scanner_preview_grid_enabled = not (mode == 'scan' and str(state.get('_scan_subview', 'scan')) == 'database')
         state.scanner_preview_rows = max(1, int(state.scanner_rows))
         state.scanner_preview_cols = max(1, int(state.scanner_cols))
+        state.model_t = np.zeros(3, dtype=np.float32)
+        state.model_rot = np.zeros(3, dtype=np.float32)
+        state.model_scale = np.ones(3, dtype=np.float32)
         _clamp_scanner_selected_cell(state)
     else:
         if mode == 'edit':
@@ -2347,11 +2350,11 @@ def draw_viewport(state, renderer, ref_tex, window):
     if imgui.small_button("Front View##vp_front"):
         frame_camera_for_mode(state, current_mode)
         state.camera.az = 0.0
-        state.camera.el = 0.0
+        state.camera.el = float(np.pi * 0.5)
     imgui.same_line()
     if imgui.small_button("3D Angle##vp_angle"):
         state.camera.az = float(np.radians(-30.0))
-        state.camera.el = float(np.radians(28.0))
+        state.camera.el = float(np.radians(32.0))
     imgui.same_line()
     if imgui.small_button("Reset Transform##vp_reset_transform"):
         state.model_t = np.zeros(3, dtype=np.float32)
@@ -2380,11 +2383,6 @@ def draw_viewport(state, renderer, ref_tex, window):
     state.vp_origin = np.array([draw_pos.x, draw_pos.y], dtype=np.float32)
     state.vp_scale  = 1.0
 
-    # Build model matrix and render FBO
-    model_mat = state.current_model_matrix()
-    mvp = (state.camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
-    mv  = (state.camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
-    bg_zoom = state.camera.zoom_factor()
     # UR5 Robot Mode shows the same scan preview as Scan Mode, and for the same
     # reason: the viewport is the layout being handed to the robot. Sharing this
     # flag keeps the two previews identical and, just as importantly, keeps the
@@ -2393,6 +2391,10 @@ def draw_viewport(state, renderer, ref_tex, window):
     scanner_stage_active = current_mode in ('scan', 'capture')
     scanner_estimate_mode = scanner_stage_active and str(state.get('scanner_color_mode', 'realistic')) == 'estimated'
     edit_controls_active = current_mode == 'edit'
+    model_mat = np.eye(4, dtype=np.float32) if scanner_stage_active else state.current_model_matrix()
+    mvp = (state.camera.mvp(disp_w, disp_h) @ model_mat).astype(np.float32)
+    mv  = (state.camera.mv(disp_w, disp_h)  @ model_mat).astype(np.float32)
+    bg_zoom = state.camera.zoom_factor()
     if not edit_controls_active:
         state.bbox_active_handle = -1
         state.bbox_hover_handle = -1
@@ -2704,14 +2706,22 @@ def draw_viewport(state, renderer, ref_tex, window):
             hover_handle = best_idx
     state.bbox_hover_handle = hover_handle
 
-    if gizmo_bounds is not None:
+    if gizmo_bounds is not None or scanner_stage_active:
         dl = imgui.get_window_draw_list()
         ox, oy = float(state.vp_origin[0]), float(state.vp_origin[1])
-        x_min, y_min, x_max, y_max = gizmo_bounds
-        if edit_controls_active:
+        vp_sc = max(float(state.vp_scale), 1e-6)
+        if edit_controls_active and gizmo_bounds is not None:
+            x_min, y_min, x_max, y_max = gizmo_bounds
             rect_col = imgui.get_color_u32((0.95, 0.95, 0.95, 0.92))
-            dl.add_rect((ox + x_min, oy + y_min), (ox + x_max, oy + y_max), rect_col, 0.0, 2.0, 0)
-        if scanner_stage_active and scanner_cell_bounds:
+            dl.add_rect(
+                (ox + x_min * vp_sc, oy + y_min * vp_sc),
+                (ox + x_max * vp_sc, oy + y_max * vp_sc),
+                rect_col,
+                0.0,
+                2.0,
+                0,
+            )
+        if scanner_stage_active:
             rows = max(1, int(getattr(state, 'scanner_rows', state.bitmap_size[0])))
             cols = max(1, int(getattr(state, 'scanner_cols', state.bitmap_size[1])))
             if str(state.get('scanner_camera_workflow', 'path')) == 'single':
@@ -2721,69 +2731,44 @@ def draw_viewport(state, renderer, ref_tex, window):
                 selected = np.asarray(getattr(state, 'scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
                 selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
                 selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))
-            grid_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.34))
-            fill_col = imgui.get_color_u32((0.15, 0.85, 1.0, 0.055))
-            selected_fill = imgui.get_color_u32((1.0, 0.78, 0.18, 0.18))
-            selected_line = imgui.get_color_u32((1.0, 0.78, 0.18, 0.92))
-            display_colors, display_stage = _scanner_display_batch_colors(state)
+            selected_line = imgui.get_color_u32((1.0, 0.82, 0.18, 0.96))
+            display_colors, _display_stage = _scanner_display_batch_colors(state)
+            view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
             for r in range(rows):
                 for c in range(cols):
-                    cell_bounds = scanner_cell_bounds[r * cols + c]
-                    if cell_bounds is None:
-                        continue
-                    cx0, cy0, cx1, cy1 = cell_bounds
                     selected_cell = r == selected_r and c == selected_c
-                    if scanner_estimate_mode:
-                        color_idx = r * cols + c
-                        batch_rgb = display_colors[color_idx] if color_idx < len(display_colors) else [42.0, 42.0, 42.0]
-                        batch_fill = imgui.get_color_u32((
-                            float(np.clip(float(batch_rgb[0]) / 255.0, 0.0, 1.0)),
-                            float(np.clip(float(batch_rgb[1]) / 255.0, 0.0, 1.0)),
-                            float(np.clip(float(batch_rgb[2]) / 255.0, 0.0, 1.0)),
-                            0.96,
-                        ))
-                        batch_line = selected_line if selected_cell else imgui.get_color_u32((0.08, 0.08, 0.08, 0.85))
-                        dl.add_rect_filled(
-                            (ox + cx0, oy + cy0),
-                            (ox + cx1, oy + cy1),
-                            batch_fill,
-                        )
-                        dl.add_rect(
-                            (ox + cx0, oy + cy0),
-                            (ox + cx1, oy + cy1),
-                            batch_line,
-                            0.0,
-                            3.0 if selected_cell else 1.5,
-                            0,
-                        )
-                        label = f"R{r + 1} C{c + 1}"
-                        dl.add_text((ox + cx0 + 8, oy + cy0 + 8), imgui.get_color_u32((1.0, 1.0, 1.0, 0.92)), label)
+                    if not scanner_estimate_mode and not selected_cell:
                         continue
-                    color_idx = r * cols + c
-                    if color_idx < len(display_colors):
-                        display_rgb = [float(v) / 255.0 for v in display_colors[color_idx]]
-                        cell_fill = imgui.get_color_u32((
-                            float(np.clip(display_rgb[0], 0.0, 1.0)),
-                            float(np.clip(display_rgb[1], 0.0, 1.0)),
-                            float(np.clip(display_rgb[2], 0.0, 1.0)),
-                            0.24 if display_stage == "actual" else (0.18 if selected_cell else 0.12),
-                        ))
-                    else:
-                        cell_fill = selected_fill if selected_cell else fill_col
-                    dl.add_rect_filled(
-                        (ox + cx0, oy + cy0),
-                        (ox + cx1, oy + cy1),
-                        cell_fill,
-                    )
-                    dl.add_rect(
-                        (ox + cx0, oy + cy0),
-                        (ox + cx1, oy + cy1),
-                        selected_line if selected_cell else grid_col,
-                        0.0,
-                        2.0 if selected_cell else 1.0,
-                        0,
-                    )
-        if edit_controls_active:
+                    if hasattr(state, 'swatch_slot_rect'):
+                        rx0, ry0, rx1, ry1 = state.swatch_slot_rect(r, c)
+                        corners = np.array([
+                            [float(rx0), float(ry0), 0.0],
+                            [float(rx1), float(ry0), 0.0],
+                            [float(rx1), float(ry1), 0.0],
+                            [float(rx0), float(ry1), 0.0],
+                        ], dtype=np.float32)
+                        scr, valid, _ = project_to_screen(transform_points(corners, model_mat), view_proj, disp_w, disp_h)
+                        if not bool(np.all(valid)):
+                            continue
+                        q = [
+                            imgui.ImVec2(ox + float(scr[i, 0]) * vp_sc, oy + float(scr[i, 1]) * vp_sc)
+                            for i in range(4)
+                        ]
+                        if scanner_estimate_mode:
+                            color_idx = r * cols + c
+                            batch_rgb = display_colors[color_idx] if color_idx < len(display_colors) else [42.0, 42.0, 42.0]
+                            batch_fill = imgui.get_color_u32((
+                                float(np.clip(float(batch_rgb[0]) / 255.0, 0.0, 1.0)),
+                                float(np.clip(float(batch_rgb[1]) / 255.0, 0.0, 1.0)),
+                                float(np.clip(float(batch_rgb[2]) / 255.0, 0.0, 1.0)),
+                                0.96,
+                            ))
+                            batch_line = selected_line if selected_cell else imgui.get_color_u32((0.08, 0.08, 0.08, 0.85))
+                            dl.add_quad_filled(q[0], q[1], q[2], q[3], batch_fill)
+                            dl.add_quad(q[0], q[1], q[2], q[3], batch_line, 3.0 if selected_cell else 1.5)
+                        elif selected_cell:
+                            dl.add_quad(q[0], q[1], q[2], q[3], selected_line, 2.5)
+        if edit_controls_active and gizmo_bounds is not None:
             for i, (hx, hy) in enumerate(bounds_handles(gizmo_bounds)):
                 is_hot = (i == hover_handle or i == active_handle)
                 fill = imgui.get_color_u32((0.95, 0.65, 0.10, 1.0) if is_hot else (0.96, 0.96, 0.96, 0.95))

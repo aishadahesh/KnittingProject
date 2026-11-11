@@ -378,19 +378,33 @@ class Camera:
     def __init__(self):
         self.target  = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.dist    = 15.0
-        self.az      = 0.0   # Horizontal angle (rad)
-        self.el      = 0.0   # Vertical angle (rad)
+        self.az      = 0.0
+        self.el      = float(np.pi * 0.5)
         self.fov_deg = 45.0
 
+    def _basis(self):
+        ca, sa = float(np.cos(self.az)), float(np.sin(self.az))
+        ce, se = float(np.cos(self.el)), float(np.sin(self.el))
+        right = np.array([ca, sa, 0.0], dtype=np.float32)
+        up    = np.array([-se * sa, se * ca, ce], dtype=np.float32)
+        back  = np.array([ce * sa, -ce * ca, se], dtype=np.float32)
+        return right, up, back
+
     def _pos(self):
-        y = self.dist * np.sin(self.el)
-        xz = self.dist * np.cos(self.el)
-        x = xz * np.sin(self.az)
-        z = xz * np.cos(self.az)
-        return self.target + np.array([x, y, z], dtype=np.float32)
+        _, _, back = self._basis()
+        return self.target + float(self.dist) * back
 
     def view(self):
-        return look_at(self._pos(), self.target)
+        right, up, back = self._basis()
+        eye = self.target + float(self.dist) * back
+        m = np.eye(4, dtype=np.float32)
+        m[0, :3] = right
+        m[1, :3] = up
+        m[2, :3] = back
+        m[0, 3]  = -float(np.dot(right, eye))
+        m[1, 3]  = -float(np.dot(up, eye))
+        m[2, 3]  = -float(np.dot(back, eye))
+        return m
 
     def proj(self, w, h):
         aspect = max(1.0, w) / max(1.0, h)
@@ -409,7 +423,7 @@ class Camera:
 
     def orbit(self, dx, dy):
         self.az -= dx * 0.005
-        self.el = np.clip(self.el + dy * 0.005, -np.pi/2 + 0.01, np.pi/2 - 0.01)
+        self.el = float(np.clip(self.el + dy * 0.005, np.radians(-15.0), np.pi * 0.5))
 
     def zoom(self, delta):
         self.dist = max(1.0, self.dist - delta)
@@ -1643,29 +1657,62 @@ class MeshRenderer:
                 model_mat, fabric_center, phys_span, grid_span=world_scene.get("grid_span")
             )
 
-        mat = np.eye(4, dtype=np.float32) if model_mat is None else np.asarray(model_mat, dtype=np.float32)
+        if model_mat is not None:
+            scene_center = transform_points(np.zeros((1, 3), dtype=np.float32), model_mat)[0].astype(np.float32)
+        else:
+            scene_center = np.zeros(3, dtype=np.float32)
+        mat = np.eye(4, dtype=np.float32)
+        mat[:3, 3] = scene_center
         mvp = (view_proj @ mat).astype(np.float32)
-        z_lift = 0.0015 * float(units_per_m)
+        z_back = 0.0012 * float(units_per_m)
+        z_lift = 0.0018 * float(units_per_m)
         u_max = float(rep_c)
         v_max = float(rep_r)
 
         self.world_prog['mvp'].write(mvp.T.tobytes())
         self.world_prog['model'].write(mat.T.tobytes())
         self.world_prog['uTex'].value = 0
-        self.world_prog['uUseTex'].value = 1.0
         self.world_prog['uUseVertexCol'].value = 0.0
-        self.world_prog['base_color'].value = (1.0, 1.0, 1.0)
 
         quad_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
         i_buf = self.ctx.buffer(quad_idx.tobytes())
         try:
+            xs0 = [float(s[0]) for s in swatch_slots]
+            ys0 = [float(s[1]) for s in swatch_slots]
+            xs1 = [float(s[2]) for s in swatch_slots]
+            ys1 = [float(s[3]) for s in swatch_slots]
+            bx0, by0, bx1, by1 = min(xs0), min(ys0), max(xs1), max(ys1)
+            pad_x = 0.015 * max(bx1 - bx0, 1.0)
+            pad_y = 0.015 * max(by1 - by0, 1.0)
+            back_verts = np.array([
+                [bx0 - pad_x, by0 - pad_y, z_back, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [bx1 + pad_x, by0 - pad_y, z_back, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [bx1 + pad_x, by1 + pad_y, z_back, 0.0, 0.0, 0.0, 1.0, 1.0],
+                [bx0 - pad_x, by1 + pad_y, z_back, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ], dtype=np.float32)
+            b_buf = self.ctx.buffer(back_verts.tobytes())
+            b_vao = self.ctx.vertex_array(
+                self.world_prog,
+                [(b_buf, '3f 3f 2f', 'in_pos', 'in_norm', 'in_uv')],
+                i_buf,
+            )
+            try:
+                self.world_prog['uUseTex'].value = 0.0
+                self.world_prog['base_color'].value = (0.18, 0.19, 0.22)
+                b_vao.render(moderngl.TRIANGLES)
+            finally:
+                b_vao.release()
+                b_buf.release()
+
+            self.world_prog['uUseTex'].value = 1.0
+            self.world_prog['base_color'].value = (1.0, 1.0, 1.0)
             for idx, (x0, y0, x1, y1) in enumerate(swatch_slots):
                 x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
                 quad_verts = np.array([
-                    [x0f, y0f, z_lift, 0.0, 0.0, 1.0, 0.0, 0.0],
-                    [x1f, y0f, z_lift, 0.0, 0.0, 1.0, u_max, 0.0],
-                    [x1f, y1f, z_lift, 0.0, 0.0, 1.0, u_max, v_max],
-                    [x0f, y1f, z_lift, 0.0, 0.0, 1.0, 0.0, v_max],
+                    [x0f, y0f, z_lift, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [x1f, y0f, z_lift, 0.0, 0.0, 0.0, u_max, 0.0],
+                    [x1f, y1f, z_lift, 0.0, 0.0, 0.0, u_max, v_max],
+                    [x0f, y1f, z_lift, 0.0, 0.0, 0.0, 0.0, v_max],
                 ], dtype=np.float32)
                 v_buf = self.ctx.buffer(quad_verts.tobytes())
                 vao = self.ctx.vertex_array(

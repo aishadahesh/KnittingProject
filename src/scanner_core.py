@@ -236,7 +236,7 @@ def _FallbackUnitTile(state, r: int, c: int) -> np.ndarray:
     if palette.size == 0:
         palette = np.asarray([[0.7, 0.7, 0.7]], dtype=np.float32)
 
-    h, w = 64, 64
+    h, w = 96, 96
     yy = np.linspace(0.0, float(p_rows), h, endpoint=False, dtype=np.float32)[:, None]
     xx = np.linspace(0.0, float(p_cols), w, endpoint=False, dtype=np.float32)[None, :]
     row_idx = np.floor(yy).astype(np.int32) % p_rows
@@ -244,15 +244,19 @@ def _FallbackUnitTile(state, r: int, c: int) -> np.ndarray:
     u = xx - np.floor(xx)
     v = yy - np.floor(yy)
 
-    leg_x = np.where(u < 0.5, 0.5 - 0.32 * v, 0.5 + 0.32 * v)
+    leg_x = np.where(u < 0.5, 0.28 + 0.18 * v, 0.72 - 0.18 * v)
     dist = np.abs(u - leg_x)
-    tube = np.clip(1.0 - (dist / 0.22) ** 2, 0.0, 1.0)
-    ridge = 0.55 + 0.45 * np.sqrt(tube) + 0.08 * np.sin((u * 12.0 + v * 8.0) * np.pi)
+    tube = np.clip(1.0 - (dist / 0.21) ** 2, 0.0, 1.0)
+    arch = np.clip(1.0 - ((u - 0.5) / 0.34) ** 2 - ((v - 0.82) / 0.24) ** 2, 0.0, 1.0)
+    yarn_mask = np.maximum(tube, 0.85 * arch)
+    twist = 0.09 * np.sin((u * 14.0 + np.where(u < 0.5, v, -v) * 10.0) * np.pi)
+    ridge = np.where(yarn_mask > 0.02, 0.38 + 0.58 * np.sqrt(yarn_mask) + twist, 0.18)
 
     active = bitmap[row_idx, col_idx] > 0.5
-    eff_row = np.where(active | (v < 0.45), row_idx, (row_idx - 1) % p_rows)
+    eff_row = np.where(active | (v < 0.48), row_idx, (row_idx - 1) % p_rows)
     base_rgb = palette[eff_row % len(palette)]
-    shaded = np.clip(base_rgb * ridge[:, :, None], 0.0, 1.0)
+    inactive_dim = np.where(active, 1.0, 0.78)[:, :, None]
+    shaded = np.clip(base_rgb * ridge[:, :, None] * inactive_dim, 0.0, 1.0)
     return np.ascontiguousarray((shaded * 255.0 + 0.5).astype(np.uint8))
 
 
@@ -304,48 +308,53 @@ def ensure_swatch_unit_tile_images(state, renderer=None) -> tuple[list[np.ndarra
     lighting = _scanner_lighting_settings(state)
     lighting_sig = tuple(sorted((k, round(float(v), 4)) for k, v in lighting.items()))
 
-    tile_images: list[np.ndarray] = []
+    can_gl = renderer is not None and hasattr(renderer, 'render_unit_cell_tile')
+    max_gl_per_call = 4
+    gl_rendered_count = 0
     regenerated = False
-    for r in range(rows):
-        for c in range(cols):
-            key = _swatch_tile_cache_key(state, r, c, sel_r, sel_c, cols, lighting_sig)
-            cached = cache.get((r, c))
-            if cached is not None and len(cached) == 3:
-                cached_key, cached_is_gl, cached_img = cached
-                if cached_key == key and (cached_is_gl or renderer is None):
-                    tile_images.append(cached_img)
-                    continue
+    mat_uniforms = _scanner_material_uniforms(state) if can_gl else None
 
-            tile_rgb = None
+    coords = [(sel_r, sel_c)] + [
+        (r, c) for r in range(rows) for c in range(cols) if (r, c) != (sel_r, sel_c)
+    ]
+    for r, c in coords:
+        key = _swatch_tile_cache_key(state, r, c, sel_r, sel_c, cols, lighting_sig)
+        cached = cache.get((r, c))
+        if cached is not None and len(cached) == 3:
+            cached_key, cached_is_gl, _cached_img = cached
+            if cached_key == key and (cached_is_gl or not can_gl):
+                continue
+
+        tile_rgb = None
+        is_gl = False
+        if can_gl and gl_rendered_count < max_gl_per_call:
+            try:
+                prepared, colors, center_xy, xp, yp = state.build_swatch_unit_cell_data(r, c)
+                rendered = renderer.render_unit_cell_tile(
+                    prepared, colors, center_xy, xp, yp, mat_uniforms
+                )
+                if (
+                    isinstance(rendered, np.ndarray)
+                    and rendered.ndim == 3
+                    and rendered.shape[2] == 3
+                    and rendered.size > 0
+                ):
+                    tile_rgb = np.ascontiguousarray(rendered, dtype=np.uint8)
+                    is_gl = True
+                    gl_rendered_count += 1
+            except Exception as exc:
+                logging.warning("scanner_core.ensure_swatch_unit_tile_images: %s", exc)
+
+        if tile_rgb is None:
+            if cached is not None and len(cached) == 3 and cached[0] == key:
+                continue
+            tile_rgb = _FallbackUnitTile(state, r, c)
             is_gl = False
-            if renderer is not None and hasattr(renderer, 'render_unit_cell_tile'):
-                try:
-                    prepared, colors, center_xy, xp, yp = state.build_swatch_unit_cell_data(r, c)
-                    rendered = renderer.render_unit_cell_tile(
-                        prepared, colors, center_xy, xp, yp, _scanner_material_uniforms(state)
-                    )
-                    if (
-                        isinstance(rendered, np.ndarray)
-                        and rendered.ndim == 3
-                        and rendered.shape[2] == 3
-                        and rendered.size > 0
-                    ):
-                        tile_rgb = np.ascontiguousarray(rendered, dtype=np.uint8)
-                        is_gl = True
-                except Exception as exc:
-                    logging.warning("scanner_core.ensure_swatch_unit_tile_images: %s", exc)
 
-            if tile_rgb is None:
-                if cached is not None and len(cached) == 3 and cached[0] == key:
-                    tile_images.append(cached[2])
-                    continue
-                tile_rgb = _FallbackUnitTile(state, r, c)
-                is_gl = False
+        cache[(r, c)] = (key, is_gl, tile_rgb)
+        regenerated = True
 
-            cache[(r, c)] = (key, is_gl, tile_rgb)
-            tile_images.append(tile_rgb)
-            regenerated = True
-
+    tile_images = [cache[(r, c)][2] for r in range(rows) for c in range(cols)]
     grid_shape = (rows, cols)
     if state.__dict__.get('_swatch_tiles_grid_shape') != grid_shape:
         object.__setattr__(state, '_swatch_tiles_grid_shape', grid_shape)

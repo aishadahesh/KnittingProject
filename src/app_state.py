@@ -726,27 +726,25 @@ class AppState:
             radius_profiles = [np.full(len(row_pts), radius, dtype=np.float32) for row_pts in ctrl_rows]
             base_colors = list(self.get('scanner_color_variants') or self.row_colors or [self.single_model_color])
 
-        seg = int(self.config['knit_parameters']['segments'])
+        seg = min(int(self.config['knit_parameters']['segments']), 12)
+        loop_res = min(int(self.config['knit_parameters']['loop_res']), 12)
+        tile_config = {
+            **self.config,
+            'knit_parameters': {
+                **self.config['knit_parameters'],
+                'segments': seg,
+                'loop_res': loop_res,
+            },
+        }
         vl = build_spline_mesh(
             ctrl_rows,
             params,
-            self.config,
+            tile_config,
             self._pidx,
             period_offset_x,
             radius_ctrl_rows=radius_profiles,
         )
-        vl, meta = build_surface_fiber_meshes(
-            vl,
-            segments=seg,
-            enabled=self.fiber_geometry_enabled,
-            count=max(1, int(round(float(self.fiber_geometry_count)))),
-            radius=radius,
-            radius_scale=float(self.fiber_geometry_radius_scale),
-            lift=float(self.fiber_geometry_lift),
-            surface_arc=float(self.fiber_geometry_surface_arc),
-            randomness=float(self.fiber_geometry_randomness),
-            twist=float(self.fiber_geometry_twist),
-        )
+        meta = [{'row': i, 'base_row': i} for i in range(len(vl))]
         bounds = self._display_mesh_bounds(vl)
         if bounds is not None:
             min_v, max_v = bounds
@@ -1748,7 +1746,7 @@ class AppState:
         else:
             self.save_params(target_path, silent=True)
 
-    def load_params(self, path, *, restore_mode=False):
+    def load_params(self, path, *, restore_mode=False, rebuild_mesh=True):
         with self.sim_lock:
             previous = self._data
             camera = {attr: self._clone(getattr(self.camera, attr)) for attr in self.camera_attributes}
@@ -1780,6 +1778,10 @@ class AppState:
                         if default.ndim == 1 and default.size and value.shape != default.shape and key != 'row_visible':
                             raise ValueError(f'{key} must have shape {default.shape}')
                     self._data[key] = value
+                if int(self._data.get('scanner_pattern_repeat_rows', 24)) <= 4:
+                    self._data['scanner_pattern_repeat_rows'] = 24
+                if int(self._data.get('scanner_pattern_repeat_cols', 24)) <= 4:
+                    self._data['scanner_pattern_repeat_cols'] = 24
                 for attr in self.camera_attributes:
                     key = f'camera_{attr}'
                     if key in gui_state:
@@ -1815,8 +1817,9 @@ class AppState:
                         self._reconcile_rows_after_anchor(pre_anchor_bitmap)
                     else:
                         self.param_ref_ctrl_rows = self._fresh_rebuild_rows()
-                uploading = True
-                self.rebuild_spline_mesh(preserve_model_placement=False)
+                if rebuild_mesh:
+                    uploading = True
+                    self.rebuild_spline_mesh(preserve_model_placement=False)
                 self.load_path = path
                 self.status_msg = _with_anchor_note(f'Loaded {os.path.basename(path)}', anchored_columns)
                 return True

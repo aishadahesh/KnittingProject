@@ -117,16 +117,17 @@ def main(robot="sim", camera_source="sim"):
 
         work_params_path = state.load_path
         initial_params_path = str(paths.INITIAL_PARAMS_JSON)
+        has_work_params = os.path.exists(work_params_path)
 
         if os.path.exists(initial_params_path):
-            if not state.load_params(initial_params_path):
-                state.rebuild_spline_from_params()
+            if not state.load_params(initial_params_path, rebuild_mesh=not has_work_params):
+                state.rebuild_spline_from_params(rebuild_mesh=not has_work_params)
         else:
-            state.rebuild_spline_from_params()
+            state.rebuild_spline_from_params(rebuild_mesh=not has_work_params)
         state.capture_initial_state()
 
-        if os.path.exists(work_params_path):
-            if not state.load_params(work_params_path, restore_mode=True):
+        if has_work_params:
+            if not state.load_params(work_params_path, restore_mode=True, rebuild_mesh=False):
                 state.restore_snapshot(state._initial_snapshot)
         state.load_path = work_params_path
         state.save_path = work_params_path
@@ -134,6 +135,23 @@ def main(robot="sim", camera_source="sim"):
         state.scanner_execution_mode = "simulation" if str(robot) == "sim" else "robot"
         if str(camera_source).isdigit():
             state.ur5_camera_device = int(camera_source)
+        scanner_storage = ScannerStorage(paths.PROJECT_ROOT)
+        object.__setattr__(state, "scanner_storage", scanner_storage)
+        if scanner_storage.restore_scanner_state(state):
+            state.scanner_status = "Restored previous scanner database state"
+        if int(state.get("scanner_pattern_repeat_rows", 24)) <= 4:
+            state.scanner_pattern_repeat_rows = 24
+        if int(state.get("scanner_pattern_repeat_cols", 24)) <= 4:
+            state.scanner_pattern_repeat_cols = 24
+        if str(state.get("app_mode", "edit")) in ("scan", "capture"):
+            state.scanner_preview_grid_enabled = True
+            state.scanner_preview_rows = max(1, int(state.scanner_rows))
+            state.scanner_preview_cols = max(1, int(state.scanner_cols))
+            state.model_t = np.zeros(3, dtype=np.float32)
+            state.model_rot = np.zeros(3, dtype=np.float32)
+            state.model_scale = np.ones(3, dtype=np.float32)
+        state.rebuild_spline_mesh(preserve_model_placement=True)
+        frame_camera_for_mode(state)
         from gui_ur5 import UR5ModeController
         ur5_ctl = UR5ModeController(state, ctx, window)
         state.ur5_controller = ur5_ctl
@@ -142,16 +160,6 @@ def main(robot="sim", camera_source="sim"):
                 connect_robot=(str(robot) == "sim"),
                 start_cam=(str(camera_source) == "sim"),
             )
-        scanner_storage = ScannerStorage(paths.PROJECT_ROOT)
-        object.__setattr__(state, "scanner_storage", scanner_storage)
-        if scanner_storage.restore_scanner_state(state):
-            state.scanner_status = "Restored previous scanner database state"
-            if str(state.get("app_mode", "edit")) == "scan":
-                state.scanner_preview_grid_enabled = True
-                state.scanner_preview_rows = max(1, int(state.scanner_rows))
-                state.scanner_preview_cols = max(1, int(state.scanner_cols))
-                state.rebuild_spline_mesh(preserve_model_placement=True)
-        frame_camera_for_mode(state)
 
         # ── Background simulation thread ──────────────────────────────────────────
         def sim_may_run(state):
