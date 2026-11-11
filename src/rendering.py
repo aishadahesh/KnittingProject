@@ -1,5 +1,8 @@
 import logging
 import math
+import tempfile
+import threading
+from pathlib import Path
 import cv2
 import numpy as np
 import moderngl
@@ -615,6 +618,26 @@ _UR5E_LINK_FILES = (
     ("wrist_3_link", ("wrist3.obj",)),
 )
 _UR5E_VISUAL_CACHE = None
+_CHARUCO_RGB_CACHE = {}
+_ENV_ASSET_LOCK = threading.Lock()
+
+
+def _get_charuco_board_rgb(spec, w_sheet, h_sheet):
+    key = (int(spec["squares_x"]), int(spec["squares_y"]), round(float(w_sheet), 4), round(float(h_sheet), 4))
+    with _ENV_ASSET_LOCK:
+        cached = _CHARUCO_RGB_CACHE.get(key)
+        if cached is not None:
+            return cached
+        page = charuco.board_image(
+            spec,
+            px_per_mm=4.0,
+            page_mm=(w_sheet * 1000.0, h_sheet * 1000.0),
+        )
+        paper = np.clip(24 + (page.astype(np.uint16) * (242 - 24)) // 255, 0, 255).astype(np.uint8)
+        rgb = np.ascontiguousarray(np.dstack((paper, paper, paper)))
+        res = (rgb.shape[1], rgb.shape[0], rgb.tobytes())
+        _CHARUCO_RGB_CACHE[key] = res
+        return res
 
 
 def _parse_obj_mesh(path):
@@ -650,20 +673,53 @@ def _parse_obj_mesh(path):
 
 def _load_ur5e_visual_meshes():
     global _UR5E_VISUAL_CACHE
-    if _UR5E_VISUAL_CACHE is not None:
-        return _UR5E_VISUAL_CACHE
-    meshes = []
-    mesh_dir = paths.UR5E_MESHES_DIR
-    for link_idx, filenames in _UR5E_LINK_FILES:
-        for fname in filenames:
-            fpath = mesh_dir / fname
-            if not fpath.is_file():
-                continue
-            parsed = _parse_obj_mesh(fpath)
-            if parsed is not None:
-                meshes.append((link_idx, *parsed))
-    _UR5E_VISUAL_CACHE = meshes
-    return meshes
+    with _ENV_ASSET_LOCK:
+        if _UR5E_VISUAL_CACHE is not None:
+            return _UR5E_VISUAL_CACHE
+        cache_file = Path(tempfile.gettempdir()) / "knitting_ur5e_visual_v1.npz"
+        if cache_file.is_file():
+            try:
+                with np.load(cache_file, allow_pickle=False) as z:
+                    count = int(z["count"])
+                    meshes = [
+                        (
+                            str(z[f"link_{i}"]),
+                            bytes(z[f"v_{i}"].tobytes()),
+                            bytes(z[f"n_{i}"].tobytes()),
+                            bytes(z[f"t_{i}"].tobytes()),
+                            int(z[f"cnt_{i}"]),
+                            tuple(float(x) for x in z[f"col_{i}"]),
+                        )
+                        for i in range(count)
+                    ]
+                _UR5E_VISUAL_CACHE = meshes
+                return meshes
+            except Exception:
+                pass
+        meshes = []
+        mesh_dir = paths.UR5E_MESHES_DIR
+        for link_idx, filenames in _UR5E_LINK_FILES:
+            for fname in filenames:
+                fpath = mesh_dir / fname
+                if not fpath.is_file():
+                    continue
+                parsed = _parse_obj_mesh(fpath)
+                if parsed is not None:
+                    meshes.append((link_idx, *parsed))
+        try:
+            payload = {"count": np.array(len(meshes), dtype=np.int32)}
+            for i, (link_idx, vb, nb, tb, n_idx, col) in enumerate(meshes):
+                payload[f"link_{i}"] = np.array(link_idx)
+                payload[f"v_{i}"] = np.frombuffer(vb, dtype=np.uint8)
+                payload[f"n_{i}"] = np.frombuffer(nb, dtype=np.uint8)
+                payload[f"t_{i}"] = np.frombuffer(tb, dtype=np.uint8)
+                payload[f"cnt_{i}"] = np.array(n_idx, dtype=np.int32)
+                payload[f"col_{i}"] = np.array(col, dtype=np.float32)
+            np.savez(cache_file, **payload)
+        except Exception:
+            pass
+        _UR5E_VISUAL_CACHE = meshes
+        return meshes
 
 # %% MESH RENDERER ────────────────────────────────────────────────────────────
 
@@ -1181,14 +1237,8 @@ class MeshRenderer:
         h_sheet = h_pat + 2.0 * border
 
         if self.charuco_tex is None:
-            page = charuco.board_image(
-                spec,
-                px_per_mm=8.0,
-                page_mm=(w_sheet * 1000.0, h_sheet * 1000.0),
-            )
-            paper = np.clip(24 + (page.astype(np.uint16) * (242 - 24)) // 255, 0, 255).astype(np.uint8)
-            rgb = np.dstack((paper, paper, paper))
-            self.charuco_tex = self.ctx.texture((rgb.shape[1], rgb.shape[0]), 3, rgb.tobytes())
+            cw, ch, cbytes = _get_charuco_board_rgb(spec, w_sheet, h_sheet)
+            self.charuco_tex = self.ctx.texture((cw, ch), 3, cbytes)
             self.charuco_tex.build_mipmaps()
             self.charuco_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
 

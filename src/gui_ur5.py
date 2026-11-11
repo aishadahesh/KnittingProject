@@ -414,7 +414,13 @@ class UR5ModeController:
     # -- camera ------------------------------------------------------------
 
     def scan_devices(self) -> None:
-        self.devices = self._simulated_cameras() + robot_camera.list_devices()
+        sim_spec = [{
+            "backend": "sim",
+            "index": -1,
+            "label": "Simulated wrist camera (3D world)",
+            "is_real": False,
+        }]
+        self.devices = sim_spec + self._simulated_cameras() + robot_camera.list_devices()
         real = [d for d in self.devices if d.get("is_real")]
         self.status = (
             f"Found {len(real)} camera(s)" if real
@@ -1188,7 +1194,7 @@ class UR5ModeController:
         ok = self.robot.connect(ip)
         failure = self.robot.last_exception
         self.blocking_program = failure if isinstance(failure, ur5_robot.ProgramAlreadyRunning) else None
-        if ok:
+        if ok and transport_kind != "sim":
             self.scan_devices()
         self.status = self.robot.status
         return ok
