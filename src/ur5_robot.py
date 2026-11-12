@@ -595,7 +595,7 @@ class SimUR5Transport(UR5Transport):
     name = "sim"
     is_real = False
 
-    def __init__(self, max_joint_speed_deg: float = 45.0, floor_seconds: float = 0.08, tool_offset: float = 0.0306):
+    def __init__(self, max_joint_speed_deg: float = 45.0, floor_seconds: float = 0.08, tool_offset: float = scan_geometry.ENDOSCOPE_TIP_OFFSET):
         self.max_joint_speed_deg = float(max_joint_speed_deg)
         self.floor_seconds = float(floor_seconds)
         self.tool_offset = float(tool_offset)

@@ -165,7 +165,7 @@ def test_a_jog_down_asks_for_the_same_spot_one_step_lower(controller, monkeypatc
     controller.robot.transport._joints = np.array(HOME_JOINTS)
     controller.robot.refresh()
     before = controller.camera_height_over_fabric(HOME_JOINTS)
-    camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
+    camera = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     controller._jog_loop(np.array([0.0, 0.0, -0.02]))
 
     assert len(flown) == 1
@@ -180,7 +180,7 @@ def test_a_sideways_jog_keeps_the_height_and_moves_one_step(controller, monkeypa
     monkeypatch.setattr(controller, "_fly_over", lambda xy, height, stop=None: flown.append((np.asarray(xy, dtype=float), height)))
     controller.robot.transport._joints = np.array(HOME_JOINTS)
     controller.robot.refresh()
-    camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
+    camera = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     controller._jog_loop(np.array([0.01, 0.0, 0.0]))
 
     assert np.linalg.norm(flown[0][0] - camera[:2]) == pytest.approx(0.01, abs=1e-6)
@@ -231,7 +231,7 @@ def test_grid_stations_spread_with_the_capture_height():
 
     pose = np.r_[0.0, 0.5, 0.40, np.pi, 0.0, 0.0]
     for height in (0.05, 0.10):
-        views, _ = scan_geometry.grid_views(pose, 1, 3, height, 0.10, 0.20, 0.0306, None, 55.0, 0.3)
+        views, _ = scan_geometry.grid_views(pose, 1, 3, height, 0.10, 0.20, scan_geometry.ENDOSCOPE_TIP_OFFSET, None, 55.0, 0.3)
         steps = np.linalg.norm(np.diff([view.position for view in views], axis=0), axis=1)
         assert steps == pytest.approx([scan_geometry.frame_side(height, 55.0) * 0.7] * 2, abs=1e-9)
 
@@ -241,14 +241,14 @@ def test_a_pose_the_arm_reaches_is_solved_even_from_a_start_facing_away():
     import scan_geometry
 
     fabric_z = scan_geometry.fabric_height(0.20)
-    camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
+    camera = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     view = scan_geometry.Viewpoint("below", np.r_[camera[:2], fabric_z + 0.06],
                                    scan_geometry.looking_down_along([1.0, 0.0]), elevation_deg=90.0)
     facing_away = np.array(HOME_JOINTS) + np.radians([120.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    solver = (fabric_z, 0.0306, None)
+    solver = (fabric_z, scan_geometry.ENDOSCOPE_TIP_OFFSET, None)
 
     solved = scan_geometry._solve(solver, view, facing_away, leaving=True)
-    reached = scan_geometry.camera_point(scan_geometry.flange_pose(solved.config), 0.0306)
+    reached = scan_geometry.camera_point(scan_geometry.flange_pose(solved.config), scan_geometry.ENDOSCOPE_TIP_OFFSET)
     assert reached == pytest.approx(view.position, abs=scan_geometry.UNREACHED_POS)
 
 
@@ -262,7 +262,7 @@ def test_a_ruler_gap_moves_the_unmarked_fabric_to_where_it_is(controller, monkey
 
     import gui_ur5
 
-    camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
+    camera = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     assert controller.camera_height_over_fabric(HOME_JOINTS) == pytest.approx(0.30, abs=1e-6)
     assert controller.state.get("teleop_fabric_z") == pytest.approx(camera[2] - 0.30, abs=1e-6)
     assert gui_ur5._capture_settings(controller.state)["fabric_z"] == pytest.approx(camera[2] - 0.30, abs=1e-6)
@@ -282,7 +282,7 @@ def test_a_jog_down_past_the_floor_stops_at_the_floor(controller, monkeypatch):
     monkeypatch.setattr(controller, "_fly_over", lambda xy, height, stop=None: flown.append(height))
     controller.robot.transport._joints = np.array(HOME_JOINTS)
     controller.robot.refresh()
-    camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
+    camera = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     controller.state.teleop_fabric_z = float(camera[2] - 0.071)
     controller._jog_loop(np.array([0.0, 0.0, -0.05]))
     assert flown == [pytest.approx(gui_ur5.CAPTURE_HEIGHT_MIN)]
@@ -341,7 +341,7 @@ def test_setting_the_height_moves_corners_marked_over_a_guess_onto_it(controller
     controller.robot.transport._joints = np.array(HOME_JOINTS)
     controller.set_fabric_gap(0.30)
 
-    plane = scan_geometry.camera_position(HOME_JOINTS, 0.0306)[2] - 0.30
+    plane = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)[2] - 0.30
     assert controller.state.get("teleop_fabric_z") == pytest.approx(plane, abs=1e-6)
     assert [corner[2] for corner in controller.state.get("teleop_fabric_corners")] == [pytest.approx(plane)] * 2
     assert gui_ur5._capture_settings(controller.state)["fabric_z"] == pytest.approx(plane, abs=1e-6)
@@ -362,7 +362,7 @@ def test_measuring_by_parallax_finds_the_fabric_height(controller, monkeypatch):
     from PIL import Image
 
     gap = 0.12
-    camera = scan_geometry.camera_position(HOME_JOINTS, 0.0306)
+    camera = scan_geometry.camera_position(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     focal = gaussian_splatting.intrinsics_from_fov(1280, 720, float(controller.state.get("ur5_splat_fov", 55.0)))["fl_x"]
     view = scan_geometry.Viewpoint("here", camera, np.zeros(3))
     monkeypatch.setattr(controller, "check_in_background", lambda: None)
@@ -392,7 +392,7 @@ def test_capturing_from_here_takes_the_height_the_camera_stands_at(controller, m
 
     monkeypatch.setattr(controller, "check_in_background", lambda: None)
 
-    camera = scan_geometry.camera_position(HOME_JOINTS, float(controller.state.get("teleop_tool_offset", 0.0306)))
+    camera = scan_geometry.camera_position(HOME_JOINTS, float(controller.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
     controller.state.teleop_fabric_z = float(camera[2]) - 0.09
     controller.robot.transport._joints = np.array(HOME_JOINTS)
     controller.adopt_camera_height()
@@ -404,7 +404,7 @@ def test_capturing_from_here_takes_the_height_the_camera_stands_at(controller, m
 def test_teaching_z_refuses_a_camera_outside_the_offered_range(controller):
     import scan_geometry
 
-    camera = scan_geometry.camera_position(HOME_JOINTS, float(controller.state.get("teleop_tool_offset", 0.0306)))
+    camera = scan_geometry.camera_position(HOME_JOINTS, float(controller.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
     controller.state.teleop_fabric_z = float(camera[2]) - 0.60
     controller.robot.transport._joints = np.array(HOME_JOINTS)
     before = controller.state.get("teleop_camera_height")
@@ -456,7 +456,7 @@ def test_the_grid_looks_straight_down_from_the_asked_height():
             assert point.position[2] - fabric_z == pytest.approx(0.09, abs=1e-6)
         assert Rotation.from_rotvec(point.rotvec).apply([0.0, 0.0, 1.0]) == pytest.approx([0.0, 0.0, -1.0], abs=1e-6)
 
-    flown = [scan_geometry.camera_point(scan_geometry.flange_pose(q), 0.0306) for q in plan.configs]
+    flown = [scan_geometry.camera_point(scan_geometry.flange_pose(q), scan_geometry.ENDOSCOPE_TIP_OFFSET) for q in plan.configs]
     assert np.max(np.abs(np.array(flown) - plan.poses[:, :3])) < scan_geometry.UNREACHED_POS
 
 
@@ -554,27 +554,27 @@ def test_only_the_move_out_of_where_the_arm_stands_may_start_on_the_fabric():
     import scan_geometry
 
     low = _below_home(0.30)
-    resting = scan_geometry.lowest_point(low, 0.0306)
-    assert resting < scan_geometry.lowest_point(HOME_JOINTS, 0.0306) - 0.10
+    resting = scan_geometry.lowest_point(low, scan_geometry.ENDOSCOPE_TIP_OFFSET)
+    assert resting < scan_geometry.lowest_point(HOME_JOINTS, scan_geometry.ENDOSCOPE_TIP_OFFSET) - 0.10
 
     lifted = _below_home(0.10)
     lift = scan_geometry.Viewpoint("lift", np.zeros(3), np.zeros(3), config=lifted)
-    scan_geometry.check_move(lift, low, resting, 0.0306, leaving=True)
+    scan_geometry.check_move(lift, low, resting, scan_geometry.ENDOSCOPE_TIP_OFFSET, leaving=True)
     assert lift.floor < scan_geometry.FABRIC_CLEARANCE
     assert lift.clear, lift.problems
 
     planned = scan_geometry.Viewpoint("lift", np.zeros(3), np.zeros(3), config=lifted)
-    scan_geometry.check_move(planned, low, resting, 0.0306)
+    scan_geometry.check_move(planned, low, resting, scan_geometry.ENDOSCOPE_TIP_OFFSET)
     assert planned.floor == scan_geometry.FABRIC_CLEARANCE
     assert not planned.clear
 
     stay = scan_geometry.Viewpoint("stay", np.zeros(3), np.zeros(3), config=low.copy())
-    scan_geometry.check_move(stay, low, resting, 0.0306, leaving=True)
+    scan_geometry.check_move(stay, low, resting, scan_geometry.ENDOSCOPE_TIP_OFFSET, leaving=True)
     assert not stay.clear
     assert "stands" in "; ".join(stay.problems)
 
     descent = scan_geometry.Viewpoint("down onto it", np.zeros(3), np.zeros(3), config=low.copy())
-    scan_geometry.check_move(descent, np.asarray(HOME_JOINTS), resting + 0.01, 0.0306, leaving=True)
+    scan_geometry.check_move(descent, np.asarray(HOME_JOINTS), resting + 0.01, scan_geometry.ENDOSCOPE_TIP_OFFSET, leaving=True)
     assert descent.floor == scan_geometry.FABRIC_CLEARANCE
     assert not descent.clear
     assert "BELOW the fabric plane" in "; ".join(descent.problems)
@@ -599,7 +599,7 @@ def test_an_orbit_circles_the_fabric_under_the_camera_not_a_point_inside_the_tab
     import scan_geometry
 
     low = _below_home(0.30)
-    fabric_z = scan_geometry.lowest_point(low, 0.0306) - 0.01
+    fabric_z = scan_geometry.lowest_point(low, scan_geometry.ENDOSCOPE_TIP_OFFSET) - 0.01
     plan = scan_geometry.build_capture_plan(low, pattern="orbit", count=3, rings=1, fabric_z=fabric_z)
 
     assert plan.subject[2] == pytest.approx(fabric_z)
@@ -648,7 +648,7 @@ def test_a_taught_view_is_never_moved_only_kept_or_skipped():
 
     low = _below_home(0.30)
     taught = [{"name": "good", "joints": HOME_JOINTS}, {"name": "on the cloth", "joints": list(low)}]
-    fabric_z = scan_geometry.lowest_point(low, 0.0306) - 0.005
+    fabric_z = scan_geometry.lowest_point(low, scan_geometry.ENDOSCOPE_TIP_OFFSET) - 0.005
 
     plan = scan_geometry.build_capture_plan(HOME_JOINTS, pattern="taught", taught=taught, fabric_z=fabric_z)
     assert plan.view_names == ["good"]

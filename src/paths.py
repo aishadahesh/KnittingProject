@@ -45,6 +45,8 @@ MODELS_DIR = PROJECT_ROOT / "models"
 MOBILESAM_DIR = MODELS_DIR / "mobilesam"
 UR5E_URDF = ASSETS_DIR / "ur5e" / "robot.urdf"
 UR5E_MESHES_DIR = ASSETS_DIR / "ur5e" / "meshes"
+# The printed endoscope mount (hardware/endoscope_holder/endoscope_flange_mount_v3.scad): mm, z = 0 on the flange face.
+ENDOSCOPE_MOUNT_STL = ASSETS_DIR / "endoscope_flange_mount.stl"
 
 # Dear ImGui's window layout. Written by the UI at runtime rather than being
 # configuration anyone edits, so it stays out of config/.

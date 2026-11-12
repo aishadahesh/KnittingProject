@@ -125,7 +125,7 @@ class TeleopAppTransport(ur5_robot.UR5Transport):
         """
         return self.on_hardware
 
-    def __init__(self, target=DEFAULT_TARGET, fleet_python=DEFAULT_FLEET_PYTHON, client_factory=TeleopClient, tool_offset=0.0306,
+    def __init__(self, target=DEFAULT_TARGET, fleet_python=DEFAULT_FLEET_PYTHON, client_factory=TeleopClient, tool_offset=geo.ENDOSCOPE_TIP_OFFSET,
                  max_joint_speed_deg=12.0, floor_seconds=6.0):
         self.target = target
         self.tool_offset = float(tool_offset)

@@ -844,6 +844,23 @@ def _load_ur5e_visual_meshes():
         _UR5E_VISUAL_CACHE = meshes
         return meshes
 
+_ENDOSCOPE_MOUNT_RGB = (0.90, 0.89, 0.86)
+
+
+def _load_endoscope_mount_mesh():
+    """The printed flange mount as a robot visual mesh on the "flange" frame; binary STL in mm, returned in metres."""
+    data = paths.ENDOSCOPE_MOUNT_STL.read_bytes()
+    count = int(np.frombuffer(data, dtype="<u4", count=1, offset=80)[0])
+    facet = np.dtype([("normal", "<f4", 3), ("verts", "<f4", (3, 3)), ("attr", "<u2")])
+    tris = np.frombuffer(data, dtype=facet, count=count, offset=84)["verts"] * np.float32(0.001)
+    normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    verts = np.ascontiguousarray(tris.reshape(-1, 3), dtype=np.float32)
+    vert_normals = np.ascontiguousarray(np.repeat(normals, 3, axis=0), dtype=np.float32)
+    indices = np.arange(len(verts), dtype=np.int32)
+    return "flange", verts.tobytes(), vert_normals.tobytes(), indices.tobytes(), len(verts), _ENDOSCOPE_MOUNT_RGB
+
+
 # %% MESH RENDERER ────────────────────────────────────────────────────────────
 
 class MeshRenderer:
@@ -1378,7 +1395,7 @@ class MeshRenderer:
             self.charuco_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
 
         if not self.robot_vaos:
-            for link_idx, pos_b, norm_b, tri_b, _n_idx, color in _load_ur5e_visual_meshes():
+            for link_idx, pos_b, norm_b, tri_b, _n_idx, color in (*_load_ur5e_visual_meshes(), _load_endoscope_mount_mesh()):
                 p_buf = self.ctx.buffer(pos_b)
                 n_buf = self.ctx.buffer(norm_b)
                 i_buf = self.ctx.buffer(tri_b)

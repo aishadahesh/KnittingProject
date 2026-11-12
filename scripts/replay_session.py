@@ -114,7 +114,7 @@ def main() -> None:
     parser.add_argument("session", nargs="?", help="a scan folder's name under robot_scans")
     parser.add_argument("--list", action="store_true", help="list the scans under robot_scans")
     parser.add_argument("--tool-offset", type=float, default=None,
-                        help=f"the camera point's distance along the flange (default: config/params.json, else {session_replay.DEFAULT_TOOL_OFFSET})")
+                        help=f"the camera point's distance along the flange (default: config/params.json, else {session_replay.scan_geometry.ENDOSCOPE_TIP_OFFSET})")
     parser.add_argument("--snapshot", type=Path, help="render one frame to this PNG instead of opening the viewer")
     parser.add_argument("--picture", type=int, default=1, help="the picture to start on (1 is the first)")
     args = parser.parse_args()

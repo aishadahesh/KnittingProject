@@ -288,7 +288,7 @@ class UR5ModeController:
 
     def _sim_camera_pose_provider(self):
         joints = self.robot.refresh().joints
-        tool_offset = float(self.state.get("teleop_tool_offset", 0.0306))
+        tool_offset = float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET))
         pos, rotvec = scan_geometry.camera_pose(joints, tool_offset)
         pose = [*pos, *rotvec]
         fov = float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES))
@@ -728,7 +728,7 @@ class UR5ModeController:
 
     def _jog_loop(self, step) -> None:
         try:
-            position, rotvec = scan_geometry.camera_pose(self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", 0.0306)))
+            position, rotvec = scan_geometry.camera_pose(self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
             axes = scan_geometry.camera_rotation(rotvec, _image_turn(self.state))
             right, down = (np.r_[axes[:2, column], 0.0] / max(float(np.linalg.norm(axes[:2, column])), 1e-9) for column in (0, 1))
             target = position + step[0] * right - step[1] * down
@@ -755,7 +755,7 @@ class UR5ModeController:
             self.status = "Corner not marked: set the fabric height first (Measure with the camera, or a ruler gap)"
             return
         try:
-            position, rotvec = scan_geometry.camera_pose(self.robot.joints_now(), float(self.state.get("teleop_tool_offset", 0.0306)))
+            position, rotvec = scan_geometry.camera_pose(self.robot.joints_now(), float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
             corner = scan_geometry.fabric_point_below(position, rotvec, _settings_fabric_z(self.state, None),
                                                       float(self.state.get("teleop_subject_distance", 0.20)))
         except Exception as exc:
@@ -780,7 +780,7 @@ class UR5ModeController:
             self.status = "Outline not set: set the fabric height first (Measure with the camera, or a ruler gap)"
             return
         try:
-            position, rotvec = scan_geometry.camera_pose(self.robot.joints_now(), float(self.state.get("teleop_tool_offset", 0.0306)))
+            position, rotvec = scan_geometry.camera_pose(self.robot.joints_now(), float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
             _, mask = fabric_detector.coverage(frame.image)
             corners = scan_geometry.outline_from_mask(mask, position, rotvec, _image_turn(self.state), _settings_fabric_z(self.state, None),
                                                       float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)))
@@ -809,7 +809,7 @@ class UR5ModeController:
         try:
             region = _fabric_region(self.state)
             here = region.centre[:2] if region is not None and region.has_outline else scan_geometry.camera_position(
-                self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", 0.0306)))[:2]
+                self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))[:2]
             here = np.asarray(here, dtype=float)
             self.status = "Calibrating the camera: looking straight down at the fabric"
             view = self._fly_over(here, CALIBRATION_HEIGHT, stop)
@@ -927,7 +927,7 @@ class UR5ModeController:
 
     def camera_height_over_fabric(self, joints) -> float:
         """How far the camera stands over the fabric plane with the arm in `joints`."""
-        camera = scan_geometry.camera_position(joints, float(self.state.get("teleop_tool_offset", 0.0306)))
+        camera = scan_geometry.camera_position(joints, float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
         return float(camera[2] - _settings_fabric_z(self.state, None))
 
     def adopt_camera_height(self, joints=None, overview=False) -> None:
@@ -982,7 +982,7 @@ class UR5ModeController:
         """Put the fabric plane `gap` under the camera in `joints`."""
         if gap <= 0.0:
             raise RuntimeError("the gap must be more than 0 cm")
-        camera = scan_geometry.camera_position(joints, float(self.state.get("teleop_tool_offset", 0.0306)))
+        camera = scan_geometry.camera_position(joints, float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
         self._set_fabric_plane(float(camera[2] - float(gap)))
 
     def _set_fabric_plane(self, z: float) -> None:
@@ -1007,7 +1007,7 @@ class UR5ModeController:
         the picture slipped. As true as the lens field of view under 1 Setup > Calibration."""
         stop = self._centring_stop
         try:
-            position, _ = scan_geometry.camera_pose(self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", 0.0306)))
+            position, _ = scan_geometry.camera_pose(self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))
             here, height = position[:2], float(position[2] - _settings_fabric_z(self.state, None))
             self.status = "Measuring the fabric height: looking straight down"
             view = self._fly_over(here, height, stop)
@@ -1086,7 +1086,7 @@ class UR5ModeController:
         try:
             region = _fabric_region(self.state)
             start = region.centre[:2] if region is not None and region.has_outline else scan_geometry.camera_position(
-                self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", 0.0306)))[:2]
+                self.robot.refresh().joints, float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)))[:2]
             here = np.asarray(start, dtype=float)
 
             self.status = "Centring: looking at the fabric from above"
@@ -1129,7 +1129,7 @@ class UR5ModeController:
         A touched corner measures the fabric's height, so it sets the plane (and moves the other
         corners onto it); three or more give the outline that keeps every automatic frame on the cloth.
         """
-        tool_offset = float(self.state.get("teleop_tool_offset", 0.0306))
+        tool_offset = float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET))
         try:
             corner = scan_geometry.camera_position(self.robot.joints_now(), tool_offset)
             at_home = float(scan_geometry.camera_position(ur5_robot.DEFAULT_HOME_JOINTS, tool_offset)[2])
@@ -1161,7 +1161,7 @@ class UR5ModeController:
         try:
             path = taught_set_path(name)
             path.parent.mkdir(parents=True, exist_ok=True)
-            write_json(path, {"name": path.stem, "tool_offset": float(self.state.get("teleop_tool_offset", 0.0306)),
+            write_json(path, {"name": path.stem, "tool_offset": float(self.state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)),
                                         "views": views}, indent=2)
         except Exception as exc:
             self.status = f"Could not save taught views: {exc}"
@@ -1939,7 +1939,7 @@ def _capture_settings(state) -> dict:
         orbit_radius      = float(state.get("teleop_orbit_radius", 0.10)),
         max_tilt_deg      = float(state.get("teleop_max_tilt", 35.0)),
         image_turn        = _image_turn(state),
-        tool_offset       = float(state.get("teleop_tool_offset", 0.0306)),
+        tool_offset       = float(state.get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET)),
         arc_degrees       = float(state.get("teleop_arc", 240.0)),
         elevation_degrees = float(state.get("teleop_elevation", 75.0)),
         rings             = int(state.get("teleop_rings", 3)),

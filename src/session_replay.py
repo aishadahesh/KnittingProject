@@ -26,8 +26,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 import paths
-
-DEFAULT_TOOL_OFFSET = 0.0306
+import scan_geometry
 
 
 @dataclass
@@ -89,9 +88,9 @@ def load_views(session: Path) -> list[View]:
 def tool_offset() -> float:
     """The planner's tool offset (the camera point's distance along the flange's +Z)."""
     try:
-        return float(json.loads(paths.PARAMS_JSON.read_text(encoding="utf-8")).get("teleop_tool_offset", DEFAULT_TOOL_OFFSET))
+        return float(json.loads(paths.PARAMS_JSON.read_text(encoding="utf-8")).get("teleop_tool_offset", scan_geometry.ENDOSCOPE_TIP_OFFSET))
     except (OSError, ValueError):
-        return DEFAULT_TOOL_OFFSET
+        return scan_geometry.ENDOSCOPE_TIP_OFFSET
 
 
 def flange_pose(view: View, offset: float) -> np.ndarray:

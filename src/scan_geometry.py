@@ -79,6 +79,8 @@ ATTACHMENT_SITE_TRANSFORM = np.array([
     [0.0, -1.0, 0.0, 0.0],
     [0.0,  0.0, 0.0, 1.0],
 ])
+# Lens tip of the endoscope pressed into its flange mount: 12 mm plate + 40 mm camera head.
+ENDOSCOPE_TIP_OFFSET = 0.052
 COLLISION_CAPSULES = (
     (0, "shoulder_link",  (0.0,  0.0,  -0.04), (0.0, 0.0, 0.0),          0.06,  0.06),
     (1, "upper_arm_link", (0.0, -0.04,  0.0),  (math.pi / 2, 0.0, 0.0),  0.06,  0.06),
@@ -431,6 +433,7 @@ def forward_kinematics(joints) -> dict:
         transform = transform @ step
         links[jt["child"]] = transform.copy()
     site_t = transform @ ATTACHMENT_SITE_TRANSFORM
+    links["flange"] = site_t
     flange = np.r_[site_t[:3, 3], _mat_to_rotvec(site_t[:3, :3])]
     return {"links": links, "anchors": anchors, "axes": axes, "site_t": site_t, "flange": flange}
 
@@ -1290,7 +1293,7 @@ def fitted_grid_centres(region, camera_height, hfov_deg, overlap):
 # The plan
 # ============================================================================
 
-def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.20, tool_offset=0.0306,
+def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.20, tool_offset=ENDOSCOPE_TIP_OFFSET,
                        arc_degrees=360.0, elevation_degrees=75.0, rings=3, max_height=0.19,
                        view_radius=0.06, grid_rows=3, grid_cols=3, camera_height=0.07, orbit_radius=0.10,
                        taught=(), fabric_z=None, fabric_outline=(), lens_hfov_deg=55.0, grid_overlap=0.3,

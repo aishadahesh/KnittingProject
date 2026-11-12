@@ -2110,7 +2110,7 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
             joints = list(st.joints[:6])
     if joints is None:
         joints = list(state.get('ur5_home_joints') or gui_ur5.ur5_robot.DEFAULT_HOME_JOINTS)
-    tool_offset = float(state.get('teleop_tool_offset', 0.0306))
+    tool_offset = float(state.get('teleop_tool_offset', gui_ur5.scan_geometry.ENDOSCOPE_TIP_OFFSET))
     cam_pos, cam_rotvec = gui_ur5.scan_geometry.camera_pose(joints, tool_offset)
     cam_pose = [*cam_pos, *cam_rotvec]
     plan_poses = []

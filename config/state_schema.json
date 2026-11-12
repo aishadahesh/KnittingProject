@@ -828,7 +828,7 @@
       "teleop_max_rise": 0.19,
       "teleop_view_radius": 0.06,
       "teleop_subject_distance": 0.2,
-      "teleop_tool_offset": 0.0306,
+      "teleop_tool_offset": 0.052,
       "teleop_move_seconds": 6.0,
       "teleop_speed_deg_s": 12.0,
       "teleop_grid_rows": 3,
