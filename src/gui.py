@@ -11,6 +11,7 @@ Module layout (dependencies point one way, no cycles):
 moved into scanner_core kept their original spelling and are re-imported below,
 so call sites in this file are unchanged.
 """
+import functools
 import os
 import json
 import numpy as np
@@ -2083,6 +2084,16 @@ def draw_sidebar(state, renderer, window=None):
     imgui.end()
 
 
+@functools.lru_cache(maxsize=1)
+def _preview_plan_poses(joints, rows, cols, camera_height, subject_distance, tool_offset, hfov, overlap, per_station, tilt):
+    """Frusta preview poses; memoised because grid_views costs ~0.2 s for a 6x8 grid and its inputs rarely change."""
+    views, _ = gui_ur5.scan_geometry.grid_views(
+        gui_ur5.scan_geometry.flange_pose(list(joints)), rows, cols, camera_height, 0.0, subject_distance,
+        tool_offset, None, hfov, overlap, gui_ur5.scan_geometry.IDENTITY_TURN, per_station, tilt, True,
+    )
+    return [np.r_[v.position, v.rotvec] for v in views]
+
+
 def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True, renderer=None):
     controller = state.get('ur5_controller')
     joints = None
@@ -2100,24 +2111,18 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
         if controller is not None and controller.plan is not None:
             plan_poses = controller.plan.poses
         else:
-            tool_pose = gui_ur5.scan_geometry.flange_pose(joints)
-            views, _ = gui_ur5.scan_geometry.grid_views(
-                tool_pose,
+            plan_poses = _preview_plan_poses(
+                tuple(float(q) for q in joints),
                 max(1, int(state.get('scanner_rows', 1))),
                 max(1, int(state.get('scanner_cols', 1))),
                 float(state.get('teleop_camera_height', 0.07)),
-                0.0,
                 float(state.get('teleop_subject_distance', 0.20)),
                 tool_offset,
-                None,
                 float(state.get('ur5_splat_fov', 55.0)),
                 float(state.get('teleop_grid_overlap', 0.3)),
-                gui_ur5.scan_geometry.IDENTITY_TURN,
                 max(1, int(state.get('scanner_angles', 1))),
                 float(state.get('teleop_max_tilt', 35.0)),
-                True,
             )
-            plan_poses = [np.r_[v.position, v.rotvec] for v in views]
     if renderer is None:
         renderer = getattr(state, 'renderer', None)
     tile_images, tiles_epoch = ensure_swatch_unit_tile_images(state, renderer)
@@ -2201,7 +2206,7 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
     sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
     sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
     show_neighbors = bool(state.get('scanner_preview_grid_enabled', False)) or bool(state.get('world_show_neighbor_swatches', True))
-    tile_lo, tile_hi = state._canonical_tile_bounds()
+    rects = state.all_swatch_slot_rects()
     gold_col = imgui.get_color_u32((1.0, 0.82, 0.22, 0.98))
     slot_col = imgui.get_color_u32((0.86, 0.90, 0.95, 0.85))
     for r in range(rows):
@@ -2209,12 +2214,8 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
             is_active = (r == sel_r and c == sel_c)
             if not is_active and not show_neighbors:
                 continue
-            if hasattr(state, 'swatch_slot_rect'):
-                rx0, _ry0, _rx1, ry1 = state.swatch_slot_rect(r, c)
-                tl_local = np.array([float(rx0), float(ry1), 0.02], dtype=np.float32)
-            else:
-                slot = state.swatch_slot_offset(r, c)
-                tl_local = slot + np.array([tile_lo[0], tile_hi[1], 0.02], dtype=np.float32)
+            rx0, _ry0, _rx1, ry1 = rects[r * cols + c]
+            tl_local = np.array([rx0, ry1, 0.02], dtype=np.float32)
             tl_world = transform_points([tl_local], model_mat) if model_mat is not None else np.asarray([tl_local], dtype=np.float32)
             scr, valid, _ = project_to_screen(tl_world, view_proj, disp_w, disp_h)
             if valid[0] and 0.0 <= float(scr[0, 0]) <= float(disp_w) and 0.0 <= float(scr[0, 1]) <= float(disp_h):
@@ -2612,8 +2613,6 @@ def draw_viewport(state, renderer, ref_tex, window):
             model_matrix = model_mat
         rows = max(1, int(getattr(state, 'scanner_rows', 1)))
         cols = max(1, int(getattr(state, 'scanner_cols', 1)))
-        base_rows = max(1, int(state.bitmap_size[0]))
-
         if scanner_estimate_mode:
             overall = projected_mesh_bounds(model_matrix)
             if overall is None:
@@ -2644,57 +2643,14 @@ def draw_viewport(state, renderer, ref_tex, window):
             ]
 
         view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
-        cell_pts = [[] for _ in range(rows * cols)]
-        for verts, row_idx in (renderer.mesh_pick_data or ()):
-            cell_index = int(row_idx) // base_rows
-            if not (0 <= cell_index < rows * cols):
-                continue
-            base_row_idx = int(row_idx) % base_rows
-            if state.row_visible is not None and len(state.row_visible) > 0 and not bool(state.row_visible[base_row_idx]):
-                continue
-            if len(verts) == 0:
-                continue
-            stride = max(1, len(verts) // 300)
-            sample = verts[::stride]
-            world_pts = transform_points(sample, model_matrix)
-            screen, valid, _ = project_to_screen(world_pts, view_proj, disp_w, disp_h)
-            if not np.any(valid):
-                continue
-            cell_pts[cell_index].append(screen[valid])
-
-        tile_lo, tile_hi = state._canonical_tile_bounds()
         bounds = []
-        for cell_idx, chunks in enumerate(cell_pts):
-            r = cell_idx // cols
-            c = cell_idx % cols
-            if hasattr(state, 'swatch_slot_rect'):
-                rx0, ry0, rx1, ry1 = state.swatch_slot_rect(r, c)
-                corners = np.array([
-                    [float(rx0), float(ry0), 0.0],
-                    [float(rx1), float(ry0), 0.0],
-                    [float(rx1), float(ry1), 0.0],
-                    [float(rx0), float(ry1), 0.0],
-                ], dtype=np.float32)
-                screen, valid, _ = project_to_screen(transform_points(corners, model_matrix), view_proj, disp_w, disp_h)
-                if not np.any(valid):
-                    bounds.append(None)
-                    continue
-                pts = screen[valid]
-            elif not chunks:
-                slot = state.swatch_slot_offset(r, c)
-                corners = np.array([
-                    [slot[0] + tile_lo[0], slot[1] + tile_lo[1], slot[2]],
-                    [slot[0] + tile_hi[0], slot[1] + tile_lo[1], slot[2]],
-                    [slot[0] + tile_hi[0], slot[1] + tile_hi[1], slot[2]],
-                    [slot[0] + tile_lo[0], slot[1] + tile_hi[1], slot[2]],
-                ], dtype=np.float32)
-                screen, valid, _ = project_to_screen(transform_points(corners, model_matrix), view_proj, disp_w, disp_h)
-                if not np.any(valid):
-                    bounds.append(None)
-                    continue
-                pts = screen[valid]
-            else:
-                pts = np.concatenate(chunks, axis=0)
+        for rx0, ry0, rx1, ry1 in state.all_swatch_slot_rects():
+            corners = np.array([[rx0, ry0, 0.0], [rx1, ry0, 0.0], [rx1, ry1, 0.0], [rx0, ry1, 0.0]], dtype=np.float32)
+            screen, valid, _ = project_to_screen(transform_points(corners, model_matrix), view_proj, disp_w, disp_h)
+            if not np.any(valid):
+                bounds.append(None)
+                continue
+            pts = screen[valid]
             x_min, y_min = np.min(pts, axis=0)
             x_max, y_max = np.max(pts, axis=0)
             pad = 8.0
@@ -2753,40 +2709,40 @@ def draw_viewport(state, renderer, ref_tex, window):
             selected_line = imgui.get_color_u32((1.0, 0.82, 0.18, 0.96))
             display_colors, _display_stage = _scanner_display_batch_colors(state)
             view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+            rects = state.all_swatch_slot_rects()
             for r in range(rows):
                 for c in range(cols):
                     selected_cell = r == selected_r and c == selected_c
                     if not scanner_estimate_mode and not selected_cell:
                         continue
-                    if hasattr(state, 'swatch_slot_rect'):
-                        rx0, ry0, rx1, ry1 = state.swatch_slot_rect(r, c)
-                        corners = np.array([
-                            [float(rx0), float(ry0), 0.0],
-                            [float(rx1), float(ry0), 0.0],
-                            [float(rx1), float(ry1), 0.0],
-                            [float(rx0), float(ry1), 0.0],
-                        ], dtype=np.float32)
-                        scr, valid, _ = project_to_screen(transform_points(corners, model_mat), view_proj, disp_w, disp_h)
-                        if not bool(np.all(valid)):
-                            continue
-                        q = [
-                            imgui.ImVec2(ox + float(scr[i, 0]) * vp_sc, oy + float(scr[i, 1]) * vp_sc)
-                            for i in range(4)
-                        ]
-                        if scanner_estimate_mode:
-                            color_idx = r * cols + c
-                            batch_rgb = display_colors[color_idx] if color_idx < len(display_colors) else [42.0, 42.0, 42.0]
-                            batch_fill = imgui.get_color_u32((
-                                float(np.clip(float(batch_rgb[0]) / 255.0, 0.0, 1.0)),
-                                float(np.clip(float(batch_rgb[1]) / 255.0, 0.0, 1.0)),
-                                float(np.clip(float(batch_rgb[2]) / 255.0, 0.0, 1.0)),
-                                0.96,
-                            ))
-                            batch_line = selected_line if selected_cell else imgui.get_color_u32((0.08, 0.08, 0.08, 0.85))
-                            dl.add_quad_filled(q[0], q[1], q[2], q[3], batch_fill)
-                            dl.add_quad(q[0], q[1], q[2], q[3], batch_line, 3.0 if selected_cell else 1.5)
-                        elif selected_cell:
-                            dl.add_quad(q[0], q[1], q[2], q[3], selected_line, 2.5)
+                    rx0, ry0, rx1, ry1 = rects[r * cols + c]
+                    corners = np.array([
+                        [float(rx0), float(ry0), 0.0],
+                        [float(rx1), float(ry0), 0.0],
+                        [float(rx1), float(ry1), 0.0],
+                        [float(rx0), float(ry1), 0.0],
+                    ], dtype=np.float32)
+                    scr, valid, _ = project_to_screen(transform_points(corners, model_mat), view_proj, disp_w, disp_h)
+                    if not bool(np.all(valid)):
+                        continue
+                    q = [
+                        imgui.ImVec2(ox + float(scr[i, 0]) * vp_sc, oy + float(scr[i, 1]) * vp_sc)
+                        for i in range(4)
+                    ]
+                    if scanner_estimate_mode:
+                        color_idx = r * cols + c
+                        batch_rgb = display_colors[color_idx] if color_idx < len(display_colors) else [42.0, 42.0, 42.0]
+                        batch_fill = imgui.get_color_u32((
+                            float(np.clip(float(batch_rgb[0]) / 255.0, 0.0, 1.0)),
+                            float(np.clip(float(batch_rgb[1]) / 255.0, 0.0, 1.0)),
+                            float(np.clip(float(batch_rgb[2]) / 255.0, 0.0, 1.0)),
+                            0.96,
+                        ))
+                        batch_line = selected_line if selected_cell else imgui.get_color_u32((0.08, 0.08, 0.08, 0.85))
+                        dl.add_quad_filled(q[0], q[1], q[2], q[3], batch_fill)
+                        dl.add_quad(q[0], q[1], q[2], q[3], batch_line, 3.0 if selected_cell else 1.5)
+                    elif selected_cell:
+                        dl.add_quad(q[0], q[1], q[2], q[3], selected_line, 2.5)
         if edit_controls_active and gizmo_bounds is not None:
             for i, (hx, hy) in enumerate(bounds_handles(gizmo_bounds)):
                 is_hot = (i == hover_handle or i == active_handle)

@@ -988,7 +988,7 @@ class MeshRenderer:
         )
 
     @staticmethod
-    def prepare_meshes(verts_list, faces_list):
+    def prepare_meshes(verts_list, faces_list, offsets=((0.0, 0.0, 0.0),)):
         """Does set_meshes' CPU-side work once, so several renderers can share it.
 
         Triangulating the quads, computing normals and packing the byte buffers
@@ -996,8 +996,11 @@ class MeshRenderer:
         uploads the same meshes to the main viewport and the orbit view on every
         rebuild, which meant doing all of that twice -- and compute_normals is
         the single most expensive thing in a rebuild.
+
+        Each of `offsets` emits a translated copy of every mesh, offset-major,
+        sharing the normals and indices computed once per mesh.
         """
-        prepared = []
+        base = []
         for (verts, _n_points), faces in zip(verts_list, faces_list):
             v = np.array(verts, dtype=np.float32)
             f = np.array(faces, dtype=np.int32)
@@ -1006,7 +1009,12 @@ class MeshRenderer:
             tris[0::2] = f[:, [0, 1, 2]]
             tris[1::2] = f[:, [0, 2, 3]]
             nm = compute_normals(v, tris).astype(np.float32)
-            prepared.append((v, tris, v.tobytes(), nm.tobytes(), tris.tobytes()))
+            base.append((v, tris, nm.tobytes(), tris.tobytes()))
+        prepared = []
+        for offset in np.asarray(offsets, dtype=np.float32):
+            for v, tris, norm_bytes, tri_bytes in base:
+                moved = v + offset
+                prepared.append((moved, tris, moved.tobytes(), norm_bytes, tri_bytes))
         return prepared
 
     def set_meshes(self, verts_list, faces_list, row_indices=None, colors=None, meta=None, prepared=None):

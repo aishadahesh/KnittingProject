@@ -75,7 +75,6 @@ class AppState:
             config_data = json.load(f)
         super().__setattr__('config', config_data)
         super().__setattr__('_scanner_template_cache', None)
-        super().__setattr__('_scanner_template_mtime', None)
         super().__setattr__('_cached_canonical_tile_bounds', None)
         super().__setattr__('_active_swatch_render_offset', np.zeros(3, dtype=np.float32))
         super().__setattr__('mesh_epoch', 0)
@@ -262,14 +261,11 @@ class AppState:
     # helpers randomize only the bitmap, then build meshes for preview/display.
 
     def _scanner_template(self):
-        path = str(paths.INITIAL_PARAMS_JSON)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            mtime = None
-        cached = getattr(self, '_scanner_template_cache', None)
-        if cached is not None and getattr(self, '_scanner_template_mtime', None) == mtime:
+        """Read initial_params.json once; the app never writes it, so the cache stays valid."""
+        cached = self._scanner_template_cache
+        if cached is not None:
             return cached
+        path = str(paths.INITIAL_PARAMS_JSON)
 
         params = np.array(
             [p['initial'] for p in self.config['knit_parameters']['parameters']],
@@ -325,7 +321,6 @@ class AppState:
             'radius_rows': radius_rows,
         }
         super().__setattr__('_scanner_template_cache', template)
-        super().__setattr__('_scanner_template_mtime', mtime)
         super().__setattr__('_cached_canonical_tile_bounds', None)
         return template
 
@@ -381,8 +376,8 @@ class AppState:
         return float(max(hi[0] - lo[0], hi[1] - lo[1], 2.0))
 
     def swatch_repeat_counts(self) -> tuple[int, int]:
-        rep_r = int(np.clip(int(self.get('scanner_pattern_repeat_rows', 24)), 1, 128))
-        rep_c = int(np.clip(int(self.get('scanner_pattern_repeat_cols', 24)), 1, 128))
+        rep_r = min(max(int(self.get('scanner_pattern_repeat_rows', 24)), 1), 128)
+        rep_c = min(max(int(self.get('scanner_pattern_repeat_cols', 24)), 1), 128)
         return rep_r, rep_c
 
     def _swatch_grid_periods(self) -> tuple[float, float, float]:
@@ -390,54 +385,34 @@ class AppState:
         rep_r, rep_c = self.swatch_repeat_counts()
         return float(cell_w * rep_c), float(cell_h * rep_r), float(cell_shift * rep_c)
 
-    def swatch_slot_offset(self, row: int, col: int) -> np.ndarray:
+    def swatch_slot_offsets(self) -> np.ndarray:
+        """Slot centres in model units, shape (scanner_rows, scanner_cols, 3)."""
         rows = max(1, int(self.get('scanner_rows', 1)))
         cols = max(1, int(self.get('scanner_cols', 1)))
         x_period, y_period, row_shift = self._swatch_grid_periods()
-        cx = 0.5 * float(cols - 1)
-        cy = 0.5 * float(rows - 1)
-        shift_x = (row_shift if (int(row) % 2 == 1) else 0.0) - (0.5 * row_shift if rows > 1 else 0.0)
-        x_off = (float(col) - cx) * x_period + shift_x
-        y_off = (float(row) - cy) * y_period
-        return np.array([x_off, y_off, 0.0], dtype=np.float32)
+        r = np.arange(rows, dtype=np.float64)[:, None]
+        c = np.arange(cols, dtype=np.float64)[None, :]
+        shift_x = np.where(r % 2 == 1, row_shift, 0.0) - (0.5 * row_shift if rows > 1 else 0.0)
+        x = (c - 0.5 * (cols - 1)) * x_period + shift_x
+        y = np.broadcast_to((r - 0.5 * (rows - 1)) * y_period, x.shape)
+        return np.stack([x, y, np.zeros_like(x)], axis=-1).astype(np.float32)
 
-    def swatch_slot_rect(self, row: int, col: int) -> tuple[float, float, float, float]:
-        slot_w, slot_h, _ = self._swatch_grid_periods()
-        off = self.swatch_slot_offset(row, col)
-        half_w = 0.47 * slot_w
-        half_h = 0.47 * slot_h
-        return (
-            float(off[0] - half_w),
-            float(off[1] - half_h),
-            float(off[0] + half_w),
-            float(off[1] + half_h),
-        )
+    def swatch_slot_offset(self, row: int, col: int) -> np.ndarray:
+        return self.swatch_slot_offsets()[int(row), int(col)]
 
     def all_swatch_slot_rects(self) -> list[tuple[float, float, float, float]]:
-        rows = max(1, int(self.get('scanner_rows', 1)))
-        cols = max(1, int(self.get('scanner_cols', 1)))
-        return [self.swatch_slot_rect(r, c) for r in range(rows) for c in range(cols)]
+        slot_w, slot_h, _ = self._swatch_grid_periods()
+        xy = self.swatch_slot_offsets()[..., :2].reshape(-1, 2).astype(np.float64)
+        half = 0.47 * np.array([slot_w, slot_h])
+        return [tuple(rect) for rect in np.hstack([xy - half, xy + half]).tolist()]
 
     def canonical_grid_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         tile_lo, tile_hi = self._canonical_tile_bounds()
         slot_w, slot_h, _ = self._swatch_grid_periods()
-        rows = max(1, int(self.get('scanner_rows', 1)))
-        cols = max(1, int(self.get('scanner_cols', 1)))
-        offsets = np.array(
-            [self.swatch_slot_offset(r, c) for r in range(rows) for c in range(cols)],
-            dtype=np.float32,
-        )
-        half_slot = np.array([0.5 * slot_w, 0.5 * slot_h, 0.0], dtype=np.float32)
-        lo = np.array([
-            float(offsets[:, 0].min() - half_slot[0]),
-            float(offsets[:, 1].min() - half_slot[1]),
-            float(tile_lo[2]),
-        ], dtype=np.float32)
-        hi = np.array([
-            float(offsets[:, 0].max() + half_slot[0]),
-            float(offsets[:, 1].max() + half_slot[1]),
-            float(tile_hi[2]),
-        ], dtype=np.float32)
+        xy = self.swatch_slot_offsets()[..., :2].reshape(-1, 2)
+        half = 0.5 * np.array([slot_w, slot_h])
+        lo = np.array([*(xy.min(axis=0) - half), tile_lo[2]], dtype=np.float32)
+        hi = np.array([*(xy.max(axis=0) + half), tile_hi[2]], dtype=np.float32)
         return lo, hi
 
     def canonical_grid_span(self) -> float:
@@ -744,7 +719,6 @@ class AppState:
             period_offset_x,
             radius_ctrl_rows=radius_profiles,
         )
-        meta = [{'row': i, 'base_row': i} for i in range(len(vl))]
         bounds = self._display_mesh_bounds(vl)
         if bounds is not None:
             min_v, max_v = bounds
@@ -764,20 +738,10 @@ class AppState:
         else:
             y_period = radius
 
-        base_fl = compute_knitting_faces(seg, vl)
-        vl_3x3, fl_3x3, colors_3x3 = [], [], []
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                offset = np.array([dx * x_period, dy * y_period, 0.0], dtype=np.float32)
-                for (verts, n_points), faces, part_meta in zip(vl, base_fl, meta):
-                    translated = (np.asarray(verts, dtype=np.float32) + offset).astype(np.float32)
-                    vl_3x3.append((translated, int(n_points)))
-                    fl_3x3.append(faces)
-                    row_idx = int(part_meta.get('row', 0))
-                    c_rgb = base_colors[row_idx % len(base_colors)]
-                    colors_3x3.append([float(c_rgb[0]), float(c_rgb[1]), float(c_rgb[2])])
-        prepared_meshes = MeshRenderer.prepare_meshes(vl_3x3, fl_3x3)
-        return prepared_meshes, colors_3x3, (float(cx), float(cy)), float(x_period), float(y_period)
+        offsets = [(dx * x_period, dy * y_period, 0.0) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+        prepared_meshes = MeshRenderer.prepare_meshes(vl, compute_knitting_faces(seg, vl), offsets)
+        row_colors = [[float(x) for x in base_colors[row % len(base_colors)][:3]] for row in range(len(vl))]
+        return prepared_meshes, row_colors * len(offsets), (float(cx), float(cy)), float(x_period), float(y_period)
 
     def build_display_meshes_precise(self, verts_list, faces_list, meta=None):
         if not verts_list:

@@ -221,7 +221,7 @@ def test_scan_template_reproduces_its_saved_fabric(state, tmp_path, monkeypatch)
         "spline_control_rows": [r.tolist() for r in scaled],
     }), encoding="utf-8")
     monkeypatch.setattr(paths, "INITIAL_PARAMS_JSON", template_path)
-    # _scanner_template memoises on the file's mtime; drop the cached entry.
+    # _scanner_template reads the file once; drop the cached entry.
     object.__setattr__(state, "_scanner_template_cache", None)
 
     # The saved rows are only usable at the size they describe, and the scan
@@ -283,7 +283,7 @@ def test_swatch_slot_offsets_and_canonical_bounds_are_invariant(state):
     rects = state.all_swatch_slot_rects()
     assert len(rects) == 4
     slot_w, slot_h, _ = state._swatch_grid_periods()
-    x0, y0, x1, y1 = state.swatch_slot_rect(0, 1)
+    x0, y0, x1, y1 = rects[1]
     assert (x1 - x0) == pytest.approx(0.94 * slot_w, rel=1e-5)
     assert (y1 - y0) == pytest.approx(0.94 * slot_h, rel=1e-5)
 
