@@ -6,6 +6,7 @@ pattern grid geometry, and the scanner database state. None of it draws anything
 Nothing in this module may import imgui; a test enforces it.
 """
 
+import functools
 import json
 import logging
 import time
@@ -13,6 +14,8 @@ import time
 import numpy as np
 
 from scan_geometry import clamp_capture_size
+
+HIDDEN_LOOP_WEIGHT = 0.10
 
 
 def _default_scanner_palette_from_model(state):
@@ -79,10 +82,7 @@ def _scanner_estimated_cell_colors(state):
     """
     rows = max(1, int(state.scanner_rows))
     cols = max(1, int(state.scanner_cols))
-    palette = np.asarray([color[:3] for color in _scanner_base_palette(state)], dtype=np.float32)
-    if palette.size == 0:
-        palette = np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32)
-    hidden_weight = 0.10
+    palette = tuple(tuple(float(v) for v in color[:3]) for color in _scanner_base_palette(state)) or ((0.5, 0.5, 0.5),)
     raw_overrides = state.get('scanner_estimated_color_overrides', [])
     estimates = []
     for cell_index in range(rows * cols):
@@ -93,10 +93,8 @@ def _scanner_estimated_cell_colors(state):
             bitmap = np.ones((pattern_rows, pattern_cols), dtype=np.float32)
         if bitmap.ndim != 2 or bitmap.size == 0:
             bitmap = np.ones((1, 1), dtype=np.float32)
-        row_colors = palette[np.arange(bitmap.shape[0]) % len(palette)]
-        active = bitmap > 0.5
-        row_weights = np.where(active, 1.0, hidden_weight).sum(axis=1)
-        rgb = np.clip(row_weights @ row_colors / max(float(row_weights.sum()), 1e-6), 0.0, 1.0)
+        visible_rgb, active_ratio, bitmap_rows = _visible_cell_colour(bitmap.tobytes(), bitmap.shape, palette)
+        rgb = np.asarray(visible_rgb)
         overridden = False
         if isinstance(raw_overrides, list) and cell_index < len(raw_overrides):
             override = raw_overrides[cell_index]
@@ -106,16 +104,26 @@ def _scanner_estimated_cell_colors(state):
                     overridden = True
                 except Exception as exc:
                     logging.warning("scanner_core._scanner_estimated_cell_colors: %s", exc)
-        active_ratio = float(active.mean())
         estimates.append({
             "row": int(cell_index // cols),
             "col": int(cell_index % cols),
             "rgb": [float(v * 255.0) for v in rgb],
             "active_ratio": active_ratio,
             "overridden": overridden,
-            "bitmap": bitmap.astype(int).tolist(),
+            "bitmap": [list(row) for row in bitmap_rows],
         })
     return estimates
+
+
+@functools.lru_cache(maxsize=4096)
+def _visible_cell_colour(bitmap_bytes, shape, palette):
+    """Visibility-weighted RGB in [0, 1], active share, and integer rows of one float32 bitmap."""
+    bitmap = np.frombuffer(bitmap_bytes, dtype=np.float32).reshape(shape)
+    row_colors = np.asarray(palette, dtype=np.float32)[np.arange(shape[0]) % len(palette)]
+    active = bitmap > 0.5
+    row_weights = np.where(active, 1.0, HIDDEN_LOOP_WEIGHT).sum(axis=1)
+    rgb = np.clip(row_weights @ row_colors / max(float(row_weights.sum()), 1e-6), 0.0, 1.0)
+    return tuple(float(v) for v in rgb), float(active.mean()), tuple(tuple(row) for row in bitmap.astype(int).tolist())
 
 
 def _scanner_measured_cell_colors(state):

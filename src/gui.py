@@ -2092,6 +2092,15 @@ def _preview_plan_poses(joints, rows, cols, camera_height, subject_distance, too
     return [np.r_[v.position, v.rotvec] for v in views]
 
 
+def _project_slot_corners(state, model_matrix, view_proj, disp_w, disp_h):
+    """Viewport pixels of every swatch slot's corners, (cells, 4, 2), and which lie in front of the camera, (cells, 4)."""
+    rects = np.asarray(state.all_swatch_slot_rects(), dtype=np.float32)
+    corners = rects[:, [[0, 1], [2, 1], [2, 3], [0, 3]]].reshape(-1, 2)
+    local = np.column_stack((corners, np.zeros(len(corners), dtype=np.float32)))
+    screen, valid, _ = project_to_screen(transform_points(local, model_matrix), view_proj, disp_w, disp_h)
+    return screen.reshape(-1, 4, 2), valid.reshape(-1, 4)
+
+
 def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True, renderer=None):
     controller = state.get('ur5_controller')
     joints = None
@@ -2204,7 +2213,8 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
     sel_r = int(np.clip(int(state.get('scanner_selected_row', 0)), 0, rows - 1))
     sel_c = int(np.clip(int(state.get('scanner_selected_col', 0)), 0, cols - 1))
     show_neighbors = bool(state.get('scanner_preview_grid_enabled', False)) or bool(state.get('world_show_neighbor_swatches', True))
-    rects = state.all_swatch_slot_rects()
+    model = model_mat if model_mat is not None else np.eye(4, dtype=np.float32)
+    corner_screen, corner_valid = _project_slot_corners(state, model, view_proj, disp_w, disp_h)
     gold_col = imgui.get_color_u32((1.0, 0.82, 0.22, 0.98))
     slot_col = imgui.get_color_u32((0.86, 0.90, 0.95, 0.85))
     for r in range(rows):
@@ -2212,15 +2222,12 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
             is_active = (r == sel_r and c == sel_c)
             if not is_active and not show_neighbors:
                 continue
-            rx0, _ry0, _rx1, ry1 = rects[r * cols + c]
-            tl_local = np.array([rx0, ry1, 0.02], dtype=np.float32)
-            tl_world = transform_points([tl_local], model_mat) if model_mat is not None else np.asarray([tl_local], dtype=np.float32)
-            scr, valid, _ = project_to_screen(tl_world, view_proj, disp_w, disp_h)
-            if valid[0] and 0.0 <= float(scr[0, 0]) <= float(disp_w) and 0.0 <= float(scr[0, 1]) <= float(disp_h):
+            x, y = (float(v) for v in corner_screen[r * cols + c, 3])
+            if corner_valid[r * cols + c, 3] and 0.0 <= x <= float(disp_w) and 0.0 <= y <= float(disp_h):
                 _hud_text(
                     dl,
-                    ox + float(scr[0, 0]) * vp_scale + 4.0,
-                    oy + float(scr[0, 1]) * vp_scale + 2.0,
+                    ox + x * vp_scale + 4.0,
+                    oy + y * vp_scale + 2.0,
                     gold_col if is_active else slot_col,
                     f"R{r + 1} C{c + 1}",
                 )
@@ -2641,14 +2648,13 @@ def draw_viewport(state, renderer, ref_tex, window):
             ]
 
         view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
+        screen, valid = _project_slot_corners(state, model_matrix, view_proj, disp_w, disp_h)
         bounds = []
-        for rx0, ry0, rx1, ry1 in state.all_swatch_slot_rects():
-            corners = np.array([[rx0, ry0, 0.0], [rx1, ry0, 0.0], [rx1, ry1, 0.0], [rx0, ry1, 0.0]], dtype=np.float32)
-            screen, valid, _ = project_to_screen(transform_points(corners, model_matrix), view_proj, disp_w, disp_h)
-            if not np.any(valid):
+        for corners, in_front in zip(screen, valid):
+            if not in_front.any():
                 bounds.append(None)
                 continue
-            pts = screen[valid]
+            pts = corners[in_front]
             x_min, y_min = np.min(pts, axis=0)
             x_max, y_max = np.max(pts, axis=0)
             pad = 8.0
@@ -2707,26 +2713,15 @@ def draw_viewport(state, renderer, ref_tex, window):
             selected_line = imgui.get_color_u32((1.0, 0.82, 0.18, 0.96))
             display_colors, _display_stage = _scanner_display_batch_colors(state)
             view_proj = state.camera.proj(disp_w, disp_h) @ state.camera.view()
-            rects = state.all_swatch_slot_rects()
+            slot_screen, slot_valid = _project_slot_corners(state, model_mat, view_proj, disp_w, disp_h)
             for r in range(rows):
                 for c in range(cols):
                     selected_cell = r == selected_r and c == selected_c
                     if not scanner_estimate_mode and not selected_cell:
                         continue
-                    rx0, ry0, rx1, ry1 = rects[r * cols + c]
-                    corners = np.array([
-                        [float(rx0), float(ry0), 0.0],
-                        [float(rx1), float(ry0), 0.0],
-                        [float(rx1), float(ry1), 0.0],
-                        [float(rx0), float(ry1), 0.0],
-                    ], dtype=np.float32)
-                    scr, valid, _ = project_to_screen(transform_points(corners, model_mat), view_proj, disp_w, disp_h)
-                    if not bool(np.all(valid)):
+                    if not slot_valid[r * cols + c].all():
                         continue
-                    q = [
-                        imgui.ImVec2(ox + float(scr[i, 0]) * vp_sc, oy + float(scr[i, 1]) * vp_sc)
-                        for i in range(4)
-                    ]
+                    q = [imgui.ImVec2(ox + float(x) * vp_sc, oy + float(y) * vp_sc) for x, y in slot_screen[r * cols + c]]
                     if scanner_estimate_mode:
                         color_idx = r * cols + c
                         batch_rgb = display_colors[color_idx] if color_idx < len(display_colors) else [42.0, 42.0, 42.0]

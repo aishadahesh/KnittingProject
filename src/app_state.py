@@ -1,3 +1,4 @@
+import functools
 import logging
 import os
 import json
@@ -31,6 +32,16 @@ def _with_anchor_note(message, anchored_columns):
     if anchored_columns is None or len(anchored_columns) == 0:
         return message
     return f'{message}; {ANCHOR_NOTE}'
+
+
+@functools.lru_cache(maxsize=4096)
+def _seeded_pattern(rows: int, cols: int, density: float, seed: int) -> np.ndarray:
+    """Random scan bitmap with at least one active cell; memoised because Scan Mode reads every cell each frame."""
+    rng = np.random.default_rng(seed)
+    bitmap = (rng.random((rows, cols)) < density).astype(np.float32)
+    if not np.any(bitmap > 0.5):
+        bitmap[rng.integers(0, rows), rng.integers(0, cols)] = 1.0
+    return bitmap
 
 
 # Inset of a scan sample inside its grid tile, in yarn radii per side. The tile
@@ -610,11 +621,7 @@ class AppState:
         pattern_rows, pattern_cols = self._scanner_pattern_size()
         density = min(max(float(self.get('scanner_pattern_density', 0.62)), 0.05), 0.95)
         seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
-        rng = np.random.default_rng(seed)
-        bitmap = (rng.random((pattern_rows, pattern_cols)) < density).astype(np.float32)
-        if not np.any(bitmap > 0.5):
-            bitmap[rng.integers(0, pattern_rows), rng.integers(0, pattern_cols)] = 1.0
-        return bitmap
+        return _seeded_pattern(pattern_rows, pattern_cols, density, seed).copy()
 
     def _scanner_loop_heights_for_bitmap(self, bitmap):
         bitmap = np.asarray(bitmap, dtype=np.float32)

@@ -1683,54 +1683,25 @@ class MeshRenderer:
                 vao.render(moderngl.TRIANGLES)
 
         if draw_frusta and world_scene.get("show_frusta", True):
-            line_verts = []
+            line_parts = []
             plan_poses = world_scene.get("capture_plan_poses")
-            if plan_poses is None:
-                plan_poses = []
-            prev_pt = None
-            for p in plan_poses:
-                pose_arr = np.asarray(p, dtype=np.float32).reshape(-1)
-                if pose_arr.size < 6:
-                    continue
-                pos_gl = scene_center + (pose_arr[:3] - fc) * units_per_m
-                if prev_pt is not None:
-                    line_verts.extend((*prev_pt, 0.30, 0.78, 0.95, *pos_gl, 0.30, 0.78, 0.95))
-                prev_pt = pos_gl
-                self._append_frustum_lines(line_verts, pose_arr, scene_center, fc, units_per_m, 0.028, (0.35, 0.75, 0.95))
+            plan = np.asarray(plan_poses if plan_poses is not None else [], dtype=np.float64).reshape(-1, 6)
+            if len(plan):
+                path = scene_center + (plan[:, :3] - fc) * units_per_m
+                line_parts.append(_line_vertices(path[:-1], path[1:], (0.30, 0.78, 0.95)))
+                line_parts.append(_frustum_line_vertices(plan, scene_center, fc, units_per_m, 0.028, (0.35, 0.75, 0.95)))
             cam_pose = world_scene.get("camera_pose")
             if cam_pose is not None:
-                pose_arr = np.asarray(cam_pose, dtype=np.float32).reshape(-1)
-                if pose_arr.size >= 6:
-                    self._append_frustum_lines(line_verts, pose_arr, scene_center, fc, units_per_m, 0.055, (1.0, 0.82, 0.22))
-            if line_verts:
-                arr = np.asarray(line_verts, dtype=np.float32)
+                pose = np.asarray(cam_pose, dtype=np.float64).reshape(1, -1)[:, :6]
+                line_parts.append(_frustum_line_vertices(pose, scene_center, fc, units_per_m, 0.055, (1.0, 0.82, 0.22)))
+            if line_parts:
+                arr = np.concatenate(line_parts).astype(np.float32)
                 vbo = self.ctx.buffer(arr.tobytes())
                 vao = self.ctx.vertex_array(self.line_prog, [(vbo, '3f 3f', 'in_pos', 'in_color')])
                 self.line_prog['mvp'].write(view_proj.astype(np.float32).T.tobytes())
                 vao.render(moderngl.LINES)
                 vao.release()
                 vbo.release()
-
-    @staticmethod
-    def _append_frustum_lines(out, pose_arr, scene_center, fc, units_per_m, depth_m, color):
-        origin = scene_center + (pose_arr[:3] - fc) * units_per_m
-        rot = scan_geometry.rotvec_to_matrix(pose_arr[3:6]).astype(np.float32)
-        d = float(depth_m) * units_per_m
-        hw = d * 0.52
-        hh = d * 0.36
-        corners_cam = np.array([
-            [-hw, -hh, d],
-            [ hw, -hh, d],
-            [ hw,  hh, d],
-            [-hw,  hh, d],
-        ], dtype=np.float32)
-        corners = origin + corners_cam @ rot.T
-        r, g, b = color
-        for c in corners:
-            out.extend((*origin, r, g, b, *c, r, g, b))
-        for i in range(4):
-            c0, c1 = corners[i], corners[(i + 1) % 4]
-            out.extend((*c0, r, g, b, *c1, r, g, b))
 
     def render_unit_cell_tile(
         self,
@@ -2152,6 +2123,24 @@ class MeshRenderer:
         return img
 
 # %% IMAGE TEXTURE HELPER ─────────────────────────────────────────────────────
+
+def _line_vertices(starts, ends, color):
+    """GL_LINES vertices, (2 * segments, 6) as xyz + rgb, joining each start to its end."""
+    verts = np.empty((len(starts), 2, 6), dtype=np.float32)
+    verts[:, 0, :3], verts[:, 1, :3], verts[:, :, 3:] = starts, ends, color
+    return verts.reshape(-1, 6)
+
+
+def _frustum_line_vertices(poses, scene_center, fc, units_per_m, depth_m, color):
+    """Camera frustum outlines for (N, 6) metre poses [x, y, z, rx, ry, rz], mapped into scene units."""
+    origins = scene_center + (poses[:, :3] - fc) * units_per_m
+    d = float(depth_m) * units_per_m
+    corners_cam = np.array([[-0.52, -0.36, 1.0], [0.52, -0.36, 1.0], [0.52, 0.36, 1.0], [-0.52, 0.36, 1.0]]) * d
+    corners = origins[:, None, :] + corners_cam @ scan_geometry.rotvec_to_matrix(poses[:, 3:6]).transpose(0, 2, 1)
+    starts = np.concatenate([np.repeat(origins[:, None, :], 4, axis=1), corners], axis=1)
+    ends = np.concatenate([corners, np.roll(corners, -1, axis=1)], axis=1)
+    return _line_vertices(starts.reshape(-1, 3), ends.reshape(-1, 3), color)
+
 
 def distortion_map(
     K: np.ndarray,
