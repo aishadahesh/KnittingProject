@@ -226,6 +226,24 @@ def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_co
     assert controller.camera is None
 
 
+def test_a_running_scan_reports_its_status_in_the_sidebar(imgui_context, state, gl_context, ref_tex):
+    from types import SimpleNamespace
+
+    import gui
+    import ur5_scan
+
+    app_state, renderer = state
+    _draw_one_frame(gui, app_state, renderer, "capture", gl_context.window, ref_tex)
+    controller = app_state.get("ur5_controller")
+    progress = ur5_scan.ScanProgress(running=True, status="Moving to view 3/12")
+    controller.runner = SimpleNamespace(running=True, paused=False, progress=progress, capture_records=[], session_id="", video_feed=None)
+    try:
+        _draw_one_frame(gui, app_state, renderer, "scan", gl_context.window, ref_tex)
+    finally:
+        controller.runner = None
+    assert app_state.scanner_status == "Moving to view 3/12"
+
+
 def test_replacing_geometry_and_closing_renderer_releases_gpu_resources(state):
     app_state, renderer = state
     buffers = list(renderer.mesh_buffers) + [renderer.pt_buffer]

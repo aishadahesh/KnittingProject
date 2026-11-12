@@ -2073,7 +2073,7 @@ def draw_sidebar(state, renderer, window=None):
 
     controller = state.get('ur5_controller')
     if controller is not None and controller.runner is not None and controller.runner.running:
-        state.scanner_status = controller.runner.progress.message
+        state.scanner_status = controller.runner.progress.status
 
     if state.status_msg:
         imgui.separator()
