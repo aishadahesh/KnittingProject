@@ -1183,8 +1183,11 @@ def draw_sidebar(state, renderer, window=None):
         use_sim = str(state.get('ur5_transport', 'sim')) == 'sim' or str(state.get('scanner_execution_mode', 'simulation')) == 'simulation'
         controller = ensure_ur5_controller(auto_connect_sim=use_sim)
         runner = controller.runner
+        if controller.scan_planning:
+            state.scanner_status = "Still planning the scan path"
+            return
         if runner is not None and runner.running:
-            if runner.paused:
+            if runner.progress.paused:
                 runner.resume()
                 state.scanner_status = "Scanner continued"
             else:
@@ -1209,17 +1212,13 @@ def draw_sidebar(state, renderer, window=None):
                 return
         if controller.camera is None or not controller.camera.running:
             controller.connect_sim(connect_robot=False, start_cam=True)
-        try:
-            plan = gui_ur5.build_scan_plan(state)
-            controller.plan = plan
-            controller.runner = gui_ur5._make_runner(state, controller, plan)
-            controller.runner.start()
-            state.scanner_status = "Scanner running"
-        except Exception as exc:
-            state.scanner_status = f"Could not start scanner: {exc}"
+        controller.start_scan_in_background()
 
     def stop_scanner_process():
         controller = state.get('ur5_controller')
+        if controller is not None and controller.scan_planning:
+            controller.cancel_scan_start()
+            return
         if controller is not None and controller.runner is not None and controller.runner.running:
             controller.runner.pause()
             state.scanner_status = "Scanner paused"
@@ -1486,8 +1485,8 @@ def draw_sidebar(state, renderer, window=None):
 
         controller = state.get('ur5_controller')
         runner = controller.runner if controller is not None else None
-        running = runner is not None and bool(runner.running) and not bool(runner.paused)
-        runner_paused = runner is not None and bool(runner.running) and bool(runner.paused)
+        running = runner is not None and bool(runner.running) and not bool(runner.progress.paused)
+        runner_paused = runner is not None and bool(runner.running) and bool(runner.progress.paused)
         single_workflow = str(state.get('scanner_camera_workflow', 'path')) == 'single'
         path_workflow = not single_workflow
 

@@ -342,6 +342,7 @@ def main(robot="sim", camera_source="sim"):
             ur5_ctl = state.get("ur5_controller")
             if ur5_ctl is not None:
                 ur5_ctl.update_preview(renderer)
+                ur5_ctl.poll_scan_start()
             draw_sidebar(state, state.active_scene_renderer(), window)
 
             # MuJoCo offscreen rendering can make its own GL context current.

@@ -226,22 +226,46 @@ def test_ur5_mode_does_not_touch_hardware_when_drawn(imgui_context, state, gl_co
     assert controller.camera is None
 
 
-def test_a_running_scan_reports_its_status_in_the_sidebar(imgui_context, state, gl_context, ref_tex):
-    from types import SimpleNamespace
+def _started_scan_controller(gui, app_state, renderer, gl_context, ref_tex):
+    _draw_one_frame(gui, app_state, renderer, "capture", gl_context.window, ref_tex)
+    controller = app_state.get("ur5_controller")
+    app_state.teleop_fabric_z = 0.03
+    controller.connect_sim()
+    controller.start_scan_in_background()
+    assert controller.scan_planning
+    controller.scan_plan_thread.join(timeout=120)
+    return controller
 
+
+def test_a_scan_plans_in_the_background_and_its_run_draws(imgui_context, state, gl_context, ref_tex):
+    """The real runner, not a stand-in: a fake with extra fields hid that RealScanRunner has no `paused`."""
     import gui
-    import ur5_scan
+
+    app_state, renderer = state
+    controller = _started_scan_controller(gui, app_state, renderer, gl_context, ref_tex)
+    controller.poll_scan_start()
+    try:
+        assert controller.runner is not None and controller.runner.running, app_state.scanner_status
+        _draw_one_frame(gui, app_state, renderer, "scan", gl_context.window, ref_tex)
+        assert app_state.scanner_status == controller.runner.progress.status
+    finally:
+        controller.runner.stop()
+        controller.runner.wait(timeout=10.0)
+
+
+def test_a_scan_cancelled_while_planning_never_starts(imgui_context, state, gl_context, ref_tex):
+    import gui
 
     app_state, renderer = state
     _draw_one_frame(gui, app_state, renderer, "capture", gl_context.window, ref_tex)
     controller = app_state.get("ur5_controller")
-    progress = ur5_scan.ScanProgress(running=True, status="Moving to view 3/12")
-    controller.runner = SimpleNamespace(running=True, paused=False, progress=progress, capture_records=[], session_id="", video_feed=None)
-    try:
-        _draw_one_frame(gui, app_state, renderer, "scan", gl_context.window, ref_tex)
-    finally:
-        controller.runner = None
-    assert app_state.scanner_status == "Moving to view 3/12"
+    controller.connect_sim()
+    controller.start_scan_in_background()
+    controller.cancel_scan_start()
+    controller.scan_plan_thread.join(timeout=120)
+    controller.poll_scan_start()
+    assert controller.runner is None
+    assert app_state.scanner_status == "Scan cancelled before the arm moved"
 
 
 def test_replacing_geometry_and_closing_renderer_releases_gpu_resources(state):

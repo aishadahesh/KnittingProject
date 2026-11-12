@@ -266,6 +266,9 @@ class UR5ModeController:
         self.rehearse_index = -1
         self.rehearse_thread: threading.Thread | None = None
         self.plan_thread: threading.Thread | None = None
+        self.scan_plan_thread: threading.Thread | None = None
+        self._scan_plan_id = 0
+        self._scan_plan_result = None
         self._check_lock = threading.Lock()
         self._check_again = False
         self._rehearse_stop = threading.Event()
@@ -584,6 +587,51 @@ class UR5ModeController:
             self.status = "Checking the path..."
             self.plan_thread = threading.Thread(target=self._check_loop, daemon=True, name="ur5-check")
             self.plan_thread.start()
+
+    @property
+    def scan_planning(self) -> bool:
+        return self.scan_plan_thread is not None and self.scan_plan_thread.is_alive()
+
+    def start_scan_in_background(self) -> None:
+        """Solve the Scan grid on a worker; poll_scan_start starts the run on the UI thread once it is solved.
+
+        A 6 x 7 grid at 6 angles takes ~40 s to solve, and solving it on the UI thread froze the window.
+        """
+        joints, settings = scan_plan_inputs(self.state)
+        self._scan_plan_id += 1
+        plan_id = self._scan_plan_id
+
+        def solve():
+            try:
+                result = scan_geometry.build_capture_plan(joints, **settings)
+            except Exception as exc:
+                logging.exception("Scan plan")
+                result = exc
+            self._scan_plan_result = (plan_id, result)
+
+        self._scan_plan_result = None
+        self.scan_plan_thread = threading.Thread(target=solve, daemon=True, name="scan-plan")
+        self.scan_plan_thread.start()
+        self.status = self.state.scanner_status = "Planning the scan path - the arm moves when it is ready"
+
+    def cancel_scan_start(self) -> None:
+        self._scan_plan_id += 1
+        self.status = self.state.scanner_status = "Scan cancelled before the arm moved"
+
+    def poll_scan_start(self) -> None:
+        """Start the scan whose plan has just been solved, unless it was cancelled meanwhile. Called every frame."""
+        if self.scan_planning or self._scan_plan_result is None:
+            return
+        (plan_id, result), self._scan_plan_result = self._scan_plan_result, None
+        if plan_id != self._scan_plan_id:
+            return
+        if isinstance(result, Exception):
+            self.status = self.state.scanner_status = f"Could not plan the scan: {result}"
+            return
+        self.apply_capture_settings()
+        self.runner = _make_runner(self.state, self, result)
+        started = self.runner.start()
+        self.status = self.state.scanner_status = "Scanner running" if started else self.runner.progress.status
 
     def replan(self) -> None:
         """Check again after a setting changed - when there is an arm to plan from, and no run is flying the path."""
@@ -1344,6 +1392,12 @@ def taught_set_names() -> list[str]:
 
 def build_scan_plan(state):
     """Builds the grid CapturePlan from the scanner grid settings."""
+    joints, settings = scan_plan_inputs(state)
+    return scan_geometry.build_capture_plan(joints, **settings)
+
+
+def scan_plan_inputs(state):
+    """The start joints and build_capture_plan settings for the Scan grid, read from AppState on the UI thread."""
     controller = state.get("ur5_controller")
     joints = (
         controller.robot.refresh().joints
@@ -1357,7 +1411,7 @@ def build_scan_plan(state):
         "grid_cols": max(1, int(state.get("scanner_cols", 1))),
         "grid_views_per_station": max(1, int(state.get("scanner_angles", 3))),
     }
-    return scan_geometry.build_capture_plan(joints, **settings)
+    return joints, settings
 
 
 def _make_runner(state, controller, plan):
@@ -2586,6 +2640,12 @@ def _draw_scan_section(state, controller):
         imgui.text_colored(COLOR_OK, "Running - progress is shown at the top")
         return
 
+    if controller.scan_planning:
+        imgui.text_colored(COLOR_WARN, "Planning the scan path - the arm moves when it is ready")
+        if imgui.button("Cancel before it moves##ur5_scan_cancel", (-1, 0)):
+            controller.cancel_scan_start()
+        return
+
     if controller.pending_start == "scan":
         _draw_start_confirmation(state, controller, "scan")
         return
@@ -2621,8 +2681,11 @@ def _start_run(state, controller, which):
     solved again here: solving from a pose the arm has since left is how a run comes to
     execute a path nobody looked at.
     """
+    if which == "scan":
+        controller.start_scan_in_background()
+        return
     try:
-        plan = controller.plan if which == "capture" else build_scan_plan(state)
+        plan = controller.plan
         if plan is None:
             raise RuntimeError("no checked capture path")
         controller.apply_capture_settings()
