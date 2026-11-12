@@ -2261,22 +2261,20 @@ def upload_rgb_texture(ctx, texture, rgb):
     correctness -- one never set the filter, another never handled a size change
     and would write new bytes into a stale-sized texture.
     """
-    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-    height, width = rgb.shape[:2]
-    rgba = np.dstack((rgb, np.full((height, width), 255, dtype=np.uint8)))
     # Flipped because GL's texture origin is bottom-left and image rows arrive
     # top-first.
-    rgba = np.ascontiguousarray(np.flipud(rgba))
+    rgb = np.ascontiguousarray(np.flipud(np.asarray(rgb, dtype=np.uint8)))
+    height, width = rgb.shape[:2]
     if texture is None or tuple(texture.size) != (width, height):
         if texture is not None:
             try:
                 texture.release()
             except Exception as exc:
                 logging.warning("rendering.upload_rgb_texture: %s", exc)
-        texture = ctx.texture((width, height), 4, rgba.tobytes())
+        texture = ctx.texture((width, height), 3, rgb.tobytes())
         texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
     else:
-        texture.write(rgba.tobytes())
+        texture.write(rgb.tobytes())
     return texture
 
 

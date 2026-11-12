@@ -94,10 +94,9 @@ def _scanner_estimated_cell_colors(state):
         if bitmap.ndim != 2 or bitmap.size == 0:
             bitmap = np.ones((1, 1), dtype=np.float32)
         row_colors = palette[np.arange(bitmap.shape[0]) % len(palette)]
-        weights = np.where(bitmap > 0.5, 1.0, hidden_weight).astype(np.float32)
-        weighted = weights[:, :, None] * row_colors[:, None, :]
-        total_weight = max(float(weights.sum()), 1e-6)
-        rgb = np.clip(weighted.sum(axis=(0, 1)) / total_weight, 0.0, 1.0)
+        active = bitmap > 0.5
+        row_weights = np.where(active, 1.0, hidden_weight).sum(axis=1)
+        rgb = np.clip(row_weights @ row_colors / max(float(row_weights.sum()), 1e-6), 0.0, 1.0)
         overridden = False
         if isinstance(raw_overrides, list) and cell_index < len(raw_overrides):
             override = raw_overrides[cell_index]
@@ -107,7 +106,7 @@ def _scanner_estimated_cell_colors(state):
                     overridden = True
                 except Exception as exc:
                     logging.warning("scanner_core._scanner_estimated_cell_colors: %s", exc)
-        active_ratio = float(np.mean(bitmap > 0.5))
+        active_ratio = float(active.mean())
         estimates.append({
             "row": int(cell_index // cols),
             "col": int(cell_index % cols),
@@ -135,11 +134,11 @@ def _scanner_measured_cell_colors(state):
     return colors
 
 
-def _scanner_display_batch_colors(state):
+def _scanner_display_batch_colors(state, estimates=None):
     measured = _scanner_measured_cell_colors(state)
     if measured is not None:
         return measured, "actual"
-    estimates = _scanner_estimated_cell_colors(state)
+    estimates = estimates if estimates is not None else _scanner_estimated_cell_colors(state)
     colors = [[float(v) for v in item.get("rgb", [42.0, 42.0, 42.0])[:3]] for item in estimates]
     return colors, "estimated"
 

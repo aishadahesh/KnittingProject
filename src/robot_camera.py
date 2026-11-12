@@ -35,6 +35,7 @@ DEFAULT_PREVIEW_WIDTH = 480
 FRESH_FRAME_TIMEOUT = 2.0
 # Between grabs: roughly 30 frames a second, which is also the rate a recorded video is written at.
 GRAB_INTERVAL = 0.033
+SIM_GRAB_INTERVAL = 0.1
 # The automatic exposure and white balance get this many frames to settle after the camera opens,
 # then are pinned for the rest of the session (lock_exposure).
 EXPOSURE_SETTLE_FRAMES = 45
@@ -75,6 +76,7 @@ class CameraBackend:
 
     name = "base"
     is_real = False
+    grab_interval = GRAB_INTERVAL
 
     def open(self) -> None:
         raise NotImplementedError
@@ -276,6 +278,7 @@ class SimCameraBackend(CameraBackend):
 
     name = "sim"
     is_real = False
+    grab_interval = SIM_GRAB_INTERVAL
 
     def __init__(
         self,
@@ -776,7 +779,7 @@ class RobotCamera:
                     self._frame = frame
                     self._new_frame.notify_all()
                 # The loop is the only reader of the device, so it sets the rate for preview and capture alike.
-                time.sleep(GRAB_INTERVAL)
+                time.sleep(self.backend.grab_interval)
         finally:
             try:
                 self.backend.close()

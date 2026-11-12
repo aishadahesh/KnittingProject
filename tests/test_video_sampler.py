@@ -70,7 +70,8 @@ def test_the_recorded_video_gives_the_same_pictures_again(tmp_path):
             live.still()
         return frame
 
-    live = ur5_scan.LiveVideo(SimpleNamespace(latest_frame=latest_frame), ur5_scan.VideoSampler(tmp_path))
+    camera = SimpleNamespace(latest_frame=latest_frame, backend=SimpleNamespace(grab_interval=1.0 / FPS))
+    live = ur5_scan.LiveVideo(camera, ur5_scan.VideoSampler(tmp_path))
     live.start()
     try:
         assert finished.wait(30), live.sampler.error

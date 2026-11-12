@@ -91,15 +91,13 @@ def _pick_file(mode, initial_path):
 
 
 def _draw_scanner_batch_color_grid(state, title=None):
-    display_colors, stage = _scanner_display_batch_colors(state)
+    estimate_list = _scanner_estimated_cell_colors(state)
+    display_colors, stage = _scanner_display_batch_colors(state, estimate_list)
     if not display_colors:
         return
     rows = max(1, int(state.scanner_rows))
     cols = max(1, int(state.scanner_cols))
-    estimates = {
-        (int(item["row"]), int(item["col"])): item
-        for item in _scanner_estimated_cell_colors(state)
-    }
+    estimates = {(int(item["row"]), int(item["col"])): item for item in estimate_list}
     selected = np.asarray(state.get('scanner_selected_cell', [0, 0]), dtype=np.int32).reshape(-1)
     selected_r = int(np.clip(selected[0] if selected.size > 0 else 0, 0, rows - 1))
     selected_c = int(np.clip(selected[1] if selected.size > 1 else 0, 0, cols - 1))

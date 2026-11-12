@@ -522,10 +522,7 @@ class AppState:
         max_rows = max(2, int(self.config['knit_parameters']['bitmap_rows']))
         rows = int(self.get('scanner_pattern_rows', max(2, int(self.bitmap_size[0]))))
         cols = int(self.get('scanner_pattern_cols', max(2, int(self.bitmap_size[1]))))
-        return (
-            int(np.clip(rows, 2, max_rows)),
-            int(np.clip(cols, 2, self.SCANNER_PATTERN_MAX_COLS)),
-        )
+        return min(max(rows, 2), max_rows), min(max(cols, 2), int(self.SCANNER_PATTERN_MAX_COLS))
 
     SWATCH_STATE_KEYS = (
         'bitmap',
@@ -611,7 +608,7 @@ class AppState:
             if bm.ndim == 2 and bm.size:
                 return bm.copy()
         pattern_rows, pattern_cols = self._scanner_pattern_size()
-        density = float(np.clip(float(self.get('scanner_pattern_density', 0.62)), 0.05, 0.95))
+        density = min(max(float(self.get('scanner_pattern_density', 0.62)), 0.05), 0.95)
         seed = int(self.get('scanner_random_seed', 1)) + int(cell_index) * 9973
         rng = np.random.default_rng(seed)
         bitmap = (rng.random((pattern_rows, pattern_cols)) < density).astype(np.float32)

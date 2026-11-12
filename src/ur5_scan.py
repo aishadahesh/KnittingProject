@@ -160,7 +160,7 @@ class LiveVideo:
     def _run(self) -> None:
         import cv2
 
-        writer, last_index, fps = None, -1, round(1.0 / robot_camera.GRAB_INTERVAL)
+        writer, last_index, fps = None, -1, round(1.0 / self.camera.backend.grab_interval)
         try:
             while not self._stop.is_set():
                 frame = self.camera.latest_frame()
