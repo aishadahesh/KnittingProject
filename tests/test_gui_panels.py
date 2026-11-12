@@ -122,6 +122,7 @@ def state(gl_context, tmp_path):
     # which would otherwise overwrite the real config/params.json every run.
     app_state.save_path = str(tmp_path / "params.json")
     app_state.load_path = str(tmp_path / "params.json")
+    app_state.project_root = str(tmp_path)
     app_state.autosave_enabled = False
     app_state.scanner_rows = 1
     app_state.scanner_cols = 1
