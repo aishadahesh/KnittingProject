@@ -1063,7 +1063,7 @@ def _copy_share_link(view, name: str) -> None:
     try:
         link = drive_store.share_link(name)
         imgui.set_clipboard_text(link)
-        view.status = f"Link copied (anyone with it can view {name or drive_store.FOLDER}): {link}"
+        view.status = f"Link copied (anyone with it can view {name or drive_store.DATA_FOLDER}): {link}"
     except Exception as exc:
         view.status = f"No link: {exc}"
 
@@ -1102,9 +1102,10 @@ def _draw_drive(view, model) -> None:
             _save_to_drive(view, model)
         if imgui.is_item_hovered():
             names = ", ".join(f.name for f in drive_store.scan_folders(model["output"]))
-            imgui.set_tooltip(f"Zips {names} into one file in Drive's {drive_store.FOLDER} folder: the photos and poses,\n"
+            imgui.set_tooltip(f"Copies {names} into Drive's {drive_store.FOLDER}, as folders: the photos and poses,\n"
                               "masks, scale, every splat (the Gaussians) and the colours, yarns and fits.\n"
-                              "Checkpoints, COLMAP databases, photo copies and renders are left out (they can be made again).")
+                              "Checkpoints, COLMAP databases, photo copies and renders are left out (they can be made again).\n"
+                              "Saving again copies only what changed.")
     imgui.same_line()
     if imgui.small_button("Refresh##drive_refresh"):
         view.drive_saved = None

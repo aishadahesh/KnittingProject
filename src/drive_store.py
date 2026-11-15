@@ -1,7 +1,7 @@
 """Save a scanned model to Google Drive, through rclone (https://rclone.org), from the app.
 
-A model is saved as folders, as they are in robot_scans (so the Drive folder can be opened and shared
-as it is): its scan folder - and, for a model built from several captures (combined.json), each
+A model is saved as folders, as they are in robot_scans, under KnittingProject_data/robot_scans on
+Drive - so the shared folder's robot_scans drops straight into a copy of the project: its scan folder - and, for a model built from several captures (combined.json), each
 capture's folder - with what cannot be made again: the raw photos and the arm's poses, the cameras'
 poses, the masks, the scale, every splat (the Gaussians, .ply) and the colours, yarns and stitch fits
 read from it. What can be made again is left out: training checkpoints, COLMAP databases, the photo
@@ -31,7 +31,8 @@ import subprocess
 from pathlib import Path
 
 REMOTE = "gdrive"
-FOLDER = "KnittingProject_data"
+DATA_FOLDER = "KnittingProject_data"            # the folder to share
+FOLDER = f"{DATA_FOLDER}/robot_scans"            # the scan folders, as in the project
 REBUILDABLE = {".ckpt", ".db"}
 HIDE_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -111,8 +112,8 @@ def upload(output: Path, list_file: Path) -> tuple[subprocess.Popen, int, int]:
 
 
 def share_link(name: str = "") -> str:
-    """A link to a folder on Drive (the whole data folder by default). Anyone with the link can view it."""
-    result = _run("link", f"{REMOTE}:{FOLDER}/{name}".rstrip("/"))
+    """A link to a scan folder on Drive (by default the whole KnittingProject_data). Anyone with the link can view it."""
+    result = _run("link", f"{REMOTE}:{FOLDER}/{name}" if name else f"{REMOTE}:{DATA_FOLDER}")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "rclone link failed")
     return result.stdout.strip()
