@@ -1,0 +1,20 @@
+{
+  "fx": 928.3100515846362,
+  "fy": 913.9160057724832,
+  "cx": 311.6666709276321,
+  "cy": 242.57935072531646,
+  "k1": 0.10387365296966208,
+  "k2": 1.141836099827129,
+  "p1": 0.001146487674775084,
+  "p2": -0.0010718159130313403,
+  "k3": -9.584745608621413,
+  "width": 640,
+  "height": 480,
+  "fov_degrees": 38.03941654897041,
+  "reprojection_error_px": 3.162297759549183,
+  "views": 22,
+  "board": "charuco 5.10 mm squares",
+  "calibrated_at": "2026-11-11 13:19:32",
+  "method": "joint lens + mount fit to 22 robot-placed ChArUco views (robot_scans/mount_20261111_130922)",
+  "note": "fixed-focus camera, 640x480; COLMAP Oct fx ~927"
+}

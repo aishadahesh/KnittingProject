@@ -1,79 +1,61 @@
 {
   "from_sessions": [
-    "ur5_20261019_180051"
+    "mount_20261111_130922"
   ],
   "rotvec": [
-    0.22026413902560313,
-    0.20452174692014302,
-    -0.7929675738355911
+    0.04338849908784605,
+    0.08508267749979166,
+    -1.728549698952869
   ],
   "translation": [
-    -0.05225401867994361,
-    -0.0045701606268687715,
-    -0.04452414651608295
+    -0.03959318733342776,
+    0.0044918501600917475,
+    -0.03338470671477115
   ],
   "target": [
-    -0.2131481269766405,
-    0.6643958269427267,
-    0.05572281764563722
+    -0.13915891093429839,
+    0.5724989147394302,
+    0.06596529868800995
   ],
-  "fov_degrees": 30.0,
-  "lens": "fitted field of view, no distortion",
+  "fov_degrees": 38.03941654897041,
+  "lens": "measured (config/camera_intrinsics.json, fitted jointly with this mount)",
   "roll": "fitted",
-  "rms_px": 10.856865428770567,
-  "max_px": 39.98265951841719,
-  "pictures_used": 50,
-  "skipped": [
-    "ur5_0009_row_01_col_01_station_001_d1_az+30_tilt7.png: the object runs off the edge of the frame",
-    "ur5_0017_row_01_col_01_station_001_d1_az+70_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0018_row_01_col_01_station_001_d1_az+40_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0019_row_01_col_01_station_001_d1_az+10_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0020_row_01_col_01_station_001_d1_az-20_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0021_row_01_col_01_station_001_d1_az-50_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0028_row_01_col_01_station_001_d1_az-100_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0029_row_01_col_01_station_001_d1_az-70_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0030_row_01_col_01_station_001_d1_az-40_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0031_row_01_col_01_station_001_d1_az-10_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0032_row_01_col_01_station_001_d1_az+20_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0033_row_01_col_01_station_001_d1_az+50_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0034_row_01_col_01_station_001_d1_az+80_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0035_row_01_col_01_station_001_d1_az+110_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0036_row_01_col_01_station_001_d1_az+140_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0044_row_01_col_01_station_001_d2_az+20_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0045_row_01_col_01_station_001_d2_az+50_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0046_row_01_col_01_station_001_d2_az+80_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0047_row_01_col_01_station_001_d2_az+110_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0048_row_01_col_01_station_001_d2_az+140_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0049_row_01_col_01_station_001_d2_az+170_tilt20.png: the object runs off the edge of the frame",
-    "ur5_0050_row_01_col_01_station_001_d2_az+160_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0051_row_01_col_01_station_001_d2_az+130_tilt13.png: the object runs off the edge of the frame",
-    "ur5_0052_row_01_col_01_station_001_d2_az+100_tilt13.png: the object runs off the edge of the frame"
+  "rms_px": 3.162297759549183,
+  "max_px": 5.54059655411381,
+  "pictures_used": 22,
+  "held_out_error": {
+    "median_mm": 1.4461092953889874,
+    "median_deg": 0.9842431099666978,
+    "worst_mm": 6.276111156816324,
+    "worst_deg": 3.9892896094532646
+  },
+  "board_from_base": [
+    [
+      -0.998039980847043,
+      0.06120467845933562,
+      -0.013045457658634628,
+      -0.039228091013812846
+    ],
+    [
+      0.06076352966068547,
+      0.9976427495079867,
+      0.03188632649458988,
+      -0.46827210152608334
+    ],
+    [
+      0.01496629860750104,
+      0.031031140630565383,
+      -0.999406362906079,
+      0.0502435387206092
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
   ],
-  "image_size": [
-    640,
-    480
-  ],
-  "fitted_at": "2026-10-25 13:00:56",
-  "worst": [
-    {
-      "name": "ur5_0016_row_01_col_01_station_001_d1_az+100_tilt13.png",
-      "error_px": 39.98265951841719
-    },
-    {
-      "name": "ur5_0037_row_01_col_01_station_001_d1_az+170_tilt20.png",
-      "error_px": 35.41381715565505
-    },
-    {
-      "name": "ur5_0053_row_01_col_01_station_001_d2_az+70_tilt13.png",
-      "error_px": 30.512889123635755
-    },
-    {
-      "name": "ur5_0038_row_01_col_01_station_001_d2_az-160_tilt20.png",
-      "error_px": 24.825723160187827
-    },
-    {
-      "name": "ur5_0054_row_01_col_01_station_001_d2_az+40_tilt13.png",
-      "error_px": 24.686650263858247
-    }
-  ]
+  "method": "ChArUco board (5.10 mm squares) + robot-placed views; camera rigid (repeat 0.2 mm / 0.06 deg)",
+  "fitted_at": "2026-11-11 13:19:32",
+  "replaces": "config/hand_eye_20261019_guessed_lens.json"
 }

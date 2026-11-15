@@ -7,7 +7,8 @@ Three designs, all for the 7 mm x 40 mm endoscope head, lens down on the tool ax
 | `endoscope_holder.scad/.stl` | in the OnRobot 2FG7 gripper's fingers | printed and in use until Oct 2026 - the camera ended up 5 cm beside the tool point and turned 49 deg (measured by the mount calibration) |
 | `endoscope_flange_mount.scad/.stl` | bolted to the tool flange (5 Oct design) | never printed |
 | `endoscope_flange_mount_v2.scad/.stl` | bolted to the tool flange, located by the flange pin | superseded by v3 (ears printed in mid-air) |
-| **`endoscope_flange_mount_v3.scad`** | same plate; plain tube with a conical press-fit bore and a cable window, no riser/ears | **export STL from OpenSCAD and print this one**; lens tip 52 mm from flange (tool offset 0.052 m) |
+| `endoscope_flange_mount_v3.scad/.stl` | same plate; plain tube with a conical press-fit bore and a cable window, no riser/ears | superseded by v4 (cable had to be threaded through the bore; camera held by friction only) |
+| **`endoscope_flange_mount_v4.scad/.stl`** | 4 mm plate, 4 bolt holes for the original M6 screws (7 mm thread, 9 mm head) in 2 mm-deep head pockets, no washers, no dowel; bore opens as an 11 mm funnel on the flange face and narrows steadily from 9 mm to a 5.6 mm lip at the tip, where the 6 mm camera (measured 12 Nov) stops; 4.2 mm cable slot up the tube and across the plate | **print this one**; camera goes in from the flange side before bolting; lens ~48 mm from flange (tool offset ~0.048 m, re-run the mount calibration). The .stl was built from the .scad's dimensions with manifold3d (OpenSCAD not installed) |
 
 ## v2: what it is
 
