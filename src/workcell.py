@@ -9,12 +9,20 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 
-from paths import WORKCELL_JSON
+from paths import FABRIC_PARTS_JSON, WORKCELL_JSON
 
 
 @lru_cache(maxsize=1)
 def cell() -> dict:
     return json.loads(WORKCELL_JSON.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=1)
+def parts() -> list[dict]:
+    """The fabric's numbered parts (scripts/map_fabric_parts.py); empty until they have been mapped."""
+    if not FABRIC_PARTS_JSON.exists():
+        return []
+    return json.loads(FABRIC_PARTS_JSON.read_text(encoding="utf-8"))["parts"]
 
 
 def surface_z(top_z_at_origin: float, x: float, y: float) -> float:

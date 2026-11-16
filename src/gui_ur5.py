@@ -355,7 +355,8 @@ class UR5ModeController:
             "swatch_tiles_epoch": tiles_epoch,
             "swatch_slots": swatch_slots,
             "swatch_repeats": swatch_repeats,
-            "hide_unit_cell_mesh": bool(tile_images and swatch_slots),
+            "hide_unit_cell_mesh": bool(tile_images and swatch_slots) or not bool(self.state.get("world_show_sim_swatches", True)),
+            "show_swatches": bool(self.state.get("world_show_sim_swatches", True)),
         }
         material_uniforms = {**material_uniforms, **macro_keys}
         return {

@@ -807,6 +807,7 @@
       "ur5_show_scene": true,
       "world_show_neighbor_swatches": true,
       "world_show_robot": true,
+      "world_show_sim_swatches": true,
       "ur5_expert": false,
       "ur5_splat_object_only": true,
       "ur5_jog_step": 0.01,

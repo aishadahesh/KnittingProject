@@ -1595,7 +1595,7 @@ class MeshRenderer:
                 self.cell_photo_vao.render(moderngl.TRIANGLES)
                 self.world_prog['uUseTex'].value = 0.0
 
-        if show_board:
+        if show_board and bool(world_scene.get("show_swatches", True)):
             self._draw_macro_fabric_sheet(view_proj, model_mat, world_scene, units_per_m=units_per_m)
 
         if has_robot and draw_robot:
@@ -2011,6 +2011,7 @@ class MeshRenderer:
                     "swatch_slots",
                     "swatch_repeats",
                     "hide_unit_cell_mesh",
+                    "show_swatches",
                 ):
                     if k in src and src[k] is not None:
                         ws[k] = src[k]

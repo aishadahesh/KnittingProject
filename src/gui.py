@@ -2101,6 +2101,11 @@ def _project_slot_corners(state, model_matrix, view_proj, disp_w, disp_h):
     return screen.reshape(-1, 4, 2), valid.reshape(-1, 4)
 
 
+def _show_swatches(state) -> bool:
+    """Whether the simulated knit swatches are drawn over the real fabric's photo."""
+    return bool(state.get('world_show_sim_swatches', True))
+
+
 def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True, renderer=None):
     controller = state.get('ur5_controller')
     joints = None
@@ -2147,7 +2152,8 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
         'swatch_tiles_epoch': tiles_epoch,
         'swatch_slots': state.all_swatch_slot_rects() if hasattr(state, 'all_swatch_slot_rects') else [],
         'swatch_repeats': _scanner_pattern_repeats(state),
-        'hide_unit_cell_mesh': (_normalize_app_mode(state.get('app_mode', 'edit'), state) in ('scan', 'capture')),
+        'show_swatches': _show_swatches(state),
+        'hide_unit_cell_mesh': (_normalize_app_mode(state.get('app_mode', 'edit'), state) in ('scan', 'capture')) or not _show_swatches(state),
     }
 
 
@@ -2195,7 +2201,8 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
             _hud_text(dl, p0.x + 6.0, p0.y - 15.0, label_col, label)
 
     eye3 = np.eye(3, dtype=np.float32)
-    if bool(world_scene.get('show_board', True)):
+    swatches = bool(world_scene.get('show_swatches', True))
+    if bool(world_scene.get('show_board', True)) and swatches:
         draw_gnomon(scene_center, eye3, 0.04 * units_per_m, "BOARD")
     if bool(world_scene.get('show_robot', True)):
         base_gl = scene_center - fc * units_per_m
@@ -2207,6 +2214,9 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
                 cam_gl = scene_center + (pose_arr[:3] - fc) * units_per_m
                 cam_rot = gui_ur5.scan_geometry.rotvec_to_matrix(pose_arr[3:6]).astype(np.float32)
                 draw_gnomon(cam_gl, cam_rot, 0.032 * units_per_m, "CAM")
+
+    if bool(world_scene.get('show_board', True)):
+        _draw_fabric_parts(dl, view_proj, scene_center, fc, units_per_m, disp_w, disp_h, ox, oy, vp_scale)
 
     rows = max(1, int(state.get('scanner_rows', 1)))
     cols = max(1, int(state.get('scanner_cols', 1)))
@@ -2220,7 +2230,7 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
     for r in range(rows):
         for c in range(cols):
             is_active = (r == sel_r and c == sel_c)
-            if not is_active and not show_neighbors:
+            if not swatches or (not is_active and not show_neighbors):
                 continue
             x, y = (float(v) for v in corner_screen[r * cols + c, 3])
             if corner_valid[r * cols + c, 3] and 0.0 <= x <= float(disp_w) and 0.0 <= y <= float(disp_h):
@@ -2240,6 +2250,24 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
     )
     status_col = imgui.get_color_u32((0.90, 0.93, 0.96, 0.94))
     _hud_text(dl, ox + 10.0, oy + float(disp_h) * vp_scale - 22.0, status_col, status_line)
+
+
+def _draw_fabric_parts(dl, view_proj, scene_center, fc, units_per_m, disp_w, disp_h, ox, oy, vp_scale):
+    """Outline and number every mapped fabric part on the simulated carton."""
+    top = workcell.cell()["carton"]["top_z_at_origin"]
+    outline_col = imgui.get_color_u32((1.0, 0.86, 0.20, 0.85))
+    label_col = imgui.get_color_u32((1.0, 0.95, 0.70, 1.0))
+    for part in workcell.parts():
+        (x0, x1), (y0, y1) = part["x"], part["y"]
+        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        points = np.array([[x, y, workcell.surface_z(top, x, y)] for x, y in (*corners, part["centre"][:2])], dtype=np.float32)
+        scr, valid, _ = project_to_screen(scene_center + (points - fc) * units_per_m, view_proj, disp_w, disp_h)
+        if not valid.all():
+            continue
+        screen = [imgui.ImVec2(ox + float(x) * vp_scale, oy + float(y) * vp_scale) for x, y in scr]
+        for a, b in zip(screen[:4], screen[1:4] + screen[:1]):
+            dl.add_line(a, b, outline_col, 1.5)
+        _hud_text(dl, screen[4].x - 7.0, screen[4].y - 7.0, label_col, f"{part['number']:02d}")
 
 
 def _camera_pose_line(state) -> str:
@@ -2395,6 +2423,10 @@ def draw_viewport(state, renderer, ref_tex, window):
         ch_rb, show_rb = imgui.checkbox("Table & Robot##vp_robot", bool(state.get('world_show_robot', True)))
         if ch_rb:
             state.world_show_robot = bool(show_rb)
+    imgui.same_line()
+    ch_sw, show_sw = imgui.checkbox("Simulated Swatches##vp_swatches", _show_swatches(state))
+    if ch_sw:
+        state.world_show_sim_swatches = bool(show_sw)
     imgui.same_line()
     imgui.text_disabled(_camera_pose_line(state))
     imgui.text_disabled("WASD/QE fly the focused view - hold LMB to steer as you fly - R resets it - Z/C roll")
@@ -2700,7 +2732,7 @@ def draw_viewport(state, renderer, ref_tex, window):
                 2.0,
                 0,
             )
-        if scanner_stage_active:
+        if scanner_stage_active and _show_swatches(state):
             rows = max(1, int(getattr(state, 'scanner_rows', state.bitmap_size[0])))
             cols = max(1, int(getattr(state, 'scanner_cols', state.bitmap_size[1])))
             if str(state.get('scanner_camera_workflow', 'path')) == 'single':

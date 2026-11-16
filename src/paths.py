@@ -43,6 +43,8 @@ WORKCELL_JSON = CONFIG_DIR / "workcell.json"
 # The carton's top with the fabric on it, photographed from above (0.25 mm per pixel, cut to workcell.json's carton
 # rectangle, top row = far edge).
 WORKCELL_CARTON_JPG = ASSETS_DIR / "workcell_carton.jpg"
+# The fabric's numbered parts found in that photo (scripts/map_fabric_parts.py), in the robot base frame.
+FABRIC_PARTS_JSON = CONFIG_DIR / "fabric_parts.json"
 
 # Downloaded model weights - fetched by scripts, never committed. MobileSAM is the fabric
 # check's segmentation model (scripts/fetch_mobilesam.py).
