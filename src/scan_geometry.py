@@ -1300,7 +1300,7 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
                        centre_xy=None, max_tilt_deg=35.0, image_turn=IDENTITY_TURN, splat_views_per_ring=12,
                        splat_layers=2, grid_views_per_station=1, grid_height_passes=1, grid_overview_height=None, grid_overview_joints=None,
                        sweep_overlap=0.65, camera_mount=None, splat_subject=None, splat_layer_step=None,
-                       splat_layer_radii=None) -> CapturePlan:
+                       splat_layer_radii=None, subject_xy=None) -> CapturePlan:
     """Solve and check a whole capture path before any of it can be commanded.
 
     Every viewpoint is solved from the previous one, so consecutive configurations stay on
@@ -1320,11 +1320,17 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
     and laid out for the real lens; each view is turned back into the planner's camera before it
     is solved and checked, so every safety check is the usual one. `splat_subject` fixes the
     dome's centre instead of taking the fabric point the camera looks at from `joints`.
+
+    `subject_xy` (x, y on the fabric plane) is what the orbit, centred, splat and centre views centre on,
+    instead of the outline's middle or the spot the camera looks at; the outline still keeps frames on the cloth.
     """
     fabric_z = fabric_height(subject_distance, fabric_z)
     region = FabricRegion(np.asarray(fabric_outline, dtype=float).reshape(-1, 3)) if len(fabric_outline) else None
     here = np.asarray(joints, dtype=float)
     tool_pose = flange_pose(here)
+    target = None if subject_xy is None else np.array([float(subject_xy[0]), float(subject_xy[1]), fabric_z])
+    if centre_xy is None and subject_xy is not None:
+        centre_xy = subject_xy
 
     sphere = None
     subject = None
@@ -1359,19 +1365,20 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
             raise RuntimeError(f"No sweep station fits inside the fabric outline at {camera_height * 100:.0f} cm - "
                                "a frame there is wider than the cloth; lower the camera, or mark the corners again")
     elif pattern == "centred":
-        subject = (region.centre if region is not None and region.has_outline
+        subject = (target if target is not None else region.centre if region is not None and region.has_outline
                    else fabric_point_below(camera_point(tool_pose, tool_offset), tool_pose[3:6], fabric_z, subject_distance))
         views, sphere = centred_views(tool_pose, subject, count, camera_height, rings, max_tilt_deg,
                                       region if region is not None and region.has_outline else None, fabric_z, lens_hfov_deg, image_turn)
     elif pattern == "splat":
         if camera_mount is not None:
             lens = _lens_pose(np.r_[camera_point(tool_pose, tool_offset), tool_pose[3:6]], camera_mount)
-            subject = (np.asarray(splat_subject, dtype=float) if splat_subject is not None
+            subject = (np.asarray(splat_subject, dtype=float) if splat_subject is not None else target if target is not None
                        else fabric_point_below(lens[:3], lens[3:6], fabric_z, subject_distance))
             views, sphere = splat_views(lens, subject, splat_views_per_ring, rings, splat_layers, camera_height, max_tilt_deg,
                                         region, image_turn, splat_layer_step, splat_layer_radii)
         else:
-            subject = fabric_point_below(camera_point(tool_pose, tool_offset), tool_pose[3:6], fabric_z, subject_distance)
+            subject = (target if target is not None
+                       else fabric_point_below(camera_point(tool_pose, tool_offset), tool_pose[3:6], fabric_z, subject_distance))
             views, sphere = splat_views(tool_pose, subject, splat_views_per_ring, rings, splat_layers, camera_height, max_tilt_deg,
                                         region, image_turn, splat_layer_step, splat_layer_radii)
     elif pattern == "centre":
@@ -1384,7 +1391,7 @@ def build_capture_plan(joints, *, pattern="orbit", count=6, subject_distance=0.2
     else:
         # With the fabric outlined, the orbit circles its middle wherever the arm happens to stand;
         # without, it circles the spot the camera looks at now, the only place known to be cloth.
-        looked_at = (region.centre if region is not None and region.has_outline
+        looked_at = (target if target is not None else region.centre if region is not None and region.has_outline
                      else fabric_point_below(camera_point(tool_pose, tool_offset), tool_pose[3:6], fabric_z, subject_distance))
         views, sphere = orbit_views(tool_pose, looked_at, count, orbit_radius, arc_degrees, elevation_degrees, rings, max_height)
         subject = sphere.subject

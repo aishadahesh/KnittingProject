@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import tempfile
@@ -891,6 +892,7 @@ class MeshRenderer:
         self.cell_photo_tex = None
         self.cell_photo_vao = None
         self.cell_photo_buffers = []
+        self._carton_pose_key = None
         self.shadow_fbo = None
         self.shadow_tex = None
         self.shadow_size = 2048
@@ -1362,10 +1364,21 @@ class MeshRenderer:
                 )
                 self.robot_vaos.append((vao, link_idx, color))
 
-        if self.room_vao is not None:
-            return
-
         cell = workcell.cell()
+        pose_key = json.dumps(cell.get("carton_pose"))
+        if self.room_vao is not None and self._carton_pose_key == pose_key:
+            return
+        self._carton_pose_key = pose_key
+        for name in ('room_vao', 'room_vbo', 'cell_photo_vao'):
+            resource = getattr(self, name)
+            if resource is not None:
+                resource.release()
+                setattr(self, name, None)
+        for buf in self.cell_photo_buffers:
+            buf.release()
+        self.cell_photo_buffers = []
+        turn, shift = workcell.carton_pose()
+
         sx, sy = cell["surface_slope"]
         table, carton = cell["table"], cell["carton"]
         z_floor = min(-0.80, float(table["top_z_at_origin"]) - 0.80)
@@ -1415,8 +1428,10 @@ class MeshRenderer:
             for ly in (ty0, ty1 - leg):
                 cell_rows.extend(_box_vertices((lx, ly, z_floor), (lx + leg, ly + leg, z_under), (0.557, 0.518, 0.486)))
         (cx0, cx1), (cy0, cy1) = carton["x"], carton["y"]
-        cell_rows.extend(_box_vertices((cx0, cy0, z_table), (cx1, cy1, float(carton["top_z_at_origin"]) - 0.002), (0.80, 0.78, 0.74)))
-        cell_arr = np.asarray(cell_rows, dtype=np.float32)
+        carton_arr = np.asarray(_box_vertices((cx0, cy0, z_table), (cx1, cy1, float(carton["top_z_at_origin"]) - 0.002), (0.80, 0.78, 0.74)), dtype=np.float32)
+        carton_arr[:, 0:2] = carton_arr[:, 0:2] @ turn.T + shift
+        carton_arr[:, 3:5] = carton_arr[:, 3:5] @ turn.T
+        cell_arr = np.concatenate([np.asarray(cell_rows, dtype=np.float32), carton_arr])
         lifted = cell_arr[:, 2] > z_floor + 1e-6
         cell_arr[lifted, 2] += sx * cell_arr[lifted, 0] + sy * cell_arr[lifted, 1]
 
@@ -1435,6 +1450,7 @@ class MeshRenderer:
                 [cx1, cy1, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
                 [cx0, cy1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             ], dtype=np.float32)
+            photo_verts[:, 0:2] = workcell.place(photo_verts[:, 0:2])
             photo_verts[:, 2] = [workcell.surface_z(carton["top_z_at_origin"] - 0.001, x, y) for x, y in photo_verts[:, :2]]
             f_buf = self.ctx.buffer(photo_verts.tobytes())
             f_idx = self.ctx.buffer(np.array([0, 1, 2, 0, 2, 3], dtype=np.int32).tobytes())

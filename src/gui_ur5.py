@@ -44,6 +44,7 @@ import scan_geometry
 import scanner_core
 import teleop_transport
 import ur5_robot
+import fabric_relocate
 import ur5_scan
 import workcell
 from scan_geometry import clamp_capture_size
@@ -101,6 +102,12 @@ MEASURE_AGREEMENT = 0.2
 CENTRING_HEIGHT = 0.25
 PROBE_STEP = 0.03
 MAX_CENTRING_STEP = 0.08
+# Re-locating the fabric: straight-down views over the carton where it was photographed (m, then placed
+# where it lies now), from a height that sees ~15 x 11 cm each - the whole carton's outline and run of
+# panel colours, which a close view cannot tell apart from its neighbours.
+RELOCATE_COLUMNS_X = (-0.26, -0.10, 0.06, 0.22, 0.36)
+RELOCATE_ROWS_Y = (0.47, 0.64)
+RELOCATE_HEIGHT = 0.22
 CENTRE_TOLERANCE = 0.03
 FULL_FRAME_SHARE = 0.97
 MAX_CENTRING_ITERATIONS = 4
@@ -272,6 +279,11 @@ class UR5ModeController:
         self._scan_plan_result = None
         self._check_lock = threading.Lock()
         self._check_again = False
+        self.preview_plan: scan_geometry.CapturePlan | None = None
+        self.preview_error = ""
+        self.preview_thread: threading.Thread | None = None
+        self._preview_lock = threading.Lock()
+        self._preview_again = False
         self._rehearse_stop = threading.Event()
         self.preview_texture = None
         self._preview_size = (0, 0)
@@ -355,8 +367,8 @@ class UR5ModeController:
             "swatch_tiles_epoch": tiles_epoch,
             "swatch_slots": swatch_slots,
             "swatch_repeats": swatch_repeats,
-            "hide_unit_cell_mesh": bool(tile_images and swatch_slots) or not bool(self.state.get("world_show_sim_swatches", True)),
-            "show_swatches": bool(self.state.get("world_show_sim_swatches", True)),
+            "hide_unit_cell_mesh": bool(tile_images and swatch_slots) or not bool(self.state.get("world_show_sim_swatches", False)),
+            "show_swatches": bool(self.state.get("world_show_sim_swatches", False)),
         }
         material_uniforms = {**material_uniforms, **macro_keys}
         return {
@@ -636,9 +648,35 @@ class UR5ModeController:
         self.status = self.state.scanner_status = "Scanner running" if started else self.runner.progress.status
 
     def replan(self) -> None:
-        """Check again after a setting changed - when there is an arm to plan from, and no run is flying the path."""
+        """Check again after a setting changed - when there is an arm to plan from, and no run is flying the path -
+        and plan the simulator's preview of the capture points either way."""
+        self.preview_in_background()
         if self.robot.transport.linked() and not (self.runner is not None and self.runner.running):
             self.check_in_background()
+
+    def preview_in_background(self) -> None:
+        """Plan the capture points the simulator shows on a worker; one asked for meanwhile follows it."""
+        with self._preview_lock:
+            if self.preview_thread is not None and self.preview_thread.is_alive():
+                self._preview_again = True
+                return
+            self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True, name="ur5-preview")
+            self.preview_thread.start()
+
+    def _preview_loop(self) -> None:
+        while True:
+            joints = (self.robot.refresh().joints if self.robot.transport.linked()
+                      else list(self.state.get("ur5_home_joints") or ur5_robot.DEFAULT_HOME_JOINTS))
+            try:
+                self.preview_plan = scan_geometry.build_capture_plan(joints, **_capture_settings(self.state))
+                self.preview_error = ""
+            except Exception as exc:
+                self.preview_plan, self.preview_error = None, str(exc)
+            with self._preview_lock:
+                if not self._preview_again:
+                    self.preview_thread = None
+                    return
+                self._preview_again = False
 
     def _check_loop(self) -> None:
         while True:
@@ -1096,6 +1134,72 @@ class UR5ModeController:
             return
         self.replan()
         self.status = f"Over the fabric's middle, {height * 100:.1f} cm up - re-planning the capture points for this height"
+
+    def target_part(self, number) -> None:
+        """Capture around fabric part `number` (None: the fabric's middle): Move over fabric and every capture
+        pattern centre on it; the outline is the whole fabric where it lies, so frames still stay on the cloth."""
+        self.state.teleop_fabric_part = number
+        centre = workcell.part_centre(number) if number is not None else workcell.fabric_center()
+        z = float(centre[2])
+        self.state.teleop_fabric_z = z
+        self.state.teleop_fabric_corners = [[float(x), float(y), z] for x, y in workcell.fabric_corners()]
+        self.plan = None
+        self.replan()
+        self.status = (f"Part {number:02d} targeted: captures centre on ({centre[0]:.3f}, {centre[1]:.3f}), {z:.3f} m"
+                       if number is not None else "No part targeted - captures centre on the fabric's middle")
+
+    def relocate_fabric(self) -> None:
+        """Find where the carton lies now from a few pictures, instead of mapping the fabric again."""
+        if self.camera is None or not self.camera.running:
+            self.status = "Re-locating needs the camera: start the live preview first"
+            return
+        self._on_worker(self._relocate_loop)
+
+    def _relocate_loop(self) -> None:
+        """Fly straight-down views spread over the carton where it is believed to lie, then align them with
+        the carton's photo (fabric_relocate) and keep the carton's new pose (workcell.save_carton_pose)."""
+        stop = self._centring_stop
+        try:
+            lens = hand_eye.load_intrinsics()
+            calibration = hand_eye.load_calibration()
+            if lens is None or calibration is None:
+                raise RuntimeError("the camera's lens and mount are not calibrated")
+            camera_matrix, distortion = charuco.camera_matrix({"fl_x": lens["fx"], "fl_y": lens["fy"],
+                                                               **{k: lens[k] for k in ("cx", "cy", "k1", "k2", "p1", "p2", "k3")}})
+            flange_camera = hand_eye.calibration_matrix(calibration)
+            cell = workcell.cell()
+            pose = cell.get("carton_pose", {"turn_deg": 0.0, "shift": [0.0, 0.0]})
+            prior = (float(pose["turn_deg"]), pose["shift"])
+            reference = workcell.reference_photo(fabric_relocate.RES_M)
+            views, skipped = [], 0
+            spots = workcell.place([(x, y) for y in RELOCATE_ROWS_Y for x in RELOCATE_COLUMNS_X])
+            for n, spot in enumerate(spots, 1):
+                self.status = f"Re-locating the fabric: picture {n} of {len(spots)}"
+                try:
+                    self._fly_over(spot, RELOCATE_HEIGHT, stop)
+                except RuntimeError:
+                    if stop.is_set():
+                        raise
+                    skipped += 1
+                    continue
+                image = np.asarray(self._frame().convert("RGB"))[:, :, ::-1].copy()
+                camera_base = np.linalg.inv(hand_eye.tcp_matrix(self.robot.refresh().tcp_pose) @ flange_camera)
+                views.append(fabric_relocate.project_view(image, camera_base, camera_matrix, distortion, cell["surface_slope"],
+                                                          cell["carton"]["top_z_at_origin"], prior))
+            self.status = "Re-locating the fabric: lining the pictures up with the carton's photo"
+            turn_deg, new_shift, correlation, share = fabric_relocate.locate(views, reference, prior)
+        except Exception as exc:
+            self.status = f"Fabric not re-located: {exc}"
+            return
+        centre = np.array(workcell.fabric_center()[:2])
+        workcell.save_carton_pose(turn_deg, new_shift)
+        moved = np.array(workcell.fabric_center()[:2]) - centre
+        target = self.state.get("teleop_fabric_part")
+        if target is not None:
+            self.target_part(target)
+        self.status = (f"Fabric re-located: its middle moved {moved[0] * 1000:+.1f}, {moved[1] * 1000:+.1f} mm and turned "
+                       f"{turn_deg - prior[0]:+.2f} deg (pictures match the photo at {correlation:.2f}, covering {share:.0%}"
+                       + (f"; {skipped} spot(s) out of reach" if skipped else "") + ")")
 
     @property
     def centring(self) -> bool:
@@ -2016,7 +2120,14 @@ def _capture_settings(state) -> dict:
         grid_overview_height = state.get("teleop_overview_height"),
         grid_overview_joints = state.get("teleop_overview_joints"),
         splat_views_per_ring = int(state.get("teleop_splat_views", 12)),
-        splat_layers      = int(state.get("teleop_splat_layers", 2)))
+        splat_layers      = int(state.get("teleop_splat_layers", 2)),
+        subject_xy        = _part_subject(state))
+
+
+def _part_subject(state):
+    """The targeted fabric part's centre (x, y) - what captures centre on - or None for the outline's middle."""
+    centre = workcell.part_centre(state.get("teleop_fabric_part"))
+    return None if centre is None else [float(centre[0]), float(centre[1])]
 
 
 def _draw_field(state, key):
@@ -2281,6 +2392,7 @@ def _draw_fabric(state, controller):
     robot = controller.robot
     busy = controller.centring or (controller.runner is not None and controller.runner.running)
     corners = list(state.get("teleop_fabric_corners", []))
+    _draw_part_target(state, controller, busy)
     _draw_fabric_gap(state, controller)
     if corners:
         region = scan_geometry.FabricRegion(np.asarray(corners, dtype=float))
@@ -2323,6 +2435,47 @@ def _draw_fabric(state, controller):
         controller.calibrate_image_turn()
     if held:
         imgui.end_disabled()
+
+
+def _draw_part_target(state, controller, busy):
+    """Pick the numbered part to capture, and re-locate the carton after it was nudged."""
+    parts = workcell.parts()
+    if not parts:
+        imgui.text_colored(COLOR_MUTED, "No fabric parts mapped (scripts/map_fabric_parts.py)")
+        return
+    target = state.get("teleop_fabric_part")
+    labels = ["(none)"] + [f"{part['number']:02d}" for part in parts]
+    numbers = [None] + [part["number"] for part in parts]
+    imgui.set_next_item_width(90)
+    changed, index = imgui.combo("Part to capture##fabric_part", numbers.index(target) if target in numbers else 0, labels)
+    if changed:
+        controller.target_part(numbers[index])
+    _help("The part's centre becomes the capture point: Move over fabric goes there and every pattern centres on it.")
+    if target is not None:
+        preview = controller.preview_plan
+        if preview is None and not controller.preview_error and controller.preview_thread is None:
+            controller.preview_in_background()
+        if controller.preview_thread is not None:
+            imgui.text_colored(COLOR_MUTED, "Planning the capture points...")
+        elif preview is not None:
+            imgui.text_colored(COLOR_OK, f"{len(preview.viewpoints)} capture points around part {target:02d} "
+                                         f"({preview.pattern}, {float(state.get('teleop_camera_height', 0.07)) * 100:.0f} cm up) - shown in the 3D view"
+                                         + (f"; {len(preview.skipped)} skipped, nothing safe near them" if preview.skipped else ""))
+        else:
+            imgui.text_colored(COLOR_DANGER, f"No capture points: {controller.preview_error}")
+    robot = controller.robot
+    held = not robot.connected or busy or robot.free_driving
+    if held:
+        imgui.begin_disabled()
+    if imgui.button("Re-locate the fabric (10 pictures)##fabric_relocate", (-1, 0)):
+        controller.relocate_fabric()
+    if held:
+        imgui.end_disabled()
+    turn, _ = workcell.carton_pose()
+    fabric = workcell.cell()["fabric"]
+    moved = np.array(workcell.fabric_center()[:2]) - np.array([np.mean(fabric["x"]), np.mean(fabric["y"])])
+    imgui.text_colored(COLOR_MUTED, f"Carton since its photo: middle {moved[0] * 1000:+.0f}, {moved[1] * 1000:+.0f} mm, "
+                                    f"turned {np.degrees(np.arctan2(turn[1, 0], turn[0, 0])):+.1f} deg")
 
 
 def _draw_hand_guiding(state, controller):

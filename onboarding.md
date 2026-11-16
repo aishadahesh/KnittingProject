@@ -61,6 +61,7 @@ These checks do not verify physical robot operation or CUDA training.
 | `src/charuco.py`, `src/hand_eye.py`, `src/session_fit.py` | Board, mount, and lens calibration and camera fitting |
 | `src/workcell.py`, `config/workcell.json` | The measured table, carton and fabric the simulated cell is drawn from |
 | `src/fabric_parts.py`, `config/fabric_parts.json` | The fabric's 40 numbered parts, found in the carton photo by `scripts/map_fabric_parts.py` |
+| `src/fabric_relocate.py` | Re-locating a nudged carton from a few pictures (UR5 panel, Re-locate the fabric); its pose is `carton_pose` in `config/workcell.json` |
 | `src/gaussian_splatting.py`, `src/free_capture.py` | Dataset export, trainer processes, and handheld capture |
 | `src/scan_fit.py`, `src/lace_lattice.py`, `src/strand_equations.py` | Fabric and crochet geometry extraction and fitting |
 | `src/fabric_palette.py`, `src/yarn_tracks.py` | Colours and yarn assignment |

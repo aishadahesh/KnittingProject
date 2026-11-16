@@ -2103,7 +2103,7 @@ def _project_slot_corners(state, model_matrix, view_proj, disp_w, disp_h):
 
 def _show_swatches(state) -> bool:
     """Whether the simulated knit swatches are drawn over the real fabric's photo."""
-    return bool(state.get('world_show_sim_swatches', True))
+    return bool(state.get('world_show_sim_swatches', False))
 
 
 def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board=True, renderer=None):
@@ -2118,8 +2118,11 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
     tool_offset = float(state.get('teleop_tool_offset', gui_ur5.scan_geometry.ENDOSCOPE_TIP_OFFSET))
     cam_pos, cam_rotvec = gui_ur5.scan_geometry.camera_pose(joints, tool_offset)
     cam_pose = [*cam_pos, *cam_rotvec]
-    plan_poses = []
-    if show_frusta and bool(state.get('scanner_add_camera', True)):
+    plan_poses, part_views = [], []
+    part_plan = None if controller is None or state.get('teleop_fabric_part') is None else (controller.plan or controller.preview_plan)
+    if part_plan is not None:
+        part_views = [[float(v.position[0]), float(v.position[1])] for v in part_plan.viewpoints]
+    elif show_frusta and bool(state.get('scanner_add_camera', True)):
         if controller is not None and controller.plan is not None:
             plan_poses = controller.plan.poses
         else:
@@ -2145,6 +2148,7 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
         'robot_joints': joints,
         'camera_pose': cam_pose,
         'capture_plan_poses': plan_poses,
+        'part_views_xy': part_views,
         'fabric_center': workcell.fabric_center(),
         'phys_span': 0.18,
         'grid_span': float(state.canonical_grid_span()),
@@ -2216,7 +2220,8 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
                 draw_gnomon(cam_gl, cam_rot, 0.032 * units_per_m, "CAM")
 
     if bool(world_scene.get('show_board', True)):
-        _draw_fabric_parts(dl, view_proj, scene_center, fc, units_per_m, disp_w, disp_h, ox, oy, vp_scale)
+        _draw_fabric_parts(dl, view_proj, scene_center, fc, units_per_m, disp_w, disp_h, ox, oy, vp_scale,
+                           state.get('teleop_fabric_part'), world_scene.get('part_views_xy') or [])
 
     rows = max(1, int(state.get('scanner_rows', 1)))
     cols = max(1, int(state.get('scanner_cols', 1)))
@@ -2252,22 +2257,35 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
     _hud_text(dl, ox + 10.0, oy + float(disp_h) * vp_scale - 22.0, status_col, status_line)
 
 
-def _draw_fabric_parts(dl, view_proj, scene_center, fc, units_per_m, disp_w, disp_h, ox, oy, vp_scale):
-    """Outline and number every mapped fabric part on the simulated carton."""
+def _draw_fabric_parts(dl, view_proj, scene_center, fc, units_per_m, disp_w, disp_h, ox, oy, vp_scale, target, views_xy):
+    """Every mapped fabric part on the simulated carton: its outline, number and capture point (a dot at its
+    centre). The targeted part stands out, with a small circle on the fabric under each planned view."""
     top = workcell.cell()["carton"]["top_z_at_origin"]
     outline_col = imgui.get_color_u32((1.0, 0.86, 0.20, 0.85))
+    target_col = imgui.get_color_u32((0.20, 1.0, 0.45, 1.0))
     label_col = imgui.get_color_u32((1.0, 0.95, 0.70, 1.0))
-    for part in workcell.parts():
-        (x0, x1), (y0, y1) = part["x"], part["y"]
-        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-        points = np.array([[x, y, workcell.surface_z(top, x, y)] for x, y in (*corners, part["centre"][:2])], dtype=np.float32)
+    centre_col = imgui.get_color_u32((1.0, 0.35, 0.25, 0.95))
+    view_col = imgui.get_color_u32((0.35, 0.85, 1.0, 1.0))
+
+    def to_screen(points_xy):
+        points = np.array([[x, y, workcell.surface_z(top, x, y)] for x, y in points_xy], dtype=np.float32).reshape(-1, 3)
         scr, valid, _ = project_to_screen(scene_center + (points - fc) * units_per_m, view_proj, disp_w, disp_h)
+        return [imgui.ImVec2(ox + float(x) * vp_scale, oy + float(y) * vp_scale) for x, y in scr], valid
+
+    for part in workcell.parts():
+        targeted = part["number"] == target
+        screen, valid = to_screen([*part["corners"], part["centre"][:2]])
         if not valid.all():
             continue
-        screen = [imgui.ImVec2(ox + float(x) * vp_scale, oy + float(y) * vp_scale) for x, y in scr]
         for a, b in zip(screen[:4], screen[1:4] + screen[:1]):
-            dl.add_line(a, b, outline_col, 1.5)
-        _hud_text(dl, screen[4].x - 7.0, screen[4].y - 7.0, label_col, f"{part['number']:02d}")
+            dl.add_line(a, b, target_col if targeted else outline_col, 3.0 if targeted else 1.5)
+        dl.add_circle_filled(screen[4], 7.0 if targeted else 4.5, target_col if targeted else centre_col)
+        _hud_text(dl, screen[4].x - 7.0, screen[4].y - 24.0, target_col if targeted else label_col, f"{part['number']:02d}")
+    if views_xy:
+        screen, valid = to_screen(views_xy)
+        for point, ok in zip(screen, valid):
+            if ok:
+                dl.add_circle(point, 4.0, view_col, 12, 1.5)
 
 
 def _camera_pose_line(state) -> str:
