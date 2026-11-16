@@ -1,0 +1,22 @@
+{
+  "frame": "UR5e controller base frame (the frame RTDE TCP poses use), metres",
+  "measured_at": "2026-11-16",
+  "from_sessions": ["env_20261116_141712_spokes", "env_20261116_143412_carton", "env_20261116_144504_heights"],
+  "surface_slope": [0.0108, 0.0345],
+  "table": {
+    "x": [-0.905, 1.505],
+    "y": [0.335, 1.055],
+    "top_z_at_origin": 0.0344,
+    "thickness": 0.04,
+    "edges": "front edge (y min) measured; the others from the user's 55 / 100 / 30 cm, read as distances from the carton"
+  },
+  "carton": {
+    "x": [-0.355, 0.505],
+    "y": [0.375, 0.755],
+    "top_z_at_origin": 0.0415
+  },
+  "fabric": {
+    "x": [-0.325, 0.330],
+    "y": [0.375, 0.755]
+  }
+}

@@ -9,9 +9,9 @@ import moderngl
 from PIL import Image
 from imgui_bundle import imgui
 
-import charuco
 import paths
 import scan_geometry
+import workcell
 
 # %% GLSL SHADERS ─────────────────────────────────────────────────────────────
 
@@ -719,26 +719,7 @@ _UR5E_MESH_MATERIAL = {
     "wrist3": "linkgray",
 }
 _UR5E_VISUAL_CACHE = None
-_CHARUCO_RGB_CACHE = {}
 _ENV_ASSET_LOCK = threading.Lock()
-
-
-def _get_charuco_board_rgb(spec, w_sheet, h_sheet):
-    key = (int(spec["squares_x"]), int(spec["squares_y"]), round(float(w_sheet), 4), round(float(h_sheet), 4))
-    with _ENV_ASSET_LOCK:
-        cached = _CHARUCO_RGB_CACHE.get(key)
-        if cached is not None:
-            return cached
-        page = charuco.board_image(
-            spec,
-            px_per_mm=4.0,
-            page_mm=(w_sheet * 1000.0, h_sheet * 1000.0),
-        )
-        paper = np.clip(24 + (page.astype(np.uint16) * (242 - 24)) // 255, 0, 255).astype(np.uint8)
-        rgb = np.ascontiguousarray(np.dstack((paper, paper, paper)))
-        res = (rgb.shape[1], rgb.shape[0], rgb.tobytes())
-        _CHARUCO_RGB_CACHE[key] = res
-        return res
 
 
 def _parse_obj_mesh(path):
@@ -907,13 +888,9 @@ class MeshRenderer:
         self.room_vao = None
         self.room_vbo = None
         self.room_vertex_count = 0
-        self.board_plinth_vao = None
-        self.board_plinth_vbo = None
-        self.board_plinth_vertex_count = 0
-        self.board_vao = None
-        self.board_buffers = []
-        self.charuco_tex = None
-        self._env_cache_key = None
+        self.cell_photo_tex = None
+        self.cell_photo_vao = None
+        self.cell_photo_buffers = []
         self.shadow_fbo = None
         self.shadow_tex = None
         self.shadow_size = 2048
@@ -958,18 +935,14 @@ class MeshRenderer:
         for buf in self.robot_buffers:
             buf.release()
         self.robot_buffers.clear()
-        if self.board_vao is not None:
-            self.board_vao.release()
-            self.board_vao = None
-        for buf in self.board_buffers:
+        for buf in self.cell_photo_buffers:
             buf.release()
-        self.board_buffers.clear()
+        self.cell_photo_buffers.clear()
         for tex in self._swatch_tile_textures:
             tex.release()
         self._swatch_tile_textures.clear()
         self._swatch_tiles_epoch = -1
-        for name in ('room_vao', 'room_vbo', 'board_plinth_vao', 'board_plinth_vbo',
-                     'charuco_tex', 'sky_vao', 'sky_prog',
+        for name in ('room_vao', 'room_vbo', 'cell_photo_vao', 'cell_photo_tex', 'sky_vao', 'sky_prog',
                      'shadow_fbo', 'shadow_tex',
                      'wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex',
                      '_tile_fbo', '_tile_color_tex', '_tile_depth_tex',
@@ -1375,25 +1348,7 @@ class MeshRenderer:
         self.sky_prog['uHorizon'].value = float(horizon)
         self.sky_vao.render(moderngl.TRIANGLES, vertices=3)
 
-    def _ensure_environment_buffers(self, fabric_center, fabric_size=None):
-        fc = np.asarray(fabric_center, dtype=np.float32).reshape(-1)[:3]
-        spec = charuco.DEFAULT_BOARD
-        if isinstance(fabric_size, (tuple, list, np.ndarray)) and len(fabric_size) >= 2:
-            w_pat = float(fabric_size[0])
-            h_pat = float(fabric_size[1])
-        else:
-            w_pat = float(spec["squares_x"]) * float(spec["square_mm"]) / 1000.0
-            h_pat = float(spec["squares_y"]) * float(spec["square_mm"]) / 1000.0
-        border = float(charuco.SHEET_BORDER_M)
-        w_sheet = w_pat + 2.0 * border
-        h_sheet = h_pat + 2.0 * border
-
-        if self.charuco_tex is None:
-            cw, ch, cbytes = _get_charuco_board_rgb(spec, w_sheet, h_sheet)
-            self.charuco_tex = self.ctx.texture((cw, ch), 3, cbytes)
-            self.charuco_tex.build_mipmaps()
-            self.charuco_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-
+    def _ensure_environment_buffers(self):
         if not self.robot_vaos:
             for link_idx, pos_b, norm_b, tri_b, _n_idx, color in (*_load_ur5e_visual_meshes(), _load_endoscope_mount_mesh()):
                 p_buf = self.ctx.buffer(pos_b)
@@ -1407,29 +1362,13 @@ class MeshRenderer:
                 )
                 self.robot_vaos.append((vao, link_idx, color))
 
-        key = (
-            round(float(fc[0]), 4),
-            round(float(fc[1]), 4),
-            round(float(fc[2]), 4),
-            round(w_sheet, 4),
-            round(h_sheet, 4),
-        )
-        if self._env_cache_key == key and self.room_vao is not None and self.board_vao is not None:
+        if self.room_vao is not None:
             return
-        self._env_cache_key = key
 
-        for name in ('room_vao', 'room_vbo', 'board_plinth_vao', 'board_plinth_vbo', 'board_vao'):
-            res = getattr(self, name, None)
-            if res is not None:
-                res.release()
-                setattr(self, name, None)
-        for buf in self.board_buffers:
-            buf.release()
-        self.board_buffers.clear()
-
-        bx, by, bz = float(fc[0]), float(fc[1]), float(fc[2])
-        z_table = bz - 0.002
-        z_floor = min(-0.80, z_table - 0.80)
+        cell = workcell.cell()
+        sx, sy = cell["surface_slope"]
+        table, carton = cell["table"], cell["carton"]
+        z_floor = min(-0.80, float(table["top_z_at_origin"]) - 0.80)
 
         room_rows = []
         tile = 0.64
@@ -1467,25 +1406,40 @@ class MeshRenderer:
             (0.42, 0.44, 0.48),
         ))
 
-        half_tx = max(0.5 * w_sheet + 0.18, 0.34)
-        half_ty = max(0.5 * h_sheet + 0.22, 0.52)
-        if bx <= -0.12:
-            tx1 = min(bx + half_tx, -0.14)
-            tx0 = min(bx - half_tx, tx1 - 2.0 * half_tx)
-        elif bx >= 0.12:
-            tx0 = max(bx - half_tx, 0.14)
-            tx1 = max(bx + half_tx, tx0 + 2.0 * half_tx)
-        else:
-            tx0, tx1 = bx - half_tx, bx + half_tx
-        ty0, ty1 = by - half_ty, by + half_ty
-        table_thick = 0.04
+        (tx0, tx1), (ty0, ty1) = table["x"], table["y"]
+        z_table = float(table["top_z_at_origin"])
+        z_under = z_table - float(table["thickness"])
         leg = 0.06
-        room_rows.extend(_box_vertices((tx0, ty0, z_table - table_thick), (tx1, ty1, z_table), (0.659, 0.620, 0.588)))
+        cell_rows = _box_vertices((tx0, ty0, z_under), (tx1, ty1, z_table), (0.20, 0.42, 0.85))
         for lx in (tx0, tx1 - leg):
             for ly in (ty0, ty1 - leg):
-                room_rows.extend(_box_vertices((lx, ly, z_floor), (lx + leg, ly + leg, z_table - table_thick), (0.557, 0.518, 0.486)))
+                cell_rows.extend(_box_vertices((lx, ly, z_floor), (lx + leg, ly + leg, z_under), (0.557, 0.518, 0.486)))
+        (cx0, cx1), (cy0, cy1) = carton["x"], carton["y"]
+        cell_rows.extend(_box_vertices((cx0, cy0, z_table), (cx1, cy1, float(carton["top_z_at_origin"]) - 0.002), (0.80, 0.78, 0.74)))
+        cell_arr = np.asarray(cell_rows, dtype=np.float32)
+        lifted = cell_arr[:, 2] > z_floor + 1e-6
+        cell_arr[lifted, 2] += sx * cell_arr[lifted, 0] + sy * cell_arr[lifted, 1]
 
-        room_arr = np.asarray(room_rows, dtype=np.float32)
+        room_arr = np.concatenate([np.asarray(room_rows, dtype=np.float32), cell_arr])
+
+        if self.cell_photo_tex is None:
+            photo = np.ascontiguousarray(np.asarray(Image.open(paths.WORKCELL_CARTON_JPG).convert("RGB")))
+            self.cell_photo_tex = self.ctx.texture((photo.shape[1], photo.shape[0]), 3, photo.tobytes())
+            self.cell_photo_tex.build_mipmaps()
+            self.cell_photo_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            self.cell_photo_tex.anisotropy = 16.0
+        if self.cell_photo_vao is None:
+            photo_verts = np.array([
+                [cx0, cy0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+                [cx1, cy0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                [cx1, cy1, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+                [cx0, cy1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ], dtype=np.float32)
+            photo_verts[:, 2] = [workcell.surface_z(carton["top_z_at_origin"] - 0.001, x, y) for x, y in photo_verts[:, :2]]
+            f_buf = self.ctx.buffer(photo_verts.tobytes())
+            f_idx = self.ctx.buffer(np.array([0, 1, 2, 0, 2, 3], dtype=np.int32).tobytes())
+            self.cell_photo_buffers = [f_buf, f_idx]
+            self.cell_photo_vao = self.ctx.vertex_array(self.world_prog, [(f_buf, '3f 3f 2f', 'in_pos', 'in_norm', 'in_uv')], f_idx)
         self.room_vertex_count = len(room_arr)
         self.room_vbo = self.ctx.buffer(room_arr.tobytes())
         self.room_vao = self.ctx.vertex_array(
@@ -1493,39 +1447,9 @@ class MeshRenderer:
             [(self.room_vbo, '3f 3f 3f', 'in_pos', 'in_norm', 'in_col')],
         )
 
-        hw, hh = 0.5 * w_sheet, 0.5 * h_sheet
-        plinth_rows = _box_vertices(
-            (bx - hw, by - hh, bz - 0.002),
-            (bx + hw, by + hh, bz),
-            (0.94, 0.94, 0.92),
-            include_top=False,
-        )
-        plinth_arr = np.asarray(plinth_rows, dtype=np.float32)
-        self.board_plinth_vertex_count = len(plinth_arr)
-        self.board_plinth_vbo = self.ctx.buffer(plinth_arr.tobytes())
-        self.board_plinth_vao = self.ctx.vertex_array(
-            self.world_prog,
-            [(self.board_plinth_vbo, '3f 3f 3f', 'in_pos', 'in_norm', 'in_col')],
-        )
-
-        top_verts = np.array([
-            [bx - hw, by - hh, bz, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [bx + hw, by - hh, bz, 0.0, 0.0, 0.0, 1.0, 1.0],
-            [bx + hw, by + hh, bz, 0.0, 0.0, 0.0, 1.0, 0.0],
-            [bx - hw, by + hh, bz, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ], dtype=np.float32)
-        top_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
-        v_buf = self.ctx.buffer(top_verts.tobytes())
-        i_buf = self.ctx.buffer(top_idx.tobytes())
-        self.board_buffers = [v_buf, i_buf]
-        self.board_vao = self.ctx.vertex_array(
-            self.world_prog,
-            [(v_buf, '3f 3f 2f', 'in_pos', 'in_norm', 'in_uv')],
-            i_buf,
-        )
 
     def _ensure_world_vaos(self):
-        self._ensure_environment_buffers((-0.45, -0.08, 0.0))
+        self._ensure_environment_buffers()
 
     def _scene_world_mapping(self, model_mat, fabric_center, phys_span, grid_span=None):
         if model_mat is not None:
@@ -1564,7 +1488,7 @@ class MeshRenderer:
         view=None,
         target_fbo=None,
     ):
-        fabric_center = world_scene.get("fabric_center", (-0.45, -0.08, 0.0))
+        fabric_center = world_scene.get("fabric_center", workcell.fabric_center())
         fabric_size = world_scene.get("fabric_size")
         raw_phys_span = world_scene.get("phys_span")
         if raw_phys_span is not None:
@@ -1576,7 +1500,7 @@ class MeshRenderer:
         else:
             phys_span = 0.18
         grid_span = world_scene.get("grid_span")
-        self._ensure_environment_buffers(fabric_center, fabric_size)
+        self._ensure_environment_buffers()
         scene_center, fc, units_per_m = self._scene_world_mapping(model_mat, fabric_center, phys_span, grid_span=grid_span)
 
         fbo = target_fbo if target_fbo is not None else self.fbo
@@ -1629,11 +1553,6 @@ class MeshRenderer:
                 self.world_prog['mvp'].write(mvp_sh.T.tobytes())
                 self.world_prog['model'].write(env_model.T.tobytes())
                 self.room_vao.render(moderngl.TRIANGLES, vertices=self.room_vertex_count)
-            if show_board and self.board_plinth_vao is not None:
-                mvp_sh = (light_vp @ env_model).astype(np.float32)
-                self.world_prog['mvp'].write(mvp_sh.T.tobytes())
-                self.world_prog['model'].write(env_model.T.tobytes())
-                self.board_plinth_vao.render(moderngl.TRIANGLES, vertices=self.board_plinth_vertex_count)
             if has_robot:
                 for vao, link_name, _color in self.robot_vaos:
                     link_mat = link_mats.get(link_name)
@@ -1667,22 +1586,16 @@ class MeshRenderer:
             self.world_prog['uUseTex'].value = 0.0
             self.world_prog['uUseVertexCol'].value = 1.0
             self.room_vao.render(moderngl.TRIANGLES, vertices=self.room_vertex_count)
-
-        if show_board and self.board_vao is not None:
-            self.world_prog['mvp'].write(env_mvp.T.tobytes())
-            self.world_prog['model'].write(env_model.T.tobytes())
-            if self.board_plinth_vao is not None:
-                self.world_prog['uUseTex'].value = 0.0
-                self.world_prog['uUseVertexCol'].value = 1.0
-                self.board_plinth_vao.render(moderngl.TRIANGLES, vertices=self.board_plinth_vertex_count)
-            if self.charuco_tex is not None:
-                self.charuco_tex.use(location=0)
+            if self.cell_photo_vao is not None:
+                self.cell_photo_tex.use(location=0)
                 self.world_prog['uTex'].value = 0
                 self.world_prog['uUseTex'].value = 1.0
                 self.world_prog['uUseVertexCol'].value = 0.0
                 self.world_prog['base_color'].value = (1.0, 1.0, 1.0)
-                self.board_vao.render(moderngl.TRIANGLES)
-            self.world_prog['uUseTex'].value = 0.0
+                self.cell_photo_vao.render(moderngl.TRIANGLES)
+                self.world_prog['uUseTex'].value = 0.0
+
+        if show_board:
             self._draw_macro_fabric_sheet(view_proj, model_mat, world_scene, units_per_m=units_per_m)
 
         if has_robot and draw_robot:
@@ -1876,7 +1789,7 @@ class MeshRenderer:
             return
 
         if units_per_m is None:
-            fabric_center = world_scene.get("fabric_center", (-0.45, -0.08, 0.0))
+            fabric_center = world_scene.get("fabric_center", workcell.fabric_center())
             fabric_size = world_scene.get("fabric_size")
             raw_phys_span = world_scene.get("phys_span")
             if raw_phys_span is not None:
@@ -1969,7 +1882,7 @@ class MeshRenderer:
         self,
         world_pose,
         joints_or_hfov=None,
-        fabric_center=(-0.45, -0.08, 0.0),
+        fabric_center=None,
         phys_span=None,
         out_w=None,
         out_h=None,
@@ -2002,6 +1915,8 @@ class MeshRenderer:
                 phys_span = 0.18
         if material_uniforms is None:
             material_uniforms = {}
+        if fabric_center is None:
+            fabric_center = workcell.fabric_center()
 
         if self.wrist_fbo is None or self.wrist_size != (out_w, out_h):
             for name in ('wrist_fbo', 'wrist_color_tex', 'wrist_depth_tex'):

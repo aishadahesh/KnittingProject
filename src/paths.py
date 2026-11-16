@@ -38,6 +38,11 @@ PARAMS_JSON = CONFIG_DIR / "params.json"
 # configuration rather than the runtime output: a set is taught once for a cell
 # and reused on every fabric mounted there.
 TAUGHT_VIEWS_DIR = CONFIG_DIR / "taught_views"
+# The measured work cell - table, carton and fabric in the robot base frame - the simulator is built from.
+WORKCELL_JSON = CONFIG_DIR / "workcell.json"
+# The carton's top with the fabric on it, photographed from above (0.25 mm per pixel, cut to workcell.json's carton
+# rectangle, top row = far edge).
+WORKCELL_CARTON_JPG = ASSETS_DIR / "workcell_carton.jpg"
 
 # Downloaded model weights - fetched by scripts, never committed. MobileSAM is the fabric
 # check's segmentation model (scripts/fetch_mobilesam.py).

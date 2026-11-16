@@ -28,6 +28,8 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image, ImageDraw
 
+import workcell
+
 
 DEFAULT_CAPTURE_SIZE = (1280, 720)
 DEFAULT_PREVIEW_WIDTH = 480
@@ -379,14 +381,15 @@ class SimCameraBackend(CameraBackend):
                 return (
                     np.asarray(res, dtype=float).reshape(-1)[:6],
                     55.0,
-                    np.array([-0.45, -0.08, 0.0], dtype=float),
+                    np.array(workcell.fabric_center(), dtype=float),
                 )
             except Exception:
                 pass
+        centre = np.array(workcell.fabric_center(), dtype=float)
         return (
-            np.array([-0.45, -0.08, 0.25, math.pi, 0.0, 0.0], dtype=float),
+            np.array([*centre[:2], centre[2] + 0.25, math.pi, 0.0, 0.0], dtype=float),
             55.0,
-            np.array([-0.45, -0.08, 0.0], dtype=float),
+            centre,
         )
 
     def read(self) -> np.ndarray | None:

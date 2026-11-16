@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 import scan_geometry
+import workcell
 
 
 # UR controller enumerations, so status text reads in words rather than codes.
@@ -509,7 +510,7 @@ class DryRunTransport(UR5Transport):
 
     def __init__(self, travel_time: float = 0.25):
         self.travel_time = float(travel_time)
-        self._pose = np.array([-0.45, -0.08, 0.30, math.pi, 0.0, 0.0], dtype=float)
+        self._pose = np.array([*workcell.fabric_center()[:2], 0.30, math.pi, 0.0, 0.0], dtype=float)
         self._target = self._pose.copy()
         self._move_started = 0.0
         self._joints = np.array(DEFAULT_HOME_JOINTS, dtype=float)

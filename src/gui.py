@@ -29,6 +29,7 @@ from rendering import (draw_fitted_texture, project_to_screen, transform_points,
                        upload_rgb_texture)
 from scan_geometry import clamp_capture_size
 import paths
+import workcell
 from gui_database import _draw_database_summary_page, draw_database_viewport
 from scanner_core import (
     _clamp_scanner_selected_cell, _ensure_scanner_shared_colors,
@@ -2139,7 +2140,7 @@ def _build_world_scene_dict(state, show_robot=True, show_frusta=True, show_board
         'robot_joints': joints,
         'camera_pose': cam_pose,
         'capture_plan_poses': plan_poses,
-        'fabric_center': (-0.45, -0.08, 0.0),
+        'fabric_center': workcell.fabric_center(),
         'phys_span': 0.18,
         'grid_span': float(state.canonical_grid_span()),
         'swatch_tile_images': tile_images,
@@ -2162,7 +2163,7 @@ def _draw_scene_hud_overlays(dl, state, world_scene, model_mat, disp_w, disp_h):
     grid_span = float(world_scene.get('grid_span') or state.canonical_grid_span())
     phys_span = max(float(world_scene.get('phys_span', 0.18)), 0.05)
     units_per_m = grid_span / phys_span
-    fc = np.asarray(world_scene.get('fabric_center', (-0.45, -0.08, 0.0)), dtype=np.float32).reshape(-1)[:3]
+    fc = np.asarray(world_scene.get('fabric_center', workcell.fabric_center()), dtype=np.float32).reshape(-1)[:3]
     if model_mat is not None:
         scene_center = transform_points(np.zeros((1, 3), dtype=np.float32), model_mat)[0].astype(np.float32)
     else:

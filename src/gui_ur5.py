@@ -45,6 +45,7 @@ import scanner_core
 import teleop_transport
 import ur5_robot
 import ur5_scan
+import workcell
 from scan_geometry import clamp_capture_size
 from rendering import draw_fitted_texture, upload_rgb_texture
 
@@ -296,7 +297,7 @@ class UR5ModeController:
         pose = [*pos, *rotvec]
         fov = float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES))
         fz = _settings_fabric_z(self.state, None)
-        return pose, fov, (-0.45, -0.08, float(fz))
+        return pose, fov, (*workcell.fabric_center()[:2], float(fz))
 
     def _sim_camera_scene_provider(self) -> dict[str, Any]:
         robot_state = self.robot.state() if callable(self.robot.state) else self.robot.refresh()
@@ -310,7 +311,7 @@ class UR5ModeController:
             if hasattr(self.state, "canonical_grid_span")
             else 80.0
         )
-        fabric_center = (-0.45, -0.08, 0.0)
+        fabric_center = workcell.fabric_center()
         fabric_size = (
             float(self.state.get("scanner_fabric_width", 0.28)),
             float(self.state.get("scanner_fabric_length", 0.19)),
@@ -1262,10 +1263,11 @@ class UR5ModeController:
             return
         try:
             if renderer is not None and hasattr(renderer, "render_wrist_camera"):
+                cx, cy, cz = workcell.fabric_center()
                 rgb = renderer.render_wrist_camera(
-                    [-0.45, -0.08, 0.25, float(np.pi), 0.0, 0.0],
+                    [cx, cy, cz + 0.25, float(np.pi), 0.0, 0.0],
                     float(self.state.get("ur5_splat_fov", gaussian_splatting.DEFAULT_FOV_DEGREES)),
-                    (-0.45, -0.08, 0.0),
+                    (cx, cy, cz),
                     0.18,
                     512,
                     512,

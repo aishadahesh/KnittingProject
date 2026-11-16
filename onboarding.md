@@ -59,6 +59,7 @@ These checks do not verify physical robot operation or CUDA training.
 | `src/ur5_robot.py`, `src/teleop_transport.py`, `src/ur5_scan.py`, `src/robot_camera.py` | Robot, simulated cell, and camera lifecycles and capture execution |
 | `src/scan_geometry.py`, `src/fabric_detector.py` | Reachability, collision checks, capture plans, and fabric/RGB view metrics |
 | `src/charuco.py`, `src/hand_eye.py`, `src/session_fit.py` | Board, mount, and lens calibration and camera fitting |
+| `src/workcell.py`, `config/workcell.json` | The measured table, carton and fabric the simulated cell is drawn from |
 | `src/gaussian_splatting.py`, `src/free_capture.py` | Dataset export, trainer processes, and handheld capture |
 | `src/scan_fit.py`, `src/lace_lattice.py`, `src/strand_equations.py` | Fabric and crochet geometry extraction and fitting |
 | `src/fabric_palette.py`, `src/yarn_tracks.py` | Colours and yarn assignment |
