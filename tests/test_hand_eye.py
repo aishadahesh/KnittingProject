@@ -22,6 +22,12 @@ FOV = 40.0
 WIDTH, HEIGHT = 640, 480
 
 
+@pytest.fixture(autouse=True)
+def _no_measured_lens(tmp_path, monkeypatch):
+    """The synthetic pictures are taken through the ideal lens, not the one in config/camera_intrinsics.json."""
+    monkeypatch.setattr(hand_eye.load_intrinsics, "__defaults__", (tmp_path / "no_lens.json",))
+
+
 def _synthetic_scan(tmp_path, rotvec=TRUE_ROTVEC, translation=TRUE_TRANSLATION, target=TRUE_TARGET, fov=FOV):
     """Captures of a dark disc at `target`, taken with a camera mounted at (rotvec, translation) on
     the tool, from the views a splat scan plans: straight down at two heights and tilted rings."""
