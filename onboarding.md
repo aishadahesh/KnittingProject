@@ -20,6 +20,7 @@ The default robot transport connects through the separately running CraftLabXRFl
 For the alternative direct RTDE transport, install `uv sync --extra camera --extra rtde`; its native extension may require a local build toolchain.
 Opening the robot panel does not connect to hardware.
 Connection and motion require explicit actions in the panel.
+When the robot will not connect, follow `docs/ROBOT_CONNECTION.md`.
 
 Dependencies are declared in `pyproject.toml` and resolved by `uv.lock`.
 The editor has no JAX, Mitsuba, VTK, or Blender runtime dependency.
